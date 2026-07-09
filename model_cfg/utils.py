@@ -261,6 +261,57 @@ def get_model_size_mb(model_path: str) -> int:
     return Path(model_path).stat().st_size // (1024 ** 2)
 
 
+# Conservative real-world sequential read estimates (MB/s) by device class.
+# Not best-case marketing figures; chosen to bound the health-check timeout
+# safely. NVMe is set conservatively; SATA SSD/HDD use the operator's figures.
+_NVME_READ_MBPS = 1500
+_SSD_READ_MBPS = 300
+_HDD_READ_MBPS = 100
+_UNKNOWN_READ_MBPS = 100
+
+
+def _detect_drive_speed(model_paths: list[Path]) -> int:
+    """Detect the slowest drive speed (MB/s) among the drives holding *model_paths*.
+
+    Classifies each drive by device type (NVMe vs SATA) and the kernel
+    rotational flag, then assigns a conservative real-world sequential read
+    estimate. No model data is read off disk and no benchmark is run. The
+    minimum across all drives is returned so the slowest disk bounds the
+    health-check timeout.
+    """
+    speeds: list[int] = []
+    for p in model_paths:
+        try:
+            mount = mount_root(str(p))
+        except Exception:
+            mount = str(p)
+        try:
+            out = subprocess.run(
+                ["lsblk", "-dno", "NAME,ROTA", mount],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode != 0 or not out.stdout.strip():
+                speeds.append(_UNKNOWN_READ_MBPS)
+                continue
+            line = out.stdout.strip().splitlines()[0].split()
+            dev_name, rota = line[0], int(line[1])
+            if dev_name.startswith("nvme"):
+                speed, kind = _NVME_READ_MBPS, "NVMe SSD"
+            elif rota == 1:
+                speed, kind = _HDD_READ_MBPS, "HDD"
+            else:
+                speed, kind = _SSD_READ_MBPS, "SATA SSD"
+            logger.info("drive: %s (%s) estimated %d MB/s", dev_name, kind, speed)
+            speeds.append(speed)
+        except Exception:
+            speeds.append(_UNKNOWN_READ_MBPS)
+
+    if not speeds:
+        logger.info("drive: unknown, defaulting to %d MB/s", _UNKNOWN_READ_MBPS)
+        return _UNKNOWN_READ_MBPS
+    return min(speeds)
+
+
 def get_available_versions(base_dir: Path) -> list[int]:
     """List available llama-b#### version numbers under base_dir."""
     return sorted(
@@ -288,7 +339,11 @@ def find_bin_dir(version: str, base_dir: Path) -> str:
 
 def parse_frontmatter(md_path: Path) -> dict:
     """Parse YAML frontmatter from .md file."""
-    content = md_path.read_text(encoding="utf-8")
+    try:
+        content = md_path.read_text(encoding="utf-8")
+    except PermissionError:
+        logger.warning("permission denied: %s", md_path)
+        return {}
     if not content.startswith("---"):
         return {}
     parts = content.split("---", 2)
@@ -315,6 +370,7 @@ def generate_stub_md(md_path: Path, model_file: Path) -> dict:
     }
     content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---\n\n# " + stem + "\n"
     md_path.write_text(content, encoding="utf-8")
+    md_path.chmod(0o644)
     return fm
 
 

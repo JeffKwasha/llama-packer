@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from model_cfg import Model, get_vram_mb, find_bin_dir
-from model_cfg.utils import compute_env_prefixes, make_subst
+from model_cfg.utils import compute_env_prefixes, make_subst, _detect_drive_speed
 from model_cfg.output import build_config, write_yaml, write_ini
 
 
@@ -56,6 +57,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection)")
     parser.add_argument("--max-context", help="Hard cap on context length for all models (e.g. 128k, 65536)")
     parser.add_argument("--no-env", action="store_true", help="Do not write the sibling config.env file")
+    parser.add_argument("--health-check-timeout", type=int, default=None,
+                        help="Health check timeout in seconds (default: auto-calculated from model sizes)")
+    parser.add_argument("--drive-speed", type=int, default=None,
+                        help="Slowest drive speed in MB/s for timeout calc (default: auto-detect, else 100)")
     parser.add_argument("--verbose", "-V", action="count", default=0, help="Increase verbosity (-V: info, -VV: debug)")
     return parser.parse_args(argv[1:] if argv else None)
 
@@ -123,6 +128,30 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     logger.info("models: %d found", len(models))
 
+    # Auto-calculate healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
+    if args.health_check_timeout is None:
+        largest_mb = max(
+            (m.gguf_path.stat().st_size // (1024 * 1024) for m in models if m.gguf_path and m.gguf_path.is_file()),
+            default=0,
+        )
+        # Resolve drive speed: CLI > env > auto-detect > default 100 MB/s
+        drive_speed = args.drive_speed
+        if drive_speed is None:
+            env_speed = os.environ.get("GEN_CONFIG_DRIVE_SPEED")
+            if env_speed:
+                try:
+                    drive_speed = int(env_speed)
+                except ValueError:
+                    logger.warning("GEN_CONFIG_DRIVE_SPEED=%r is not numeric; ignoring", env_speed)
+                    drive_speed = None
+        if drive_speed is None:
+            model_paths = [m.gguf_path for m in models if m.gguf_path and m.gguf_path.is_file()]
+            drive_speed = _detect_drive_speed(model_paths)
+        hct = max(120, int(1.2 * largest_mb / drive_speed))
+        logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)", hct, largest_mb, drive_speed)
+    else:
+        hct = args.health_check_timeout
+
     # Get VRAM
     if args.vram:
         from model_cfg.utils import resolve_spare_mb
@@ -150,6 +179,9 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("no model entries generated")
         sys.exit(1)
     logger.info("entries: %d generated", len(config["models"]))
+
+    # Top-level llama-swap settings
+    config["healthCheckTimeout"] = hct
 
     output_path = Path(args.output)
     if not output_path.is_absolute():

@@ -298,7 +298,12 @@ class Model:
                 except ValueError:
                     pass
 
-        logger.warning("could not parse fit-params output for %s:\n%s", self.stem, out.stdout)
+        if out.returncode != 0:
+            logger.warning("fit-params crashed for %s (exit %d)", self.stem, out.returncode)
+        else:
+            # Parse failed but process exited cleanly — log first 3 lines of output
+            preview = "\n".join(out.stdout.splitlines()[:3])
+            logger.warning("could not parse fit-params output for %s: %s", self.stem, preview)
         return 0, 0, 0
 
     def calc_ctx(
@@ -347,8 +352,14 @@ class Model:
         )
 
         if model_mib == 0:
-            logger.warning("fit-params failed for %s, using min ctx", self.stem)
-            return utils._MIN_CTX_SIZE
+            # fit-params failed (binary missing, safetensors unsupported, etc.).
+            # Without a measurement we cannot produce a safe estimate, so die.
+            raise RuntimeError(
+                f"fit-params failed to measure VRAM for {self.stem}; "
+                f"cannot estimate a safe context size. Ensure llama-fit-params "
+                f"is available/built and the model format is supported "
+                f"(safetensors may be unsupported)."
+            )
 
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
@@ -370,6 +381,7 @@ class Model:
         fm = {k: v for k, v in self.frontmatter.items() if k in self.FIELDS}
         content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---\n"
         path.write_text(content, encoding="utf-8")
+        path.chmod(0o644)
         logger.info("wrote sidecar: %s", path.name)
 
     @property
