@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated config outputs
+config.yaml
+config.env
+docker-compose.yml
+
+# Scratch / temp
+_help_
+sha
+tunableop_results*.csv
+
+# Large build artifacts / model weights (not source)
+llama-b*/
+llama-swap
+models

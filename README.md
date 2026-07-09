@@ -1,0 +1,56 @@
+# llama-packer
+
+Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) (or llama-server router-mode) from GGUF model metadata. Takes a directory of models and produces ready-to-run server configurations with optimal flags tuned to your hardware.
+
+Scans GGUF model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across models, and writes `config.yaml` — no manual flag wrangling.
+
+## Quick start
+
+```sh
+uv run gen-config.py
+```
+
+Output goes to `config.yaml` and `config.env` in the project root.
+
+## What it does
+
+- Discovers models from `.md` sidecar files in `models/`
+- Detects GPU VRAM via `amd-smi`, `nvidia-smi`, or `rocminfo`
+- Runs `llama-fit-params` to measure per-model VRAM usage
+- Calculates optimal context window that fits available VRAM
+- Resolves companion files (mmproj, MTP draft models) by fuzzy match
+- Applies sampling profiles from `profiles.yaml`
+- Assembles llama-swap YAML with per-model metadata and `setParamsByID`
+- Writes INI format for llama-server router mode
+- Solves multi-model VRAM budgets for embed/rerank/chat on shared GPUs
+
+## Sidecar example
+
+```yaml
+---
+name: gemma-4-12B-it-qat-UD-Q4_K_XL
+parameters: 12B
+context_length: 262144
+quantization: Q4_K_XL
+mmproj: gemma-4-12B-it-mmproj-F16.gguf
+capabilities: [vision, tools, reasoning]
+freethought: 0.55
+strengths: ["strong multimodal", "full 256K context"]
+weaknesses: ["MTP adds VRAM"]
+---
+```
+
+Any key not consumed by the builder passes through to clients — add descriptive fields without code changes.
+
+## Standalone launcher
+
+`start.py` launches a single `llama-server` instance directly:
+
+```sh
+uv run start.py models/some-model.gguf
+```
+
+## See also
+
+- [SPEC.md](SPEC.md) — detailed configuration specification
+- [profiles.yaml](profiles.yaml) — sampling profile definitions

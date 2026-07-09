@@ -1,0 +1,19 @@
+[project]
+name = "model-cfg"
+version = "0.1.0"
+description = "Generate llama-swap config from model metadata"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml",
+]
+
+[project.scripts]
+gen-config = "model_cfg.__main__:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model_cfg*"]

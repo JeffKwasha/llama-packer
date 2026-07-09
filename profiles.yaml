@@ -1,0 +1,56 @@
+# ── Command templates ──────────────────────────────────
+templates:
+  llama-server:
+    cmd: |
+      {{llama_bin}} --port ${PORT}
+      --cont-batching --flash-attn on --no-mmap --no-context-shift
+      --model {{model_path}}
+      --ctx-size {{ctx_size}}
+      --parallel {{parallel}}
+      --cache-type-k {{cache_type}} --cache-type-v {{cache_type}}
+      {{extra_args}}
+
+  vllm-docker:
+    cmd: |
+      docker run --init --rm --gpus all --name ${MODEL_ID}
+        -v {{models_dir}}:/models
+        vllm/vllm-openai:v0.10.0
+        --model {{model_path}}
+        --served-model-name ${MODEL_ID}
+        --max-model-len {{context_length}}
+        --gpu-memory-utilization 0.9
+        --enforce-eager
+
+# ── Global defaults ────────────────────────────────────
+defaults:
+  cache_type: q8_0
+  parallel: 1
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.01
+  pres_pen: 0.0
+
+# ── Profile definitions ────────────────────────────────
+profiles:
+  default:
+
+  coder:
+    description: "Optimized for code generation and bash commands"
+    temperature: "base * 0.6"
+    top_k: 20
+    min_p: 0.1
+
+  research:
+    description: "Optimized for deep reasoning and analysis"
+    min_p: 0.05
+
+  creative:
+    description: "Higher temperature for creative and writing tasks"
+    temperature: "base * 1.2"
+    top_p: 0.97
+    top_k: 40
+
+  server:
+    description: "concurrency"
+    parallel: 2

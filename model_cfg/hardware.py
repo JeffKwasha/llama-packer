@@ -1,0 +1,278 @@
+"""GPU hardware detection, target profiling, and family-specific rules.
+
+Auto-detection lives here so that callers can alternatively construct a
+``GpuProfile`` from CLI arguments or a ``profiles.yaml`` ``hardware:`` section,
+making it possible to generate configs for remote or unavailable hardware.
+
+The ``gpu_family`` string dispatches to a ``GpuFamilyHandler`` subclass via a
+registry.  Only a ``DefaultHandler`` is registered now; specific families (rdna3,
+hopper, etc.) will be added when their calculation rules diverge from the
+default.  An unknown family logs a warning and falls back to the default.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+logger = logging.getLogger(__name__)
+
+# ── VRAM detection (moved from utils.py) ──────────────────────────────────
+
+
+def _detect_vram_amd() -> int | None:
+    """Detect VRAM via AMD tools. Returns MiB or None."""
+    try:
+        out = subprocess.run(
+            ["amd-smi", "metric", "-m", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            data = json.loads(out.stdout)
+            total = data["gpu_data"][0]["mem_usage"]["total_vram"]["value"]
+            return int(total)
+    except Exception:
+        pass
+
+    try:
+        for p in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
+            return int(p.read_text().strip()) // (1024 ** 2)
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=10)
+        for line in out.stdout.splitlines():
+            if "Global Memory" in line or "VRAM" in line:
+                m = re.search(r"(\d+)\s*([GM])B", line)
+                if m:
+                    val = int(m.group(1))
+                    return val * 1024 if m.group(2) == "G" else val
+    except Exception:
+        pass
+
+    return None
+
+
+def _detect_vram_nvidia() -> int | None:
+    """Detect VRAM via nvidia-smi. Returns MiB or None.
+
+    On unified memory systems (e.g. NVIDIA GB10/Grace), nvidia-smi reports
+    'Not Supported' for memory — returns None so caller falls back to system RAM.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            val = out.stdout.strip().splitlines()[0].strip()
+            if val in ("N/A", "[N/A]", "Not Supported", ""):
+                return None
+            return int(val)
+    except Exception:
+        pass
+    return None
+
+
+def _detect_system_ram_mb() -> int:
+    """Get total system RAM in MiB (for unified memory fallback)."""
+    try:
+        out = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
+        for line in out.stdout.splitlines():
+            if line.startswith("Mem:"):
+                return int(line.split()[1])
+    except Exception:
+        pass
+    try:
+        return int(Path("/proc/meminfo").read_text().split()[1]) // 1024
+    except Exception:
+        pass
+    raise SystemExit("error: could not determine system RAM")
+
+
+def detect_vram_mb() -> int:
+    """Detect VRAM budget in MiB.
+
+    Tries GPU-specific tools first. On unified memory systems (NVIDIA GB10,
+    Apple Silicon, Intel integrated), falls back to system RAM with a warning.
+    """
+    vram = _detect_vram_amd()
+    if vram is not None:
+        logger.info("vram: %d MiB (discrete GPU)", vram)
+        return vram
+
+    vram = _detect_vram_nvidia()
+    if vram is not None:
+        logger.info("vram: %d MiB (nvidia-smi)", vram)
+        return vram
+
+    try:
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and "NVIDIA" in out.stdout:
+            ram = _detect_system_ram_mb()
+            available = ram // 2
+            logger.warning("unified memory detected (nvidia-smi reports N/A) — "
+                           "system RAM %d MiB, using 50%%: %d MiB", ram, available)
+            return available
+    except Exception:
+        pass
+
+    try:
+        ram = _detect_system_ram_mb()
+        available = ram // 2
+        logger.warning("no GPU detection tool available — system RAM %d MiB, using 50%%: %d MiB",
+                       ram, available)
+        return available
+    except Exception:
+        pass
+
+    raise SystemExit(
+        "error: could not detect VRAM — no GPU tools found (amd-smi, nvidia-smi, rocminfo)\n"
+        "use --vram to specify (e.g. --vram 32G)"
+    )
+
+
+def detect_gpu_env_var() -> str:
+    """Return the vendor env var used to pin a process to a GPU device.
+
+    ROCm uses ROCR_VISIBLE_DEVICES; NVIDIA uses CUDA_VISIBLE_DEVICES.
+    Defaults to ROCR_VISIBLE_DEVICES when detection is inconclusive.
+    """
+    try:
+        out = subprocess.run(
+            ["amd-smi", "metric", "-m", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return "ROCR_VISIBLE_DEVICES"
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return "CUDA_VISIBLE_DEVICES"
+    except Exception:
+        pass
+    return "ROCR_VISIBLE_DEVICES"
+
+
+# ── GPU family registry ───────────────────────────────────────────────────
+
+_FAMILY_REGISTRY: dict[str, type[GpuFamilyHandler]] = {}
+
+
+def register_family(name: str) -> Callable[[type], type]:
+    """Decorator: register a ``GpuFamilyHandler`` subclass under ``name``."""
+    def decorator(cls: type) -> type:
+        _FAMILY_REGISTRY[name] = cls
+        return cls
+    return decorator
+
+
+class GpuFamilyHandler:
+    """Family-specific calculation rules (extensible per chip class).
+
+    Subclasses override methods to express divergences (native quant support,
+    compute overhead, MoE routing, etc.).  The default handler is permissive.
+    """
+
+    def supports_quant(self, quant: str) -> bool:
+        """Whether this GPU family can natively accelerate ``quant`` (e.g. FP8)."""
+        return True
+
+
+@register_family("default")
+class DefaultHandler(GpuFamilyHandler):
+    """Permissive handler used when no specific family matches."""
+    pass
+
+
+def get_family_handler(family: str) -> GpuFamilyHandler:
+    """Return a handler instance for ``family``; warn + default if unknown."""
+    cls = _FAMILY_REGISTRY.get(family)
+    if cls is None:
+        logger.warning("unknown gpu_family %r — using default", family)
+        cls = _FAMILY_REGISTRY["default"]
+    return cls()
+
+
+# ── GpuProfile ────────────────────────────────────────────────────────────
+
+# Matches memory values like 2.3G, 123m, 512k, or bare numbers
+_MEM_RE = re.compile(r"^([\d.]+)\s*([kKmMgG]?)$")
+
+
+def _parse_mem_mb(value: str, vram_mb_for_hint: int = 0) -> int:
+    """Parse a memory string to MiB (shared with utils.resolve_spare_mb)."""
+    m = _MEM_RE.match(str(value).strip())
+    if not m:
+        logger.warning("invalid memory value %r, using 0", value)
+        return 0
+    num = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "g":
+        return int(num * 1024)
+    if unit == "m":
+        return int(num)
+    if unit == "k":
+        return max(1, int(num // 1024))
+    vram_gb = vram_mb_for_hint / 1024
+    if num < 3 * vram_gb:
+        return int(num * 1024)
+    return int(num)
+
+
+@dataclass
+class GpuProfile:
+    """Target GPU hardware description.
+
+    ``vram_mb`` feeds the VRAM budget equation; ``family`` dispatches to a
+    ``GpuFamilyHandler`` for future chip-specific calculation rules.  Profiles
+    can be constructed from auto-detection, CLI args, or a YAML section, so
+    configs can be generated for hardware that is not present locally.
+    """
+
+    vram_mb: int
+    family: str = "default"
+    handler: GpuFamilyHandler = field(default_factory=lambda: DefaultHandler(), repr=False)
+
+    def __post_init__(self) -> None:
+        self.handler = get_family_handler(self.family)
+
+    @classmethod
+    def detect(cls) -> GpuProfile:
+        """Auto-detect local GPU hardware."""
+        return cls(vram_mb=detect_vram_mb(), family="default")
+
+    @classmethod
+    def from_args(
+        cls,
+        *,
+        vram: str | None = None,
+        gpu_family: str | None = None,
+        yaml_hw: dict | None = None,
+    ) -> GpuProfile:
+        """Construct profile with precedence: explicit args > YAML > auto-detect."""
+        yaml_hw = yaml_hw or {}
+
+        if vram is not None:
+            vram_mb = _parse_mem_mb(vram)
+            logger.info("vram: %d MiB (from --vram)", vram_mb)
+        elif yaml_hw.get("vram"):
+            vram_mb = _parse_mem_mb(str(yaml_hw["vram"]))
+            logger.info("vram: %d MiB (from profiles.yaml hardware.vram)", vram_mb)
+        else:
+            vram_mb = detect_vram_mb()
+
+        family = gpu_family or yaml_hw.get("gpu_family", "default")
+
+        return cls(vram_mb=vram_mb, family=family)
