@@ -34,6 +34,8 @@ class Model:
         self.frontmatter = frontmatter
         self.stem = md_path.stem
         self._fit_cache = {}
+        self._sf_estimate = None  # cached safetensors header estimate
+        self._fit_logged: set[str] = set()  # dedupe fit-params warnings per model
 
         # Resolve the model file path
         self.gguf_path = self._resolve_gguf_path()
@@ -299,11 +301,17 @@ class Model:
                     pass
 
         if out.returncode != 0:
-            logger.warning("fit-params crashed for %s (exit %d)", self.stem, out.returncode)
+            msg = f"fit-params crashed for {self.stem} (exit {out.returncode})"
+            if msg not in self._fit_logged:
+                self._fit_logged.add(msg)
+                logger.warning(msg)
         else:
             # Parse failed but process exited cleanly — log first 3 lines of output
             preview = "\n".join(out.stdout.splitlines()[:3])
-            logger.warning("could not parse fit-params output for %s: %s", self.stem, preview)
+            msg = f"could not parse fit-params output for {self.stem}: {preview}"
+            if msg not in self._fit_logged:
+                self._fit_logged.add(msg)
+                logger.warning(msg)
         return 0, 0, 0
 
     def calc_ctx(
@@ -357,19 +365,21 @@ class Model:
             # which gives an accurate VRAM + KV-cache figure without benchmarking.
             assert self.gguf_path is not None
             if str(self.gguf_path).endswith(".safetensors"):
-                try:
-                    est_model_mib, est_kv_per_token_mib = utils.estimate_safetensors(
-                        self.gguf_path, cache_type
+                if self._sf_estimate is None:
+                    try:
+                        self._sf_estimate = utils.estimate_safetensors(
+                            self.gguf_path, cache_type
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"fit-params failed and safetensors estimate unavailable "
+                            f"for {self.stem}: {e}"
+                        ) from e
+                    logger.warning(
+                        "fit-params failed for %s; estimating VRAM from safetensors header",
+                        self.stem,
                     )
-                except Exception as e:
-                    raise RuntimeError(
-                        f"fit-params failed and safetensors estimate unavailable "
-                        f"for {self.stem}: {e}"
-                    ) from e
-                logger.warning(
-                    "fit-params failed for %s; estimating VRAM from safetensors header",
-                    self.stem,
-                )
+                est_model_mib, est_kv_per_token_mib = self._sf_estimate
                 model_mib = est_model_mib
                 compute_mib = int(0.02 * est_model_mib) + 128
                 ctx_at_design_mib = int(est_kv_per_token_mib * design)
