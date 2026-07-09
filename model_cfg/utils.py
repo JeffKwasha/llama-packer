@@ -261,6 +261,80 @@ def get_model_size_mb(model_path: str) -> int:
     return Path(model_path).stat().st_size // (1024 ** 2)
 
 
+# Bytes per element for safetensors dtypes (used to size model weights).
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
+    "F8": 1, "F6E4M3FN": 1, "F6E5M2": 1, "F4": 1, "F6E2M1FN": 0.5,
+    "F3": 0.375, "F2": 0.25, "F1": 0.125,
+}
+
+# Approx bytes per element for KV-cache quantization (incl. q8_0 block overhead).
+_KV_CACHE_BYTES = {
+    "q8_0": 1.0625, "q8_1": 1.0625, "q8_k": 1.0625,
+    "f16": 2.0, "bf16": 2.0, "f32": 4.0,
+    "q4_0": 0.5625, "q4_1": 0.5625, "q4_k": 0.5625,
+    "q5_0": 0.6875, "q5_k": 0.6875,
+    "q6_0": 0.8125, "q6_k": 0.8125,
+}
+
+
+def estimate_safetensors(
+    model_path: str | os.PathLike,
+    cache_type: str = "q8_0",
+) -> tuple[int, float]:
+    """Estimate (model_mib, kv_per_token_mib) from a safetensors header.
+
+    Reads only the JSON header (tensor names, shapes, dtypes) — no weights are
+    loaded. Used as a fallback when llama-fit-params cannot measure the model
+    (e.g. safetensors input, or an architecture fit-params does not model).
+
+    Raises ValueError if the file is not a parseable safetensors header or if no
+    per-layer k/v projection can be found to size the KV cache.
+    """
+    path = Path(model_path)
+    with path.open("rb") as fh:
+        magic = fh.read(8)
+        if len(magic) < 8:
+            raise ValueError("file too small to be safetensors")
+        header_len = int.from_bytes(magic[:8], "little")
+        header_bytes = fh.read(header_len)
+    if not header_bytes:
+        raise ValueError("empty safetensors header")
+    header = json.loads(header_bytes.decode("utf-8"))
+
+    def dtype_bytes(dt: str) -> float:
+        return _SAFETENSORS_DTYPE_BYTES.get(dt, 2.0)  # unknown -> assume 2 (safe)
+
+    total_bytes = 0
+    kv_out_dims: dict[int, int] = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        shape = meta.get("shape", [])
+        n = 1
+        for d in shape:
+            n *= int(d)
+        total_bytes += n * dtype_bytes(meta.get("dtype"))
+        low = name.lower()
+        if "k_proj" in low and low.endswith("weight"):
+            m = re.search(r"\.layers\.(\d+)\.", low) or re.search(r"layers\.(\d+)", low)
+            if m and shape:
+                kv_out_dims[int(m.group(1))] = int(shape[0])
+        elif "v_proj" in low and low.endswith("weight"):
+            m = re.search(r"\.layers\.(\d+)\.", low) or re.search(r"layers\.(\d+)", low)
+            if m and shape:
+                kv_out_dims.setdefault(int(m.group(1)), int(shape[0]))
+
+    if not kv_out_dims:
+        raise ValueError("no per-layer k/v projection found; cannot size KV cache")
+
+    cache_bytes = _KV_CACHE_BYTES.get(cache_type, 1.0625)
+    kv_per_token_bytes = 2 * sum(kv_out_dims.values()) * cache_bytes
+    kv_per_token_mib = kv_per_token_bytes / (1024 * 1024)
+    model_mib = int(total_bytes // (1024 * 1024))
+    return model_mib, kv_per_token_mib
+
+
 # Conservative real-world sequential read estimates (MB/s) by device class.
 # Not best-case marketing figures; chosen to bound the health-check timeout
 # safely. NVMe is set conservatively; SATA SSD/HDD use the operator's figures.

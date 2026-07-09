@@ -353,13 +353,33 @@ class Model:
 
         if model_mib == 0:
             # fit-params failed (binary missing, safetensors unsupported, etc.).
-            # Without a measurement we cannot produce a safe estimate, so die.
-            raise RuntimeError(
-                f"fit-params failed to measure VRAM for {self.stem}; "
-                f"cannot estimate a safe context size. Ensure llama-fit-params "
-                f"is available/built and the model format is supported "
-                f"(safetensors may be unsupported)."
-            )
+            # For safetensors we can still estimate from the header (tensor shapes),
+            # which gives an accurate VRAM + KV-cache figure without benchmarking.
+            assert self.gguf_path is not None
+            if str(self.gguf_path).endswith(".safetensors"):
+                try:
+                    est_model_mib, est_kv_per_token_mib = utils.estimate_safetensors(
+                        self.gguf_path, cache_type
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"fit-params failed and safetensors estimate unavailable "
+                        f"for {self.stem}: {e}"
+                    ) from e
+                logger.warning(
+                    "fit-params failed for %s; estimating VRAM from safetensors header",
+                    self.stem,
+                )
+                model_mib = est_model_mib
+                compute_mib = int(0.02 * est_model_mib) + 128
+                ctx_at_design_mib = int(est_kv_per_token_mib * design)
+            else:
+                raise RuntimeError(
+                    f"fit-params failed to measure VRAM for {self.stem}; "
+                    f"cannot estimate a safe context size. Ensure llama-fit-params "
+                    f"is available/built and the model format is supported "
+                    f"(safetensors may be unsupported)."
+                )
 
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
