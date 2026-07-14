@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 import warnings
 from pathlib import Path
 from typing import ClassVar
@@ -12,6 +13,9 @@ from typing import ClassVar
 from model_cfg import utils
 
 logger = logging.getLogger(__name__)
+
+# Frontmatter keys that are computed/derived rather than declared
+_CL_RE = re.compile(r"^context_limit_\d+G$")
 
 
 class Model:
@@ -28,6 +32,17 @@ class Model:
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "targets", "allow_profiles", "reasoning", "spare",
     })
+
+    # frontmatter key -> (llama-server --override-kv key, value type)
+    # Injected into llama-server's /v1/models meta (vllm-style identity + freethought)
+    _OVERRIDE_KV_MAP: ClassVar[dict[str, tuple[str, str]]] = {
+        "license": ("general.license", "str"),
+        "base_model": ("general.basename", "str"),
+        "finetune": ("general.finetune", "str"),
+        "type": ("general.type", "str"),
+        "name": ("general.name", "str"),
+        "freethought": ("general.freethought", "float"),
+    }
 
     def __init__(self, md_path: Path, frontmatter: dict):
         self.md_path = md_path
@@ -455,6 +470,25 @@ class Model:
         return self.frontmatter.get("description")
 
     @property
+    def capabilities(self) -> list[str]:
+        """Declared capabilities, with `vision` auto-added when a companion mmproj exists."""
+        caps = [str(c) for c in (self.frontmatter.get("capabilities") or [])]
+        if self.mmproj and "vision" not in [c.lower() for c in caps]:
+            caps.append("vision")
+        return caps
+
+    @property
+    def freethought(self) -> float | None:
+        """0.0 = readily refuses 'distasteful' topics; 1.0 = reasons about anything rationally."""
+        v = self.frontmatter.get("freethought")
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def mmproj_size_mb(self) -> int:
         if self.mmproj and self.mmproj.gguf_path:
             return utils.get_model_size_mb(str(self.mmproj.gguf_path))
@@ -463,6 +497,106 @@ class Model:
     def metadata(self) -> dict:
         """Return remaining frontmatter fields as metadata (not consumed by builder)."""
         return {k: v for k, v in self.frontmatter.items() if k not in self.FIELDS}
+
+    def pass_through_metadata(self) -> dict:
+        """Frontmatter fields exposed to clients, minus builder-consumed keys.
+
+        The result is pass-through-by-default: any new field an agent writes in a
+        sidecar flows through automatically. `capabilities` includes auto-detected
+        vision (companion mmproj). Falsy-but-meaningful values (0, 0.0) are kept.
+        """
+        meta: dict = {}
+        for k, v in self.frontmatter.items():
+            if k in self.FIELDS or k == "template" or _CL_RE.match(k):
+                continue
+            if v is None or v == "" or (isinstance(v, (list, dict)) and len(v) == 0):
+                continue
+            meta[k] = copy.deepcopy(v)
+        caps = self.capabilities
+        if caps:
+            meta["capabilities"] = list(caps)
+        return meta
+
+    def override_kv_args(self) -> list[str]:
+        """llama-server --override-kv flags injecting vllm-style identity + freethought."""
+        out: list[str] = []
+        for fm_key, (kv_key, kv_type) in self._OVERRIDE_KV_MAP.items():
+            v = self.frontmatter.get(fm_key)
+            if v is None or v == "":
+                continue
+            if kv_type == "float":
+                try:
+                    out.append(f"--override-kv {kv_key}=float:{float(v)}")
+                except (TypeError, ValueError):
+                    continue
+            elif kv_type == "int":
+                try:
+                    out.append(f"--override-kv {kv_key}=int:{int(v)}")
+                except (TypeError, ValueError):
+                    continue
+            else:
+                out.append(f"--override-kv {kv_key}=str:{v}")
+        return out
+
+    def _param_counts(self) -> tuple[float, float]:
+        """(total_B, active_B) in billions parsed from the `parameters` field."""
+        raw = str(self.frontmatter.get("parameters", ""))
+        nums = re.findall(r"(\d+(?:\.\d+)?)\s*([BM])", raw)
+        if not nums:
+            return (0.0, 0.0)
+
+        def to_b(x: str, u: str) -> float:
+            return float(x) * (1.0 if u == "B" else 1e-3)
+
+        total = to_b(*nums[0])
+        active = to_b(*nums[1]) if len(nums) > 1 else total
+        return (total, active)
+
+    def _quant_bits(self) -> float:
+        """Approximate bits-per-weight for the `quantization` field."""
+        q = str(self.frontmatter.get("quantization", "")).upper()
+        q = re.sub(r"^(UD-|I1-|U-)?", "", q)
+        table = {
+            "Q2_K": 2.75, "Q3_K_S": 3.0, "Q3_K_M": 3.5, "Q3_K_L": 3.75,
+            "Q4_0": 4.0, "Q4_1": 4.5, "Q4_K_S": 4.25, "Q4_K_M": 4.5, "Q4_K_XL": 4.5,
+            "Q5_0": 5.0, "Q5_1": 5.5, "Q5_K_S": 5.25, "Q5_K_M": 5.5, "Q5_K_XL": 5.5,
+            "Q6_K": 6.5, "Q8_0": 8.0, "Q8_K": 8.5,
+            "F16": 16.0, "FP16": 16.0, "BF16": 16.0, "FP8": 8.0, "F32": 32.0,
+            "IQ1": 1.5, "IQ2": 2.5, "IQ3": 3.5, "IQ4": 4.5,
+        }
+        for key, bits in table.items():
+            if key in q:
+                return bits
+        return 0.0
+
+    def _mtp_info(self) -> tuple[bool, int]:
+        has_mtp = self.frontmatter.get("mtp")
+        speculative = self.frontmatter.get("speculative")
+        if has_mtp or (speculative and "mtp" in str(speculative).lower()):
+            n_max = int(self.frontmatter.get("mtp_draft_n_max", utils._MTP_DRAFT_N_MAX))
+            return True, n_max
+        return False, 0
+
+    def throughput_factor(self) -> float | None:
+        """Heuristic relative throughput index (higher = faster). Not real tok/s.
+
+        Combines MTP speedup (1 + draft_n * accept_prob) with a relative base from
+        active param count and quantization bits. Use only for comparing models.
+        """
+        active = self._param_counts()[1]
+        bits = self._quant_bits()
+        if active <= 0 or bits <= 0:
+            return None
+        base = 54.0 / (active * bits)  # 12B Q4 ~= 1.0
+        mtp_on, n_max = self._mtp_info()
+        acc = self.frontmatter.get("mtp_accuracy")
+        speedup = 1.0
+        if mtp_on and acc is not None:
+            try:
+                speedup = 1.0 + float(n_max) * float(acc)
+            except (TypeError, ValueError):
+                speedup = 1.0
+        return round(base * speedup, 3)
 
 
 # Import yaml here to avoid circular import issues

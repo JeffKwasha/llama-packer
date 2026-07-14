@@ -158,6 +158,9 @@ def _build_entry(
     if extra:
         parts.append(extra)
 
+    # vllm-style identity + freethought metadata injected into llama-server
+    parts += model.override_kv_args()
+
     cmd_str = " ".join(parts).strip()
 
     # Profile params → setParamsByID
@@ -176,12 +179,27 @@ def _build_entry(
     has_default = "default" in names
     entry_id = base_id if (has_default or len(profiles_group) > 1) else f"{base_id}.{names[0]}"
 
-    # Metadata: remaining frontmatter keys not consumed
-    metadata = {k: copy.deepcopy(v) for k, v in model.frontmatter.items()
-                if k not in Model.FIELDS
-                and k not in ("parameters", "quantization", "template", "description")
-                and not _CL_RE.match(k)
-                and v}
+    # Metadata: pass-through frontmatter + computed selection signals.
+    # Pass-through-by-default: any new sidecar field an agent writes flows
+    # through automatically; only builder-consumed keys are excluded.
+    metadata = model.pass_through_metadata()
+    metadata["ctx_size"] = ctx_size
+
+    caps = metadata.get("capabilities", [])
+    modalities = ["text"]
+    if "vision" in caps:
+        modalities.append("image")
+    if "audio" in caps:
+        modalities.append("audio")
+    metadata["modalities"] = modalities
+
+    if model.description:
+        metadata["description"] = model.description
+
+    tf = model.throughput_factor()
+    if tf is not None:
+        metadata["throughput_factor"] = tf
+
     metadata["mtp_enabled"] = mtp_enabled
     if mtp_enabled:
         metadata["mtp_draft_max"] = mtp_n_max
