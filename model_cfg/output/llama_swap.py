@@ -412,32 +412,3 @@ def write_yaml(config: dict, path: Path | str) -> None:
     """Write config to YAML file."""
     with open(path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-
-def write_ini(config: dict, path: Path | str) -> None:
-    """Write config to INI file."""
-    try:
-        import configparser
-    except ImportError:
-        raise ImportError("configparser is required for INI output")
-
-    parser = configparser.ConfigParser()
-    parser.add_section("models")
-
-    for model_id, model_cfg in config.get("models", {}).items():
-        parser.set("models", model_id, model_cfg.get("cmd", ""))
-
-        for key, value in model_cfg.items():
-            if key == "cmd":
-                continue
-            section = f"models.{model_id}"
-            if not parser.has_section(section):
-                parser.add_section(section)
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    parser.set(section, str(k), str(v))
-            else:
-                parser.set(section, key, str(value))
-
-    with open(path, "w") as f:
-        parser.write(f)
