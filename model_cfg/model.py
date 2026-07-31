@@ -34,20 +34,9 @@ class Model:
         "name", "template", "context_length", "description", "cli_args", "model",
         "attention", "kv_cache", "tool_args", "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
-        "targets", "allow_profiles", "reasoning", "spare",
+        "targets", "allow_profiles", "reasoning", "spare", "capabilities",
         "ignore", "device", "concurrency", "fit-params",
     })
-
-    # frontmatter key -> (llama-server --override-kv key, value type)
-    # Injected into llama-server's /v1/models meta (vllm-style identity + freethought)
-    _OVERRIDE_KV_MAP: ClassVar[dict[str, tuple[str, str]]] = {
-        "license": ("general.license", "str"),
-        "base_model": ("general.basename", "str"),
-        "finetune": ("general.finetune", "str"),
-        "type": ("general.type", "str"),
-        "name": ("general.name", "str"),
-        "freethought": ("general.freethought", "float"),
-    }
 
     def __init__(self, md_path: Path, frontmatter: dict):
         self.md_path = md_path
@@ -435,8 +424,9 @@ class Model:
         """Frontmatter fields exposed to clients, minus builder-consumed keys.
 
         The result is pass-through-by-default: any new field an agent writes in a
-        sidecar flows through automatically. `capabilities` includes auto-detected
-        vision (companion mmproj). Falsy-but-meaningful values (0, 0.0) are kept.
+        sidecar flows through automatically. `capabilities` is builder-consumed
+        (mapped to llama-swap's native capabilities block) and excluded here.
+        Falsy-but-meaningful values (0, 0.0) are kept.
         """
         meta: dict = {}
         for k, v in self.frontmatter.items():
@@ -445,31 +435,7 @@ class Model:
             if v is None or v == "" or (isinstance(v, (list, dict)) and len(v) == 0):
                 continue
             meta[k] = copy.deepcopy(v)
-        caps = self.capabilities
-        if caps:
-            meta["capabilities"] = list(caps)
         return meta
-
-    def override_kv_args(self) -> list[str]:
-        """llama-server --override-kv flags injecting vllm-style identity + freethought."""
-        out: list[str] = []
-        for fm_key, (kv_key, kv_type) in self._OVERRIDE_KV_MAP.items():
-            v = self.frontmatter.get(fm_key)
-            if v is None or v == "":
-                continue
-            if kv_type == "float":
-                try:
-                    out.append(f"--override-kv {kv_key}=float:{float(v)}")
-                except (TypeError, ValueError):
-                    continue
-            elif kv_type == "int":
-                try:
-                    out.append(f"--override-kv {kv_key}=int:{int(v)}")
-                except (TypeError, ValueError):
-                    continue
-            else:
-                out.append(f"--override-kv {kv_key}=str:{v}")
-        return out
 
     def _param_counts(self) -> tuple[float, float]:
         """(total_B, active_B) in billions parsed from the `parameters` field."""
