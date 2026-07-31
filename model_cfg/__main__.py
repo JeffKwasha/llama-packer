@@ -15,7 +15,7 @@ import yaml
 from model_cfg import Model, find_bin_dir
 from model_cfg.hardware import GpuProfile
 from model_cfg.utils import compute_env_prefixes, make_subst, _detect_drive_speed
-from model_cfg.output import build_config, write_yaml, write_ini
+from model_cfg.output import build_config, write_yaml
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # project root (one level up from model_cfg/)
@@ -47,7 +47,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print config to stdout instead of writing")
     parser.add_argument("--output", default="config.yaml", help="Output path (default: config.yaml)")
-    parser.add_argument("--format", choices=["yaml", "ini"], default="yaml", help="Output format (default: yaml)")
     parser.add_argument("-v", "--version", default="latest", help="llama-server version (default: latest)")
     parser.add_argument("--llama-server", help="Explicit path to llama-server binary")
     parser.add_argument("--models-dir", default="models", help="Model directory (default: ./models)")
@@ -272,15 +271,12 @@ def main(argv: list[str] | None = None) -> None:
     if not output_path.is_absolute():
         output_path = SCRIPT_DIR / args.output
 
-    writers = {"yaml": write_yaml, "ini": write_ini}
-    writer = writers[args.format]
-
     if args.dry_run:
         sys.stdout.write(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
     else:
-        writer(config, output_path)
+        write_yaml(config, output_path)
         logger.info("written: %s", output_path)
         if not args.no_env:
             env_path = output_path.with_name("config.env")

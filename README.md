@@ -1,6 +1,6 @@
 # llama-packer
 
-Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) (or llama-server router-mode) from GGUF model metadata. Takes a directory of models and produces ready-to-run server configurations with optimal flags tuned to your hardware.
+Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. Takes a directory of models and produces ready-to-run server configurations with optimal flags tuned to your hardware.
 
 Scans GGUF model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across models, and writes `config.yaml` — no manual flag wrangling.
 
@@ -20,8 +20,7 @@ Output goes to `config.yaml` and `config.env` in the project root.
 - Calculates optimal context window that fits available VRAM
 - Resolves companion files (mmproj, MTP draft models) by fuzzy match
 - Applies sampling profiles from `profiles.yaml`
-- Assembles llama-swap YAML with per-model metadata and `setParamsByID`
-- Writes INI format for llama-server router mode
+- Assembles llama-swap YAML with per-model metadata, native `capabilities`, and `setParamsByID`
 - Solves multi-model VRAM budgets for embed/rerank/chat on shared GPUs
 
 ## Sidecar example
@@ -42,13 +41,6 @@ weaknesses: ["MTP adds VRAM"]
 
 Any key not consumed by the builder passes through to clients — add descriptive fields without code changes.
 
-## Standalone launcher
-
-`start.py` launches a single `llama-server` instance directly:
-
-```sh
-uv run start.py models/some-model.gguf
-```
 
 ## See also
 

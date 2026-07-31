@@ -2,7 +2,7 @@
 
 ## Overview
 
-`llama-packer` generates `config.yaml` for [llama-swap](https://github.com/mostlygeek/llama-swap) (and INI for llama-server router-mode) from GGUF model metadata. It scans model directories, detects GPU hardware, measures per-model VRAM costs via `llama-fit-params`, budgets context windows, resolves companion files, applies sampling profiles, and writes ready-to-run server configurations.
+`llama-packer` generates `config.yaml` for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. It scans model directories, detects GPU hardware, measures per-model VRAM costs via `llama-fit-params`, budgets context windows, resolves companion files, applies sampling profiles, and writes ready-to-run server configurations.
 
 **Entry point:** `gen-config.py` → `model_cfg.__main__.main`
 
@@ -26,16 +26,11 @@ Also emits:
 - **`config.env`** — sibling file with `${env.*}` variables for systemd `EnvironmentFile=` or docker `--env-file`.
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
 
-### llama-server router INI (`write_ini()`)
-
-Flat INI with `[models]` section containing command strings, and `[models.<id>]` sections for metadata.
-
 ### Writer module
 
 `model_cfg/output/llama_swap.py` provides:
 - **`build_config()`** — builds the full llama-swap `models` dict from `Model` objects + profiles
 - **`write_yaml()`** — YAML output with literal block scalars
-- **`write_ini()`** — router-mode INI output
 
 ## Hardware Detection
 
