@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# tools
+llama_swap.py
+start.py
+
 # Generated config outputs
 config.yaml
 config.env

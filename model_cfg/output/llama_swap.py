@@ -162,9 +162,6 @@ def _build_entry(
     if extra:
         parts.append(extra)
 
-    # vllm-style identity + freethought metadata injected into llama-server
-    parts += model.override_kv_args()
-
     cmd_str = " ".join(parts).strip()
 
     # Profile params → setParamsByID
@@ -187,18 +184,13 @@ def _build_entry(
     # Pass-through-by-default: any new sidecar field an agent writes flows
     # through automatically; only builder-consumed keys are excluded.
     metadata = model.pass_through_metadata()
-    metadata["ctx_size"] = ctx_size
 
-    caps = metadata.get("capabilities", [])
+    caps = model.capabilities
     modalities = ["text"]
     if "vision" in caps:
         modalities.append("image")
     if "audio" in caps:
         modalities.append("audio")
-    metadata["modalities"] = modalities
-
-    if model.description:
-        metadata["description"] = model.description
 
     tf = model.throughput_factor()
     if tf is not None:
@@ -217,6 +209,15 @@ def _build_entry(
         entry["description"] = model.description
     if metadata:
         entry["metadata"] = metadata
+
+    # Native llama-swap capabilities block (shown in /v1/models).
+    entry["capabilities"] = {
+        "in": modalities,
+        "out": modalities,
+        "tools": "tools" in caps,
+        "reranker": "reranker" in caps or model.type == "rerank",
+        "context": ctx_size,
+    }
 
     # Per-model GPU device pinning (multi-GPU). Emits the appropriate
     # vendor env var so the server only sees that device.
