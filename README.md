@@ -4,13 +4,24 @@ Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) from
 
 Scans GGUF model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across models, and writes `config.yaml` — no manual flag wrangling.
 
-## Quick start
+## Install
+
+Python 3.10+ and [uv](https://docs.astral.sh/uv/) (or pip):
+
+```sh
+uv tool install .        # installs the `gen-config` command
+gen-config --dry-run
+```
+
+Or run from source without installing:
 
 ```sh
 uv run gen-config.py
 ```
 
-Output goes to `config.yaml` and `config.env` in the project root.
+`gen-config` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. Point it elsewhere with `--models-dir`, `--profiles`, and `--llama-server` (or `LLAMA_BIN_DIR`).
+
+Output goes to `config.yaml` and `config.env` in the current directory.
 
 ## What it does
 

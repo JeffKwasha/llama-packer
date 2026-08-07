@@ -1,4 +1,4 @@
-# model_cfg/output/llama_swap.py
+# llama_packer/writer.py
 """Generate llama-swap config entries from Model objects."""
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ from pathlib import Path
 
 import yaml
 
-from model_cfg.model import Model, _CL_RE
-from model_cfg.vram import solve_matrix_ctx
-from model_cfg.hardware import detect_gpu_env_var
-from model_cfg import utils
+from llama_packer.model import Model, _CL_RE
+from llama_packer.vram import solve_matrix_ctx
+from llama_packer.hardware import detect_gpu_env_var
+from llama_packer import utils
 
 logger = logging.getLogger(__name__)
 
@@ -139,9 +139,12 @@ def _build_entry(
     parts.append(utils.resolve_template(t_conf["model"], {"model_path": str(model.gguf_path)}))
     if ctx_size:
         parts.append(utils.resolve_template(t_conf["ctx"], {"ctx_size": str(ctx_size)}))
-    if parallel > 1:
-        parts.append(utils.resolve_template(t_conf["parallel"], {"parallel": str(parallel)}))
+    parts.append(utils.resolve_template(t_conf["parallel"], {"parallel": str(parallel)}))
     parts.append(utils.resolve_template(t_conf["cache_type"], {"cache_type": cache_type}))
+
+    # CPU-resident models (embed/rerank sidecars): force CPU inference.
+    if model.on_cpu:
+        parts.append("--n-gpu-layers 0")
 
     # MTP args
     mtp_arg_str, mtp_enabled, mtp_n_max, _ = _build_mtp_args(model)
@@ -272,11 +275,15 @@ def _solve_matrix_context(
     if not chat_params:
         return None
 
-    # Get static params for embed/rerank
-    embed_fp = embed_model.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-    rerank_fp = rerank_model.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-    embed_params = (embed_fp.model_mib, embed_fp.ctx_factor, embed_fp.compute_mib) if embed_fp else None
-    rerank_params = (rerank_fp.model_mib, rerank_fp.ctx_factor, rerank_fp.compute_mib) if rerank_fp else None
+    # Get static params for embed/rerank. CPU-resident models cost 0 VRAM.
+    embed_params = None
+    if not embed_model.on_cpu:
+        embed_fp = embed_model.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+        embed_params = (embed_fp.model_mib, embed_fp.ctx_factor, embed_fp.compute_mib) if embed_fp else None
+    rerank_params = None
+    if not rerank_model.on_cpu:
+        rerank_fp = rerank_model.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+        rerank_params = (rerank_fp.model_mib, rerank_fp.ctx_factor, rerank_fp.compute_mib) if rerank_fp else None
 
     # Use conservative context defaults for embed/rerank if not specified
     embed_ctx = 8192  # typical embed context
@@ -380,11 +387,17 @@ def build_config(
             for (parallel, cache_type, spare_mb), profiles_group in groups.items():
                 # Use matrix-solved context as design context if available
                 design_ctx = matrix_chat_ctx if matrix_chat_ctx else None
+                mmproj_mb = (
+                    utils.get_model_size_mb(str(model.mmproj.gguf_path))
+                    if model.mmproj and model.mmproj.gguf_path
+                    else 0
+                )
                 ctx_size = model.vram.calc_ctx(
                     vram_total,
                     fit_bin=fit_bin,
                     parallel=parallel,
                     spare_mb=spare_mb,
+                    mmproj_mb=mmproj_mb,
                     cache_type=cache_type,
                     design_ctx=design_ctx,
                 )

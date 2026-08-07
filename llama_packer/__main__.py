@@ -1,9 +1,10 @@
-# model_cfg/__main__.py
-"""CLI entry point for model-cfg."""
+# llama_packer/__main__.py
+"""CLI entry point for llama-packer."""
 
 from __future__ import annotations
 
 import argparse
+import importlib.resources
 import logging
 import os
 import sys
@@ -12,13 +13,11 @@ from pathlib import Path
 
 import yaml
 
-from model_cfg import Model, find_bin_dir
-from model_cfg.hardware import GpuProfile
-from model_cfg.utils import compute_env_prefixes, make_subst, _detect_drive_speed
-from model_cfg.output import build_config, write_yaml
+from llama_packer import Model, find_bin_dir
+from llama_packer.hardware import GpuProfile
+from llama_packer.utils import compute_env_prefixes, make_subst, _detect_drive_speed
+from llama_packer.writer import build_config, write_yaml
 
-
-SCRIPT_DIR = Path(__file__).resolve().parent.parent  # project root (one level up from model_cfg/)
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
 
@@ -130,15 +129,20 @@ def main(argv: list[str] | None = None) -> None:
     setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
 
-    models_dir = (SCRIPT_DIR / args.models_dir).absolute()
+    models_dir = Path(args.models_dir).absolute()
     if not models_dir.is_dir():
         logger.error("models directory not found: %s", models_dir)
         sys.exit(1)
 
-    profiles_path = (SCRIPT_DIR / args.profiles).absolute()
+    profiles_path = Path(args.profiles).absolute()
     if not profiles_path.is_file():
-        logger.error("profiles file not found: %s", profiles_path)
-        sys.exit(1)
+        bundled = importlib.resources.files("llama_packer").joinpath("profiles.yaml")
+        if bundled.is_file():
+            profiles_path = Path(str(bundled))
+            logger.info("using bundled profiles: %s", profiles_path)
+        else:
+            logger.error("profiles file not found: %s", profiles_path)
+            sys.exit(1)
 
     with open(profiles_path) as f:
         profiles_cfg = yaml.safe_load(f) or {}
@@ -154,16 +158,16 @@ def main(argv: list[str] | None = None) -> None:
         llama_bin = str(Path(args.llama_server).resolve())
         bin_dir = str(Path(args.llama_server).parent)
     else:
-        bin_dir = find_bin_dir(args.version, SCRIPT_DIR)
-        llama_bin = str(SCRIPT_DIR / bin_dir / "llama-server")
+        bin_dir = find_bin_dir(args.version, Path.cwd())
+        llama_bin = str(Path.cwd() / bin_dir / "llama-server")
 
-    fit_bin = str(SCRIPT_DIR / bin_dir / "llama-fit-params")
+    fit_bin = str(Path.cwd() / bin_dir / "llama-fit-params")
 
     template_vars = {"llama_bin": llama_bin, "models_dir": str(models_dir)}
 
     max_ctx = None
     if args.max_context:
-        from model_cfg.utils import parse_context_length
+        from llama_packer.utils import parse_context_length
         max_ctx = parse_context_length(args.max_context)
 
     # Discover models
@@ -247,6 +251,11 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     logger.info("entries: %d generated", len(config["models"]))
 
+    # Resolve ${VAR} macros to absolute paths in the config itself so that
+    # -watch-config reloads pick up new paths (e.g. a new llama-server version)
+    # without requiring a llama-swap service restart.
+    config["macros"] = {name: value for name, value in sorted(var_to_value.items())}
+
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
         vars_ = _build_matrix_vars(models, embed_model, rerank_model, logger)
@@ -254,22 +263,28 @@ def main(argv: list[str] | None = None) -> None:
         # NAMES (c1 | c2 | ...), not the model IDs — llama-swap sets DSL
         # references var names, which map to model IDs via `vars`.
         chat_var_names = [k for k in vars_ if k.startswith("c")]
-        chat_expr = " | ".join(chat_var_names)
+        # Parenthesize the OR-list: '&' binds tighter than '|' in the DSL.
+        chat_expr = "(" + " | ".join(chat_var_names) + ")"
         sets = {}
         for sname, sexpr in (matrix_cfg.get("sets") or {}).items():
             sets[sname] = sexpr.replace("__CHAT_VARS__", chat_expr)
-        config["matrix"] = {
-            "vars": vars_,
-            "evict_costs": matrix_cfg.get("evict_costs", {}),
-            "sets": sets,
+        # llama-swap schema: matrix lives under routing.router.settings.matrix,
+        # not at the top level.
+        config["routing"] = {
+            "router": {
+                "use": "matrix",
+                "settings": {"matrix": {
+                    "vars": vars_,
+                    "evict_costs": matrix_cfg.get("evict_costs", {}),
+                    "sets": sets,
+                }},
+            },
         }
 
     # Top-level llama-swap settings
     config["healthCheckTimeout"] = hct
 
-    output_path = Path(args.output)
-    if not output_path.is_absolute():
-        output_path = SCRIPT_DIR / args.output
+    output_path = Path(args.output).absolute()
 
     if args.dry_run:
         sys.stdout.write(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True))

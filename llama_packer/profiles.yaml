@@ -46,16 +46,3 @@ profiles:
 #  server:
 #    description: "concurrency"
 #    parallel: 2
-
-# ── Swap matrix ─────────────────────────────────────────
-# Enables the llama-swap matrix router: every chat model shares a set with the
-# CPU-resident embed (emb) and rerank (rnk) models, so RAG models stay loaded
-# alongside whatever chat model is active. __CHAT_VARS__ is expanded to the
-# generated (c1 | c2 | ...) var expression at build time.
-matrix:
-  evict_costs:
-    emb: 100
-    rnk: 100
-  sets:
-    rag: "__CHAT_VARS__ & emb & rnk"
-
