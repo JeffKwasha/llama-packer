@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+.venv/
 
 # tools
 llama_swap.py
@@ -18,6 +20,11 @@ sha
 tunableop_results*.csv
 
 # Large build artifacts / model weights (not source)
+.old/
+tmp/
 llama-b*/
 llama-swap
 models
+
+# uv / setuptools build artifacts
+build/

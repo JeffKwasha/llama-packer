@@ -17,7 +17,7 @@ from pathlib import Path
 # Allow running from source without install
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from model_cfg.__main__ import main
+from llama_packer.__main__ import main
 
 if __name__ == "__main__":
     main()

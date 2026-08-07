@@ -1,4 +1,4 @@
-# model_cfg/model.py
+# llama_packer/model.py
 """Model class representing a language model with companions and VRAM calculations."""
 
 from __future__ import annotations
@@ -12,10 +12,10 @@ from typing import TYPE_CHECKING, ClassVar
 
 import yaml
 
-from model_cfg import utils
+from llama_packer import utils
 
 if TYPE_CHECKING:
-    from model_cfg.vram import VramBudget
+    from llama_packer.vram import VramBudget
 
 logger = logging.getLogger(__name__)
 
@@ -263,9 +263,9 @@ class Model:
 
     @property
     def vram(self) -> VramBudget:
-        """Lazy-initialized VRAM budget calculator (see model_cfg.vram)."""
+        """Lazy-initialized VRAM budget calculator (see llama_packer.vram)."""
         if self._vram is None:
-            from model_cfg.vram import VramBudget
+            from llama_packer.vram import VramBudget
             self._vram = VramBudget(self)
         return self._vram
 
@@ -299,20 +299,8 @@ class Model:
             return self._gguf_ctx_cache
         if self.gguf_path is None or str(self.gguf_path).endswith(".safetensors"):
             return None
-        try:
-            from gguf import GGUFReader
-            r = GGUFReader(str(self.gguf_path))
-            for name, field in r.fields.items():
-                if "context_length" in name:
-                    data = field.parts[-1]
-                    if hasattr(data, "__len__") and len(data) > 0:
-                        self._gguf_ctx_cache = int(data[0])
-                    else:
-                        self._gguf_ctx_cache = int(data)
-                    return self._gguf_ctx_cache
-        except Exception as e:
-            logger.debug("could not read GGUF context_length for %s: %s", self.stem, e)
-        return None
+        self._gguf_ctx_cache = utils.read_gguf_context_length(self.gguf_path)
+        return self._gguf_ctx_cache
 
     @property
     def name(self) -> str:
@@ -365,8 +353,18 @@ class Model:
         return utils.get_model_size_mb(str(self.gguf_path))
 
     @property
+    def on_cpu(self) -> bool:
+        """True when the model is CPU-resident (`device: cpu` in frontmatter)."""
+        return str(self.frontmatter.get("device", "")).strip().lower() == "cpu"
+
+    @property
     def device(self) -> int | None:
-        """Explicit GPU device index (for multi-GPU pinning), if declared."""
+        """Explicit GPU device index (for multi-GPU pinning), if declared.
+
+        Returns None for CPU-resident models (`device: cpu`).
+        """
+        if self.on_cpu:
+            return None
         v = self.frontmatter.get("device")
         if v is None:
             return None

@@ -17,10 +17,10 @@ from typing import TYPE_CHECKING
 
 import yaml
 
-from model_cfg import utils
+from llama_packer import utils
 
 if TYPE_CHECKING:
-    from model_cfg.model import Model
+    from llama_packer.model import Model
 
 logger = logging.getLogger(__name__)
 

@@ -1,5 +1,5 @@
-# model_cfg/utils.py
-"""Shared utilities for model-cfg."""
+# llama_packer/utils.py
+"""Shared utilities for llama-packer."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
@@ -61,7 +62,7 @@ _TARGET_TEMPLATES = {
         "cache_type": "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}}",
         "mtp": "--spec-type {{mtp_spec_type}} --spec-draft-n-max {{mtp_n_max}} --spec-draft-p-min {{mtp_p_min}}",
         "mmproj": "--mmproj {{mmproj_path}}",
-        "extra": "--embedding --pooling cls --embd-normalize 2 {{extra_args}}",
+        "extra": "--embedding --embd-normalize 2 -b 4096 -ub 4096 {{extra_args}}",
     },
     # Reranking models: expose /v1/rerank.
     "rerank": {
@@ -72,7 +73,7 @@ _TARGET_TEMPLATES = {
         "cache_type": "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}}",
         "mtp": "--spec-type {{mtp_spec_type}} --spec-draft-n-max {{mtp_n_max}} --spec-draft-p-min {{mtp_p_min}}",
         "mmproj": "--mmproj {{mmproj_path}}",
-        "extra": "--rerank --pooling rank {{extra_args}}",
+        "extra": "--rerank --pooling rank -b 4096 -ub 4096 {{extra_args}}",
     },
 }
 
@@ -149,6 +150,67 @@ def _gguf_family(stem: str) -> str:
 def get_model_size_mb(model_path: str) -> int:
     """Get model file size in MB."""
     return Path(model_path).stat().st_size // (1024 ** 2)
+
+
+def read_gguf_context_length(path: str | os.PathLike) -> int | None:
+    """Read `<architecture>.context_length` from a GGUF header.
+
+    Minimal dependency-free parser: walks the metadata KV block until it finds a
+    `context_length` key and returns its integer value. Returns None for
+    safetensors, non-GGUF files, or parse failures. The value is the model's
+    architectural context limit as shipped — no RoPE/YaRN extension applied.
+    """
+    import struct
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            f.read(4)  # version (u32)
+            f.read(8)  # tensor_count (u64)
+            (n_kv,) = struct.unpack("<Q", f.read(8))  # metadata_kv_count
+            # value-type -> byte width (u8/i8/u16/i16/u32/i32/f32/bool/u64/i64/f64)
+            widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+            for _ in range(n_kv):
+                (klen,) = struct.unpack("<Q", f.read(8))
+                if klen > 4096:  # sanity: keys are short; guards against misalignment
+                    return None
+                key = f.read(klen).decode(errors="replace")
+                (vtype,) = struct.unpack("<I", f.read(4))
+                if vtype == 8:  # string
+                    (slen,) = struct.unpack("<Q", f.read(8))
+                    f.read(slen)
+                elif vtype == 9:  # array
+                    (etype,) = struct.unpack("<I", f.read(4))
+                    (alen,) = struct.unpack("<Q", f.read(8))
+                    esize = widths.get(etype, 4)
+                    for _ in range(alen):
+                        if etype == 8:
+                            (elen,) = struct.unpack("<Q", f.read(8))
+                            f.read(elen)
+                        else:
+                            f.read(esize)
+                elif vtype in widths:
+                    raw = f.read(widths[vtype])
+                    if "context_length" in key:
+                        if vtype in (0, 1):
+                            return raw[0]
+                        if vtype == 2:
+                            return struct.unpack("<H", raw)[0]
+                        if vtype == 3:
+                            return struct.unpack("<h", raw)[0]
+                        if vtype == 4:
+                            return struct.unpack("<I", raw)[0]
+                        if vtype == 5:
+                            return struct.unpack("<i", raw)[0]
+                        if vtype == 10:
+                            return struct.unpack("<Q", raw)[0]
+                        if vtype == 11:
+                            return struct.unpack("<q", raw)[0]
+                else:
+                    return None
+    except (OSError, ValueError, struct.error):
+        return None
+    return None
 
 
 # Bytes per element for safetensors dtypes (used to size model weights).
@@ -293,7 +355,10 @@ def find_bin_dir(version: str, base_dir: Path) -> str:
     if version == "latest":
         versions = get_available_versions(base_dir)
         if not versions:
-            raise SystemExit("error: no llama-b#### directory found")
+            raise SystemExit(
+                "error: no llama-b#### directory found here\n"
+                "  use --llama-server <path> or set LLAMA_BIN_DIR to locate llama-server"
+            )
         return f"llama-b{versions[-1]}"
     if (base_dir / f"llama-b{version}").is_dir():
         return f"llama-b{version}"
@@ -447,7 +512,7 @@ def mount_root(path: str | os.PathLike) -> str:
     return cur
 
 
-def compute_env_prefixes(paths: list[str | os.PathLike], project_hint: str | os.PathLike | None = None):
+def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None):
     """Compute ``${env.*}`` variable names for the longest common path of each
     mount group among *paths*.
 
@@ -496,14 +561,16 @@ def compute_env_prefixes(paths: list[str | os.PathLike], project_hint: str | os.
 
 def make_subst(prefix_to_var: dict[str, str]):
     """Return ``sub(path)`` that replaces the longest matching prefix with
-    ``${env.VAR}`` (matching llama-swap's environment-variable macro syntax)."""
+    ``${VAR}`` (llama-swap config `macros:` syntax). The resolved values are
+    written into the config's ``macros:`` block, so reloads pick them up
+    without depending on a stale process environment."""
     prefixes = sorted(prefix_to_var, key=len, reverse=True)
 
     def sub(path: str | os.PathLike) -> str:
         p = os.fspath(path)
         for pref in prefixes:
             if p == pref or p.startswith(pref + os.sep):
-                return "${env." + prefix_to_var[pref] + "}" + p[len(pref):]
+                return "${" + prefix_to_var[pref] + "}" + p[len(pref):]
         return p
 
     return sub

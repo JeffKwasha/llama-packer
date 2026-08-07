@@ -4,7 +4,7 @@
 
 `llama-packer` generates `config.yaml` for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. It scans model directories, detects GPU hardware, measures per-model VRAM costs via `llama-fit-params`, budgets context windows, resolves companion files, applies sampling profiles, and writes ready-to-run server configurations.
 
-**Entry point:** `gen-config.py` → `model_cfg.__main__.main`
+**Entry point:** `gen-config.py` → `llama_packer.__main__.main`
 
 ## Output Format
 
@@ -28,13 +28,13 @@ Also emits:
 
 ### Writer module
 
-`model_cfg/output/llama_swap.py` provides:
+`llama_packer/writer.py` provides:
 - **`build_config()`** — builds the full llama-swap `models` dict from `Model` objects + profiles
 - **`write_yaml()`** — YAML output with literal block scalars
 
 ## Hardware Detection
 
-VRAM is detected via a vendor-probe chain in `model_cfg/hardware.py`:
+VRAM is detected via a vendor-probe chain in `llama_packer/hardware.py`:
 
 | Priority | Method | Notes |
 |----------|--------|-------|
@@ -95,7 +95,7 @@ available = Σ(chat_weight + chat_factor × chat_ctx)
            + (rerank_weight + rerank_factor × rerank_ctx)
 ```
 
-The solver (`model_cfg/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (default 8192 each). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models.
+The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (default 8192 each). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models.
 
 Embed/rerank models are auto-selected as the smallest model of each type, or matched by `--embed`/`--rerank` CLI selectors.
 
@@ -130,7 +130,7 @@ mtp_draft_n_max: 3            # default: 2
 ---
 ```
 
-If absent, the module-level defaults apply (see `model_cfg/utils.py`).
+If absent, the module-level defaults apply (see `llama_packer/utils.py`).
 
 ### Baked-in vs Companion MTP
 
@@ -275,7 +275,7 @@ This block is:
 
 ## Constants
 
-All module-level constants are in `model_cfg/utils.py`.
+All module-level constants are in `llama_packer/utils.py`.
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
