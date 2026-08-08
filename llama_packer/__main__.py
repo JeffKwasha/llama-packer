@@ -15,7 +15,7 @@ import yaml
 
 from llama_packer import Model, find_bin_dir
 from llama_packer.hardware import GpuProfile
-from llama_packer.utils import compute_env_prefixes, make_subst, _detect_drive_speed
+from llama_packer.utils import _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed
 from llama_packer.writer import build_config, write_yaml
 
 
@@ -56,6 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection)")
     parser.add_argument("--gpu-family", help="GPU family for chip-specific calculation rules (default: auto-detect or profiles.yaml hardware.gpu_family)")
     parser.add_argument("--max-context", help="Hard cap on context length for all models (e.g. 128k, 65536)")
+    parser.add_argument("--min-context", help="Minimum useful context for chat models; mmproj (vision) is skipped when needed to reach it (default: 131072 = 128k)")
     parser.add_argument("--no-env", action="store_true", help="Do not write the sibling config.env file")
     parser.add_argument("--health-check-timeout", type=int, default=None,
                         help="Health check timeout in seconds (default: auto-calculated from model sizes)")
@@ -170,6 +171,11 @@ def main(argv: list[str] | None = None) -> None:
         from llama_packer.utils import parse_context_length
         max_ctx = parse_context_length(args.max_context)
 
+    min_ctx = None
+    if args.min_context:
+        from llama_packer.utils import parse_context_length
+        min_ctx = parse_context_length(args.min_context)
+
     # Discover models
     models = Model.from_dir(models_dir, generate_stubs=not args.no_stubs, extra_dirs=args.extra_dirs)
     if not models:
@@ -244,6 +250,8 @@ def main(argv: list[str] | None = None) -> None:
         models, profiles_cfg, template_vars, fit_bin, gpu.vram_mb,
         spare=args.spare, max_context=max_ctx,
         matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
+        baseline_mb=gpu.baseline_mb,
+        min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
     )
     config = _apply_env_subst(config, sub, raw_paths)
     if not config.get("models"):

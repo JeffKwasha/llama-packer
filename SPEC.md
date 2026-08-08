@@ -68,11 +68,24 @@ Values are persisted to the model's `.md` sidecar as a `fit-params` block, avoid
 
 **Fallback chain:** saved frontmatter → in-memory cache → `llama-fit-params` binary → safetensors header estimation.
 
+`llama-fit-params` is always invoked with `--fit off` so it measures the explicit `-c` (or design) context rather than auto-adjusting arguments — `--fit on` (the default) would otherwise change `-ngl`/`-c` when the GPU is busy, corrupting the measurement.
+
+### Companion (mmproj / MTP) VRAM accounting
+
+Companion GGUFs cannot be measured by `llama-fit-params` — mmproj files fail to load as standalone models, and MTP draft heads abort on a missing `ctx_other`. Their VRAM is therefore folded into the main model's budget via a combined "effective static" pass (`llama_packer/vram.py:effective_static`):
+
+- **Main model**: measured fit-params values.
+- **MTP draft**: file-size weight plus an estimated per-token `ctx_factor` (the draft holds its own KV cache that scales with context) and a fixed compute buffer.
+- **mmproj**: file-size weight plus a fixed compute buffer (`_MMPROJ_COMPUTE_MB`, ~150 MiB for the vision projection buffers); no per-token factor.
+
+An attempt is made to run `llama-fit-params` on each companion first (cached per companion); on failure it falls back to the file-size estimate with a warning. This fixes companion VRAM being under-budgeted by raw file size alone (a Gemma4-31B + MTP + mmproj combination was measured to need ~1.8 GiB more than the sum of companion file sizes).
+
 ### Context calculation formula
 
 ```
-available = vram_total - RESERVE_SYSTEM(1024) - RESERVE_VIDEO(1024) - spare - mmproj_size - mtp_companion_size
-remaining = available - model_mib - compute_mib
+reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
+available = vram_total - reserve - spare
+remaining = available - model_mib - compute_mib        # model/ctx/compute now include companions
 max_ctx = remaining / ctx_factor
 max_ctx = floor(max_ctx / CTX_ROUND_TO) * CTX_ROUND_TO    # round down to 8192 boundary
 max_ctx = max(max_ctx, MIN_CTX_SIZE)                       # floor at 4096
@@ -81,18 +94,30 @@ max_ctx = min(max_ctx, sidecar_context_length)             # cap at sidecar ceil
 max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-context
 ```
 
+`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes (auto-detected from `amd-smi used_vram` / `nvidia-smi memory.used`, or set via `profiles.yaml` `hardware.baseline_mb`). The effective reserve is the fixed system reserve plus the larger of the fixed video reserve and the live baseline, so budgets never assume a blank GPU.
+
 **Design context:** When `llama-fit-params` measures `ctx_factor`, it uses the model's GGUF architectural context length as the reference point (or sidecar `context_length`, or 32768 default). If the design context fits within the remaining budget, it is used directly without scaling down.
 
 **Note:** `parallel` slots are accounted for inside `llama-fit-params` measurement — no separate division step.
+
+### Minimum useful context and vision (mmproj) skipping
+
+Chat models target a minimum useful context (`_MIN_USEFUL_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without vision (at the global `--spare`):
+
+- `ctx_with ≥ min_context` → keep vision; a single entry is emitted with `--mmproj` and the `vision` capability.
+- `ctx_with < min_context` → the main entry **drops** mmproj: no `--mmproj`, the `vision` capability is removed, and `metadata.mmproj_skipped: true` is set. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
+- If even the text-only context is `< min_context`, a warning is logged (the main entry is still emitted).
+
+Both the main and vision-variant entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare.
 
 ## Matrix Context Solving
 
 When `profiles.yaml` defines a `matrix` section with `embed` and `rerank` models, the system solves a shared VRAM budget equation across all model types:
 
 ```
-available = Σ(chat_weight + chat_factor × chat_ctx)
-           + (embed_weight + embed_factor × embed_ctx)
-           + (rerank_weight + rerank_factor × rerank_ctx)
+reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
+available = vram_total - reserve - spare
+chat_ctx solves Σ(chat_weight + chat_factor × chat_ctx) = available - embed - rerank
 ```
 
 The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (default 8192 each). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models.
@@ -282,8 +307,12 @@ All module-level constants are in `llama_packer/utils.py`.
 | `_DEFAULT_CONTEXT_LENGTH` | 32768 | Fallback when no `.md` sidecar or GGUF context exists |
 | `_CTX_ROUND_TO` | 8192 | Round context size down to nearest boundary |
 | `_MIN_CTX_SIZE` | 4096 | Hard floor for context size |
+| `_MIN_USEFUL_CTX` | 131072 | Min useful chat context; mmproj dropped below this (`--min-context`) |
 | `_RESERVE_SYSTEM` | 1024 | MB reserved for OS/driver/scratch buffers |
 | `_RESERVE_VIDEO` | 1024 | MB reserved for GPU video output framebuffer |
+| `_MMPROJ_COMPUTE_MB` | 150 | Fixed compute buffer for mmproj companions |
+| `_DRAFT_COMPUTE_MB` | 64 | Fixed compute overhead for MTP draft companions |
+| `_DRAFT_CTX_SAFETY` | 1.6 | Safety factor on the MTP draft per-token KV estimate |
 | `_MTP_SPEC_TYPE` | `"draft-mtp"` | Default MTP speculative type |
 | `_MTP_DRAFT_N_MAX` | 2 | Default max draft tokens for MTP |
 

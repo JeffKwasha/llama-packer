@@ -125,8 +125,16 @@ def _build_entry(
     template_vars: dict,
     context_length: int,
     ctx_size: int,
+    include_mmproj: bool = True,
+    name_suffix: str = "",
 ) -> tuple[str, dict]:
-    """Build a single llama-swap config entry for a model+profile group."""
+    """Build a single llama-swap config entry for a model+profile group.
+
+    ``include_mmproj=False`` omits the vision projection from the command,
+    removes the ``vision`` capability, and flags ``metadata.mmproj_skipped``.
+    ``name_suffix`` is appended to the model display name (e.g. the vision
+    variant's `` [vision 92k]``).
+    """
     base_id = utils.slugify(model.name)
 
     # Build command string
@@ -142,17 +150,21 @@ def _build_entry(
     parts.append(utils.resolve_template(t_conf["parallel"], {"parallel": str(parallel)}))
     parts.append(utils.resolve_template(t_conf["cache_type"], {"cache_type": cache_type}))
 
-    # CPU-resident models (embed/rerank sidecars): force CPU inference.
+    # GPU-resident models: pin all layers to VRAM so the runtime matches the
+    # fit-params measurement (which assumes full offload). CPU-resident models
+    # (embed/rerank sidecars) force CPU inference instead.
     if model.on_cpu:
         parts.append("--n-gpu-layers 0")
+    else:
+        parts.append("--n-gpu-layers 999")
 
     # MTP args
     mtp_arg_str, mtp_enabled, mtp_n_max, _ = _build_mtp_args(model)
     if mtp_enabled and mtp_arg_str:
         parts.append(mtp_arg_str)
 
-    # mmproj
-    if model.mmproj and model.mmproj.gguf_path:
+    # mmproj (omitted when the vision projection is being dropped)
+    if include_mmproj and model.mmproj and model.mmproj.gguf_path:
         parts.append(utils.resolve_template(t_conf["mmproj"], {"mmproj_path": str(model.mmproj.gguf_path)}))
 
     # Template-level extra flags (e.g. --embedding/--rerank for embed/rerank targets)
@@ -188,12 +200,20 @@ def _build_entry(
     # through automatically; only builder-consumed keys are excluded.
     metadata = model.pass_through_metadata()
 
-    caps = model.capabilities
+    caps = list(model.capabilities)
     modalities = ["text"]
     if "vision" in caps:
         modalities.append("image")
     if "audio" in caps:
         modalities.append("audio")
+
+    # When mmproj is dropped, remove the (auto-added) vision capability so the
+    # main entry no longer advertises image input.
+    if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
+        caps = [c for c in caps if c.lower() != "vision"]
+        if "image" in modalities:
+            modalities.remove("image")
+        metadata["mmproj_skipped"] = True
 
     tf = model.throughput_factor()
     if tf is not None:
@@ -207,7 +227,7 @@ def _build_entry(
     if set_params:
         entry["setParamsByID"] = set_params
     if model.name:
-        entry["name"] = model.name
+        entry["name"] = model.name + name_suffix
     if model.description:
         entry["description"] = model.description
     if metadata:
@@ -245,6 +265,8 @@ def _solve_matrix_context(
     vram_total: int,
     spare: str | None,
     defaults: dict,
+    baseline_mb: int = 0,
+    drop_stems: set[str] | None = None,
 ) -> int | None:
     """Solve VRAM budget equation for chat context given embed/rerank allocations.
 
@@ -254,23 +276,30 @@ def _solve_matrix_context(
                    + (rerank_weight + rerank_factor*rerank_ctx)
 
     Returns the maximum chat context that fits, or None on failure.
+
+    ``drop_stems`` is the set of chat-model stems whose mmproj is being skipped
+    to reach the minimum useful context (their combined budget omits mmproj).
     """
     # Resolve global spare
     spare_mb = 0
     if spare:
         spare_mb = utils.resolve_spare_mb(str(spare), vram_total)
 
+    drop_stems = drop_stems or set()
     cache_type = str(defaults.get("cache_type", "q8_0"))
     parallel = int(defaults.get("parallel", 1))
 
-    # Get static params for chat models
+    # Get static params for chat models (companion VRAM folded in).
+    # The drop decision (mmproj skipped to reach the min useful context) is
+    # decided in build_config and threaded in via drop_stems.
     chat_params = []
     for m in chat_models:
-        fp = m.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+        fp = m.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
+                                     include_mmproj=m.stem not in drop_stems)
         if fp is None:
             logger.warning("matrix: could not get fit params for %s", m.stem)
             continue
-        chat_params.append((m, fp.model_mib, fp.ctx_factor, fp.compute_mib))
+        chat_params.append((m, fp[0], fp[1], fp[2]))
 
     if not chat_params:
         return None
@@ -297,6 +326,7 @@ def _solve_matrix_context(
         rerank_params=rerank_params,
         embed_ctx=embed_ctx,
         rerank_ctx=rerank_ctx,
+        baseline_mb=baseline_mb,
     )
 
 
@@ -311,6 +341,8 @@ def build_config(
     matrix_cfg: dict | None = None,
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
+    baseline_mb: int = 0,
+    min_context: int = utils._MIN_USEFUL_CTX,
 ) -> dict:
     """Build llama-swap config from list of Model objects.
 
@@ -325,18 +357,64 @@ def build_config(
         matrix_cfg: Matrix configuration for embed/rerank context solving
         embed_model: Embedding model (if matrix configured)
         rerank_model: Reranking model (if matrix configured)
+        baseline_mb: Driver/compositor VRAM already in use (added to reserve)
+        min_context: Minimum useful context for chat models. When a chat model
+            with an mmproj companion cannot reach this WITH vision, the vision
+            projection is dropped from the main entry (a ``vision-<N>k`` variant
+            is emitted instead, still exposing vision at best-effort context).
     """
     defaults = profiles_cfg.get("defaults", {})
     profile_list = profiles_cfg.get("profiles", {})
 
     entries: dict[str, dict] = {}
 
-    # Pre-pass: solve matrix context if configured
+    # ── Pre-pass: decide mmproj drop per chat model ──
+    # A chat model keeps mmproj if it can reach the minimum useful context WITH
+    # vision; otherwise the main entry drops it and a best-effort vision variant
+    # is emitted.  The decision uses the global spare and default cache/parallel;
+    # per-profile spare overrides still bound ctx via calc_ctx per group.
+    global_spare_mb = 0
+    global_spare_str = defaults.get("spare") or spare
+    if global_spare_str:
+        global_spare_mb = utils.resolve_spare_mb(str(global_spare_str), vram_total)
+    default_cache_type = str(defaults.get("cache_type", "q8_0"))
+    default_parallel = int(defaults.get("parallel", 1))
+
+    # stem -> True when the main entry should omit mmproj
+    drop_mmproj: dict[str, bool] = {}
+    for model in models:
+        if model.type in ("embeddings", "rerank"):
+            continue
+        if not (model.mmproj and model.mmproj.gguf_path):
+            continue
+        ctx_with = model.vram.calc_ctx(
+            vram_total, fit_bin=fit_bin, parallel=default_parallel,
+            spare_mb=global_spare_mb, include_mmproj=True,
+            baseline_mb=baseline_mb, cache_type=default_cache_type,
+        )
+        if ctx_with >= min_context:
+            drop_mmproj[model.stem] = False
+            logger.info("mmproj: keep for %s (ctx %d >= %d)", model.stem, ctx_with, min_context)
+            continue
+        ctx_without = model.vram.calc_ctx(
+            vram_total, fit_bin=fit_bin, parallel=default_parallel,
+            spare_mb=global_spare_mb, include_mmproj=False,
+            baseline_mb=baseline_mb, cache_type=default_cache_type,
+        )
+        drop_mmproj[model.stem] = True
+        logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
+                    model.stem, ctx_with, min_context, ctx_without)
+        if ctx_without < min_context:
+            logger.warning("mmproj: %s cannot reach %d context even without vision "
+                           "(text ctx %d)", model.stem, min_context, ctx_without)
+
+    # ── Pre-pass: solve matrix context if configured ──
     matrix_chat_ctx: int | None = None
     if matrix_cfg and embed_model and rerank_model:
         matrix_chat_ctx = _solve_matrix_context(
             models, embed_model, rerank_model,
             fit_bin, vram_total, spare, defaults,
+            baseline_mb=baseline_mb, drop_stems={s for s, d in drop_mmproj.items() if d},
         )
         if matrix_chat_ctx is not None:
             logger.info("matrix: solved chat_ctx=%d", matrix_chat_ctx)
@@ -345,6 +423,9 @@ def build_config(
         # Use GGUF architectural max as the effective context limit.
         # Falls back to sidecar context_length, then default.
         context_length = model.gguf_context_length or model.context_length
+
+        # Whether this model's main entry keeps or drops mmproj
+        include_mmproj = not drop_mmproj.get(model.stem, False)
 
         # Filter profiles by model's allow_profiles
         filtered_profiles = _filter_profiles(profile_list, model.allow_profiles)
@@ -387,17 +468,15 @@ def build_config(
             for (parallel, cache_type, spare_mb), profiles_group in groups.items():
                 # Use matrix-solved context as design context if available
                 design_ctx = matrix_chat_ctx if matrix_chat_ctx else None
-                mmproj_mb = (
-                    utils.get_model_size_mb(str(model.mmproj.gguf_path))
-                    if model.mmproj and model.mmproj.gguf_path
-                    else 0
-                )
+
+                # Main entry (possibly without mmproj)
                 ctx_size = model.vram.calc_ctx(
                     vram_total,
                     fit_bin=fit_bin,
                     parallel=parallel,
                     spare_mb=spare_mb,
-                    mmproj_mb=mmproj_mb,
+                    include_mmproj=include_mmproj,
+                    baseline_mb=baseline_mb,
                     cache_type=cache_type,
                     design_ctx=design_ctx,
                 )
@@ -408,10 +487,40 @@ def build_config(
                 entry_id, entry = _build_entry(
                     model, parallel, cache_type, profiles_group,
                     defaults, template_vars, context_length, ctx_size,
+                    include_mmproj=include_mmproj,
                 )
                 if variant_suffix:
                     entry_id = entry_id + variant_suffix
                 entries[entry_id] = entry
+
+                # Vision variant: emitted when mmproj was dropped from the main
+                # entry. Best-effort context WITH vision; id ``-vision-<N>k``
+                # where N = context // 1000 (e.g. 92567 -> vision-92k).
+                if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
+                    vision_ctx = model.vram.calc_ctx(
+                        vram_total,
+                        fit_bin=fit_bin,
+                        parallel=parallel,
+                        spare_mb=spare_mb,
+                        include_mmproj=True,
+                        baseline_mb=baseline_mb,
+                        cache_type=cache_type,
+                        design_ctx=design_ctx,
+                    )
+                    vision_ctx = min(vision_ctx, context_length)
+                    if max_context is not None:
+                        vision_ctx = min(vision_ctx, max_context)
+                    n_k = vision_ctx // 1000
+                    vision_id, vision_entry = _build_entry(
+                        model, parallel, cache_type, profiles_group,
+                        defaults, template_vars, context_length, vision_ctx,
+                        include_mmproj=True,
+                        name_suffix=f" [vision {n_k}k]",
+                    )
+                    vision_id = f"{vision_id}-vision-{n_k}k"
+                    if variant_suffix:
+                        vision_id = vision_id + variant_suffix
+                    entries[vision_id] = vision_entry
 
     config: dict = {}
     config["models"] = {

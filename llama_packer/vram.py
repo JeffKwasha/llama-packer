@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 # Required keys in the fit-params frontmatter block
 _FIT_PARAMS_REQUIRED = frozenset({"model_mib", "ctx_factor", "compute_mib"})
 
+# Companion VRAM fallback constants (see _companion_fit docstring).
+# mmproj: fixed compute buffer on top of its weights (vision projection buffers).
+_MMPROJ_COMPUTE_MB = 150
+# MTP draft: fixed compute overhead + per-token KV factor estimate safety margin.
+_DRAFT_COMPUTE_MB = 64
+_DRAFT_CTX_SAFETY = 1.6
+
 
 @dataclass
 class FitParams:
@@ -119,6 +126,8 @@ class VramBudget:
         self.model = model
         self._cache: dict[tuple, tuple[int, int, int]] = {}
         self._static_cache: dict[tuple, FitParams] = {}
+        self._effective_cache: dict[tuple, tuple[int, float, int]] = {}
+        self._companion_cache: dict[tuple, tuple[int, float, int]] = {}
         self._sf_estimate: tuple[int, float] | None = None
         self._logged: set[str] = set()
 
@@ -143,20 +152,29 @@ class VramBudget:
         fit_target_mib: int | None = None,
         cache_type: str = "q8_0",
         parallel: int = 1,
+        model_path: str | None = None,
+        label: str | None = None,
     ) -> tuple[int, int, int] | None:
         """Run llama-fit-params and return (model_mib, context_mib, compute_mib).
 
         Returns None on failure (binary missing, timeout, parse error).
+        ``label`` is used in log messages instead of the model stem (useful
+        when measuring a companion GGUF).
         """
-        cache_key = (fit_ctx, fit_target_mib, cache_type, parallel)
+        if model_path is None:
+            if self.model.gguf_path is None:
+                return None
+            model_path = str(self.model.gguf_path)
+        label = label or self.model.stem
+        cache_key = (model_path, fit_ctx, fit_target_mib, cache_type, parallel)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        assert self.model.gguf_path is not None
         cmd = [
             fit_bin,
             "--fit-print", "on",
-            "-m", str(self.model.gguf_path),
+            "--fit", "off",
+            "-m", str(model_path),
             "--cache-type-k", cache_type,
             "--cache-type-v", cache_type,
         ]
@@ -170,13 +188,13 @@ class VramBudget:
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
-            logger.warning("fit-params timeout for %s", self.model.stem)
+            logger.warning("fit-params timeout for %s", label)
             return None
         except FileNotFoundError:
             logger.warning("fit-params binary not found: %s", fit_bin)
             return None
         except Exception as e:
-            logger.warning("fit-params failed for %s: %s", self.model.stem, e)
+            logger.warning("fit-params failed for %s: %s", label, e)
             return None
 
         for line in out.stdout.splitlines():
@@ -192,13 +210,13 @@ class VramBudget:
                     pass
 
         if out.returncode != 0:
-            msg = f"fit-params crashed for {self.model.stem} (exit {out.returncode})"
+            msg = f"fit-params crashed for {label} (exit {out.returncode})"
             if msg not in self._logged:
                 self._logged.add(msg)
                 logger.warning(msg)
         else:
             preview = "\n".join(out.stdout.splitlines()[:3])
-            msg = f"could not parse fit-params output for {self.model.stem}: {preview}"
+            msg = f"could not parse fit-params output for {label}: {preview}"
             if msg not in self._logged:
                 self._logged.add(msg)
                 logger.warning(msg)
@@ -295,6 +313,115 @@ class VramBudget:
             parallel=parallel,
         )
 
+    # ── companion measurement / estimation ──
+
+    def _companion_fit(
+        self,
+        companion: "Model",
+        fit_bin: str,
+        main_fp: FitParams | None,
+        design_ctx: int,
+        cache_type: str = "q8_0",
+        parallel: int = 1,
+        is_mmproj: bool = False,
+    ) -> tuple[int, float, int] | None:
+        """Measure a companion (mmproj or MTP draft) static VRAM params.
+
+        Returns (model_mib, ctx_factor, compute_mib).  Attempts llama-fit-params
+        on the companion GGUF; falls back to a conservative file-size estimate
+        with a warning when the binary cannot measure it (mmproj GGUFs fail to
+        load, and MTP draft heads abort on missing ``ctx_other``).  Results are
+        cached per companion so a run measures each companion at most once.
+        """
+        cache_key = ("companion", companion.stem, cache_type, parallel)
+        if cache_key in self._companion_cache:
+            return self._companion_cache[cache_key]
+
+        result = self.fit_params(
+            fit_bin=fit_bin,
+            fit_ctx=design_ctx,
+            fit_target_mib=None,
+            cache_type=cache_type,
+            parallel=parallel,
+            model_path=str(companion.gguf_path),
+            label=companion.stem,
+        )
+
+        if result is not None:
+            model_mib, ctx_at_design_mib, compute_mib = result
+            ctx_factor = ctx_at_design_mib / design_ctx if design_ctx > 0 else 0.0
+            params = (model_mib, ctx_factor, compute_mib)
+        else:
+            # Conservative file-size fallback. The MTP draft holds its own KV
+            # cache that scales with context, so we estimate its per-token
+            # factor from the main model scaled by relative size, padded by a
+            # safety factor so the estimate errs on the side of reserving more.
+            size_mb = utils.get_model_size_mb(str(companion.gguf_path))
+            if is_mmproj:
+                params = (size_mb, 0.0, _MMPROJ_COMPUTE_MB)
+            elif main_fp is not None and main_fp.ctx_factor > 0 and main_fp.model_mib > 0:
+                draft_factor = main_fp.ctx_factor * (size_mb / main_fp.model_mib) * _DRAFT_CTX_SAFETY
+                params = (size_mb, draft_factor, _DRAFT_COMPUTE_MB)
+            else:
+                params = (size_mb, 0.0, _DRAFT_COMPUTE_MB)
+            msg = f"fit-params could not measure companion {companion.stem}; using file-size estimate"
+            if msg not in self._logged:
+                self._logged.add(msg)
+                logger.warning(msg)
+
+        self._companion_cache[cache_key] = params
+        return params
+
+    def effective_static(
+        self,
+        fit_bin: str,
+        cache_type: str = "q8_0",
+        parallel: int = 1,
+        design_ctx: int | None = None,
+        include_mmproj: bool = True,
+    ) -> tuple[int, float, int] | None:
+        """Combined static VRAM params for main model plus its companions.
+
+        Returns (model_mib, ctx_factor, compute_mib) where the MTP draft's
+        weight and per-token KV factor and the mmproj's weight/compute are
+        folded into the main model's numbers, so downstream context math sees a
+        single budget.  This is what fixes companion VRAM being under-budgeted
+        (previously charged by raw file size only).
+        """
+        cache_key = ("effective", cache_type, parallel, include_mmproj)
+        if cache_key in self._effective_cache:
+            return self._effective_cache[cache_key]
+
+        main = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+        if main is None:
+            return None
+
+        design = design_ctx if design_ctx is not None else self._design_ctx()
+        model_mib = main.model_mib
+        ctx_factor = main.ctx_factor
+        compute_mib = main.compute_mib
+
+        if self.model.mtp and self.model.mtp.gguf_path:
+            draft = self._companion_fit(self.model.mtp, fit_bin, main, design,
+                                        cache_type=cache_type, parallel=parallel)
+            if draft:
+                model_mib += draft[0]
+                ctx_factor += draft[1]
+                compute_mib += draft[2]
+
+        if include_mmproj and self.model.mmproj and self.model.mmproj.gguf_path:
+            proj = self._companion_fit(self.model.mmproj, fit_bin, main, design,
+                                       cache_type=cache_type, parallel=parallel,
+                                       is_mmproj=True)
+            if proj:
+                model_mib += proj[0]
+                ctx_factor += proj[1]
+                compute_mib += proj[2]
+
+        params = (model_mib, ctx_factor, compute_mib)
+        self._effective_cache[cache_key] = params
+        return params
+
     # ── context calculation ──
 
     def calc_ctx(
@@ -303,39 +430,37 @@ class VramBudget:
         fit_bin: str,
         parallel: int = 1,
         spare_mb: int = 0,
-        mmproj_mb: int = 0,
+        include_mmproj: bool = True,
+        baseline_mb: int = 0,
         cache_type: str = "q8_0",
         design_ctx: int | None = None,
     ) -> int:
         """Calculate max context size for given VRAM.
 
         Uses saved fit-params if available; otherwise runs the binary (or
-        safetensors estimation) and persists the results.
-        """
-        available = (
-            vram_total_mb
-            - utils._RESERVE_SYSTEM
-            - utils._RESERVE_VIDEO
-            - spare_mb
-            - mmproj_mb
-        )
+        safetensors estimation) and persists the results.  Companion (MTP draft,
+        mmproj) VRAM is folded in via :meth:`effective_static`.
 
-        # Subtract MTP companion size
-        if self.model.mtp and self.model.mtp.gguf_path:
-            mtp_mb = utils.get_model_size_mb(str(self.model.mtp.gguf_path))
-            available -= mtp_mb
-            logger.debug("mtp companion %s: %d MB subtracted from VRAM",
-                         self.model.mtp.stem, mtp_mb)
+        ``include_mmproj=False`` drops the vision projection from the budget
+        (used when skipping mmproj to reach the minimum useful context).
+        ``baseline_mb`` is the driver/compositor VRAM already in use; the
+        effective reserve is ``_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline)``.
+        """
+        reserve = utils._RESERVE_SYSTEM + max(utils._RESERVE_VIDEO, baseline_mb)
+        available = vram_total_mb - reserve - spare_mb
 
         if available <= 0:
-            logger.warning("available VRAM <= 0 for %s (spare=%d, mmproj=%d)",
-                           self.model.stem, spare_mb, mmproj_mb)
+            logger.warning("available VRAM <= 0 for %s (spare=%d)",
+                           self.model.stem, spare_mb)
             return utils._MIN_CTX_SIZE
 
         design = design_ctx if design_ctx is not None else self._design_ctx()
 
-        # Try saved or compute static params
-        static = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+        # Try saved or compute combined static params (main + companions)
+        static = self.effective_static(
+            fit_bin, cache_type=cache_type, parallel=parallel,
+            design_ctx=design, include_mmproj=include_mmproj,
+        )
 
         if static is None:
             # Fatal: no way to estimate VRAM for this model
@@ -346,13 +471,14 @@ class VramBudget:
                 f"(safetensors may be unsupported)."
             )
 
-        remaining = available - static.model_mib - static.compute_mib
+        model_mib, ctx_factor, compute_mib = static
+        remaining = available - model_mib - compute_mib
         if remaining <= 0:
             logger.warning("model + compute exceeds available VRAM for %s", self.model.stem)
             return utils._MIN_CTX_SIZE
 
         # If design context fits, use it (capped by sidecar context_length)
-        ctx_at_design_mib = int(static.ctx_factor * design)
+        ctx_at_design_mib = int(ctx_factor * design)
         if ctx_at_design_mib <= remaining:
             sidecar_ctx = self.model.frontmatter.get("context_length")
             if sidecar_ctx is not None:
@@ -360,7 +486,9 @@ class VramBudget:
             return design
 
         # Scale down linearly
-        max_ctx = int(remaining / static.ctx_factor)
+        if ctx_factor <= 0:
+            return utils._MIN_CTX_SIZE
+        max_ctx = int(remaining / ctx_factor)
         max_ctx = (max_ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
         return max(max_ctx, utils._MIN_CTX_SIZE)
 
@@ -422,6 +550,7 @@ def solve_matrix_ctx(
     rerank_params: tuple[int, float, int] | None,
     embed_ctx: int = 0,
     rerank_ctx: int = 0,
+    baseline_mb: int = 0,
 ) -> int:
     """Solve the VRAM budget equation for chat context.
 
@@ -442,11 +571,13 @@ def solve_matrix_ctx(
         rerank_params: (model_mib, context_factor, compute_mib) for reranker
         embed_ctx: Requested context for embedding model
         rerank_ctx: Requested context for reranking model
+        baseline_mb: Driver/compositor VRAM already in use (added to the reserve)
 
     Returns:
         Maximum chat context in tokens (rounded to _CTX_ROUND_TO)
     """
-    available = vram_total_mb - utils._RESERVE_SYSTEM - utils._RESERVE_VIDEO - spare_mb
+    reserve = utils._RESERVE_SYSTEM + max(utils._RESERVE_VIDEO, baseline_mb)
+    available = vram_total_mb - reserve - spare_mb
 
     embed_overhead = 0
     if embed_params and embed_ctx > 0:

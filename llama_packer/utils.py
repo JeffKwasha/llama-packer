@@ -22,6 +22,10 @@ _DEFAULT_CONTEXT_LENGTH = 32768
 _CTX_ROUND_TO = 8192
 _MIN_CTX_SIZE = 4096
 
+# Chat models should be useful beyond this context; mmproj (vision) is dropped
+# from the main entry when keeping it would fall below this floor. 128k.
+_MIN_USEFUL_CTX = 131072
+
 # VRAM reservation breakdown (MB)
 _RESERVE_SYSTEM = 1024
 _RESERVE_VIDEO = 1024
