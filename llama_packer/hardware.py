@@ -138,6 +138,43 @@ def detect_vram_mb() -> int:
     )
 
 
+def detect_vram_baseline_mb() -> int:
+    """Detect baseline VRAM in MiB already consumed by the driver/compositor.
+
+    This is the VRAM *used* before any model is loaded (kernel driver,
+    display compositor, other processes). It is reserved on top of the fixed
+    reserves so that VRAM budgets do not assume a blank GPU. Returns 0 when no
+    usable tool is available (treated as no baseline).
+    """
+    try:
+        out = subprocess.run(
+            ["amd-smi", "metric", "-m", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            baseline = int(json.loads(out.stdout)["gpu_data"][0]["mem_usage"]["used_vram"]["value"])
+            logger.info("vram baseline: %d MiB (amd-smi used_vram)", baseline)
+            return baseline
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            val = out.stdout.strip().splitlines()[0].strip()
+            if val not in ("N/A", "[N/A]", "Not Supported", ""):
+                baseline = int(val)
+                logger.info("vram baseline: %d MiB (nvidia-smi memory.used)", baseline)
+                return baseline
+    except Exception:
+        pass
+
+    return 0
+
+
 def detect_gpu_env_var() -> str:
     """Return the vendor env var used to pin a process to a GPU device.
 
@@ -243,6 +280,7 @@ class GpuProfile:
 
     vram_mb: int
     family: str = "default"
+    baseline_mb: int = 0
     handler: GpuFamilyHandler = field(default_factory=lambda: DefaultHandler(), repr=False)
 
     def __post_init__(self) -> None:
@@ -251,7 +289,8 @@ class GpuProfile:
     @classmethod
     def detect(cls) -> GpuProfile:
         """Auto-detect local GPU hardware."""
-        return cls(vram_mb=detect_vram_mb(), family="default")
+        return cls(vram_mb=detect_vram_mb(), family="default",
+                   baseline_mb=detect_vram_baseline_mb())
 
     @classmethod
     def from_args(
@@ -275,4 +314,13 @@ class GpuProfile:
 
         family = gpu_family or yaml_hw.get("gpu_family", "default")
 
-        return cls(vram_mb=vram_mb, family=family)
+        # Baseline reserve: explicit > auto-detect. 0 means "no baseline known".
+        if yaml_hw.get("baseline_mb"):
+            baseline_mb = _parse_mem_mb(str(yaml_hw["baseline_mb"]))
+            logger.info("vram baseline: %d MiB (from profiles.yaml hardware.baseline_mb)", baseline_mb)
+        elif vram is None and not yaml_hw.get("vram"):
+            baseline_mb = detect_vram_baseline_mb()
+        else:
+            baseline_mb = 0
+
+        return cls(vram_mb=vram_mb, family=family, baseline_mb=baseline_mb)
