@@ -325,49 +325,37 @@ class VramBudget:
         parallel: int = 1,
         is_mmproj: bool = False,
     ) -> tuple[int, float, int] | None:
-        """Measure a companion (mmproj or MTP draft) static VRAM params.
+        """Estimate a companion (mmproj or MTP draft) static VRAM params.
 
-        Returns (model_mib, ctx_factor, compute_mib).  Attempts llama-fit-params
-        on the companion GGUF; falls back to a conservative file-size estimate
-        with a warning when the binary cannot measure it (mmproj GGUFs fail to
-        load, and MTP draft heads abort on missing ``ctx_other``).  Results are
-        cached per companion so a run measures each companion at most once.
+        Returns (model_mib, ctx_factor, compute_mib). Companion GGUFs cannot be
+        measured by llama-fit-params — mmproj fails to load as a standalone
+        model and MTP draft heads abort on a missing ``ctx_other`` — so the
+        binary is not even attempted; instead VRAM is estimated directly from
+        the file size (with the MTP draft's per-token KV factor scaled from the
+        main model). This avoids launching a subprocess that would only crash
+        (SIGABRT), which on a GPU that already has a model resident is both
+        noisy and risky. Results are cached per companion.
         """
         cache_key = ("companion", companion.stem, cache_type, parallel)
         if cache_key in self._companion_cache:
             return self._companion_cache[cache_key]
 
-        result = self.fit_params(
-            fit_bin=fit_bin,
-            fit_ctx=design_ctx,
-            fit_target_mib=None,
-            cache_type=cache_type,
-            parallel=parallel,
-            model_path=str(companion.gguf_path),
-            label=companion.stem,
-        )
-
-        if result is not None:
-            model_mib, ctx_at_design_mib, compute_mib = result
-            ctx_factor = ctx_at_design_mib / design_ctx if design_ctx > 0 else 0.0
-            params = (model_mib, ctx_factor, compute_mib)
+        # Conservative file-size estimate. The MTP draft holds its own KV cache
+        # that scales with context, so we estimate its per-token factor from
+        # the main model scaled by relative size, padded by a safety factor so
+        # the estimate errs on the side of reserving more.
+        size_mb = utils.get_model_size_mb(str(companion.gguf_path))
+        if is_mmproj:
+            params = (size_mb, 0.0, _MMPROJ_COMPUTE_MB)
+        elif main_fp is not None and main_fp.ctx_factor > 0 and main_fp.model_mib > 0:
+            draft_factor = main_fp.ctx_factor * (size_mb / main_fp.model_mib) * _DRAFT_CTX_SAFETY
+            params = (size_mb, draft_factor, _DRAFT_COMPUTE_MB)
         else:
-            # Conservative file-size fallback. The MTP draft holds its own KV
-            # cache that scales with context, so we estimate its per-token
-            # factor from the main model scaled by relative size, padded by a
-            # safety factor so the estimate errs on the side of reserving more.
-            size_mb = utils.get_model_size_mb(str(companion.gguf_path))
-            if is_mmproj:
-                params = (size_mb, 0.0, _MMPROJ_COMPUTE_MB)
-            elif main_fp is not None and main_fp.ctx_factor > 0 and main_fp.model_mib > 0:
-                draft_factor = main_fp.ctx_factor * (size_mb / main_fp.model_mib) * _DRAFT_CTX_SAFETY
-                params = (size_mb, draft_factor, _DRAFT_COMPUTE_MB)
-            else:
-                params = (size_mb, 0.0, _DRAFT_COMPUTE_MB)
-            msg = f"fit-params could not measure companion {companion.stem}; using file-size estimate"
-            if msg not in self._logged:
-                self._logged.add(msg)
-                logger.warning(msg)
+            params = (size_mb, 0.0, _DRAFT_COMPUTE_MB)
+        msg = f"companion {companion.stem} VRAM estimated from file size (fit-params cannot measure mmproj/MTP)"
+        if msg not in self._logged:
+            self._logged.add(msg)
+            logger.info(msg)
 
         self._companion_cache[cache_key] = params
         return params
@@ -446,6 +434,12 @@ class VramBudget:
         ``baseline_mb`` is the driver/compositor VRAM already in use; the
         effective reserve is ``_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline)``.
         """
+        # CPU-resident models (--n-gpu-layers 0) are not VRAM-bound, so size
+        # them to their own architectural/sidecar context limit rather than the
+        # (possibly tiny) GPU budget, which would otherwise shrink them.
+        if self.model.on_cpu:
+            return self._design_ctx()
+
         reserve = utils._RESERVE_SYSTEM + max(utils._RESERVE_VIDEO, baseline_mb)
         available = vram_total_mb - reserve - spare_mb
 

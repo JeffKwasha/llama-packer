@@ -52,8 +52,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
     parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
     parser.add_argument("--extra-dirs", nargs="*", default=["embed", "rerank"], help="Extra subdirectories of --models-dir to scan for orphan GGUFs (default: embed rerank)")
-    parser.add_argument("--spare", help="Additional VRAM to reserve: suffixed (2G, 512m, 64k) or bare number (auto: GB if < 3×VRAM, else MB)")
-    parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection)")
+    parser.add_argument("--spare", help="Additional VRAM to reserve on TOP of the fixed 2048 MiB system+driver reserve "
+                                         "(1024 MiB OS/driver + 1024 MiB video framebuffer): suffixed (2G, 512m, 64k) or bare number "
+                                         "(auto: GB if < 3×VRAM, else MB)")
+    parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection). "
+                                         "The fixed 2048 MiB system+video reserve plus --spare are subtracted before budgeting context.")
+    parser.add_argument("--baseline", help="Driver/compositor VRAM already in use, added to the fixed 2048 MiB reserve "
+                                         "(default: 0; live auto-detection is disabled so the packer's own resident model "
+                                         "servers are not counted against the budget). Set only when other non-model processes occupy VRAM.")
     parser.add_argument("--gpu-family", help="GPU family for chip-specific calculation rules (default: auto-detect or profiles.yaml hardware.gpu_family)")
     parser.add_argument("--max-context", help="Hard cap on context length for all models (e.g. 128k, 65536)")
     parser.add_argument("--min-context", help="Minimum useful context for chat models; mmproj (vision) is skipped when needed to reach it (default: 131072 = 128k)")
@@ -213,6 +219,7 @@ def main(argv: list[str] | None = None) -> None:
         vram=args.vram,
         gpu_family=args.gpu_family,
         yaml_hw=yaml_hw,
+        baseline=args.baseline,
     )
 
     # Compute optimal ${env.*} prefixes from the raw paths actually emitted,

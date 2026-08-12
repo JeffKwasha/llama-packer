@@ -23,7 +23,14 @@ logger = logging.getLogger(__name__)
 _CL_RE = re.compile(r"^context_limit_\d+G$")
 
 
-class Model:
+class _ModelMeta(type):
+    """Metaclass so ``Model[name]`` resolves via ``Model._lookup``."""
+
+    def __getitem__(cls, name: str) -> "Model":
+        return cls._lookup(name)
+
+
+class Model(metaclass=_ModelMeta):
     """Represents a main model with optional mmproj and MTP companions."""
 
     _by_stem: ClassVar[dict[str, Model]] = {}
@@ -188,54 +195,47 @@ class Model:
         cls._by_stem.clear()
         cls._by_companion.clear()
 
+        # Single source of truth for role classification (see utils.classify_models).
+        classified = utils.classify_models(models_dir, extra_dirs)
+        md_items = {p: k for p, k in classified if p.suffix.lower() == ".md"}
+        gguf_items = {p: k for p, k in classified if p.suffix.lower() in (".gguf", ".safetensors")}
+
         known_md: set[Path] = set()
         models: list[Model] = []
 
-        # Collect .md sidecars. rglob on a symlinked models_dir may not
-        # descend into subdirectories, so also scan each extra_dir explicitly.
-        md_sources: list[Path] = [models_dir]
-        for d in (extra_dirs or []):
-            extra = models_dir / d
-            if extra.is_dir():
-                md_sources.append(extra)
-        seen_md: set[Path] = set()
-        for src in md_sources:
-            for md_path in sorted(src.rglob("*.md")):
-                if md_path in seen_md:
+        for md_path in md_items:
+            if md_path in known_md:
+                continue
+            fm = utils.parse_frontmatter(md_path)
+            if not fm.get("name"):
+                continue
+            if fm.get("ignore"):
+                logger.info("ignore: skipping %s", md_path.name)
+                continue
+            known_md.add(md_path)
+            try:
+                model = cls(md_path, fm)
+                models.append(model)
+            except Exception as e:
+                logger.warning("failed to load model from %s: %s", md_path, e)
+
+        if generate_stubs:
+            for gguf, kind in gguf_items.items():
+                # Companions (mmproj/mtp) are never main-model stubs.
+                if kind in ("mmproj", "mtp"):
                     continue
-                seen_md.add(md_path)
-                fm = utils.parse_frontmatter(md_path)
-                if not fm.get("name"):
+                md_path = gguf.with_suffix(".md")
+                if md_path in md_items:
                     continue
-                if fm.get("ignore"):
-                    logger.info("ignore: skipping %s", md_path.name)
+                if not gguf.is_file():
                     continue
-                known_md.add(md_path.absolute())
+                fm = utils.generate_stub_md(md_path, gguf)
                 try:
                     model = cls(md_path, fm)
                     models.append(model)
+                    logger.info("stub: %s", md_path.name)
                 except Exception as e:
-                    logger.warning("failed to load model from %s: %s", md_path, e)
-
-        if generate_stubs:
-            dirs_to_scan = [models_dir] + [models_dir / d for d in (extra_dirs or [])]
-            for scan_dir in dirs_to_scan:
-                if not scan_dir.is_dir():
-                    continue
-                for gguf in sorted(scan_dir.glob("*.gguf")) + sorted(scan_dir.glob("*.safetensors")):
-                    if "mmproj" in gguf.stem.lower():
-                        continue
-                    if utils._is_mtp_companion(gguf.stem):
-                        continue
-                    md_path = gguf.with_suffix(".md")
-                    if md_path not in seen_md and md_path not in known_md and gguf.is_file():
-                        fm = utils.generate_stub_md(md_path, gguf)
-                        try:
-                            model = cls(md_path, fm)
-                            models.append(model)
-                            logger.info("stub: %s", md_path.name)
-                        except Exception as e:
-                            logger.warning("failed to create stub for %s: %s", gguf, e)
+                    logger.warning("failed to create stub for %s: %s", gguf, e)
 
         return models
 
@@ -245,19 +245,25 @@ class Model:
         return list(cls._by_stem.values())
 
     @classmethod
-    def __getitem__(cls, name: str) -> Model:
+    def _lookup(cls, name: str) -> Model:
         """Look up a model by filename stem.
 
         If the name is a companion (mmproj/mtp), returns the parent main model.
         If no parent found, warns and raises KeyError.
         """
-        stem = Path(name).stem
-        if stem in cls._by_stem:
-            return cls._by_stem[stem]
-        if stem in cls._by_companion:
-            return cls._by_companion[stem]
+        # Normalize: strip a known model-sidecar extension (never Path.stem,
+        # which truncates at the last dot and breaks names like "Ornith-1.0-*").
+        n = str(name)
+        for ext in (".gguf", ".md", ".safetensors"):
+            if n.lower().endswith(ext):
+                n = n[: -len(ext)]
+                break
+        if n in cls._by_stem:
+            return cls._by_stem[n]
+        if n in cls._by_companion:
+            return cls._by_companion[n]
         # Looks like a companion file but no parent registered
-        if "mmproj" in stem.lower() or utils._is_mtp_companion(stem):
+        if utils.companion_kind(n):
             warnings.warn(f"Not a main model file: {name}")
         raise KeyError(f"Model not found: {name}")
 

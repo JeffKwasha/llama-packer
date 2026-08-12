@@ -94,7 +94,7 @@ max_ctx = min(max_ctx, sidecar_context_length)             # cap at sidecar ceil
 max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-context
 ```
 
-`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes (auto-detected from `amd-smi used_vram` / `nvidia-smi memory.used`, or set via `profiles.yaml` `hardware.baseline_mb`). The effective reserve is the fixed system reserve plus the larger of the fixed video reserve and the live baseline, so budgets never assume a blank GPU.
+`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes. It is **opt-in**: set via `--baseline` or `profiles.yaml` `hardware.baseline_mb`, and defaults to **0**. The fixed `_RESERVE_VIDEO` (1024 MiB) already covers driver/compositor overhead, so auto-detection of the live `used_vram` is intentionally NOT performed — llama-swap keeps model servers resident, and counting that usage would make the budget assume a blank GPU and collapse every context to the minimum. The effective reserve is the fixed system reserve (1024) plus the larger of the fixed video reserve (1024) and any explicit `baseline_mb`. `--spare` is subtracted on top of this reserve. CPU-resident models (`device: cpu`) are excluded from VRAM budgeting entirely and are sized to their own architectural/sidecar context.
 
 **Design context:** When `llama-fit-params` measures `ctx_factor`, it uses the model's GGUF architectural context length as the reference point (or sidecar `context_length`, or 32768 default). If the design context fits within the remaining budget, it is used directly without scaling down.
 

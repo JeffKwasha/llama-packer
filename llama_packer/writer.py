@@ -294,6 +294,12 @@ def _solve_matrix_context(
     # decided in build_config and threaded in via drop_stems.
     chat_params = []
     for m in chat_models:
+        # Embed/rerank models are handled via the separate overhead terms below
+        # (and CPU-resident models cost no VRAM), so they must not enter the
+        # shared chat budget — otherwise a small resident model can dictate the
+        # chat context for the whole fleet.
+        if m.type in ("embeddings", "rerank") or m.on_cpu:
+            continue
         fp = m.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
                                      include_mmproj=m.stem not in drop_stems)
         if fp is None:
@@ -392,6 +398,8 @@ def build_config(
             spare_mb=global_spare_mb, include_mmproj=True,
             baseline_mb=baseline_mb, cache_type=default_cache_type,
         )
+        if max_context is not None:
+            ctx_with = min(ctx_with, max_context)
         if ctx_with >= min_context:
             drop_mmproj[model.stem] = False
             logger.info("mmproj: keep for %s (ctx %d >= %d)", model.stem, ctx_with, min_context)
@@ -401,6 +409,8 @@ def build_config(
             spare_mb=global_spare_mb, include_mmproj=False,
             baseline_mb=baseline_mb, cache_type=default_cache_type,
         )
+        if max_context is not None:
+            ctx_without = min(ctx_without, max_context)
         drop_mmproj[model.stem] = True
         logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
                     model.stem, ctx_with, min_context, ctx_without)
