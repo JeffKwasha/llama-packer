@@ -418,6 +418,79 @@ def _is_mtp_companion(stem: str) -> bool:
     return bool(re.search(r"(?:^mtp-|\.mtp$|-mtp$)", s))
 
 
+# ── Role classification ────────────────────────────────────────────────
+#
+# A model directory mixes several roles that discovery previously
+# distinguished with ad-hoc inline checks ("mmproj" in stem,
+# _is_mtp_companion, targets[0]).  classify_models() is the single source of
+# truth: it walks the directory and returns (path, kind) tuples.
+
+MODEL_KINDS = ("main", "embeddings", "rerank", "mmproj", "mtp")
+
+
+def companion_kind(stem: str) -> str | None:
+    """Return 'mmproj' or 'mtp' if ``stem`` names a companion, else None."""
+    s = stem.lower()
+    if "mmproj" in s:
+        return "mmproj"
+    if _is_mtp_companion(stem):
+        return "mtp"
+    return None
+
+
+def model_kind(path: str | os.PathLike) -> str:
+    """Classify a single model file by role.
+
+    Companions are detected by filename regardless of any sidecar/companion
+    metadata:
+      * ``mmproj``  — vision projection (``*mmproj*`` on a .gguf)
+      * ``mtp``     — MTP speculative-draft head
+    Everything else is classified from its ``.md`` sidecar ``targets[0]``
+    (``embeddings`` / ``rerank`` / ``main``); a file with no sidecar is
+    ``main``.
+    """
+    p = Path(path)
+    if p.suffix.lower() == ".gguf":
+        ck = companion_kind(p.stem)
+        if ck:
+            return ck
+    md = p.with_suffix(".md")
+    fm = parse_frontmatter(md) if md.is_file() else {}
+    targets = fm.get("targets") or []
+    t = str(targets[0]) if targets else "main"
+    return t if t in MODEL_KINDS else "main"
+
+
+def classify_models(
+    models_dir: str | os.PathLike,
+    extra_dirs: list[str] | None = None,
+) -> list[tuple[Path, str]]:
+    """Classify model files in ``models_dir`` (and ``extra_dirs``) by role.
+
+    Returns a list of ``(path, kind)`` tuples where ``kind`` is one of
+    :data:`MODEL_KINDS` (``main``, ``embeddings``, ``rerank``, ``mmproj``,
+    ``mtp``).  ``model.py`` uses this as the single source of truth for
+    discovery, replacing the previously scattered inline heuristics.
+    """
+    roots = [Path(models_dir)]
+    for d in (extra_dirs or []):
+        extra = Path(models_dir) / d
+        if extra.is_dir():
+            roots.append(extra)
+
+    out: list[tuple[Path, str]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in ("*.gguf", "*.safetensors", "*.md"):
+            recursive = pattern == "*.md"
+            walker = root.rglob(pattern) if recursive else root.glob(pattern)
+            for p in walker:
+                if p.is_file():
+                    out.append((p, model_kind(p)))
+    return out
+
+
 def _eval_expr(expr: str, base_val: float) -> float:
     """Safely evaluate expressions like 'base * 0.6'."""
     try:

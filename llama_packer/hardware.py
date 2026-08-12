@@ -299,6 +299,7 @@ class GpuProfile:
         vram: str | None = None,
         gpu_family: str | None = None,
         yaml_hw: dict | None = None,
+        baseline: str | None = None,
     ) -> GpuProfile:
         """Construct profile with precedence: explicit args > YAML > auto-detect."""
         yaml_hw = yaml_hw or {}
@@ -314,13 +315,20 @@ class GpuProfile:
 
         family = gpu_family or yaml_hw.get("gpu_family", "default")
 
-        # Baseline reserve: explicit > auto-detect. 0 means "no baseline known".
+        # Baseline reserve: explicit (profiles.yaml hardware.baseline_mb or
+        # --baseline) > 0. Auto-detection of the live ``used_vram`` is
+        # intentionally NOT used by default: it includes the packer's own
+        # resident model servers (llama-swap keeps models loaded), which would
+        # make the budget assume a blank GPU and collapse every context to the
+        # minimum. The fixed _RESERVE_VIDEO (1024 MiB) already covers driver/
+        # compositor overhead. Set hardware.baseline_mb or --baseline to opt in
+        # only when other non-model processes occupy VRAM.
+        baseline_mb = 0
         if yaml_hw.get("baseline_mb"):
             baseline_mb = _parse_mem_mb(str(yaml_hw["baseline_mb"]))
             logger.info("vram baseline: %d MiB (from profiles.yaml hardware.baseline_mb)", baseline_mb)
-        elif vram is None and not yaml_hw.get("vram"):
-            baseline_mb = detect_vram_baseline_mb()
-        else:
-            baseline_mb = 0
+        elif baseline is not None:
+            baseline_mb = _parse_mem_mb(str(baseline))
+            logger.info("vram baseline: %d MiB (from --baseline)", baseline_mb)
 
         return cls(vram_mb=vram_mb, family=family, baseline_mb=baseline_mb)
