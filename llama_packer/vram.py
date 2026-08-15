@@ -62,7 +62,7 @@ class FitParams:
     parallel: int
 
     @classmethod
-    def from_dict(cls, d: dict, cache_type: str, parallel: int) -> FitParams | None:
+    def from_dict(cls, d: object, cache_type: str, parallel: int) -> FitParams | None:
         """Validate and construct from a frontmatter dict.
 
         Returns None if the block is missing, incomplete, has non-numeric
