@@ -1,15 +1,3 @@
-# ── Command templates ──────────────────────────────────
-templates:
-  llama-server:
-    cmd: |
-      {{llama_bin}} --port ${PORT}
-      --cont-batching --flash-attn on --no-mmap --no-context-shift
-      --model {{model_path}}
-      --ctx-size {{ctx_size}}
-      --parallel {{parallel}}
-      --cache-type-k {{cache_type}} --cache-type-v {{cache_type}}
-      {{extra_args}}
-
 # ── Global defaults ────────────────────────────────────
 defaults:
   cache_type: q8_0

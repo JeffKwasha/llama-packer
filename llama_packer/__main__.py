@@ -204,9 +204,6 @@ def main(argv: list[str] | None = None) -> None:
     with open(profiles_path) as f:
         profiles_cfg = yaml.safe_load(f) or {}
 
-    if not profiles_cfg.get("templates"):
-        logger.error("no templates defined in profiles.yaml")
-        sys.exit(1)
     if not profiles_cfg.get("profiles"):
         logger.error("no profiles defined in profiles.yaml")
         sys.exit(1)
