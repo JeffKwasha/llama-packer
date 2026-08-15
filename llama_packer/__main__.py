@@ -18,7 +18,7 @@ from llama_packer import Model, find_bin_dir
 from llama_packer.hardware import GpuProfile
 from llama_packer.utils import (
     _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
-    resolve_spare_mb, _RESERVE_SYSTEM, _RESERVE_VIDEO,
+    parse_mem_mb, _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
@@ -311,7 +311,7 @@ def main(argv: list[str] | None = None) -> None:
         spare_mb = 0
         global_spare = (profiles_cfg.get("defaults", {}).get("spare") or args.spare)
         if global_spare:
-            spare_mb = resolve_spare_mb(str(global_spare), gpu.vram_mb)
+            spare_mb = parse_mem_mb(str(global_spare), gpu.vram_mb)
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, gpu.baseline_mb)
         available = gpu.vram_mb - reserve - spare_mb
         if gpu.vram_mb > 0:
