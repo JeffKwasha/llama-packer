@@ -16,7 +16,7 @@ Each model entry produces:
 | `cmd` | `llama-server` invocation (multiline `\|` scalar) |
 | `name` | Human-readable model name (from `.md` frontmatter) |
 | `description` | Optional model description |
-| `setParamsByID` | Per-profile sampling overrides keyed by `${MODEL_ID}:profile` |
+| `filters.setParamsByID` | Per-request sampling overrides keyed by `${MODEL_ID}:profile` (global profiles, or a model's own `modes:` when declared). Always nested under `filters:` (see [Sampling Modes](#sampling-modes)) |
 | `metadata` | Pass-through metadata from `.md` frontmatter (excluded: consumed keys) |
 | `capabilities` | Native llama-swap block: `in`/`out` modalities, `tools`, `reranker`, `context` |
 | `env` | Per-model GPU device pinning (e.g. `ROCR_VISIBLE_DEVICES=0`) |
@@ -24,6 +24,7 @@ Each model entry produces:
 
 Also emits:
 - **`config.env`** — sibling file with `${env.*}` variables for systemd `EnvironmentFile=` or docker `--env-file`.
+- **`includeAliasesInList: true`** — presents the `${MODEL_ID}:<mode>`/`${MODEL_ID}:<profile>` aliases in `/v1/models` (llama-swap default is `false`).
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
 
 ### Writer module
@@ -174,6 +175,52 @@ When `reasoning` is set to `"auto"` in frontmatter, the system auto-generates mu
 
 Each variant gets its own llama-swap entry ID. A specific mode (e.g. `reasoning: native`) generates a single entry with that mode.
 
+## Sampling Modes
+
+By default sampling parameters come **only** from `profiles.yaml` (`defaults:` + `profiles:`),
+merged into `setParamsByID` keys. A model can instead declare its own full sampling profiles
+per **mode** (e.g. `instruct`, `thinking`, `writing`) — for models whose recommended samplers
+differ per usage, like one presence-penalty for instruction and another for reasoning.
+
+```yaml
+---
+default_mode: instruct
+modes:
+  instruct:
+    temperature: 0.6
+    top_p: 0.9
+    top_k: 40
+    min_p: 0.05
+    pres_pen: 1.5
+    repeat_penalty: 1.1
+  thinking:
+    temperature: 1.0
+    pres_pen: 0.0
+    repeat_penalty: 1.0
+---
+```
+
+- **`modes`**: a map of mode name → full param set. The declared block is authoritative —
+  global profile sampling overrides are not applied for this model. Models may declare any
+  number of modes (commonly 1–3).
+- **`default_mode`**: which mode is the model's default. It is emitted under the bare
+  `${MODEL_ID}` `setParamsByID` key; every other mode under `${MODEL_ID}:<mode>`. Falls back to
+  the first declared mode.
+- **Keys**: llama.cpp parameter names — `temperature`, `top_p`, `top_k`, `min_p`, `pres_pen`,
+  `repeat_penalty`, `freq_pen` (see `SAMPLING_KEYS`). Unknown or non-numeric values are
+  ignored with a warning. Emission translates to the request-body JSON names llama-server
+  parses (`pres_pen` → `presence_penalty`, `freq_pen` → `frequency_penalty`).
+- **Schema**: per llama-swap, `setParamsByID` is a *filter* and is always nested under
+  `filters:` in each model entry — a top-level key is silently ignored.
+- **Alias visibility**: each mode/profile key (`${MODEL_ID}`, `${MODEL_ID}:<mode>`,
+  `${MODEL_ID}:<profile>`) auto-registers as a model alias and applies per-request without
+  reloading. The generated config sets global `includeAliasesInList: true` so these aliases
+  appear in `/v1/models`, letting dynamic-list clients (OpenWebUI, OpenClaw, ...) select them.
+- **Metadata**: a model with `modes:` also exposes `metadata.modes` (sorted list) and
+  `metadata.default_mode` for static client discovery (hermes, opencode configs).
+- Models without `modes:` are unaffected and keep the global-profile `setParamsByID` behavior
+  (also nested under `filters:`).
+
 ## Health-Check Timeout
 
 Auto-calculated when not explicitly set via `--health-check-timeout`:
@@ -218,8 +265,8 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 `name`, `template`, `context_length`, `description`, `cli_args`, `model`, `attention`,
 `kv_cache`, `tool_args`, `speculative`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
-`mtp_draft_p_min`, `targets`, `allow_profiles`, `reasoning`, `spare`, `capabilities`,
-`ignore`, `device`, `concurrency`, `fit-params`.
+`mtp_draft_p_min`, `role`, `allow_profiles`, `reasoning`, `spare`, `capabilities`,
+`ignore`, `device`, `concurrency`, `fit-params`, `modes`, `default_mode`.
 
 ### Per-model config options
 
@@ -229,6 +276,8 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `concurrency` | int | Per-model concurrency limit → `concurrencyLimit` in config |
 | `spare` | str | Additional VRAM to reserve (overrides global `--spare`) |
 | `allow_profiles` | str/list/bool | Restrict which profiles apply (regex string, list, or false to disable) |
+| `modes` | dict | Per-model sampling modes (full profiles): name → param dict. Replaces the global-profile sampling overrides for this model. Values use llama.cpp names; see [Sampling Modes](#sampling-modes) |
+| `default_mode` | str | Which declared `modes` entry is the model's default (maps to the bare `${MODEL_ID}` `setParamsByID` key). Falls back to the first mode |
 | `reasoning` | str/bool | `auto` → multi-variant generation; specific mode → single variant; `true`/absent → no change |
 | `ignore` | bool | Skip this model entirely |
 

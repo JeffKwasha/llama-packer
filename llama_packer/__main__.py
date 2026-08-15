@@ -90,13 +90,13 @@ def _apply_env_subst(config: dict, sub, raw_paths: list[str]) -> dict:
 
 
 def _select_model(models: list, type_name: str, selector: str | None, logger) -> "Model | None":
-    """Pick a model of `type_name` (targets[0]).
+    """Pick a model of `type_name` (role).
 
     With no selector, returns the smallest by VRAM footprint. With a selector
     substring, returns the single model whose id/name/stem contains it; errors
     if the match is not exactly one.
     """
-    cands = [m for m in models if m.type == type_name]
+    cands = [m for m in models if m.role == type_name]
     if not cands:
         return None
     if selector:
@@ -120,7 +120,7 @@ def _build_matrix_vars(models: list, embed_model, rerank_model, logger) -> dict:
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
-        if m.type in ("embeddings", "rerank"):
+        if m.role in ("embeddings", "rerank"):
             continue
         chat_idx += 1
         vars_[f"c{chat_idx}"] = m.template_id

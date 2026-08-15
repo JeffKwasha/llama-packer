@@ -31,7 +31,8 @@ Output goes to `config.yaml` and `config.env` in the current directory.
 - Calculates optimal context window that fits available VRAM
 - Resolves companion files (mmproj, MTP draft models) by fuzzy match
 - Applies sampling profiles from `profiles.yaml`
-- Assembles llama-swap YAML with per-model metadata, native `capabilities`, and `setParamsByID`
+- Assembles llama-swap YAML with per-model metadata, native `capabilities`, and `filters.setParamsByID`
+  overrides (aliases like `<model>:<mode>` switch sampling parameters per-request without reload)
 - Solves multi-model VRAM budgets for embed/rerank/chat on shared GPUs
 
 ## Sidecar example
@@ -47,6 +48,10 @@ capabilities: [vision, tools, reasoning]
 freethought: 0.55
 strengths: ["strong multimodal", "full 256K context"]
 weaknesses: ["MTP adds VRAM"]
+default_mode: instruct
+modes:
+  instruct: { temperature: 0.6, pres_pen: 1.5 }   # llama.cpp param names
+  thinking:  { temperature: 1.0, pres_pen: 0.0 }
 ---
 ```
 
