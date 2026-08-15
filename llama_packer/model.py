@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import logging
 import re
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -23,18 +22,8 @@ logger = logging.getLogger(__name__)
 _CL_RE = re.compile(r"^context_limit_\d+G$")
 
 
-class _ModelMeta(type):
-    """Metaclass so ``Model[name]`` resolves via ``Model._lookup``."""
-
-    def __getitem__(cls, name: str) -> "Model":
-        return cls._lookup(name)
-
-
-class Model(metaclass=_ModelMeta):
+class Model:
     """Represents a main model with optional mmproj and MTP companions."""
-
-    _by_stem: ClassVar[dict[str, Model]] = {}
-    _by_companion: ClassVar[dict[str, Model]] = {}
 
     # Frontmatter keys this Model consumes (not passed through to metadata)
     FIELDS: ClassVar[frozenset[str]] = frozenset({
@@ -59,19 +48,10 @@ class Model(metaclass=_ModelMeta):
         if not self.gguf_path and self.hf_repo is None:
             raise ValueError(f"No GGUF/safetensors or hf_repo found for {md_path}")
 
-        # Register as main model
-        Model._by_stem[self.stem] = self
-
         # Resolve companions (mmproj, MTP)
         self.mmproj: Model | None = None
         self.mtp: Model | None = None
         self._resolve_companions()
-
-        # Register reverse mapping for companions
-        if self.mmproj:
-            Model._by_companion[self.mmproj.stem] = self
-        if self.mtp:
-            Model._by_companion[self.mtp.stem] = self
 
         logger.info("model: %s (gguf=%s, mmproj=%s, mtp=%s)",
                     self.stem, self.gguf_path.name if self.gguf_path else self.hf_repo,
@@ -194,9 +174,6 @@ class Model(metaclass=_ModelMeta):
 
         Returns list of instantiated Model objects (main models only).
         """
-        cls._by_stem.clear()
-        cls._by_companion.clear()
-
         # Single source of truth for role classification (see utils.classify_models).
         classified = utils.classify_models(models_dir, extra_dirs)
         md_items = {p: k for p, k in classified if p.suffix.lower() == ".md"}
@@ -245,34 +222,6 @@ class Model(metaclass=_ModelMeta):
                     logger.warning("failed to create stub for %s: %s", gguf, e)
 
         return models
-
-    @classmethod
-    def all(cls) -> list[Model]:
-        """Return all registered main models."""
-        return list(cls._by_stem.values())
-
-    @classmethod
-    def _lookup(cls, name: str) -> Model:
-        """Look up a model by filename stem.
-
-        If the name is a companion (mmproj/mtp), returns the parent main model.
-        If no parent found, warns and raises KeyError.
-        """
-        # Normalize: strip a known model-sidecar extension (never Path.stem,
-        # which truncates at the last dot and breaks names like "Ornith-1.0-*").
-        n = str(name)
-        for ext in (".gguf", ".md", ".safetensors"):
-            if n.lower().endswith(ext):
-                n = n[: -len(ext)]
-                break
-        if n in cls._by_stem:
-            return cls._by_stem[n]
-        if n in cls._by_companion:
-            return cls._by_companion[n]
-        # Looks like a companion file but no parent registered
-        if utils.companion_kind(n):
-            warnings.warn(f"Not a main model file: {name}")
-        raise KeyError(f"Model not found: {name}")
 
     @property
     def vram(self) -> VramBudget:
