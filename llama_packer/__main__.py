@@ -62,8 +62,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection). "
                                          "The fixed 2048 MiB system+video reserve plus --spare are subtracted before budgeting context.")
     parser.add_argument("--baseline", help="Driver/compositor VRAM already in use, added to the fixed 2048 MiB reserve "
-                                         "(default: 0; live auto-detection is disabled so the packer's own resident model "
-                                         "servers are not counted against the budget). Set only when other non-model processes occupy VRAM.")
+                                          "(default: 0; live auto-detection is disabled so the packer's own resident model "
+                                          "servers are not counted against the budget). Set only when other non-model processes occupy VRAM.")
+    parser.add_argument("--unified-system-mb", help="System memory reserved for the OS on unified-memory hosts "
+                                          "(GB10/DGX Spark, Apple Silicon): suffixed (8G, 4096m) or bare MB. "
+                                          "Default: 8192 (8 GiB). Only applies to auto-detected unified pools; "
+                                          "explicit --vram/hardware.vram overrides the whole budget instead.")
     parser.add_argument("--gpu-family", help="GPU family for chip-specific calculation rules (default: auto-detect or profiles.yaml hardware.gpu_family)")
     parser.add_argument("--max-context", help="Hard cap on context length for all models (e.g. 128k, 65536)")
     parser.add_argument("--min-context", help="Minimum useful context for chat models; mmproj (vision) is skipped when needed to reach it (default: 131072 = 128k)")
@@ -226,6 +230,7 @@ def main(argv: list[str] | None = None) -> None:
         gpu_family=args.gpu_family,
         yaml_hw=yaml_hw,
         baseline=args.baseline,
+        unified_system_mb=args.unified_system_mb,
     )
 
     # Compute optimal ${env.*} prefixes from the raw paths actually emitted,

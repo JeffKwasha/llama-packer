@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from llama_packer import utils
+
 logger = logging.getLogger(__name__)
 
 # ── VRAM detection (moved from utils.py) ──────────────────────────────────
@@ -96,39 +98,39 @@ def _detect_system_ram_mb() -> int:
     raise SystemExit("error: could not determine system RAM")
 
 
-def detect_vram_mb() -> int:
-    """Detect VRAM budget in MiB.
+def _detect_pool_mb() -> tuple[int, bool]:
+    """Detect the memory pool available to models.
 
-    Tries GPU-specific tools first. On unified memory systems (NVIDIA GB10,
-    Apple Silicon, Intel integrated), falls back to system RAM with a warning.
+    Returns ``(pool_mb, is_unified)``.  Discrete GPUs (AMD/NVIDIA tools) report
+    full card VRAM; unified-memory systems (NVIDIA GB10/Grace, Apple Silicon,
+    Intel integrated) and boxes with no GPU tools fall back to total system RAM.
+    The ``is_unified`` flag lets callers fold the fixed reserve into a single
+    system reservation instead of adding it on top (see ``GpuProfile.detect``).
     """
     vram = _detect_vram_amd()
     if vram is not None:
         logger.info("vram: %d MiB (discrete GPU)", vram)
-        return vram
+        return vram, False
 
     vram = _detect_vram_nvidia()
     if vram is not None:
         logger.info("vram: %d MiB (nvidia-smi)", vram)
-        return vram
+        return vram, False
 
     try:
         out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=10)
         if out.returncode == 0 and "NVIDIA" in out.stdout:
             ram = _detect_system_ram_mb()
-            available = ram // 2
             logger.warning("unified memory detected (nvidia-smi reports N/A) — "
-                           "system RAM %d MiB, using 50%%: %d MiB", ram, available)
-            return available
+                           "system RAM %d MiB", ram)
+            return ram, True
     except Exception:
         pass
 
     try:
         ram = _detect_system_ram_mb()
-        available = ram // 2
-        logger.warning("no GPU detection tool available — system RAM %d MiB, using 50%%: %d MiB",
-                       ram, available)
-        return available
+        logger.warning("no GPU detection tool available — system RAM %d MiB", ram)
+        return ram, True
     except Exception:
         pass
 
@@ -136,6 +138,20 @@ def detect_vram_mb() -> int:
         "error: could not detect VRAM — no GPU tools found (amd-smi, nvidia-smi, rocminfo)\n"
         "use --vram to specify (e.g. --vram 32G)"
     )
+
+
+# Default reservation (MiB) for the OS/kernel/driver on unified-memory hosts.
+# These machines exist to run models, so the pool is total system RAM minus a
+# modest system slice rather than 50% of RAM.  Override per-host via
+# ``hardware.unified_system_mb`` in profiles.yaml or ``--unified-system-mb``.
+# The value is a guesstimate: in-use memory on a unified host already includes
+# the slices we reserve, so it is not measured, only reserved.
+_UNIFIED_SYSTEM_RESERVE_DEFAULT = 8192
+
+
+def detect_vram_mb() -> int:
+    """Detect VRAM budget in MiB (pool total, reserve folded by caller)."""
+    return _detect_pool_mb()[0]
 
 
 def detect_vram_baseline_mb() -> int:
@@ -289,8 +305,13 @@ class GpuProfile:
     @classmethod
     def detect(cls) -> GpuProfile:
         """Auto-detect local GPU hardware."""
-        return cls(vram_mb=detect_vram_mb(), family="default",
-                   baseline_mb=detect_vram_baseline_mb())
+        pool_mb, is_unified = _detect_pool_mb()
+        baseline_mb = detect_vram_baseline_mb()
+        if is_unified:
+            reserve = _UNIFIED_SYSTEM_RESERVE_DEFAULT
+            logger.info("unified memory: reserving %d MiB for the system", reserve)
+            baseline_mb = max(baseline_mb, reserve - utils._RESERVE_SYSTEM)
+        return cls(vram_mb=pool_mb, family="default", baseline_mb=baseline_mb)
 
     @classmethod
     def from_args(
@@ -300,10 +321,24 @@ class GpuProfile:
         gpu_family: str | None = None,
         yaml_hw: dict | None = None,
         baseline: str | None = None,
+        unified_system_mb: str | None = None,
     ) -> GpuProfile:
         """Construct profile with precedence: explicit args > YAML > auto-detect."""
         yaml_hw = yaml_hw or {}
 
+        # System reservation on unified-memory hosts: CLI > YAML > default.
+        # Folded into the reserve only when the pool is auto-detected as
+        # unified (explicit --vram/hardware.vram owns the number instead).
+        system_mb = _UNIFIED_SYSTEM_RESERVE_DEFAULT
+        if yaml_hw.get("unified_system_mb"):
+            system_mb = _parse_mem_mb(str(yaml_hw["unified_system_mb"]))
+            logger.info("unified system reserve: %d MiB (from profiles.yaml hardware.unified_system_mb)",
+                        system_mb)
+        if unified_system_mb is not None:
+            system_mb = _parse_mem_mb(str(unified_system_mb))
+            logger.info("unified system reserve: %d MiB (from --unified-system-mb)", system_mb)
+
+        is_unified = False
         if vram is not None:
             vram_mb = _parse_mem_mb(vram)
             logger.info("vram: %d MiB (from --vram)", vram_mb)
@@ -311,7 +346,7 @@ class GpuProfile:
             vram_mb = _parse_mem_mb(str(yaml_hw["vram"]))
             logger.info("vram: %d MiB (from profiles.yaml hardware.vram)", vram_mb)
         else:
-            vram_mb = detect_vram_mb()
+            vram_mb, is_unified = _detect_pool_mb()
 
         family = gpu_family or yaml_hw.get("gpu_family", "default")
 
@@ -324,11 +359,24 @@ class GpuProfile:
         # compositor overhead. Set hardware.baseline_mb or --baseline to opt in
         # only when other non-model processes occupy VRAM.
         baseline_mb = 0
+        explicit_baseline = False
         if yaml_hw.get("baseline_mb"):
             baseline_mb = _parse_mem_mb(str(yaml_hw["baseline_mb"]))
+            explicit_baseline = True
             logger.info("vram baseline: %d MiB (from profiles.yaml hardware.baseline_mb)", baseline_mb)
         elif baseline is not None:
             baseline_mb = _parse_mem_mb(str(baseline))
+            explicit_baseline = True
             logger.info("vram baseline: %d MiB (from --baseline)", baseline_mb)
+
+        # Fold the fixed reserve into the unified system reservation so the
+        # knob reads as the total system cost: reserve = _RESERVE_SYSTEM +
+        # max(_RESERVE_VIDEO, baseline).  Setting baseline_mb = knob -
+        # _RESERVE_SYSTEM makes the reserve exactly the knob.  Explicit
+        # --baseline/hardware.baseline_mb (live spike detection) wins instead.
+        if is_unified and not explicit_baseline:
+            baseline_mb = max(baseline_mb, system_mb - utils._RESERVE_SYSTEM)
+            logger.info("unified memory: reserving %d MiB for the system (knob %d MiB)",
+                        system_mb, system_mb)
 
         return cls(vram_mb=vram_mb, family=family, baseline_mb=baseline_mb)
