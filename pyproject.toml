@@ -1,6 +1,6 @@
 [project]
 name = "llama-packer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Generate llama-swap config from model metadata"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-gen-config = "llama_packer.__main__:main"
+llama-packer = "llama_packer.__main__:main"
 
 [dependency-groups]
 dev = ["pytest"]
@@ -28,3 +28,6 @@ include = ["llama_packer*"]
 
 [tool.setuptools.package-data]
 llama_packer = ["profiles.yaml", "templates/*.md"]
+
+[tool.setuptools.dynamic]
+version = {attr = "llama_packer.__version__"}

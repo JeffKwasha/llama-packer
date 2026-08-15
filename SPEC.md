@@ -4,9 +4,9 @@
 
 `llama-packer` generates `config.yaml` for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. It scans model directories, detects GPU hardware, measures per-model VRAM costs via `llama-fit-params`, budgets context windows, resolves companion files, applies sampling profiles, and writes ready-to-run server configurations.
 
-**Entry point:** `gen-config.py` → `llama_packer.__main__.main`
+**Entry point:** `llama-packer` (console script) → `llama_packer.__main__.main`
 
-**Models directory guide:** `gen-config.py --agents` writes `models/AGENTS.md`
+**Models directory guide:** `llama-packer --agents` writes `models/AGENTS.md`
 from the bundled template (`llama_packer/templates/models_AGENTS.md`) when the
 file is missing — never overwriting an existing one, and logging (not aborting)
 on write failure. The guide documents discovery and sidecar conventions for AI
@@ -466,5 +466,5 @@ All module-level constants are in `llama_packer/utils.py`.
   - `eval time = … (N tokens per second)` → generation (tg) tok/s
   - fallbacks: `… tok/s`, `… t/s`. Tolerant regexes; multiple patterns.
 - **Aggregation:** average per model stem → `models/.throughput_cache.json` `{stem: {tps, pp_tps, samples, updated}}`.
-- **Consumption:** `gen-config` reads the cache and adds `observed_tps` / `observed_pp_tps` to `metadata` when present, overriding `throughput_factor`.
+- **Consumption:** `llama-packer` reads the cache and adds `observed_tps` / `observed_pp_tps` to `metadata` when present, overriding `throughput_factor`.
 - **Graceful:** new/unrun models simply lack the cache entry — no change to the core metadata pipeline required (pure enrichment source).

@@ -4,8 +4,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Entry points
 
-- [`gen-config.py`](gen-config.py) — CLI wrapper → `llama_packer.__main__`
-- [`llama_packer/__main__.py`](llama_packer/__main__.py) — CLI, VRAM/env resolution, matrix wiring
+- [`llama_packer/__main__.py`](llama_packer/__main__.py) — CLI entry point (`llama-packer`), VRAM/env resolution, matrix wiring
 - [`llama_packer/profiles.yaml`](llama_packer/profiles.yaml) — sampling profiles + `vllm:` backend defaults (bundled)
 - [`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md) — bundled `models/AGENTS.md` guide (written with `--agents`)
 

@@ -4,14 +4,14 @@ This directory holds the model files that `llama-packer` turns into a
 `config.yaml` for llama-swap. Write `.md` sidecar files that describe the
 models so agents can choose between them intelligently.
 
-> This file was auto-written by `gen-config.py` (bundled template). It is
+> This file was auto-written by `llama-packer` (bundled template). It is
 > never overwritten once it exists — edit it freely to record this
 > directory's own layout (which files are here, what each is for). The next
 > run skips it if present; pass `--agents` to write it when missing.
 
 ## What llama-packer reads here
 
-`gen-config.py` discovers models from three file kinds and classifies them:
+`llama-packer` discovers models from three file kinds and classifies them:
 
 | File | Role |
 |------|------|
