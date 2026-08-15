@@ -368,7 +368,7 @@ def _solve_matrix_context(
     # Resolve global spare
     spare_mb = 0
     if spare:
-        spare_mb = utils.resolve_spare_mb(str(spare), vram_total)
+        spare_mb = utils.parse_mem_mb(str(spare), vram_total)
 
     drop_stems = drop_stems or set()
     cache_type = str(defaults.get("cache_type", "q8_0"))
@@ -467,7 +467,7 @@ def build_config(
     global_spare_mb = 0
     global_spare_str = defaults.get("spare") or spare
     if global_spare_str:
-        global_spare_mb = utils.resolve_spare_mb(str(global_spare_str), vram_total)
+        global_spare_mb = utils.parse_mem_mb(str(global_spare_str), vram_total)
     default_cache_type = str(defaults.get("cache_type", "q8_0"))
     default_parallel = int(defaults.get("parallel", 1))
 
@@ -543,7 +543,7 @@ def build_config(
                 # Resolve spare for this profile
                 profile_spare_str = resolved_profile.get("spare") or spare
                 if profile_spare_str:
-                    profile_spare_mb = utils.resolve_spare_mb(str(profile_spare_str), vram_total)
+                    profile_spare_mb = utils.parse_mem_mb(str(profile_spare_str), vram_total)
                 else:
                     profile_spare_mb = 0
 
@@ -553,7 +553,7 @@ def build_config(
             # If no profiles matched, generate a single entry with defaults
             if not groups:
                 default_spare_str = defaults.get("spare") or spare
-                default_spare_mb = utils.resolve_spare_mb(str(default_spare_str), vram_total) if default_spare_str else 0
+                default_spare_mb = utils.parse_mem_mb(str(default_spare_str), vram_total) if default_spare_str else 0
                 groups = {
                     (int(variant_fm.get("parallel", 1)), str(defaults.get("cache_type", "q8_0")), default_spare_mb): [
                         ("default", dict(defaults)),

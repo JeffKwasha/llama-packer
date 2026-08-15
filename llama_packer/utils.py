@@ -128,16 +128,17 @@ _RE_V_SUFFIX = re.compile(r"[-_][vV]\d.*")
 _MEM_RE = re.compile(r"^([\d.]+)\s*([kKmMgG]?)$")
 
 
-def resolve_spare_mb(spare_str: str, vram_mb: int) -> int:
-    """Parse --spare value to MB.
+def parse_mem_mb(value: str, vram_mb_for_hint: int = 0) -> int:
+    """Parse a memory string to MiB.
 
     Suffixed values (``2G``, ``512m``, ``64k``) resolve directly.
     Bare numbers auto-detect: if < 3 × VRAM(GB) they're treated as GB,
-    otherwise as MB (safe for sub-GB values like ``512``).
+    otherwise as MB (safe for sub-GB values like ``512``).  ``vram_mb_for_hint``
+    is only used for that bare-number heuristic.
     """
-    m = _MEM_RE.match(str(spare_str).strip())
+    m = _MEM_RE.match(str(value).strip())
     if not m:
-        logger.warning("invalid spare value %r, using 0", spare_str)
+        logger.warning("invalid memory value %r, using 0", value)
         return 0
     num = float(m.group(1))
     unit = m.group(2).lower()
@@ -147,7 +148,7 @@ def resolve_spare_mb(spare_str: str, vram_mb: int) -> int:
         return int(num)
     if unit == "k":
         return max(1, int(num // 1024))
-    vram_gb = vram_mb / 1024
+    vram_gb = vram_mb_for_hint / 1024
     if num < 3 * vram_gb:
         return int(num * 1024)
     return int(num)

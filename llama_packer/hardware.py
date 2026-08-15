@@ -260,29 +260,6 @@ def get_family_handler(family: str) -> GpuFamilyHandler:
 
 # ── GpuProfile ────────────────────────────────────────────────────────────
 
-# Matches memory values like 2.3G, 123m, 512k, or bare numbers
-_MEM_RE = re.compile(r"^([\d.]+)\s*([kKmMgG]?)$")
-
-
-def _parse_mem_mb(value: str, vram_mb_for_hint: int = 0) -> int:
-    """Parse a memory string to MiB (shared with utils.resolve_spare_mb)."""
-    m = _MEM_RE.match(str(value).strip())
-    if not m:
-        logger.warning("invalid memory value %r, using 0", value)
-        return 0
-    num = float(m.group(1))
-    unit = m.group(2).lower()
-    if unit == "g":
-        return int(num * 1024)
-    if unit == "m":
-        return int(num)
-    if unit == "k":
-        return max(1, int(num // 1024))
-    vram_gb = vram_mb_for_hint / 1024
-    if num < 3 * vram_gb:
-        return int(num * 1024)
-    return int(num)
-
 
 @dataclass
 class GpuProfile:
@@ -331,19 +308,19 @@ class GpuProfile:
         # unified (explicit --vram/hardware.vram owns the number instead).
         system_mb = _UNIFIED_SYSTEM_RESERVE_DEFAULT
         if yaml_hw.get("unified_system_mb"):
-            system_mb = _parse_mem_mb(str(yaml_hw["unified_system_mb"]))
+            system_mb = utils.parse_mem_mb(str(yaml_hw["unified_system_mb"]))
             logger.info("unified system reserve: %d MiB (from profiles.yaml hardware.unified_system_mb)",
                         system_mb)
         if unified_system_mb is not None:
-            system_mb = _parse_mem_mb(str(unified_system_mb))
+            system_mb = utils.parse_mem_mb(str(unified_system_mb))
             logger.info("unified system reserve: %d MiB (from --unified-system-mb)", system_mb)
 
         is_unified = False
         if vram is not None:
-            vram_mb = _parse_mem_mb(vram)
+            vram_mb = utils.parse_mem_mb(vram)
             logger.info("vram: %d MiB (from --vram)", vram_mb)
         elif yaml_hw.get("vram"):
-            vram_mb = _parse_mem_mb(str(yaml_hw["vram"]))
+            vram_mb = utils.parse_mem_mb(str(yaml_hw["vram"]))
             logger.info("vram: %d MiB (from profiles.yaml hardware.vram)", vram_mb)
         else:
             vram_mb, is_unified = _detect_pool_mb()
@@ -361,11 +338,11 @@ class GpuProfile:
         baseline_mb = 0
         explicit_baseline = False
         if yaml_hw.get("baseline_mb"):
-            baseline_mb = _parse_mem_mb(str(yaml_hw["baseline_mb"]))
+            baseline_mb = utils.parse_mem_mb(str(yaml_hw["baseline_mb"]))
             explicit_baseline = True
             logger.info("vram baseline: %d MiB (from profiles.yaml hardware.baseline_mb)", baseline_mb)
         elif baseline is not None:
-            baseline_mb = _parse_mem_mb(str(baseline))
+            baseline_mb = utils.parse_mem_mb(str(baseline))
             explicit_baseline = True
             logger.info("vram baseline: %d MiB (from --baseline)", baseline_mb)
 
