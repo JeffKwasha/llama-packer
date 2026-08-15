@@ -36,14 +36,17 @@ profiles:
 #    description: "concurrency"
 #    parallel: 2
 
-# ── vLLM docker backend ────────────────────────────────
-# Defaults for models opted into the `template: vllm-docker` backend.
-# Image can also be overridden per run via `gen-config.py --vllm-image`.
+# ── vLLM backend ───────────────────────────────────────
+# Defaults for models opted into the `template: vllm` / `template: vllm-docker`
+# backend. The image can be overridden per run via `gen-config.py --vllm-image`,
+# the binary via `--vllm-server`.
 vllm:
   image: vllm/vllm-openai:latest
+  bin: vllm
   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
   container_port: 8000
-  gpu_mem_util: 0.9
+  # gpu_mem_util: 0.9   # optional; when omitted it is derived from the same
+                        # reserve/spare VRAM budget llama.cpp uses
 
 # ── Hardware ───────────────────────────────────────────
 # VRAM detection lives in llama_packer/hardware.py. Optional overrides:

@@ -53,10 +53,11 @@ class Model(metaclass=_ModelMeta):
         self._gguf_ctx_cache: int | None = None  # cached GGUF architectural context
         self._vram: VramBudget | None = None  # lazy VRAM budget calculator
 
-        # Resolve the model file path
+        # Resolve the model file path. vLLM backends may have no local file —
+        # they are served from an HF repo id (hf_repo / hf_url) instead.
         self.gguf_path = self._resolve_gguf_path()
-        if not self.gguf_path:
-            raise ValueError(f"No GGUF found for {md_path}")
+        if not self.gguf_path and self.hf_repo is None:
+            raise ValueError(f"No GGUF/safetensors or hf_repo found for {md_path}")
 
         # Register as main model
         Model._by_stem[self.stem] = self
@@ -73,7 +74,7 @@ class Model(metaclass=_ModelMeta):
             Model._by_companion[self.mtp.stem] = self
 
         logger.info("model: %s (gguf=%s, mmproj=%s, mtp=%s)",
-                    self.stem, self.gguf_path.name,
+                    self.stem, self.gguf_path.name if self.gguf_path else self.hf_repo,
                     self.mmproj.stem if self.mmproj else "none",
                     self.mtp.stem if self.mtp else "none")
 
@@ -326,6 +327,11 @@ class Model(metaclass=_ModelMeta):
         if explicit:
             return explicit
         return self.role
+
+    @property
+    def is_vllm(self) -> bool:
+        """True when this model is served by a vLLM backend (binary or docker)."""
+        return self.template in ("vllm", "vllm-docker")
 
     @property
     def parallel(self) -> int:

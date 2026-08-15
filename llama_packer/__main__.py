@@ -18,8 +18,9 @@ from llama_packer import Model, find_bin_dir
 from llama_packer.hardware import GpuProfile
 from llama_packer.utils import (
     _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
-    VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_DOCKER_ARGS, VLLM_DEFAULT_CONTAINER_PORT,
-    VLLM_DEFAULT_GPU_MEM_UTIL,
+    resolve_spare_mb, _RESERVE_SYSTEM, _RESERVE_VIDEO,
+    VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
+    VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
 from llama_packer.writer import build_config, write_yaml
 
@@ -87,6 +88,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rerank", help="Substring selector for the reranker; else smallest rerank-type model")
     parser.add_argument("--vllm-image", help="vLLM docker image for `template: vllm-docker` models "
                          "(overrides profiles.yaml vllm.image)")
+    parser.add_argument("--vllm-server", help="vLLM binary for `template: vllm` models "
+                         "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -274,7 +277,8 @@ def main(argv: list[str] | None = None) -> None:
     # then substitute them into the binary path and post-process the config.
     raw_paths = [llama_bin, fit_bin]
     for _m in models:
-        raw_paths.append(str(_m.gguf_path))
+        if _m.gguf_path:
+            raw_paths.append(str(_m.gguf_path))
         if _m.mmproj and _m.mmproj.gguf_path:
             raw_paths.append(str(_m.mmproj.gguf_path))
         if _m.mtp and _m.mtp.gguf_path:
@@ -283,8 +287,8 @@ def main(argv: list[str] | None = None) -> None:
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
 
-    # vLLM docker backend defaults: CLI --vllm-image > profiles.yaml `vllm:`
-    # section > built-in constants.
+    # vLLM backend defaults: CLI --vllm-image / --vllm-server > profiles.yaml
+    # `vllm:` section > built-in constants.
     vllm_cfg = profiles_cfg.get("vllm") or {}
     if args.vllm_image:
         template_vars["vllm_image"] = args.vllm_image
@@ -292,9 +296,31 @@ def main(argv: list[str] | None = None) -> None:
         template_vars["vllm_image"] = (
             vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE
         )
+    if args.vllm_server:
+        template_vars["vllm_bin"] = args.vllm_server
+    else:
+        template_vars["vllm_bin"] = str(vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
-    template_vars["gpu_mem_util"] = str(vllm_cfg.get("gpu_mem_util") or VLLM_DEFAULT_GPU_MEM_UTIL)
+    # gpu_mem_util: explicit profiles.yaml value wins; otherwise derive the
+    # fraction from the same reserve/spare budget llama.cpp uses, so vLLM's
+    # --max-model-len and --gpu-memory-utilization describe one consistent pool.
+    if vllm_cfg.get("gpu_mem_util") is not None:
+        template_vars["gpu_mem_util"] = str(vllm_cfg["gpu_mem_util"])
+    else:
+        spare_mb = 0
+        global_spare = (profiles_cfg.get("defaults", {}).get("spare") or args.spare)
+        if global_spare:
+            spare_mb = resolve_spare_mb(str(global_spare), gpu.vram_mb)
+        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, gpu.baseline_mb)
+        available = gpu.vram_mb - reserve - spare_mb
+        if gpu.vram_mb > 0:
+            util = max(0.0, min(1.0, available / gpu.vram_mb))
+        else:
+            util = VLLM_DEFAULT_GPU_MEM_UTIL
+        template_vars["gpu_mem_util"] = str(round(util, 3))
+        logger.info("vllm gpu-memory-utilization: %s (derived from budget)",
+                    template_vars["gpu_mem_util"])
 
     # Detect matrix configuration before build_config
     matrix_cfg = profiles_cfg.get("matrix")

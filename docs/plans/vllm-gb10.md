@@ -95,16 +95,24 @@ safetensors, so the GGUF fallback is a last resort.
 - `README.md`, `SPEC.md` — documented
 - `docs/plans/vllm-gb10.md` — this file
 
+## Implemented (since scaffold)
+
+- **vLLM memory estimator** (`llama_packer/vllm_estimate.py`) — `vllm-memory-estimator`
+  (optional, Python API) produces `model_mib`/`ctx_factor`/`compute_mib` for vLLM models,
+  falling back to the local `.safetensors` header estimate, feeding the existing
+  `FitParams`/`calc_ctx`/`solve_matrix_ctx` pipeline unchanged. `--gpu-memory-utilization`
+  is derived from the same reserve/spare budget llama.cpp uses.
+- **Direct binary mode** — `template: vllm` emits `vllm serve` (no docker); `vllm-b-docker`
+  stays selectable. Binary resolved via `--vllm-server` > `vllm.bin` > `vllm` on PATH.
+- **`hf_repo`-only models** — `Model.gguf_path` is optional for vLLM backends; a sidecar
+  with only `hf_repo`/`hf_url` is valid.
+
 ## Planned (not yet implemented)
 
-- **vLLM memory estimator** hook: run `vllm-memory-estimator` (or its Python API)
-  once per vLLM model to get model_mib / ctx factor / concurrency, replacing llama.cpp
-  fit-params for `template: vllm-docker` entries. Feeds `solve_matrix_ctx` for the
-  128GB unified-memory budget via `--gpu-mem`.
 - **MTP translation** — vLLM-mode `mtp`/`speculative` → `--num-speculative-tokens`;
   warn-and-skip for unsupported architectures.
-- **Direct binary mode** — `vllm serve` (not docker) for the Spark, per launcher
-  (docker stays selectable).
+- **tensor-parallel / multi-GPU** — emit `--tensor-parallel-size` and size the estimator
+  accordingly (currently TP is fixed at 1).
 - **update design for matrix evict_costs** on vLLM entries (slow cold starts) and
   higher health check timeout where the computed `hct` is too small.
 

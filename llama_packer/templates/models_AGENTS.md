@@ -102,7 +102,8 @@ mtp: true                    # if MTP is baked into the main GGUF (vs a companio
 description: "a decent general model with reasoning."
 role: chat                  # chat | embeddings | rerank (default chat; see below)
 # --- backend selection ---
-template: vllm-docker       # OPTIONAL: serve with vLLM in a container instead of llama-server
+template: vllm               # OPTIONAL: serve with vLLM (host binary) instead of llama-server
+                              #   (or template: vllm-docker for a container)
 hf_repo: org/model          # for vLLM: HF repo id (optional; parsed from hf_url when absent)
 vllm_image: vllm/vllm-openai:latest   # optional per-model image override
 # --- agent-selection metadata (all optional; exposed to clients) ---
@@ -142,11 +143,11 @@ parameter names: `temperature`, `top_p`, `top_k`, `min_p`, `pres_pen`,
 `role` (chat | embeddings | rerank) selects how the model is served —
 embeddings and rerank run under llama-server with `--embedding` / `--rerank`
 flags; chat is the default and serves the OpenAI /llm text endpoint. Serve a
-chat model with vLLM instead of llama-server by adding `template: vllm-docker`
-(plus optional `hf_repo` / `vllm_image`). The emitted entry is a `docker run
-... vllm serve` command; vLLM serves safetensors, and image precedence is
-per-model `vllm_image:` > `--vllm-image` CLI > `vllm.image` in profiles.yaml >
-built-in default.
+chat model with vLLM instead of llama-server by adding `template: vllm` (host
+binary) or `template: vllm-docker` (container) plus optional `hf_repo` /
+`vllm_image`. The emitted entry is a `vllm serve` command; vLLM serves
+safetensors, and image precedence is per-model `vllm_image:` > `--vllm-image`
+CLI > `vllm.image` in profiles.yaml > built-in default.
 
 ### Role vs type
 
@@ -162,8 +163,8 @@ built-in default.
 
 Do NOT set `mmproj:` or `speculative:` for files in `embed/`.
 Do NOT set `mtp: true` for files that don't have MTP layers.
-Do NOT set `template: vllm-docker` on a GGUF — vLLM serves safetensors/HF
-format; a GGUF's correct backend is the default llama-server one.
+Do NOT set `template: vllm` or `template: vllm-docker` on a GGUF — vLLM serves
+safetensors/HF format; a GGUF's correct backend is the default llama-server one.
 
 ## Capabilities and derived fields
 
