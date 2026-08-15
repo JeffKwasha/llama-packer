@@ -15,7 +15,11 @@ import yaml
 
 from llama_packer import Model, find_bin_dir
 from llama_packer.hardware import GpuProfile
-from llama_packer.utils import _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed
+from llama_packer.utils import (
+    _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
+    VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_DOCKER_ARGS, VLLM_DEFAULT_CONTAINER_PORT,
+    VLLM_DEFAULT_GPU_MEM_UTIL,
+)
 from llama_packer.writer import build_config, write_yaml
 
 
@@ -71,6 +75,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--verbose", "-V", action="count", default=0, help="Increase verbosity (-V: info, -VV: debug)")
     parser.add_argument("--embed", help="Substring selector for the embedder; else smallest embed-type model")
     parser.add_argument("--rerank", help="Substring selector for the reranker; else smallest rerank-type model")
+    parser.add_argument("--vllm-image", help="vLLM docker image for `template: vllm-docker` models "
+                         "(overrides profiles.yaml vllm.image)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -234,6 +240,19 @@ def main(argv: list[str] | None = None) -> None:
     prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin)
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
+
+    # vLLM docker backend defaults: CLI --vllm-image > profiles.yaml `vllm:`
+    # section > built-in constants.
+    vllm_cfg = profiles_cfg.get("vllm") or {}
+    if args.vllm_image:
+        template_vars["vllm_image"] = args.vllm_image
+    else:
+        template_vars["vllm_image"] = (
+            vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE
+        )
+    template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
+    template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
+    template_vars["gpu_mem_util"] = str(vllm_cfg.get("gpu_mem_util") or VLLM_DEFAULT_GPU_MEM_UTIL)
 
     # Detect matrix configuration before build_config
     matrix_cfg = profiles_cfg.get("matrix")

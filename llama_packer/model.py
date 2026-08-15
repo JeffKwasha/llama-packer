@@ -395,6 +395,34 @@ class Model(metaclass=_ModelMeta):
         return self.role
 
     @property
+    def vllm_image(self) -> str | None:
+        """Per-model vLLM docker image override (sidecar `vllm_image:`).
+
+        Overrides the profiles.yaml ``vllm.image`` / ``--vllm-image`` for this
+        entry only. Returns None when not declared (uses the global default).
+        """
+        v = self.frontmatter.get("vllm_image")
+        return str(v) if v else None
+
+    @property
+    def hf_repo(self) -> str | None:
+        """Hugging Face repo id to serve, for backends that load safetensors.
+
+        Resolved from an explicit ``hf_repo`` frontmatter field, else parsed
+        out of ``hf_url`` (``https://huggingface.co/{owner}/{repo}``). Returns
+        None when neither is declared (llama-server GGUFs then use the local
+        file path instead).
+        """
+        repo = self.frontmatter.get("hf_repo")
+        if repo:
+            return str(repo)
+        url = str(self.frontmatter.get("hf_url", "")).strip()
+        if not url:
+            return None
+        m = re.search(r"huggingface\.co/([^/?#]+/[^/?#]+)", url)
+        return m.group(1) if m else None
+
+    @property
     def vram_mb(self) -> int:
         """Model file size in MB (used for 'smallest' selection)."""
         if not self.gguf_path:
