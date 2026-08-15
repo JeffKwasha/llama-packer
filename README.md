@@ -1,8 +1,8 @@
 # llama-packer
 
-Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. Takes a directory of models and produces ready-to-run server configurations with optimal flags tuned to your hardware.
+Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF (llama.cpp) or HF (vLLM) model metadata. Takes a directory of models and produces ready-to-run server configurations with optimal flags tuned to your hardware.
 
-Scans GGUF model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across models, and writes `config.yaml` — no manual flag wrangling.
+Scans model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across models, and writes `config.yaml` — no manual flag wrangling. Serves models with llama-server (GGUF) or vLLM (`template: vllm` for the host binary, `template: vllm-docker` for a container). Both backends share the same accurate context-length budgeting and per-request alias support.
 
 ## Install
 
@@ -34,9 +34,10 @@ Output goes to `config.yaml` and `config.env` in the current directory.
 - Assembles llama-swap YAML with per-model metadata, native `capabilities`, and `filters.setParamsByID`
   overrides (aliases like `<model>:<mode>` switch sampling parameters per-request without reload)
 - Solves multi-model VRAM budgets for embed/rerank/chat on shared GPUs
-- Opts individual models into a vLLM docker backend with `template: vllm-docker` in the sidecar
-  (image from `--vllm-image`, the `vllm:` section of `profiles.yaml`, or a per-model `vllm_image:`
-  frontmatter override)
+- Opts individual models into a vLLM backend with `template: vllm` (host binary) or
+  `template: vllm-docker` (container) in the sidecar. vLLM models are memory-estimated
+  with `vllm-memory-estimator` (or a local safetensors header) instead of `llama-fit-params`,
+  and `--gpu-memory-utilization` is derived from the same reserve/spare budget as llama.cpp.
 
 ## Sidecar example
 
@@ -69,27 +70,48 @@ is logged without aborting. The bundled source is
 [`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md);
 edit a copy in your models dir rather than the template to record your own layout.
 
-### vLLM docker backend
+### vLLM backend
 
-Serve a model with vLLM instead of llama-server by declaring the backend in its sidecar
-(`hf_repo` is optional; when absent it is parsed from `hf_url`):
+Serve a model with vLLM instead of llama-server by declaring the backend in its sidecar.
+`template: vllm` runs the host binary (`vllm serve`); `template: vllm-docker` runs it in a
+container. `hf_repo` is optional — when absent it is parsed from `hf_url`:
 
 ```yaml
 ---
 name: my-qwen3
-template: vllm-docker
+template: vllm              # or vllm-docker
 hf_repo: Qwen/Qwen3-30B-A3B-Instruct    # optional; derived from hf_url when omitted
-vllm_image: vllm/vllm-openai:v0.11.0    # optional per-model image
+vllm_image: vllm/vllm-openai:v0.11.0    # optional per-model image (vllm-docker only)
 context_length: 65536
 ---
 ```
 
-The emitted entry is a `docker run` command using `vllm serve` inside the container,
-published to llama-swap's `${PORT}`. Image precedence: per-model `vllm_image:` > `--vllm-image`
-CLI > `vllm.image` in profiles.yaml > built-in default.
+The emitted entry runs `vllm serve --model <repo> --served-model-name ${MODEL_ID}
+--max-model-len <ctx> --gpu-memory-utilization <fraction>`, published to llama-swap's
+`${PORT}`. Context is budgeted against the same VRAM pool as llama.cpp, and
+`--gpu-memory-utilization` is derived from that budget (override via `vllm.gpu_mem_util`
+in profiles.yaml). Image precedence (vllm-docker): per-model `vllm_image:` > `--vllm-image`
+CLI > `vllm.image` in profiles.yaml > built-in default. Binary path (vllm): `--vllm-server`
+CLI > `vllm.bin` in profiles.yaml > `vllm` on PATH.
 
 
 ## See also
 
 - [SPEC.md](SPEC.md) — detailed configuration specification
 - [profiles.yaml](profiles.yaml) — sampling profile definitions
+
+## Limitations
+
+- vLLM memory sizing needs `vllm-memory-estimator` installed for HF-repo models; without it
+  (or a local `.safetensors` file), context falls back to the declared `context_length` and
+  vLLM's own startup profiling bounds the allocation
+- MTP/speculative flags are not translated for the vLLM backend yet
+- Runs one vLLM server per model per image/binary; multi-image or cluster/tensor-parallel provisioning is future work
+- Multi-GPU setups are not natively configured; use `CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` to pin models to specific devices
+- Companion VRAM falls back to file-size estimates when `llama-fit-params` measurement fails
+
+## Future Roadmap
+
+- Support multi-image/tensor-parallel vLLM provisioning
+- Translate MTP/speculative sidecar fields to vLLM `--speculative-config`
+- Enrich `throughput_factor` with measured server log data (offline parsing)

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from llama_packer import utils
+from llama_packer import vllm_estimate
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -245,7 +246,16 @@ class VramBudget:
             self._static_cache[cache_key] = saved
             return saved
 
-        # 2. Compute via binary or safetensors
+        # 2. vLLM backends: estimate from the HF repo (vllm-memory-estimator)
+        #    or a local safetensors header — llama-fit-params only measures GGUF.
+        if self.model.is_vllm:
+            params = self._fit_params_vllm(cache_type, parallel)
+            if params is not None:
+                self._static_cache[cache_key] = params
+                self._persist(params)
+            return params
+
+        # 3. Compute via binary or safetensors
         design = self._design_ctx()
         result = self.fit_params(
             fit_bin=fit_bin,
@@ -267,7 +277,7 @@ class VramBudget:
                 parallel=parallel,
             )
         else:
-            # 3. Try safetensors estimation fallback
+            # 4. Try safetensors estimation fallback
             params = self._estimate_safetensors(cache_type, parallel, design)
 
         if params is not None:
@@ -275,6 +285,40 @@ class VramBudget:
             self._persist(params)
 
         return params
+
+    def _fit_params_vllm(
+        self, cache_type: str, parallel: int,
+    ) -> FitParams | None:
+        """Estimate VRAM params for a vLLM-served model.
+
+        Sources, in order:
+        1. ``vllm-memory-estimator`` on the HF repo (accurate; reuses vLLM's
+           own config/KV-cache logic) — requires ``hf_repo`` and the package.
+        2. local ``.safetensors`` header estimate (``utils.estimate_safetensors``).
+
+        Returns None when neither is available (no estimator, no local file):
+        the caller then sizes the model to its declared context and lets vLLM's
+        own startup profiling bound the actual allocation.
+        """
+        design = self._design_ctx()
+        if self.model.hf_repo:
+            est = vllm_estimate.estimate_vllm(
+                self.model.hf_repo, design,
+                max_active_seqs=parallel,
+            )
+            if est is not None:
+                model_mib, ctx_factor, compute_mib = est
+                return FitParams(
+                    model_mib=model_mib,
+                    ctx_factor=ctx_factor,
+                    compute_mib=compute_mib,
+                    source="vllm-estimate",
+                    cache_type=cache_type,
+                    parallel=parallel,
+                )
+        if self.model.gguf_path and str(self.model.gguf_path).endswith(".safetensors"):
+            return self._estimate_safetensors(cache_type, parallel, design)
+        return None
 
     def _estimate_safetensors(
         self, cache_type: str, parallel: int, design: int,
@@ -384,6 +428,13 @@ class VramBudget:
         if main is None:
             return None
 
+        # vLLM serves safetensors from an HF repo — vision/draft companions are
+        # baked into the repo, not separate GGUF files, so nothing to fold in.
+        if self.model.is_vllm:
+            params = (main.model_mib, main.ctx_factor, main.compute_mib)
+            self._effective_cache[cache_key] = params
+            return params
+
         design = design_ctx if design_ctx is not None else self._design_ctx()
         model_mib = main.model_mib
         ctx_factor = main.ctx_factor
@@ -457,6 +508,11 @@ class VramBudget:
         )
 
         if static is None:
+            if self.model.is_vllm:
+                # No memory estimate available (no estimator, no local
+                # safetensors): size to the declared context and let vLLM's own
+                # startup profiling bound the actual allocation.
+                return self._design_ctx()
             # Fatal: no way to estimate VRAM for this model
             raise RuntimeError(
                 f"fit-params failed to measure VRAM for {self.model.stem}; "

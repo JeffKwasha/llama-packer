@@ -85,11 +85,20 @@ _TARGET_TEMPLATES = {
                "--max-model-len {{ctx_size}} --gpu-memory-utilization {{gpu_mem_util}} "
                "{{extra_args}}",
     },
+    # vLLM served as a host binary (`vllm serve`), no container. Selected via
+    # `template: vllm` on a chat sidecar. Binds llama-swap's `${PORT}` directly.
+    "vllm": {
+        "cmd": "{{vllm_bin}} serve --model {{model_path}} --served-model-name ${MODEL_ID} "
+               "--host 0.0.0.0 --port ${PORT} "
+               "--max-model-len {{ctx_size}} --gpu-memory-utilization {{gpu_mem_util}} "
+               "{{extra_args}}",
+    },
 }
 
-# Built-in defaults for the vLLM docker backend. Override via the `vllm:`
-# section of profiles.yaml and, for the image only, via --vllm-image.
+# Built-in defaults for the vLLM backend. Override via the `vllm:` section of
+# profiles.yaml and, for the image only, via --vllm-image.
 VLLM_DEFAULT_IMAGE = "vllm/vllm-openai:latest"
+VLLM_DEFAULT_BIN = "vllm"
 VLLM_DEFAULT_CONTAINER_PORT = 8000
 VLLM_DEFAULT_DOCKER_ARGS = "--runtime=nvidia --gpus all --shm-size=16g"
 VLLM_DEFAULT_GPU_MEM_UTIL = 0.9

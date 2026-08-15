@@ -198,6 +198,7 @@ def _build_entry(
             "model_path": model_ref,
             "ctx_size": str(ctx_size),
             "vllm_image": vllm_image,
+            "vllm_bin": template_vars.get("vllm_bin", utils.VLLM_DEFAULT_BIN),
             "container_port": str(template_vars.get("container_port", utils.VLLM_DEFAULT_CONTAINER_PORT)),
             "docker_args": template_vars.get("docker_args", utils.VLLM_DEFAULT_DOCKER_ARGS),
             "gpu_mem_util": str(template_vars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)),
