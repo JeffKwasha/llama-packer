@@ -1,13 +1,14 @@
-"""GPU hardware detection, target profiling, and family-specific rules.
+"""GPU hardware detection and target profiling.
 
 Auto-detection lives here so that callers can alternatively construct a
 ``GpuProfile`` from CLI arguments or a ``profiles.yaml`` ``hardware:`` section,
 making it possible to generate configs for remote or unavailable hardware.
 
-The ``gpu_family`` string dispatches to a ``GpuFamilyHandler`` subclass via a
-registry.  Only a ``DefaultHandler`` is registered now; specific families (rdna3,
-hopper, etc.) will be added when their calculation rules diverge from the
-default.  An unknown family logs a warning and falls back to the default.
+Per-library calculation rules (cuda11/cuda12/rocm6/rocm7, flash-attention/FP8
+support, unified vs dedicated VRAM) are deferred: no formula currently diverges
+by library, so ``GpuProfile.family`` is an inert annotation.  When a rule does
+diverge, reintroduce a small handler hierarchy keyed by ``family`` rather than
+scattering conditionals through the budget math.
 """
 
 from __future__ import annotations
@@ -16,9 +17,8 @@ import json
 import logging
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from llama_packer import utils
 
@@ -218,66 +218,28 @@ def detect_gpu_env_var() -> str:
     return "ROCR_VISIBLE_DEVICES"
 
 
-# ── GPU family registry ───────────────────────────────────────────────────
-
-_FAMILY_REGISTRY: dict[str, type[GpuFamilyHandler]] = {}
-
-
-def register_family(name: str) -> Callable[[type], type]:
-    """Decorator: register a ``GpuFamilyHandler`` subclass under ``name``."""
-    def decorator(cls: type) -> type:
-        _FAMILY_REGISTRY[name] = cls
-        return cls
-    return decorator
-
-
-class GpuFamilyHandler:
-    """Family-specific calculation rules (extensible per chip class).
-
-    Subclasses override methods to express divergences (native quant support,
-    compute overhead, MoE routing, etc.).  The default handler is permissive.
-    """
-
-    def supports_quant(self, quant: str) -> bool:
-        """Whether this GPU family can natively accelerate ``quant`` (e.g. FP8)."""
-        return True
-
-
-@register_family("default")
-class DefaultHandler(GpuFamilyHandler):
-    """Permissive handler used when no specific family matches."""
-    pass
-
-
-def get_family_handler(family: str) -> GpuFamilyHandler:
-    """Return a handler instance for ``family``; warn + default if unknown."""
-    cls = _FAMILY_REGISTRY.get(family)
-    if cls is None:
-        logger.warning("unknown gpu_family %r — using default", family)
-        cls = _FAMILY_REGISTRY["default"]
-    return cls()
-
-
 # ── GpuProfile ────────────────────────────────────────────────────────────
+#
+# Per-library memory rules (cuda11/cuda12/rocm6/rocm7, flash-attention/FP8
+# support, unified vs dedicated VRAM, server) are not implemented yet: today no
+# formula actually diverges by library.  When one does, reintroduce a small
+# handler hierarchy keyed by `family` (see docs/plans/vllm-gb10.md) instead of
+# scattering conditionals through the budget math.
 
 
 @dataclass
 class GpuProfile:
     """Target GPU hardware description.
 
-    ``vram_mb`` feeds the VRAM budget equation; ``family`` dispatches to a
-    ``GpuFamilyHandler`` for future chip-specific calculation rules.  Profiles
-    can be constructed from auto-detection, CLI args, or a YAML section, so
-    configs can be generated for hardware that is not present locally.
+    ``vram_mb`` feeds the VRAM budget equation; ``family`` is an inert
+    annotation reserved for future library-specific rules.  Profiles can be
+    constructed from auto-detection, CLI args, or a YAML section, so configs
+    can be generated for hardware that is not present locally.
     """
 
     vram_mb: int
     family: str = "default"
     baseline_mb: int = 0
-    handler: GpuFamilyHandler = field(default_factory=lambda: DefaultHandler(), repr=False)
-
-    def __post_init__(self) -> None:
-        self.handler = get_family_handler(self.family)
 
     @classmethod
     def detect(cls) -> GpuProfile:
