@@ -11,6 +11,12 @@ dependencies = [
 [project.scripts]
 gen-config = "llama_packer.__main__:main"
 
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
