@@ -9,17 +9,25 @@ Scans model directories, reads YAML sidecar files, detects GPU VRAM, budgets mem
 Python 3.10+ and [uv](https://docs.astral.sh/uv/) (or pip):
 
 ```sh
-uv tool install .        # installs the `gen-config` command
-gen-config --dry-run
+uvx llama-packer --dry-run    # one-shot, no install (fetches from PyPI)
 ```
 
-Or run from source without installing:
+Or install it as a persistent, editable command (tracks source changes):
 
 ```sh
-uv run gen-config.py
+uv pip install -e .          # exposes `llama-packer` on PATH
+llama-packer --dry-run
 ```
 
-`gen-config` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. Point it elsewhere with `--models-dir`, `--profiles`, and `--llama-server` (or `LLAMA_BIN_DIR`).
+Or run straight from source without installing:
+
+```sh
+uv run llama-packer --dry-run
+```
+
+`llama-packer` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. Point it elsewhere with `--models-dir`, `--profiles`, and `--llama-server` (or `LLAMA_BIN_DIR`).
+
+Print the version with `llama-packer --version` (also shown in verbose `-V` output).
 
 Output goes to `config.yaml` and `config.env` in the current directory.
 
@@ -63,7 +71,7 @@ Any key not consumed by the builder passes through to clients — add descriptiv
 
 ### Models directory guide (`AGENTS.md`)
 
-Run `gen-config.py --agents` to write a `models/AGENTS.md` guide (from the bundled
+Run `llama-packer --agents` to write a `models/AGENTS.md` guide (from the bundled
 template) that explains what llama-packer reads and the sidecar conventions. It is
 written only when missing — your edits are never overwritten — and failure to write
 is logged without aborting. The bundled source is
