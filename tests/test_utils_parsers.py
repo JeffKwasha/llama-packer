@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from llama_packer.utils import parse_context_length, parse_mem_mb
+from llama_packer.utils import parse_context_length, parse_mem_mb, resolve_template
 
 
 def test_resolve_spare_suffixed_gigabytes():
@@ -40,3 +40,14 @@ def test_parse_context_length_m():
 
 def test_parse_context_length_bare():
     assert parse_context_length("65536") == 65536
+
+
+def test_resolve_template_collision_safe():
+    out = resolve_template("{{model}} {{model_path}}", {"model": "a", "model_path": "b"})
+    assert out == "a b"
+
+
+def test_resolve_template_unknown_var_raises():
+    import pytest
+    with pytest.raises(KeyError):
+        resolve_template("{{nope}}", {})

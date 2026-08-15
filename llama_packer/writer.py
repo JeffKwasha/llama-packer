@@ -182,71 +182,50 @@ def _build_entry(
     """
     base_id = utils.slugify(model.name)
 
-    # Build command string. The sidecar may declare an explicit
-    # `template:` to opt a model into a non-default backend (e.g.
-    # `template: vllm-docker`); otherwise the template follows the role.
+    # Build the launch command from the model's backend template (a full `cmd`
+    # string).  The sidecar may declare an explicit `template:` (e.g. vllm);
+    # otherwise the template follows the role.
     target = model.template
     t_conf = utils._TARGET_TEMPLATES.get(target, utils._TARGET_TEMPLATES["chat"])
 
-    # A template may define a single full `cmd` string (docker/vllm) instead
-    # of the llama-server part-by-part assembly below.
-    full_cmd = t_conf.get("cmd")
-    if full_cmd:
-        model_ref = model.hf_repo or str(model.gguf_path)
-        vllm_image = model.vllm_image or template_vars.get("vllm_image", utils.VLLM_DEFAULT_IMAGE)
-        cmd_str = utils.resolve_template(full_cmd, {
-            "model_path": model_ref,
-            "ctx_size": str(ctx_size),
-            "vllm_image": vllm_image,
-            "vllm_bin": template_vars.get("vllm_bin", utils.VLLM_DEFAULT_BIN),
-            "container_port": str(template_vars.get("container_port", utils.VLLM_DEFAULT_CONTAINER_PORT)),
-            "docker_args": template_vars.get("docker_args", utils.VLLM_DEFAULT_DOCKER_ARGS),
-            "gpu_mem_util": str(template_vars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)),
-            "models_dir": template_vars.get("models_dir", ""),
-            "llama_bin": template_vars.get("llama_bin", ""),
-            "extra_args": model.cli_args.strip(),
-        })
-        cmd_str = _strip_repeat_ws(cmd_str)
+    # MTP args (llama-server only; vLLM MTP is not translated yet).
+    mtp_arg_str, mtp_enabled, mtp_n_max, _ = _build_mtp_args(model)
+    if model.is_vllm:
+        mtp_arg_str = ""
         mtp_enabled = False
         mtp_n_max = utils._MTP_DRAFT_N_MAX
-    else:
-        parts = []
-        parts.append(utils.resolve_template(t_conf["bin"], {"llama_bin": template_vars.get("llama_bin", "")}))
-        parts.append("--port ${PORT}")
-        parts.append(utils.resolve_template(t_conf["model"], {"model_path": str(model.gguf_path)}))
-        if ctx_size:
-            parts.append(utils.resolve_template(t_conf["ctx"], {"ctx_size": str(ctx_size)}))
-        parts.append(utils.resolve_template(t_conf["parallel"], {"parallel": str(parallel)}))
-        parts.append(utils.resolve_template(t_conf["cache_type"], {"cache_type": cache_type}))
 
-        # GPU-resident models: pin all layers to VRAM so the runtime matches the
-        # fit-params measurement (which assumes full offload). CPU-resident models
-        # (embed/rerank sidecars) force CPU inference instead.
-        if model.on_cpu:
-            parts.append("--n-gpu-layers 0")
-        else:
-            parts.append("--n-gpu-layers 999")
+    # mmproj (llama-server only, omitted when the vision projection is dropped).
+    mmproj_args = ""
+    if not model.is_vllm and include_mmproj and model.mmproj and model.mmproj.gguf_path:
+        mmproj_args = f"--mmproj {model.mmproj.gguf_path}"
 
-        # MTP args
-        mtp_arg_str, mtp_enabled, mtp_n_max, _ = _build_mtp_args(model)
-        if mtp_enabled and mtp_arg_str:
-            parts.append(mtp_arg_str)
+    # Model source: HF repo for vLLM backends, local file for llama-server.
+    model_ref = (model.hf_repo or str(model.gguf_path)) if model.is_vllm else str(model.gguf_path)
 
-        # mmproj (omitted when the vision projection is being dropped)
-        if include_mmproj and model.mmproj and model.mmproj.gguf_path:
-            parts.append(utils.resolve_template(t_conf["mmproj"], {"mmproj_path": str(model.mmproj.gguf_path)}))
+    vllm_image = model.vllm_image or template_vars.get("vllm_image", utils.VLLM_DEFAULT_IMAGE)
+    # GPU-resident models pin all layers to VRAM so the runtime matches the
+    # fit-params measurement; CPU-resident models (embed/rerank) stay on CPU.
+    n_gpu_layers = "--n-gpu-layers 0" if model.on_cpu else "--n-gpu-layers 999"
 
-        # Template-level extra flags (e.g. --embedding/--rerank for embed/rerank roles)
-        t_extra = t_conf.get("extra", "").strip()
-        if t_extra:
-            parts.append(utils.resolve_template(t_extra, {"extra_args": model.cli_args.strip()}))
-
-        # Extra CLI args (frontmatter)
-        extra = model.cli_args.strip()
-        if extra:
-            parts.append(extra)
-
-        cmd_str = " ".join(parts).strip()
+    cmd_str = utils.resolve_template(t_conf["cmd"], {
+        "llama_bin": template_vars.get("llama_bin", ""),
+        "vllm_bin": template_vars.get("vllm_bin", utils.VLLM_DEFAULT_BIN),
+        "vllm_image": vllm_image,
+        "model_path": model_ref,
+        "ctx_size": str(ctx_size),
+        "parallel": str(parallel),
+        "cache_type": cache_type,
+        "n_gpu_layers": n_gpu_layers,
+        "mtp_args": mtp_arg_str,
+        "mmproj_args": mmproj_args,
+        "extra_args": model.cli_args.strip(),
+        "gpu_mem_util": str(template_vars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)),
+        "container_port": str(template_vars.get("container_port", utils.VLLM_DEFAULT_CONTAINER_PORT)),
+        "docker_args": template_vars.get("docker_args", utils.VLLM_DEFAULT_DOCKER_ARGS),
+        "models_dir": template_vars.get("models_dir", ""),
+    })
+    cmd_str = _strip_repeat_ws(cmd_str)
 
     # Profile params → setParamsByID
     set_params: dict[str, dict] = {}

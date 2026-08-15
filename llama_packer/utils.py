@@ -35,42 +35,35 @@ _MTP_SPEC_TYPE = "draft-mtp"
 _MTP_DRAFT_N_MAX = 2
 _MTP_DRAFT_P_MIN = 0.75
 
-# Templates are selected by a model's `role` (chat | embeddings | rerank),
-# unless the sidecar declares an explicit `template:` override (e.g.
-# ``template: vllm-docker`` to opt a chat model into the vLLM docker backend).
-# The llama-server roles differ only in the role-specific extra CLI flags.
+# Templates are the single source of truth for how a model is launched: one
+# full `cmd` string per (backend, role) combination, selected by a model's
+# `role` (chat | embeddings | rerank) unless the sidecar declares an explicit
+# `template:` override (`vllm` / `vllm-docker`).  Optional/tunable flags are
+# NOT template concerns — they arrive via the `{{extra_args}}` hole (the
+# model's `cli_args` frontmatter) and via `{{mtp_args}}` / `{{mmproj_args}}`
+# (computed by the builder).  `${PORT}` and `${MODEL_ID}` are llama-swap macros.
 _TARGET_TEMPLATES = {
     "chat": {
-        "bin": "{{llama_bin}}",
-        "model": "-m {{model_path}}",
-        "ctx": "-c {{ctx_size}}",
-        "parallel": "--parallel {{parallel}}",
-        "cache_type": "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}}",
-        "mtp": "--spec-type {{mtp_spec_type}} --spec-draft-n-max {{mtp_n_max}} --spec-draft-p-min {{mtp_p_min}}",
-        "mmproj": "--mmproj {{mmproj_path}}",
-        "extra": "{{extra_args}}",
+        "cmd": "{{llama_bin}} --port ${PORT} -m {{model_path}} "
+               "-c {{ctx_size}} --parallel {{parallel}} "
+               "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}} "
+               "{{n_gpu_layers}} {{mtp_args}} {{mmproj_args}} {{extra_args}}",
     },
     # Embedding models: restrict server to /v1/embeddings.
     "embeddings": {
-        "bin": "{{llama_bin}}",
-        "model": "-m {{model_path}}",
-        "ctx": "-c {{ctx_size}}",
-        "parallel": "--parallel {{parallel}}",
-        "cache_type": "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}}",
-        "mtp": "--spec-type {{mtp_spec_type}} --spec-draft-n-max {{mtp_n_max}} --spec-draft-p-min {{mtp_p_min}}",
-        "mmproj": "--mmproj {{mmproj_path}}",
-        "extra": "--embedding --embd-normalize 2 -b 4096 -ub 4096 {{extra_args}}",
+        "cmd": "{{llama_bin}} --port ${PORT} -m {{model_path}} "
+               "-c {{ctx_size}} --parallel {{parallel}} "
+               "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}} "
+               "{{n_gpu_layers}} {{mtp_args}} {{mmproj_args}} "
+               "--embedding --embd-normalize 2 -b 4096 -ub 4096 {{extra_args}}",
     },
     # Reranking models: expose /v1/rerank.
     "rerank": {
-        "bin": "{{llama_bin}}",
-        "model": "-m {{model_path}}",
-        "ctx": "-c {{ctx_size}}",
-        "parallel": "--parallel {{parallel}}",
-        "cache_type": "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}}",
-        "mtp": "--spec-type {{mtp_spec_type}} --spec-draft-n-max {{mtp_n_max}} --spec-draft-p-min {{mtp_p_min}}",
-        "mmproj": "--mmproj {{mmproj_path}}",
-        "extra": "--rerank --pooling rank -b 4096 -ub 4096 {{extra_args}}",
+        "cmd": "{{llama_bin}} --port ${PORT} -m {{model_path}} "
+               "-c {{ctx_size}} --parallel {{parallel}} "
+               "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}} "
+               "{{n_gpu_layers}} {{mtp_args}} {{mmproj_args}} "
+               "--rerank --pooling rank -b 4096 -ub 4096 {{extra_args}}",
     },
     # vLLM served inside a container. Selected via `template: vllm-docker` on a
     # chat sidecar. `${PORT}` is llama-swap's per-model host port macro; vLLM
@@ -710,9 +703,20 @@ def make_subst(prefix_to_var: dict[str, str]):
     return sub
 
 
+_TMPL_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
 def resolve_template(template: str, vars_: dict) -> str:
-    """Replace {{variable}} placeholders in template string."""
-    out = template
-    for k, v in vars_.items():
-        out = out.replace(f"{{{{{k}}}}}", str(v))
-    return out
+    """Replace {{variable}} placeholders in ``template`` with values from ``vars_``.
+
+    Single-pass regex substitution (collision-safe: ``{{model}}`` and
+    ``{{model_path}}`` are distinct).  Unknown placeholders raise KeyError to
+    fail fast on template typos instead of silently passing through.
+    """
+    def _sub(m: re.Match) -> str:
+        key = m.group(1)
+        if key not in vars_:
+            raise KeyError(f"unknown template variable {key!r}")
+        return str(vars_[key])
+
+    return _TMPL_RE.sub(_sub, template)
