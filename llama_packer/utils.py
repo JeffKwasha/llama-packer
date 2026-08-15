@@ -35,10 +35,10 @@ _MTP_SPEC_TYPE = "draft-mtp"
 _MTP_DRAFT_N_MAX = 2
 _MTP_DRAFT_P_MIN = 0.75
 
-# Templates are selected by a model's `role` (chat | embeddings | rerank).
-# All roles are served by llama-server; the only difference is the role-specific
-# extra CLI flags. (vllm support was removed — it never had a working ROCm
-# build.)
+# Templates are selected by a model's `role` (chat | embeddings | rerank),
+# unless the sidecar declares an explicit `template:` override (e.g.
+# ``template: vllm-docker`` to opt a chat model into the vLLM docker backend).
+# The llama-server roles differ only in the role-specific extra CLI flags.
 _TARGET_TEMPLATES = {
     "chat": {
         "bin": "{{llama_bin}}",
@@ -72,7 +72,27 @@ _TARGET_TEMPLATES = {
         "mmproj": "--mmproj {{mmproj_path}}",
         "extra": "--rerank --pooling rank -b 4096 -ub 4096 {{extra_args}}",
     },
+    # vLLM served inside a container. Selected via `template: vllm-docker` on a
+    # chat sidecar. `${PORT}` is llama-swap's per-model host port macro; vLLM
+    # binds the container port ({{container_port}}) which gets published via
+    # `-p ${PORT}:{{container_port}}`.
+    "vllm-docker": {
+        "cmd": "docker run --init --rm {{docker_args}} --name ${MODEL_ID} "
+               "-v {{models_dir}}:/models -p ${PORT}:{{container_port}} "
+               "{{vllm_image}} "
+               "--model {{model_path}} --served-model-name ${MODEL_ID} "
+               "--host 0.0.0.0 --port {{container_port}} "
+               "--max-model-len {{ctx_size}} --gpu-memory-utilization {{gpu_mem_util}} "
+               "{{extra_args}}",
+    },
 }
+
+# Built-in defaults for the vLLM docker backend. Override via the `vllm:`
+# section of profiles.yaml and, for the image only, via --vllm-image.
+VLLM_DEFAULT_IMAGE = "vllm/vllm-openai:latest"
+VLLM_DEFAULT_CONTAINER_PORT = 8000
+VLLM_DEFAULT_DOCKER_ARGS = "--runtime=nvidia --gpus all --shm-size=16g"
+VLLM_DEFAULT_GPU_MEM_UTIL = 0.9
 
 # Sidecar/profile sampling parameter names accepted in llama-packer input.
 # These are llama.cpp CLI-style names.

@@ -221,6 +221,51 @@ modes:
 - Models without `modes:` are unaffected and keep the global-profile `setParamsByID` behavior
   (also nested under `filters:`).
 
+## vLLM Docker Backend
+
+A chat model can be served with vLLM instead of llama-server by declaring
+`template: vllm-docker` in its sidecar. The emitted entry is a `docker run` command that
+launches the `vllm/vllm-openai` image with `vllm serve`, published to llama-swap's `${PORT}`
+host macro. Everything else works identically: aliases/modes (`filters.setParamsByID`),
+`metadata`, capabilities, matrix routing.
+
+```yaml
+---
+name: qwen3-30b
+template: vllm-docker
+hf_repo: Qwen/Qwen3-30B-A3B-Instruct
+context_length: 65536
+---
+```
+
+### Model resolution
+
+- `hf_repo` frontmatter wins when declared; otherwise parsed from `hf_url`
+  (`https://huggingface.co/{owner}/{repo}`). If neither exists, the local GGUF path is used
+  as `--model`.
+- vLLM serves safetensors — the local GGUF file is *not* used unless it is also an HF checkout.
+
+### Image precedence
+
+The container image is resolved, highest to lowest:
+
+1. Per-model `vllm_image:` frontmatter
+2. `--vllm-image` CLI flag
+3. `vllm.image` in `profiles.yaml`
+4. Built-in default (`vllm/vllm-openai:latest`)
+
+`profiles.yaml` `vllm:` also configures `docker_args`, `container_port`, and `gpu_mem_util`
+(the vLLM `--gpu-memory-utilization` fraction).
+
+### Limitations
+
+- Scenario not yet handled: per-model VRAM planning for safetensors (vLLM memory estimator
+  hook) — the emitted `--max-model-len`/`--gpu-memory-utilization` come from llama.cpp's
+  fit-params budget for now.
+- MTP/speculative flags are not translated for the vLLM backend yet.
+- Runs one vLLM server per model per docker image; multi-image or cluster/tensor-parallel
+  provisioning is future work.
+
 ## Health-Check Timeout
 
 Auto-calculated when not explicitly set via `--health-check-timeout`:
@@ -276,6 +321,7 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `concurrency` | int | Per-model concurrency limit → `concurrencyLimit` in config |
 | `spare` | str | Additional VRAM to reserve (overrides global `--spare`) |
 | `allow_profiles` | str/list/bool | Restrict which profiles apply (regex string, list, or false to disable) |
+| `template` | str | Backend template override. `template: vllm-docker` serves this model with vLLM in a container instead of llama-server; omitted → derived from `role` (chat/embeddings/rerank) |
 | `modes` | dict | Per-model sampling modes (full profiles): name → param dict. Replaces the global-profile sampling overrides for this model. Values use llama.cpp names; see [Sampling Modes](#sampling-modes) |
 | `default_mode` | str | Which declared `modes` entry is the model's default (maps to the bare `${MODEL_ID}` `setParamsByID` key). Falls back to the first mode |
 | `reasoning` | str/bool | `auto` → multi-variant generation; specific mode → single variant; `true`/absent → no change |
@@ -292,6 +338,8 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `mtp_accuracy` | float | MTP draft acceptance rate; feeds `throughput_factor` |
 | `parameters` | str | `"12B"` or MoE `"26B-A4B"` (total-active) for accurate throughput |
 | `hf_url` | str | HuggingFace model URL |
+| `hf_repo` | str | HF repo id for vLLM backends. Optional; parsed from `hf_url` when absent |
+| `vllm_image` | str | Per-model vLLM docker image. Overrides profiles.yaml `vllm.image` and `--vllm-image` for this entry |
 
 ### Derived fields (computed, not authored)
 

@@ -34,6 +34,9 @@ Output goes to `config.yaml` and `config.env` in the current directory.
 - Assembles llama-swap YAML with per-model metadata, native `capabilities`, and `filters.setParamsByID`
   overrides (aliases like `<model>:<mode>` switch sampling parameters per-request without reload)
 - Solves multi-model VRAM budgets for embed/rerank/chat on shared GPUs
+- Opts individual models into a vLLM docker backend with `template: vllm-docker` in the sidecar
+  (image from `--vllm-image`, the `vllm:` section of `profiles.yaml`, or a per-model `vllm_image:`
+  frontmatter override)
 
 ## Sidecar example
 
@@ -56,6 +59,25 @@ modes:
 ```
 
 Any key not consumed by the builder passes through to clients — add descriptive fields without code changes.
+
+### vLLM docker backend
+
+Serve a model with vLLM instead of llama-server by declaring the backend in its sidecar
+(`hf_repo` is optional; when absent it is parsed from `hf_url`):
+
+```yaml
+---
+name: my-qwen3
+template: vllm-docker
+hf_repo: Qwen/Qwen3-30B-A3B-Instruct    # optional; derived from hf_url when omitted
+vllm_image: vllm/vllm-openai:v0.11.0    # optional per-model image
+context_length: 65536
+---
+```
+
+The emitted entry is a `docker run` command using `vllm serve` inside the container,
+published to llama-swap's `${PORT}`. Image precedence: per-model `vllm_image:` > `--vllm-image`
+CLI > `vllm.image` in profiles.yaml > built-in default.
 
 
 ## See also

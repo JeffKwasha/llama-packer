@@ -35,3 +35,12 @@ profiles:
 #  server:
 #    description: "concurrency"
 #    parallel: 2
+
+# ── vLLM docker backend ────────────────────────────────
+# Defaults for models opted into the `template: vllm-docker` backend.
+# Image can also be overridden per run via `gen-config.py --vllm-image`.
+vllm:
+  image: vllm/vllm-openai:latest
+  docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
+  container_port: 8000
+  gpu_mem_util: 0.9
