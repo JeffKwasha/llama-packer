@@ -41,8 +41,9 @@ class Model(metaclass=_ModelMeta):
         "name", "template", "context_length", "description", "cli_args", "model",
         "attention", "kv_cache", "tool_args", "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
-        "targets", "allow_profiles", "reasoning", "spare", "capabilities",
+        "role", "targets", "allow_profiles", "reasoning", "spare", "capabilities",
         "ignore", "device", "concurrency", "fit-params",
+        "modes", "default_mode",
     })
 
     def __init__(self, md_path: Path, frontmatter: dict):
@@ -203,7 +204,7 @@ class Model(metaclass=_ModelMeta):
         known_md: set[Path] = set()
         models: list[Model] = []
 
-        for md_path in md_items:
+        for md_path, kind in md_items.items():
             if md_path in known_md:
                 continue
             fm = utils.parse_frontmatter(md_path)
@@ -212,6 +213,10 @@ class Model(metaclass=_ModelMeta):
             if fm.get("ignore"):
                 logger.info("ignore: skipping %s", md_path.name)
                 continue
+            # Classification drives role: an embed/rerank file whose sidecar
+            # does not declare `role:` inherits it from its location/type.
+            if kind in ("embeddings", "rerank") and str(fm.get("role") or "") not in ("embeddings", "rerank"):
+                fm = {**fm, "role": kind}
             known_md.add(md_path)
             try:
                 model = cls(md_path, fm)
@@ -221,8 +226,9 @@ class Model(metaclass=_ModelMeta):
 
         if generate_stubs:
             for gguf, kind in gguf_items.items():
-                # Companions (mmproj/mtp) are never main-model stubs.
-                if kind in ("mmproj", "mtp"):
+                # Companions (mmproj/mtp) and embed/rerank models are never
+                # main-model (chat) stubs.
+                if kind in ("mmproj", "mtp", "embeddings", "rerank"):
                     continue
                 md_path = gguf.with_suffix(".md")
                 if md_path in md_items:
@@ -314,13 +320,12 @@ class Model(metaclass=_ModelMeta):
 
     @property
     def template(self) -> str:
-        # Prefer an explicit template, else derive from the first target
-        # (e.g. targets: [embeddings] -> "embeddings" template).
+        # Prefer an explicit template, else derive from the role
+        # (e.g. role: embeddings -> "embeddings" template).
         explicit = self.frontmatter.get("template")
         if explicit:
             return explicit
-        t = self.targets[0]
-        return t
+        return self.role
 
     @property
     def parallel(self) -> int:
@@ -343,13 +348,51 @@ class Model(metaclass=_ModelMeta):
         return self.frontmatter.get("allow_profiles")
 
     @property
-    def targets(self) -> list[str]:
-        return self.frontmatter.get("targets", ["llama-server"])
+    def modes(self) -> dict[str, dict] | None:
+        """Sidecar-defined sampling modes (full profiles): name -> param dict.
+
+        When declared, these fully replace the global profile sampling
+        overrides for this model. ``None`` keeps the legacy global-profile
+        behavior.
+        """
+        m = self.frontmatter.get("modes")
+        if not isinstance(m, dict):
+            return None
+        return {str(name): dict(params) for name, params in m.items()}
+
+    @property
+    def default_mode(self) -> str | None:
+        """The mode used as this model's default (bare ``${MODEL_ID}`` key).
+
+        Falls back to the first declared mode. Returns None when no modes
+        are declared.
+        """
+        modes = self.modes
+        if not modes:
+            return None
+        dm = str(self.frontmatter.get("default_mode") or "")
+        if dm and dm not in modes:
+            logger.warning("modes: %s: default_mode %r not declared; using first mode",
+                           self.stem, dm)
+            return next(iter(modes))
+        if dm:
+            return dm
+        return next(iter(modes))
+
+    @property
+    def role(self) -> str:
+        """Role this model plays: ``chat``, ``embeddings``, or ``rerank``.
+
+        Defaults to ``chat``. Discovery (``from_dir``) injects the role derived
+        from a model's directory (``embed/``/``rerank/``) or ``type:`` field
+        when the sidecar does not declare one explicitly.
+        """
+        return str(self.frontmatter.get("role") or "chat")
 
     @property
     def type(self) -> str:
-        """Model type used for selection/grouping: first `targets` entry."""
-        return self.targets[0]
+        """Model type used for selection/grouping: the model's role."""
+        return self.role
 
     @property
     def vram_mb(self) -> int:

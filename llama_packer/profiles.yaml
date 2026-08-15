@@ -10,17 +10,6 @@ templates:
       --cache-type-k {{cache_type}} --cache-type-v {{cache_type}}
       {{extra_args}}
 
-  vllm-docker:
-    cmd: |
-      docker run --init --rm --gpus all --name ${MODEL_ID}
-        -v {{models_dir}}:/models
-        vllm/vllm-openai:v0.10.0
-        --model {{model_path}}
-        --served-model-name ${MODEL_ID}
-        --max-model-len {{context_length}}
-        --gpu-memory-utilization 0.9
-        --enforce-eager
-
 # ── Global defaults ────────────────────────────────────
 defaults:
   cache_type: q8_0

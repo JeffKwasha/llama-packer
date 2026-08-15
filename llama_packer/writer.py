@@ -116,6 +116,46 @@ def _build_mtp_args(
     return "", False, utils._MTP_DRAFT_N_MAX, None
 
 
+def _build_mode_params(model: Model) -> dict[str, dict]:
+    """Build ``setParamsByID`` from a model's sidecar-declared ``modes``.
+
+    Full-profile definition: every declared numeric param is emitted — no
+    diff-vs-defaults suppression. The model's ``default_mode`` maps to the
+    bare ``${MODEL_ID}`` key; every other mode to ``${MODEL_ID}:<mode>``.
+
+    Returns an empty dict when the model declares no modes (caller then keeps
+    the global-profile behavior).
+    """
+    modes = model.modes
+    if not modes:
+        return {}
+
+    set_params: dict[str, dict] = {}
+    default_mode = model.default_mode
+    for name, params in modes.items():
+        overrides: dict = {}
+        for k, v in params.items():
+            if k not in utils.SAMPLING_KEYS:
+                logger.warning("modes: %s: unknown sampling key %r (ignored)", model.stem, k)
+                continue
+            if isinstance(v, bool):
+                logger.warning("modes: %s: %s.%s=%r is not numeric (ignored)", model.stem, name, k, v)
+                continue
+            if isinstance(v, (int, float)):
+                val = v
+            else:
+                try:
+                    val = float(v)
+                except (TypeError, ValueError):
+                    logger.warning("modes: %s: %s.%s=%r is not numeric (ignored)", model.stem, name, k, v)
+                    continue
+            overrides[utils.request_sampling_key(k)] = round(val, 6) if isinstance(val, float) else val
+        key = "${MODEL_ID}" if name == default_mode else f"${{MODEL_ID}}:{name}"
+        if overrides:
+            set_params[key] = overrides
+    return set_params
+
+
 def _build_entry(
     model: Model,
     parallel: int,
@@ -138,8 +178,8 @@ def _build_entry(
     base_id = utils.slugify(model.name)
 
     # Build command string
-    target = model.targets[0] if model.targets else "llama-server"
-    t_conf = utils._TARGET_TEMPLATES.get(target, utils._TARGET_TEMPLATES["llama-server"])
+    target = model.role
+    t_conf = utils._TARGET_TEMPLATES.get(target, utils._TARGET_TEMPLATES["chat"])
 
     parts = []
     parts.append(utils.resolve_template(t_conf["bin"], {"llama_bin": template_vars.get("llama_bin", "")}))
@@ -167,7 +207,7 @@ def _build_entry(
     if include_mmproj and model.mmproj and model.mmproj.gguf_path:
         parts.append(utils.resolve_template(t_conf["mmproj"], {"mmproj_path": str(model.mmproj.gguf_path)}))
 
-    # Template-level extra flags (e.g. --embedding/--rerank for embed/rerank targets)
+    # Template-level extra flags (e.g. --embedding/--rerank for embed/rerank roles)
     t_extra = t_conf.get("extra", "").strip()
     if t_extra:
         parts.append(utils.resolve_template(t_extra, {"extra_args": model.cli_args.strip()}))
@@ -186,10 +226,16 @@ def _build_entry(
         for k in utils.SAMPLING_KEYS:
             val, dval = resolved_prof.get(k), profiles_defaults.get(k)
             if val is not None and dval is not None and val != dval:
-                overrides[k] = round(val, 6) if isinstance(val, float) else val
+                overrides[utils.request_sampling_key(k)] = round(val, 6) if isinstance(val, float) else val
         if overrides:
             key = "${MODEL_ID}" if pname == "default" else f"${{MODEL_ID}}:{pname}"
             set_params[key] = overrides
+
+    # Sidecar-declared modes fully replace the global profile sampling
+    # overrides for this model.
+    mode_params = _build_mode_params(model)
+    if mode_params:
+        set_params = mode_params
 
     names = [p[0] for p in profiles_group]
     has_default = "default" in names
@@ -223,9 +269,19 @@ def _build_entry(
     if mtp_enabled:
         metadata["mtp_draft_max"] = mtp_n_max
 
+    # Expose declared sampling modes so clients (hermes, opencode, UIs) can
+    # discover the per-request aliases ("<id>:<mode>") without hitting the
+    # model list. Static discovery: metadata is passed through in /v1/models.
+    mode_params = model.modes
+    if mode_params:
+        metadata["modes"] = sorted(mode_params)
+        metadata["default_mode"] = model.default_mode
+
     entry: dict = {"cmd": cmd_str}
     if set_params:
-        entry["setParamsByID"] = set_params
+        # setParamsByID is a llama-swap *filter* and must be nested under
+        # `filters:` — a top-level key is silently ignored.
+        entry["filters"] = {"setParamsByID": set_params}
     if model.name:
         entry["name"] = model.name + name_suffix
     if model.description:
@@ -238,7 +294,7 @@ def _build_entry(
         "in": modalities,
         "out": modalities,
         "tools": "tools" in caps,
-        "reranker": "reranker" in caps or model.type == "rerank",
+        "reranker": "reranker" in caps or model.role == "rerank",
         "context": ctx_size,
     }
 
@@ -298,7 +354,7 @@ def _solve_matrix_context(
         # (and CPU-resident models cost no VRAM), so they must not enter the
         # shared chat budget — otherwise a small resident model can dictate the
         # chat context for the whole fleet.
-        if m.type in ("embeddings", "rerank") or m.on_cpu:
+        if m.role in ("embeddings", "rerank") or m.on_cpu:
             continue
         fp = m.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
                                      include_mmproj=m.stem not in drop_stems)
@@ -389,7 +445,7 @@ def build_config(
     # stem -> True when the main entry should omit mmproj
     drop_mmproj: dict[str, bool] = {}
     for model in models:
-        if model.type in ("embeddings", "rerank"):
+        if model.role in ("embeddings", "rerank"):
             continue
         if not (model.mmproj and model.mmproj.gguf_path):
             continue
@@ -537,6 +593,11 @@ def build_config(
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
     }
+
+    # Present setParamsByID aliases (e.g. "<id>:<mode>") in the /v1/models
+    # listing so dynamic-list clients (OpenWebUI, OpenClaw, ...) can select
+    # them. Default in llama-swap is false and aliases would be invisible.
+    config["includeAliasesInList"] = True
     return config
 
 

@@ -35,9 +35,12 @@ _MTP_SPEC_TYPE = "draft-mtp"
 _MTP_DRAFT_N_MAX = 2
 _MTP_DRAFT_P_MIN = 0.75
 
-# Templates for llama-server and vllm
+# Templates are selected by a model's `role` (chat | embeddings | rerank).
+# All roles are served by llama-server; the only difference is the role-specific
+# extra CLI flags. (vllm support was removed — it never had a working ROCm
+# build.)
 _TARGET_TEMPLATES = {
-    "llama-server": {
+    "chat": {
         "bin": "{{llama_bin}}",
         "model": "-m {{model_path}}",
         "ctx": "-c {{ctx_size}}",
@@ -45,16 +48,6 @@ _TARGET_TEMPLATES = {
         "cache_type": "--cache-type-k {{cache_type}} --cache-type-v {{cache_type}}",
         "mtp": "--spec-type {{mtp_spec_type}} --spec-draft-n-max {{mtp_n_max}} --spec-draft-p-min {{mtp_p_min}}",
         "mmproj": "--mmproj {{mmproj_path}}",
-        "extra": "{{extra_args}}",
-    },
-    "vllm": {
-        "bin": "vllm serve",
-        "model": "{{model_path}}",
-        "ctx": "--max-model-len {{ctx_size}}",
-        "parallel": "--max-num-batched-tokens {{ctx_size}}",
-        "cache_type": "--kv-cache-dtype {{cache_type}}",
-        "mtp": "--speculative-model {{model_path}}",
-        "mmproj": "--mmproj-path {{mmproj_path}}",
         "extra": "{{extra_args}}",
     },
     # Embedding models: restrict server to /v1/embeddings.
@@ -81,7 +74,25 @@ _TARGET_TEMPLATES = {
     },
 }
 
-SAMPLING_KEYS = frozenset({"temperature", "top_p", "top_k", "min_p", "pres_pen"})
+# Sidecar/profile sampling parameter names accepted in llama-packer input.
+# These are llama.cpp CLI-style names.
+SAMPLING_KEYS = frozenset({
+    "temperature", "top_p", "top_k", "min_p",
+    "pres_pen", "repeat_penalty", "freq_pen",
+})
+
+# llama-swap injects setParamsByID values into the OpenAI-compatible request
+# body, so the emitted keys must be the request-JSON names llama-server parses.
+# (pres_pen/freq_pen are CLI names, not request-body names.)
+REQUEST_SAMPLING_KEYS = {
+    "pres_pen": "presence_penalty",
+    "freq_pen": "frequency_penalty",
+}
+
+
+def request_sampling_key(key: str) -> str:
+    """Map a sidecar/profile sampling key to the request-body JSON key."""
+    return REQUEST_SAMPLING_KEYS.get(key, key)
 
 _RE_Q_SUFFIX = re.compile(r"[-_.][iI]?Q\d[_A-Z0-9]*$")
 _RE_V_SUFFIX = re.compile(r"[-_][vV]\d.*")
@@ -399,7 +410,6 @@ def generate_stub_md(md_path: Path, model_file: Path) -> dict:
         "context_length": _DEFAULT_CONTEXT_LENGTH,
         "quantization": infer_quantization(stem),
         "hf_url": "",
-        "targets": ["llama-server"],
     }
     content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---\n\n# " + stem + "\n"
     md_path.write_text(content, encoding="utf-8")
@@ -423,9 +433,14 @@ def _is_mtp_companion(stem: str) -> bool:
 # A model directory mixes several roles that discovery previously
 # distinguished with ad-hoc inline checks ("mmproj" in stem,
 # _is_mtp_companion, targets[0]).  classify_models() is the single source of
-# truth: it walks the directory and returns (path, kind) tuples.
+# truth: it walks the directory and returns (path, kind) tuples keyed by role
+# (chat / embeddings / rerank) plus the companion kinds (mmproj / mtp).
 
-MODEL_KINDS = ("main", "embeddings", "rerank", "mmproj", "mtp")
+MODEL_KINDS = ("chat", "embeddings", "rerank", "mmproj", "mtp")
+
+# Mapping from an ``extra_dir`` name to the role its contents play.  Files
+# discovered under ``embed/`` are embedding models, under ``rerank/`` rerankers.
+_EXTRA_DIR_ROLE = {"embed": "embeddings", "rerank": "rerank"}
 
 
 def companion_kind(stem: str) -> str | None:
@@ -438,27 +453,39 @@ def companion_kind(stem: str) -> str | None:
     return None
 
 
-def model_kind(path: str | os.PathLike) -> str:
+def model_kind(path: str | os.PathLike, role: str | None = None) -> str:
     """Classify a single model file by role.
 
     Companions are detected by filename regardless of any sidecar/companion
     metadata:
       * ``mmproj``  — vision projection (``*mmproj*`` on a .gguf)
       * ``mtp``     — MTP speculative-draft head
-    Everything else is classified from its ``.md`` sidecar ``targets[0]``
-    (``embeddings`` / ``rerank`` / ``main``); a file with no sidecar is
-    ``main``.
+
+    For everything else the role is resolved in priority order:
+      1. an explicit ``role:`` field in the ``.md`` sidecar,
+      2. ``role`` passed by the caller (the directory a file was found in,
+         e.g. ``embed``/``rerank``),
+      3. a ``type:`` field of ``embedding``/``rerank``,
+      4. default ``chat``.
     """
     p = Path(path)
     if p.suffix.lower() == ".gguf":
         ck = companion_kind(p.stem)
         if ck:
             return ck
+    if role in ("embeddings", "rerank"):
+        return role
     md = p.with_suffix(".md")
     fm = parse_frontmatter(md) if md.is_file() else {}
-    targets = fm.get("targets") or []
-    t = str(targets[0]) if targets else "main"
-    return t if t in MODEL_KINDS else "main"
+    explicit = fm.get("role")
+    if explicit:
+        return str(explicit)
+    typ = str(fm.get("type") or "").lower()
+    if "rerank" in typ:
+        return "rerank"
+    if "embed" in typ:
+        return "embeddings"
+    return "chat"
 
 
 def classify_models(
@@ -468,18 +495,18 @@ def classify_models(
     """Classify model files in ``models_dir`` (and ``extra_dirs``) by role.
 
     Returns a list of ``(path, kind)`` tuples where ``kind`` is one of
-    :data:`MODEL_KINDS` (``main``, ``embeddings``, ``rerank``, ``mmproj``,
+    :data:`MODEL_KINDS` (``chat``, ``embeddings``, ``rerank``, ``mmproj``,
     ``mtp``).  ``model.py`` uses this as the single source of truth for
     discovery, replacing the previously scattered inline heuristics.
     """
-    roots = [Path(models_dir)]
+    roots: list[tuple[Path, str | None]] = [(Path(models_dir), None)]
     for d in (extra_dirs or []):
         extra = Path(models_dir) / d
         if extra.is_dir():
-            roots.append(extra)
+            roots.append((extra, _EXTRA_DIR_ROLE.get(d)))
 
     out: list[tuple[Path, str]] = []
-    for root in roots:
+    for root, role in roots:
         if not root.is_dir():
             continue
         for pattern in ("*.gguf", "*.safetensors", "*.md"):
@@ -487,7 +514,7 @@ def classify_models(
             walker = root.rglob(pattern) if recursive else root.glob(pattern)
             for p in walker:
                 if p.is_file():
-                    out.append((p, model_kind(p)))
+                    out.append((p, model_kind(p, role)))
     return out
 
 
