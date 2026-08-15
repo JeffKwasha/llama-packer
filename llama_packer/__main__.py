@@ -7,6 +7,7 @@ import argparse
 import importlib.resources
 import logging
 import os
+import shutil
 import sys
 import textwrap
 from pathlib import Path
@@ -24,6 +25,8 @@ from llama_packer.writer import build_config, write_yaml
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
+
+logger = logging.getLogger(__name__)
 
 
 def setup_logging(verbosity: int = 0) -> None:
@@ -55,6 +58,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--models-dir", default="models", help="Model directory (default: ./models)")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
     parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
+    parser.add_argument("--agents", action="store_true",
+                        help="Write the AGENTS.md model guide to the models directory if missing "
+                             "(never overwrites an existing file; bundled template)")
     parser.add_argument("--extra-dirs", nargs="*", default=["embed", "rerank"], help="Extra subdirectories of --models-dir to scan for orphan GGUFs (default: embed rerank)")
     parser.add_argument("--spare", help="Additional VRAM to reserve on TOP of the fixed 2048 MiB system+driver reserve "
                                          "(1024 MiB OS/driver + 1024 MiB video framebuffer): suffixed (2G, 512m, 64k) or bare number "
@@ -82,6 +88,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vllm-image", help="vLLM docker image for `template: vllm-docker` models "
                          "(overrides profiles.yaml vllm.image)")
     return parser.parse_args(argv[1:] if argv else None)
+
+
+def write_agents_md(models_dir: Path) -> None:
+    """Write the bundled AGENTS.md guide into ``models_dir`` if missing.
+
+    The canonical guide ships inside the package
+    (``llama_packer/templates/models_AGENTS.md``) so it travels with the tool.
+    It is copied only when ``models/AGENTS.md`` does not already exist — user
+    edits are never overwritten.  A failure to write is logged and ignored so
+    config generation can continue.
+    """
+    dest = models_dir / "AGENTS.md"
+    if dest.exists():
+        logger.info("AGENTS.md exists, keeping: %s", dest)
+        return
+    try:
+        src = importlib.resources.files("llama_packer").joinpath("templates", "models_AGENTS.md")
+        if not src.is_file():
+            logger.warning("bundled AGENTS.md template missing: %s", src)
+            return
+        shutil.copyfile(str(src), dest)
+        try:
+            os.chmod(dest, 0o644)
+        except OSError:
+            pass
+        logger.info("wrote AGENTS.md guide: %s", dest)
+    except Exception as e:
+        logger.warning("could not write AGENTS.md (%s), continuing", e)
 
 
 def _apply_env_subst(config: dict, sub, raw_paths: list[str]) -> dict:
@@ -150,6 +184,9 @@ def main(argv: list[str] | None = None) -> None:
     if not models_dir.is_dir():
         logger.error("models directory not found: %s", models_dir)
         sys.exit(1)
+
+    if args.agents:
+        write_agents_md(models_dir)
 
     profiles_path = Path(args.profiles).absolute()
     if not profiles_path.is_file():

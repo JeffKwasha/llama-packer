@@ -60,6 +60,15 @@ modes:
 
 Any key not consumed by the builder passes through to clients — add descriptive fields without code changes.
 
+### Models directory guide (`AGENTS.md`)
+
+Run `gen-config.py --agents` to write a `models/AGENTS.md` guide (from the bundled
+template) that explains what llama-packer reads and the sidecar conventions. It is
+written only when missing — your edits are never overwritten — and failure to write
+is logged without aborting. The bundled source is
+[`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md);
+edit a copy in your models dir rather than the template to record your own layout.
+
 ### vLLM docker backend
 
 Serve a model with vLLM instead of llama-server by declaring the backend in its sidecar

@@ -6,6 +6,13 @@
 
 **Entry point:** `gen-config.py` → `llama_packer.__main__.main`
 
+**Models directory guide:** `gen-config.py --agents` writes `models/AGENTS.md`
+from the bundled template (`llama_packer/templates/models_AGENTS.md`) when the
+file is missing — never overwriting an existing one, and logging (not aborting)
+on write failure. The guide documents discovery and sidecar conventions for AI
+agents. As a non-frontmatter `.md` (no leading `---`), `AGENTS.md` is skipped by
+model discovery.
+
 ## Output Format
 
 ### llama-swap YAML (`write_yaml()`)
