@@ -1,188 +1,95 @@
-# AGENTS.md — Model Files Reference
+# AGENTS.md — Model Sidecars
 
-This directory holds the model files that `llama-packer` turns into a
-`config.yaml` for llama-swap. Write `.md` sidecar files that describe the
-models so agents can choose between them intelligently.
+Write one `.md` sidecar per model. `llama-packer` reads them to generate the
+llama-swap `config.yaml`; agents read the same fields to choose among models.
 
-> This file was auto-written by `llama-packer` (bundled template). It is
-> never overwritten once it exists — edit it freely to record this
-> directory's own layout (which files are here, what each is for). The next
-> run skips it if present; pass `--agents` to write it when missing.
+## Naming
 
-## What llama-packer reads here
+A sidecar is YAML frontmatter (between `---` lines) in a `.md` file whose stem
+matches the model file next to it:
 
-`llama-packer` discovers models from three file kinds and classifies them:
+| File | Served as |
+|------|-----------|
+| `<name>.gguf` | chat model (llama-server) |
+| `<name>.safetensors` | chat model (vLLM backend) |
+| `<name>.md` | sidecar for the file above |
+| `embed/<name>.gguf` | embeddings model |
+| `rerank/<name>.gguf` | rerank model |
 
-| File | Role |
-|------|------|
-| `<name>.gguf` | A language model served by `llama-server` |
-| `<name>.safetensors` | An HF-format model served by the `template: vllm-docker` backend |
-| `<name>.md` | YAML-frontmatter sidecar describing the model next to it |
+If the `.md` cannot share the model's stem, point at the file with
+`model: <filename>`.
 
-Sidecars drive everything: which models exist, how they are served, what
-sample parameters they get, which companions (mmproj/MTP) attach, and what
-`metadata` agents see. Any frontmatter key the builder does not consume
-passes through to clients, so adding descriptive fields needs no code change.
+Companions sit next to their parent and are referenced by filename from the
+parent sidecar — they are never main models:
 
-## DO NOT generate sidecars for these
+| Companion | Field |
+|-----------|-------|
+| `<parent>-mmproj*.gguf` (vision projection) | `mmproj: <file>` |
+| `<parent>.mtp.gguf` / `<parent>-mtp.gguf` (MTP draft) | `speculative: <file>` |
 
-### `embed/` directory — Text Encoders / Extractors
+Set `mtp: true` when the MTP heads are baked into the main GGUF (no companion).
 
-These are **NOT language models**. They are text encoders/feature extractors
-used for embeddings, classification, or RAG pipelines. Do NOT create `.md`
-sidecar files for them. Do NOT add them to the `llama-swap` config.
-
-- `embed/<encoder-file>.gguf` — any text encoder / feature extractor
-
-### mmproj files — Vision Projection Models
-
-These are **NOT standalone models**. They are multimodal projection layers
-that attach to a parent model. Do NOT create standalone entries for them.
-
-- `<parent>-mmproj-F16.gguf` — projects vision embeddings for `<parent>`
-
-Reference these from the parent model's sidecar via the `mmproj:` frontmatter
-field. Discovery treats them as companions (role `mmproj`), never as main
-models, and the builder auto-adds the `vision` capability when present.
-
-### fit-params (auto-computed)
-
-Sidecars may contain a `fit-params:` nested block written by `llama-packer`
-(`llama-fit-params` VRAM measurements). Not a manual authoring concern — do
-not edit; it is invalidated automatically when cache type / parallel change.
-
-### MTP companion files — Speculative Decoding Drafts
-
-These are **NOT standalone models**. They are draft models for MTP
-speculative decoding. Do NOT create standalone entries for them.
-
-- `<parent>.mtp.gguf` (or a stem containing `-mtp`) — draft model for `<parent>`
-
-Reference these from the parent model's sidecar via the `speculative:`
-frontmatter field, or set `mtp: true` when the draft heads are baked into the
-main GGUF.
-
-### Other non-model files
-
-- `.safetensors.index.json`, `tokenizer*`, `*.json`, README stubs, or any file
-  that is not a model you want served. Do not sidecar these.
-
-> When in doubt: only write a sidecar for files intended to be directly served
-> as chat / embeddings / rerank models.
-
-## Main Models — Safe to generate sidecars
-
-Organize main models by:
-
-- family: gemma (google), qwen (alibaba), mistral, llama (meta), hy (tencent),
-  mimo (xiaomi), glm (zai), kimi (moonshot), deepseek, nemotron (nvidia),
-  grok (xai), stepfun, minimax, ...
-- size
-- specialization: coder, reasoning, creative writing, ...
-- quantization
-- max context window
-
-## Sidecar conventions
-
-Sidecar `.md` files live alongside their model file and use YAML frontmatter
-(between `---` lines). **Any field you add flows through to clients
-automatically** (pass-through-by-default) — the system is built for
-flexibility as new models arrive, so agents can choose models intelligently.
+## Sidecar format
 
 ```yaml
 ---
-name: "Model Name"
-parameters: 12B              # or "26B-A4B" for MoE (total-active) so throughput uses active params
+name: "Model Name"           # required — a sidecar without it is skipped
+parameters: 12B              # or "26B-A4B" for MoE (total-active)
 context_length: 262144
 quantization: Q4_K_XL
 hf_url: https://huggingface.co/org/model
-mmproj: model-mmproj.gguf    # if vision companion exists (auto-adds `vision` capability)
-speculative: model.mtp.gguf  # if MTP companion exists
-mtp: true                    # if MTP is baked into the main GGUF (vs a companion file)
-description: "a decent general model with reasoning."
-role: chat                  # chat | embeddings | rerank (default chat; see below)
-# --- backend selection ---
-template: vllm               # OPTIONAL: serve with vLLM (host binary) instead of llama-server
-                              #   (or template: vllm-docker for a container)
-hf_repo: org/model          # for vLLM: HF repo id (optional; parsed from hf_url when absent)
-vllm_image: vllm/vllm-openai:latest   # optional per-model image override
-# --- agent-selection metadata (all optional; exposed to clients) ---
-capabilities: [vision, tools, reasoning, audio]  # vision auto-added if mmproj present
-freethought: 0.7            # 0.0 = refuses 'distasteful' topics; 1.0 = reasons about anything
-license: apache-2.0         # -> general.license (llama-server /v1/models meta)
-base_model: llama-3         # -> general.basename
-finetune: instruct          # -> general.finetune
-type: instruct              # -> general.type (descriptive; NOT the role)
-mtp_accuracy: 0.9           # MTP draft acceptance (float); feeds throughput estimate
-default_mode: instruct      # default sampling mode (maps to the bare ${MODEL_ID} profile)
-modes:                      # full per-mode sampling profiles (replaces global profiles.yaml
-  instruct:                 #   overrides for THIS model); llama.cpp names: temperature, top_p,
-    temperature: 0.6        #   top_k, min_p, pres_pen, repeat_penalty, freq_pen. Models with
-    pres_pen: 1.5           #   1 or 2 modes simply omit the others.
+description: "one-line summary."
+# --- serving ---
+role: chat                  # chat (default) | embeddings | rerank
+template: vllm              # serve with vLLM instead of llama-server
+                            #   (vllm = host binary, vllm-docker = container)
+hf_repo: org/model          # vLLM: HF repo id (parsed from hf_url if absent)
+vllm_image: vllm/vllm-openai:latest   # per-model vLLM image
+mmproj: model-mmproj.gguf   # vision companion (auto-adds `vision` capability)
+speculative: model.mtp.gguf # MTP draft companion file
+mtp: true                   # MTP baked into the main GGUF (no companion)
+# --- agent metadata (optional; passed through to clients) ---
+capabilities: [vision, tools, reasoning, audio]
+freethought: 0.7            # 0.0 = refuses; 1.0 = reasons about anything
+license: apache-2.0
+base_model: llama-3
+finetune: instruct
+type: instruct              # descriptive label; type: embedding|rerank hints role
+mtp_accuracy: 0.9           # MTP draft acceptance; feeds throughput estimate
+strengths: ["bash tool calling"]
+weaknesses: ["slow on 32GB"]
+# --- per-model sampling (replaces global profiles.yaml defaults) ---
+default_mode: instruct      # maps to the bare ${MODEL_ID} profile
+modes:                      # keys use llama.cpp names: temperature, top_p,
+  instruct:                 #   top_k, min_p, pres_pen, repeat_penalty, freq_pen
+    temperature: 0.6
+    pres_pen: 1.5
   thinking:
     temperature: 1.0
     pres_pen: 0.0
-strengths:                  # concise task phrases for agents to match on
-  - "bash tool calling"
-  - "low context usage"
-weaknesses:
-  - "slow on 32GB"
 ---
 ```
 
-## Global defaults
+Any field not listed above still flows through to clients as `metadata`.
 
-`profiles.yaml` (bundled) provides global sampling defaults. A sidecar
-`modes:` block replaces those defaults for that model; `default_mode` picks
-which mode is the bare `${MODEL_ID}` profile. Sampling values use llama.cpp
-parameter names: `temperature`, `top_p`, `top_k`, `min_p`, `pres_pen`,
-`repeat_penalty`, `freq_pen`.
+## Roles
 
-## Backends and roles
+`role:` selects how a model is served — `chat` (default), `embeddings`
+(`--embedding`), or `rerank` (`--rerank`). It is inferred from the `embed/` /
+`rerank/` directory or a `type:` of `embedding` / `rerank`; declare `role:`
+explicitly to override.
 
-`role` (chat | embeddings | rerank) selects how the model is served —
-embeddings and rerank run under llama-server with `--embedding` / `--rerank`
-flags; chat is the default and serves the OpenAI /llm text endpoint. Serve a
-chat model with vLLM instead of llama-server by adding `template: vllm` (host
-binary) or `template: vllm-docker` (container) plus optional `hf_repo` /
-`vllm_image`. The emitted entry is a `vllm serve` command; vLLM serves
-safetensors, and image precedence is per-model `vllm_image:` > `--vllm-image`
-CLI > `vllm.image` in profiles.yaml > built-in default.
-
-### Role vs type
-
-`role` and `type` are different things:
-
-- `role` (chat | embeddings | rerank) determines serve behavior. It is
-  inferred automatically: a sidecar under `embed/` is treated as `embeddings`,
-  under `rerank/` as `rerank`. Declare `role:` explicitly only to override
-  that inference.
-- `type` is a separate, descriptive label (e.g. `instruct`, `embedding`) that
-  flows through to clients as `general.type` — it does NOT determine serving
-  behavior. Do not use `type` to mean role.
-
-Do NOT set `mmproj:` or `speculative:` for files in `embed/`.
-Do NOT set `mtp: true` for files that don't have MTP layers.
-Do NOT set `template: vllm` or `template: vllm-docker` on a GGUF — vLLM serves
-safetensors/HF format; a GGUF's correct backend is the default llama-server one.
-
-## Capabilities and derived fields
-
-`capabilities` drives the derived `modalities` (text + image/audio) shown to
-clients. `freethought` is also injected into llama-server's `/v1/models`
-`meta` via `--override-kv`. The builder computes `capabilities.context` from
-the measured VRAM budget (do not hardcode it) and a relative
-`throughput_factor` from active parameters / quantization / MTP.
-
-## Other sidecar controls (llama-packer consumed)
+## Other fields
 
 | Key | Meaning |
 |-----|---------|
-| `device: N` | Pin to GPU N (`CUDA_VISIBLE_DEVICES=N` / `ROCR_VISIBLE_DEVICES=N`) |
+| `model: <file>` | Model file to load when it doesn't match the sidecar stem |
+| `device: N` | Pin to GPU N; `device: cpu` runs the model on CPU |
 | `concurrency: N` | Per-model concurrency limit |
-| `spare: 512M` | Extra VRAM reserve for this model (overrides global `--spare`) |
-| `allow_profiles: [...]` | Restrict which sampling profiles apply |
+| `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
+| `reasoning: auto` | Emit one variant per reasoning mode |
+| `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / `2`) |
 | `ignore: true` | Skip this model entirely |
-| `reasoning: auto` | Multi-variant generation |
+| `fit-params:` | Auto-written by llama-packer — do not edit |
 
-For the full schema reference see the project `SPEC.md`.
+See `SPEC.md` for the complete schema.
