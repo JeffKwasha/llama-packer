@@ -9,13 +9,10 @@ block (``FitParams`` dataclass stored in sidecar frontmatter).
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import yaml
 
 from llama_packer import utils
 from llama_packer import vllm_estimate
@@ -556,9 +553,10 @@ class VramBudget:
     def _persist(self, params: FitParams) -> None:
         """Update only the fit-params block in the sidecar, preserving everything else.
 
-        Reads the raw .md file, re-parses the frontmatter, injects the
-        fit-params block, and writes back.  All other frontmatter keys and
-        the markdown body are preserved unchanged.
+        Reads the raw .md file, round-trips the frontmatter with ruamel.yaml so
+        comments and formatting survive, injects the fit-params block, and
+        writes back.  All other frontmatter keys and the markdown body are
+        preserved unchanged.
         """
         md_path = self.model.md_path
         try:
@@ -574,13 +572,28 @@ class VramBudget:
             return
 
         try:
-            fm = yaml.safe_load(parts[1]) or {}
-        except yaml.YAMLError:
-            logger.debug("cannot parse sidecar frontmatter for persist: %s", md_path)
+            from ruamel.yaml import YAML
+        except ImportError:  # pragma: no cover - ruamel.yaml is a hard dependency
+            logger.debug("ruamel.yaml unavailable; skipping fit-params persist")
             return
 
+        yml = YAML()
+        yml.preserve_quotes = True
+        try:
+            fm = yml.load(parts[1])
+        except Exception as e:
+            logger.debug("cannot parse sidecar frontmatter for persist: %s", e)
+            return
+        if fm is None:
+            from ruamel.yaml.comments import CommentedMap
+            fm = CommentedMap()
+
         fm["fit-params"] = params.to_dict()
-        new_content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---" + parts[2]
+
+        import io
+        buf = io.StringIO()
+        yml.dump(fm, buf)
+        new_content = "---\n" + buf.getvalue().rstrip("\n") + "\n---" + parts[2]
 
         try:
             md_path.write_text(new_content, encoding="utf-8")
