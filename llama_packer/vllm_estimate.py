@@ -39,7 +39,7 @@ def estimate_vllm(
     fails (caller then falls back to a local safetensors estimate).
     """
     try:
-        from memory_estimator import EstimatorInputs, estimate_from_inputs
+        from memory_estimator import EstimatorInputs, estimate_from_inputs  # type: ignore[reportMissingImports]
     except ImportError:
         logger.debug("vllm-memory-estimator not installed; skipping")
         return None

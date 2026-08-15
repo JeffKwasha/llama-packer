@@ -9,6 +9,11 @@ dependencies = [
     "ruamel-yaml>=0.19.1",
 ]
 
+[project.optional-dependencies]
+# Recommended (not required) for vLLM-backend memory sizing. Without it,
+# vLLM-served models fall back to a local safetensors-header estimate.
+vllm = ["vllm-memory-estimator"]
+
 [project.scripts]
 llama-packer = "llama_packer.__main__:main"
 
@@ -31,3 +36,6 @@ llama_packer = ["profiles.yaml", "templates/*.md"]
 
 [tool.setuptools.dynamic]
 version = {attr = "llama_packer.__version__"}
+
+[tool.uv.sources]
+vllm-memory-estimator = { git = "https://github.com/ashishkamra/vllm-memory-estimator.git" }
