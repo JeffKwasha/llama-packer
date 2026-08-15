@@ -20,4 +20,4 @@ where = ["."]
 include = ["llama_packer*"]
 
 [tool.setuptools.package-data]
-llama_packer = ["profiles.yaml"]
+llama_packer = ["profiles.yaml", "templates/*.md"]

@@ -7,6 +7,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [`gen-config.py`](gen-config.py) — CLI wrapper → `llama_packer.__main__`
 - [`llama_packer/__main__.py`](llama_packer/__main__.py) — CLI, VRAM/env resolution, matrix wiring
 - [`llama_packer/profiles.yaml`](llama_packer/profiles.yaml) — sampling profiles + `vllm:` docker defaults (bundled)
+- [`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md) — bundled `models/AGENTS.md` guide (written with `--agents`)
 
 ## Modules
 
@@ -33,6 +34,6 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Data dirs
 
-- `models/` — GGUF + `.md` sidecars (+ `embed/`, `rerank/`)
+- `models/` — GGUF + `.md` sidecars (+ `embed/`, `rerank/`); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
 - `model_cfg/` — legacy (superseded by llama_packer)
