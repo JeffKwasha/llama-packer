@@ -251,6 +251,20 @@ class Model:
         return self.frontmatter.get("context_length", utils._DEFAULT_CONTEXT_LENGTH)
 
     @property
+    def design_context(self) -> int:
+        """Architectural context limit (GGUF) > sidecar context_length > default.
+
+        Single source of truth for a model's effective context ceiling, used by
+        the VRAM budget and matrix solver alike.
+        """
+        arch = self.gguf_context_length
+        if arch is not None and arch > 0:
+            return arch
+        return int(self.frontmatter.get(
+            "context_length", utils._DEFAULT_CONTEXT_LENGTH
+        ))
+
+    @property
     def gguf_context_length(self) -> int | None:
         """Read the model's architectural context limit from GGUF metadata.
 

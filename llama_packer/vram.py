@@ -543,12 +543,7 @@ class VramBudget:
 
     def _design_ctx(self) -> int:
         """Design context: GGUF architectural max > sidecar > default."""
-        arch = self.model.gguf_context_length
-        if arch is not None and arch > 0:
-            return arch
-        return int(self.model.frontmatter.get(
-            "context_length", utils._DEFAULT_CONTEXT_LENGTH
-        ))
+        return self.model.design_context
 
     def _persist(self, params: FitParams) -> None:
         """Update only the fit-params block in the sidecar, preserving everything else.
@@ -667,9 +662,7 @@ def solve_matrix_ctx(
             ctx = model.gguf_context_length or utils._DEFAULT_CONTEXT_LENGTH
         ctx = (ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
         ctx = max(ctx, utils._MIN_CTX_SIZE)
-        arch_max = model.gguf_context_length or model.frontmatter.get(
-            "context_length", utils._DEFAULT_CONTEXT_LENGTH
-        )
+        arch_max = model.design_context
         ctx = min(ctx, arch_max)
         best_ctx = max(best_ctx, ctx)
 

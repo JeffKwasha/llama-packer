@@ -496,7 +496,7 @@ def build_config(
     for model in models:
         # Use GGUF architectural max as the effective context limit.
         # Falls back to sidecar context_length, then default.
-        context_length = model.gguf_context_length or model.context_length
+        context_length = model.design_context
 
         # Whether this model's main entry keeps or drops mmproj
         include_mmproj = not drop_mmproj.get(model.stem, False)
