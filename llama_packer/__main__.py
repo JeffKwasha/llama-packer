@@ -256,6 +256,11 @@ def main(argv: list[str] | None = None) -> None:
             model_paths = [m.gguf_path for m in models if m.gguf_path and m.gguf_path.is_file()]
             drive_speed = _detect_drive_speed(model_paths)
         hct = max(120, int(1.2 * largest_mb / drive_speed))
+        # vLLM cold starts (docker image pull, HF download, model load) exceed
+        # the llama.cpp load path by minutes — raise the floor when any model
+        # uses a vLLM backend.
+        if any(m.is_vllm for m in models):
+            hct = max(hct, 300)
         logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)", hct, largest_mb, drive_speed)
     else:
         hct = args.health_check_timeout
