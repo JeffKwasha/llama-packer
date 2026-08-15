@@ -43,9 +43,18 @@ VRAM is detected via a vendor-probe chain in `llama_packer/hardware.py`:
 | 2 | `/sys/class/drm/card*/device/mem_info_vram_total` | AMD kernel sysfs |
 | 3 | `rocminfo` | AMD ROCm fallback |
 | 4 | `nvidia-smi --query-gpu=memory.total` | NVIDIA discrete GPUs |
-| 5 | System RAM × 50% | Unified memory or no GPU tools |
+| 5 | System RAM − `hardware.unified_system_mb` | Unified memory or no GPU tools |
 
 If all detection fails, `SystemExit` is raised (use `--vram` to override).
+
+Unified-memory hosts (NVIDIA GB10/DGX Spark, Apple Silicon, Intel integrated) report
+`N/A` from `nvidia-smi`, so detection uses total system RAM as the pool and
+reserves a fixed system slice (`hardware.unified_system_mb`, default 8 GiB) —
+not 50% of RAM, since these machines exist to run models. The knob folds into
+the reserve (reserve = exactly the knob, not knob + fixed 2 GiB); override per
+host via `profiles.yaml` `hardware.unified_system_mb` or `--unified-system-mb`.
+It is a guesstimate, not a measurement: in-use memory on a unified host already
+includes the slices we reserve, so used-vs-free is not counted twice.
 
 Precedence for VRAM value: `--vram` CLI flag > `profiles.yaml` `hardware.vram` > auto-detect.
 

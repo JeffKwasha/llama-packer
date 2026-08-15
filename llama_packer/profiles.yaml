@@ -44,3 +44,13 @@ vllm:
   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
   container_port: 8000
   gpu_mem_util: 0.9
+
+# ── Hardware ───────────────────────────────────────────
+# VRAM detection lives in llama_packer/hardware.py. Optional overrides:
+#   hardware:
+#     vram: 120G                 # full override of the detected VRAM pool
+#     unified_system_mb: 8192    # system reservation on unified-memory hosts
+#                                # (GB10/DGX Spark, Apple Silicon): the VRAM
+#                                # budget is total RAM minus this. Default 8192
+#                                # (8 GiB); override per-host for unusually
+#                                # light/heavy system use. CLI: --unified-system-mb
