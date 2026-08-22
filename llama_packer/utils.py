@@ -105,6 +105,9 @@ VLLM_DEFAULT_BIN = "vllm"
 VLLM_DEFAULT_CONTAINER_PORT = 8000
 VLLM_DEFAULT_DOCKER_ARGS = "--runtime=nvidia --gpus all --shm-size=16g"
 VLLM_DEFAULT_GPU_MEM_UTIL = 0.9
+# vLLM MTP docs recommend a small depth to start ("a small value like 1 is a
+# good default"); the llama.cpp-side default (2) does not transfer.
+VLLM_DEFAULT_MTP_TOKENS = 1
 
 # Sidecar/profile sampling parameter names accepted in llama-packer input.
 # These are llama.cpp CLI-style names.

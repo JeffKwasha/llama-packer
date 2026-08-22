@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from llama_packer.backends import (
@@ -100,6 +101,50 @@ def test_vllm_host_cmd(make_model):
     assert "--model org/model" in cmd
     assert "--max-model-len 65536" in cmd
     assert meta == {"mtp_enabled": False}
+
+
+def test_vllm_baked_in_mtp_emits_speculative_config(make_model):
+    m = make_model("v", hf_repo="org/model", mtp=True)
+    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert '--speculative-config {"method":"mtp","num_speculative_tokens":1}' in cmd
+    assert meta == {"mtp_enabled": True, "mtp_draft_max": 1}
+
+
+def test_vllm_mtp_depth_override(make_model):
+    m = make_model("v", hf_repo="org/model", mtp=True, **{"mtp_draft_n_max": 3})
+    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert '"num_speculative_tokens":3' in cmd
+    assert meta["mtp_draft_max"] == 3
+
+
+def test_vllm_explicit_speculative_config_wins(make_model):
+    cfg = {"method": "eagle3", "model": "org/eagle-head",
+           "num_speculative_tokens": 4}
+    m = make_model("v", hf_repo="org/model", mtp=True,
+                   **{"speculative_config": cfg})
+    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--speculative-config" in cmd
+    # JSON emitted verbatim (key order preserved), not the derived mtp config
+    assert '"method":"eagle3"' in cmd and '"num_speculative_tokens":4' in cmd
+    assert "mtp" not in cmd.split("--speculative-config")[1].split()
+    assert meta == {"mtp_enabled": True, "mtp_draft_max": 4}
+
+
+def test_vllm_gguf_speculative_companion_warned_and_skipped(make_model, caplog):
+    m = make_model("v", hf_repo="org/model", speculative="v.mtp.gguf",
+                   backend="vllm")
+    with caplog.at_level(logging.WARNING):
+        cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--speculative-config" not in cmd
+    assert meta == {"mtp_enabled": False}
+    assert any("cannot be loaded by vLLM" in r.message for r in caplog.records)
+
+
+def test_vllm_docker_mtp_flag(make_model):
+    m = make_model("v", hf_repo="org/model", mtp=True)
+    cmd, meta = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--speculative-config" in cmd
+    assert meta["mtp_enabled"] is True
 
 
 def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
