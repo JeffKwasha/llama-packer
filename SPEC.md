@@ -243,6 +243,26 @@ If absent, the module-level defaults apply (see `llama_packer/utils.py`).
 - **Baked-in:** Draft heads are part of the main GGUF. Set `mtp: true` in frontmatter. No separate file needed.
 - **Companion:** A separate GGUF file containing draft heads. Set `speculative: <filename>` in frontmatter. The file is resolved by fuzzy match in the model directory.
 
+### Speculative decoding under vLLM
+
+vLLM models get `--speculative-config '<json>'` (see
+[vLLM speculative decoding docs](https://docs.vllm.ai/en/latest/features/speculative_decoding/)).
+Resolution order in `backends/vllm.py:_speculative_config`:
+
+1. **`speculative_config:`** — explicit frontmatter mapping, emitted verbatim.
+   Full control over any vLLM method, e.g. a cross-vocabulary draft model:
+   `{method: draft_model, model: org/smoll-draft, num_speculative_tokens: 3}`
+2. **`mtp: true`** (baked-in MTP) → `{method: mtp, num_speculative_tokens: N}`
+   where N = `mtp_draft_n_max`, defaulting to **1** (`VLLM_DEFAULT_MTP_TOKENS`;
+   the llama.cpp-side default of 2 does not transfer — vLLM's MTP docs recommend
+   starting at 1).
+3. A GGUF **`speculative:` companion cannot be loaded by vLLM** (it needs an HF
+   repo): warned and skipped — use `speculative_config:` with a draft HF repo.
+
+Caveats: baked-in MTP weights are not added to the VRAM budget (same as the
+llama-server path); `mtp_spec_type` is llama.cpp-only and ignored by vLLM;
+metadata `mtp_enabled` / `mtp_draft_max` reflect the resolved config either way.
+
 ## Reasoning
 
 Reasoning/thinking support is two layers: a **server-side default** that
@@ -436,8 +456,9 @@ The binary (`vllm`) is resolved, highest to lowest:
 
 - Accurate sizing requires `vllm-memory-estimator` (or a local `.safetensors` file); otherwise
   context falls back to the declared `context_length`.
-- MTP/speculative flags are not translated for the vLLM backend yet.
 - LoRA adapters are emitted for llama-server only; vLLM `loras:` is warned and ignored.
+- Baked-in MTP weights are not added to the VRAM budget; GGUF draft companions cannot be
+  loaded by vLLM (see [Speculative decoding under vLLM](#speculative-decoding-under-vllm)).
 - Runs one vLLM server per model per image/binary; multi-image or cluster/tensor-parallel
   provisioning is future work.
 
@@ -667,7 +688,7 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 `name`, `context_length`, `description`, `cli_args`, `model`, `backend`, `hf_repo`,
 `chat_template`, `chat_template_kwargs`, `loras`, `attention`, `kv_cache`, `tool_args`,
-`speculative`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
+`speculative`, `speculative_config`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
 `mtp_draft_p_min`, `role`, `targets`, `allow_profiles`, `spare`, `capabilities`,
 `ignore`, `device`, `concurrency`, `fit-params`, `vllm_image`, `modes`, `default_mode`,
 `reasoning-format`, `reasoning-preserve`, `cache_type`, `parallel`.

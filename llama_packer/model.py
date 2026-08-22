@@ -33,6 +33,7 @@ class Model:
         "backend", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
         "attention", "kv_cache", "tool_args", "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
+        "speculative_config",
         "role", "targets", "allow_profiles", "spare", "capabilities",
         "ignore", "device", "concurrency", "fit-params", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",

@@ -10,6 +10,7 @@ registry, so a declared ``loras`` setting is warned about and skipped.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar
@@ -21,6 +22,46 @@ if TYPE_CHECKING:
     from llama_packer.model import Model
 
 logger = logging.getLogger(__name__)
+
+
+def _speculative_config(model: "Model") -> dict | None:
+    """The ``--speculative-config`` JSON dict for *model*, or None.
+
+    Precedence:
+
+    1. Explicit ``speculative_config:`` frontmatter (a raw mapping — full
+       control over any vLLM method: eagle3, ngram, draft_model, ...).
+    2. Baked-in MTP (``mtp: true``) → ``{"method": "mtp",
+       "num_speculative_tokens": N}`` (vLLM docs recommend N=1 to start).
+
+    A GGUF ``speculative:`` companion cannot be loaded by vLLM (it needs an
+    HF repo); that case is warned about and skipped — use
+    ``speculative_config: {method: draft_model, model: <hf-repo>, ...}``
+    instead.  See https://docs.vllm.ai/en/latest/features/speculative_decoding/
+    """
+    fm = model.frontmatter
+    cfg = fm.get("speculative_config")
+    if isinstance(cfg, dict) and cfg:
+        return cfg
+    if fm.get("mtp"):
+        n = int(fm.get("mtp_draft_n_max", utils.VLLM_DEFAULT_MTP_TOKENS))
+        return {"method": "mtp", "num_speculative_tokens": n}
+    if fm.get("speculative"):
+        logger.warning("vllm: %s: GGUF speculative companion %r cannot be loaded "
+                       "by vLLM; skipping speculative decoding (use "
+                       "`speculative_config:` with a draft HF repo instead)",
+                       model.stem, fm["speculative"])
+    return None
+
+
+def _spec_meta(model: "Model") -> dict:
+    """Backend metadata for the writer's mtp_* metadata keys."""
+    spec = _speculative_config(model)
+    if not spec:
+        return {"mtp_enabled": False}
+    meta = {"mtp_enabled": True,
+            "mtp_draft_max": spec.get("num_speculative_tokens", 0)}
+    return meta
 
 
 def _map_paths_into(paths: list[Path], models_dirs) -> tuple[list[str], list[str]]:
@@ -94,6 +135,9 @@ class VllmHostBackend(BaseBackend):
         if ct is not None:
             ref = map_path(ct) if map_path else str(ct)
             flags += ["--chat-template", ref]
+        spec = _speculative_config(model)
+        if spec:
+            flags += ["--speculative-config", json.dumps(spec, separators=(",", ":"))]
         return flags
 
     def build_cmd(
@@ -110,7 +154,7 @@ class VllmHostBackend(BaseBackend):
         flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util))
         cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command([vllm_bin, "serve"], flags, cli_args)
-        return cmd, {"mtp_enabled": False}
+        return cmd, _spec_meta(model)
 
 
 class VllmDockerBackend(VllmHostBackend):
@@ -169,4 +213,4 @@ class VllmDockerBackend(VllmHostBackend):
             image,
         ]
         cmd = " ".join(docker_parts) + " " + serve
-        return cmd, {"mtp_enabled": False}
+        return cmd, _spec_meta(model)

@@ -82,14 +82,12 @@ Serve a model with vLLM instead of llama-server via an override rule in `profile
 - vLLM memory sizing needs `vllm-memory-estimator` installed for HF-repo models; without it
   (or a local `.safetensors` file), context falls back to the declared `context_length` and
   vLLM's own startup profiling bounds the allocation
-- MTP/speculative flags are not translated for the vLLM backend yet; LoRA adapters are
-  llama-server-only
-- One vLLM server per model per image/binary; no multi-GPU sharding (tensor split) — pin
-  whole models to a device with the sidecar `device:` key
+- LoRA adapters are llama-server-only; GGUF MTP draft companions are llama-server-only —
+  under vLLM use baked-in MTP (`mtp: true`) or an explicit `speculative_config:` with a
+  draft HF repo
 
 ## Future Roadmap
 
 - Support multi-image/tensor-parallel vLLM provisioning
-- Translate MTP/speculative sidecar fields to vLLM `--speculative-config`
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
