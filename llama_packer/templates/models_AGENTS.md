@@ -41,10 +41,12 @@ hf_url: https://huggingface.co/org/model
 description: "one-line summary."
 # --- serving ---
 role: chat                  # chat (default) | embeddings | rerank
-template: vllm              # serve with vLLM instead of llama-server
-                            #   (vllm = host binary, vllm-docker = container)
+# Backend is usually NOT declared here: when absent it is inferred from the
+# model file (.gguf -> llama-server; safetensors/HF-repo -> vllm-docker).
+# Fleet-level choices (backend, chat_template, loras) belong in profiles.yaml
+# `overrides:` rules. See SPEC.md "Override Rules".
 hf_repo: org/model          # vLLM: HF repo id (parsed from hf_url if absent)
-vllm_image: vllm/vllm-openai:latest   # per-model vLLM image
+vllm_image: vllm/vllm-openai:latest   # optional per-model vLLM image override
 mmproj: model-mmproj.gguf   # vision companion (auto-adds `vision` capability)
 speculative: model.mtp.gguf # MTP draft companion file
 mtp: true                   # MTP baked into the main GGUF (no companion)

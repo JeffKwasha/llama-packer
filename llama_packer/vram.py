@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer import vllm_estimate
+from llama_packer.backends import VLLM_BACKENDS
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -245,7 +246,7 @@ class VramBudget:
 
         # 2. vLLM backends: estimate from the HF repo (vllm-memory-estimator)
         #    or a local safetensors header — llama-fit-params only measures GGUF.
-        if self.model.is_vllm:
+        if self.model.backend in VLLM_BACKENDS:
             params = self._fit_params_vllm(cache_type, parallel)
             if params is not None:
                 self._static_cache[cache_key] = params
@@ -427,7 +428,7 @@ class VramBudget:
 
         # vLLM serves safetensors from an HF repo — vision/draft companions are
         # baked into the repo, not separate GGUF files, so nothing to fold in.
-        if self.model.is_vllm:
+        if self.model.backend in VLLM_BACKENDS:
             params = (main.model_mib, main.ctx_factor, main.compute_mib)
             self._effective_cache[cache_key] = params
             return params
@@ -505,7 +506,7 @@ class VramBudget:
         )
 
         if static is None:
-            if self.model.is_vllm:
+            if self.model.backend in VLLM_BACKENDS:
                 # No memory estimate available (no estimator, no local
                 # safetensors): size to the declared context and let vLLM's own
                 # startup profiling bound the actual allocation.

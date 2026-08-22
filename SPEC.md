@@ -239,19 +239,21 @@ modes:
 
 ## vLLM Backend
 
-A chat model can be served with vLLM instead of llama-server by declaring
-`template: vllm` (host binary) or `template: vllm-docker` (container) in its sidecar.
-The emitted entry runs `vllm serve`, published to llama-swap's `${PORT}` host macro.
-Everything else works identically: aliases/modes (`filters.setParamsByID`), `metadata`,
-capabilities, matrix routing.
+A chat model can be served with vLLM instead of llama-server by an override
+rule (see below) that sets `backend: vllm` (host binary) or `backend: vllm-docker`
+(container). The emitted entry runs `vllm serve`, published to llama-swap's `${PORT}`
+host macro. Everything else works identically: aliases/modes (`filters.setParamsByID`),
+`metadata`, capabilities, matrix routing.
+
+Sidecars themselves carry no backend key — backend selection, chat templates and
+LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`.
 
 ```yaml
----
-name: qwen3-30b
-template: vllm          # or vllm-docker
-hf_repo: Qwen/Qwen3-30B-A3B-Instruct
-context_length: 65536
----
+# profiles.yaml
+overrides:
+  - when: {base_model: 'qwen3\\.30b'}
+    backend: vllm            # or vllm-docker
+    hf_repo: Qwen/Qwen3-30B-A3B-Instruct
 ```
 
 ### Model resolution
@@ -304,8 +306,88 @@ The binary (`vllm`) is resolved, highest to lowest:
 - Accurate sizing requires `vllm-memory-estimator` (or a local `.safetensors` file); otherwise
   context falls back to the declared `context_length`.
 - MTP/speculative flags are not translated for the vLLM backend yet.
+- LoRA adapters are emitted for llama-server only; vLLM `loras:` is warned and ignored.
 - Runs one vLLM server per model per image/binary; multi-image or cluster/tensor-parallel
   provisioning is future work.
+
+
+## Override Rules
+
+Sidecars carry model-intrinsic data. Cross-cutting serving choices —
+**backend**, **HF repo**, **chat template**, **LoRA adapters**, and extra
+**CLI args** — are selected by pattern-scoped rules under `overrides:` in
+`profiles.yaml` (a sidecar may still pin a `backend:` for one-off exceptions,
+but fleet-level policy belongs here).
+
+```yaml
+# profiles.yaml
+overrides:
+  # All Qwen 3.6/3.8 chat models get the fixed Jinja chat template (and its
+  # declared kwargs, exposed to clients for per-request control).
+  - when: {base_model: 'qwen3\.[68]'}
+    chat_template: qwen_chat_template.jinja
+    chat_template_kwargs: {enable_thinking: true}
+
+  # One-off: pin a specific model to the vLLM container backend.
+  - when: {name: 'Nail-Qwen'}
+    backend: vllm-docker
+    hf_repo: peculiar-ragdoll/Nail-Qwen3.6-35B-A3B-GGUF-MTP
+
+  # A qwen finetune (still base_model: qwen3.8) also gets a LoRA adapter.
+  - when: {base_model: 'qwen3\.8', parameters: '27B'}
+    loras: [my-qwen36-uncensored-lora.gguf]
+```
+
+**Matching.** `when` is **required** — a rule missing an empty/null `when`, or
+with no known settings, aborts the run (a silently-ignored rule would compound
+the misconfiguration). Each `when` is a map of `field: regex`; a model matches
+only if *every* field regex matches (`re.search`). Fields come from the sidecar
+frontmatter plus the synthetic `stem` and `name`. Use `when: true` to match
+every model. Regex literals are easiest in YAML **single-quoted** or unquoted
+scalars — only double quotes interpret backslashes (`\.` stays literal in
+single quotes).
+
+**Merge semantics.** Settings seed from the model's own sidecar fields, then
+each matching rule is layered on top **last-match-wins per key** (CSS-like:
+rules read top→bottom as increasing specificity). So a later rule that changes
+`backend` does not clobber a `chat_template` set by an earlier rule.
+
+**Settings keys** (all optional): `backend`, `hf_repo`, `chat_template`,
+`chat_template_kwargs`, `loras`, `cli_args`.
+
+**Backend inference.** When neither the sidecar nor any rule declares a
+`backend`, one is inferred from the model's file format: backends register the
+formats they load and are consulted in preference order, gated by whether each
+backend's required resources are configured (llama-server binary, vLLM image /
+binary). Today that means `.gguf` → `llama-server` and safetensors / `hf_repo`
+→ `vllm-docker` (falling back to host `vllm` when only the binary is
+configured). A format no available backend covers logs an error and the
+model's entries are skipped.
+
+**Path resolution.** `chat_template` and `loras` values are paths resolved
+relative to the models directory. A missing file logs an error and the model's
+entries are skipped (fail loud). Resolved paths are written into the generated
+`cmd` and exposed for `${env.*}` substitution.
+
+**Chat templates & client kwargs.** A declared `chat_template` makes the writer
+emit `--jinja --chat-template-file <path>` (llama-server) or `--chat-template
+<path>` (vLLM), and records `metadata.chat_template` (the file stem). The
+`chat_template_kwargs` map is **client-facing metadata only** — there is no
+server-side flag for it; clients pass it per-request (e.g. Qwen's
+`enable_thinking`).
+
+**Backend support matrix.** A backend that cannot serve a model — wrong file
+format (e.g. a `.gguf` under vLLM) or unsupported role (e.g. embeddings/rerank
+under vLLM in this version) — logs an error and the model's entries are skipped
+entirely. A backend that recognizes a setting it cannot render (e.g. `loras`
+under vLLM) logs a warning and ignores that one setting; settings that simply do
+not apply (e.g. `cache_type` under vLLM) are silently dropped.
+
+| Backend | Model formats | Roles |
+|---------|--------------|-------|
+| `llama-server` | `.gguf` | chat, embeddings, rerank |
+| `vllm` | safetensors, `hf_repo` | chat |
+| `vllm-docker` | safetensors, `hf_repo` | chat |
 
 
 ## Health-Check Timeout
@@ -363,7 +445,6 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `concurrency` | int | Per-model concurrency limit → `concurrencyLimit` in config |
 | `spare` | str | Additional VRAM to reserve (overrides global `--spare`) |
 | `allow_profiles` | str/list/bool | Restrict which profiles apply (regex string, list, or false to disable) |
-| `template` | str | Backend template override. `template: vllm` serves this model with vLLM (host binary) instead of llama-server; `template: vllm-docker` serves it in a container; omitted → derived from `role` (chat/embeddings/rerank) |
 | `modes` | dict | Per-model sampling modes (full profiles): name → param dict. Replaces the global-profile sampling overrides for this model. Values use llama.cpp names; see [Sampling Modes](#sampling-modes) |
 | `default_mode` | str | Which declared `modes` entry is the model's default (maps to the bare `${MODEL_ID}` `setParamsByID` key). Falls back to the first mode |
 | `reasoning` | str/bool | `auto` → multi-variant generation; specific mode → single variant; `true`/absent → no change |

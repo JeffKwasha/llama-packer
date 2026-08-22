@@ -31,20 +31,19 @@ output. That approach is **dropped**. Instead:
 
 ### vLLM docker backend scaffold
 
-A chat model opts into vLLM via sidecar `template: vllm-docker`:
+A chat model opts into vLLM via an `overrides:` rule that sets `backend: vllm-docker`
+(see SPEC.md "Override Rules"):
 
 ```yaml
----
-name: qwen3-30b
-template: vllm-docker
-hf_repo: Qwen/Qwen3-30B-A3B-Instruct   # optional; derived from hf_url when absent
-vllm_image: vllm/vllm-openai:v0.11.0   # optional per-model image
-context_length: 65536
----
+# profiles.yaml
+overrides:
+  - when: {name: 'qwen3-30b'}
+    backend: vllm-docker
+    hf_repo: Qwen/Qwen3-30B-A3B-Instruct   # optional; derived from hf_url when absent
+    vllm_image: vllm/vllm-openai:v0.11.0   # optional per-model image
 ```
 
-Emitted entry (`llama_packer/utils.py` `_TARGET_TEMPLATES["vllm-docker"]`, used by
-`_build_entry` in `writer.py` when the template defines a full `cmd`):
+Emitted entry (built by `VllmDockerBackend` in `llama_packer/backends/vllm.py`):
 
 ```yaml
 models:
@@ -58,8 +57,9 @@ models:
     filters: {setParamsByID: {qwen3-30b: {...}, "qwen3-30b:coder": {...}}}
 ```
 
-`cmd` is resolved with `model.template` (explicit sidecar `template:` wins over role).
-Aliases/modes, metadata, capabilities, matrix all flow through unchanged.
+`cmd` is composed per-backend; backend selection is driven by override rules
+(last-match-wins per setting key). Aliases/modes, metadata, capabilities, matrix
+all flow through unchanged.
 
 ### Image specification
 
@@ -87,9 +87,11 @@ safetensors, so the GGUF fallback is a last resort.
 
 ### Files changed
 
-- `llama_packer/utils.py` — `vllm-docker` target template + `VLLM_DEFAULT_*` constants
-- `llama_packer/writer.py` — full-`cmd` template branch in `_build_entry` + `_strip_repeat_ws`
-- `llama_packer/model.py` — `hf_repo`, `vllm_image` properties
+- `llama_packer/backends/` — backend package (`base`, `llama_server`, `vllm`) composing
+  per-engine `cmd`s; `VLLM_DEFAULT_*` constants remain in `utils.py`
+- `llama_packer/overrides.py` — pattern-scoped `overrides:` rules select backend/hf_repo
+- `llama_packer/writer.py` — `_build_entry` delegates to the selected backend + `_strip_repeat_ws`
+- `llama_packer/model.py` — `backend`, `hf_repo`, `vllm_image` properties
 - `llama_packer/__main__.py` — `--vllm-image` flag + precedence resolution
 - `llama_packer/profiles.yaml` — `vllm:` defaults section
 - `README.md`, `SPEC.md` — documented
@@ -102,7 +104,7 @@ safetensors, so the GGUF fallback is a last resort.
   falling back to the local `.safetensors` header estimate, feeding the existing
   `FitParams`/`calc_ctx`/`solve_matrix_ctx` pipeline unchanged. `--gpu-memory-utilization`
   is derived from the same reserve/spare budget llama.cpp uses.
-- **Direct binary mode** — `template: vllm` emits `vllm serve` (no docker); `vllm-b-docker`
+- **Direct binary mode** — `backend: vllm` emits `vllm serve` (no docker); `vllm-docker`
   stays selectable. Binary resolved via `--vllm-server` > `vllm.bin` > `vllm` on PATH.
 - **`hf_repo`-only models** — `Model.gguf_path` is optional for vLLM backends; a sidecar
   with only `hf_repo`/`hf_url` is valid.
