@@ -45,3 +45,15 @@ vllm:
 #                                # budget is total RAM minus this. Default 8192
 #                                # (8 GiB); override per-host for unusually
 #                                # light/heavy system use. CLI: --unified-system-mb
+
+# ── Override rules (pattern-scoped serving choices) ────
+# Match models by sidecar fields and set backend / hf_repo / chat_template /
+# chat_template_kwargs / loras / cli_args / reasoning-format /
+# reasoning-preserve. `when` is required; use `when: true` to match all.
+# See SPEC.md "Override Rules" + "Reasoning".
+#
+# overrides:
+#   - when: {base_model: 'qwen3\.[68]'}
+#     chat_template: qwen_chat_template.jinja
+#     reasoning-format: deepseek
+#     reasoning-preserve: true

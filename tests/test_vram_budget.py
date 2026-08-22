@@ -59,6 +59,29 @@ def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
     assert ctx == 65536
 
 
+# ── cache-type scaling ────────────────────────────────────────────────────
+
+
+def test_saved_for_cache_type_mismatch_returns_none(make_model, fit_params_block):
+    model = make_model("s", **{"fit-params": fit_params_block})
+    assert model.vram.saved_for("q8_0", 1) is not None
+    assert model.vram.saved_for("f16", 1) is None
+    assert model.vram.saved_for("q8_0", 2) is None  # parallel mismatch too
+
+
+def test_fit_params_static_scales_cache_type(make_model, fit_params_block):
+    model = make_model("s", **{"fit-params": fit_params_block})
+    fp = model.vram.fit_params_static("unused", cache_type="f16", parallel=1)
+    assert fp is not None
+    assert fp.source == "fit-params-scaled"
+    assert fp.cache_type == "f16"
+    # q8_0 -> f16 scales the KV factor by bytes/elem ratio 2.0 / 1.0625
+    assert fp.ctx_factor == pytest.approx(0.5 * 2.0 / 1.0625)
+    # weights and compute are cache-independent
+    assert fp.model_mib == fit_params_block["model_mib"]
+    assert fp.compute_mib == fit_params_block["compute_mib"]
+
+
 # ── solve_matrix_ctx ──────────────────────────────────────────────────────
 
 

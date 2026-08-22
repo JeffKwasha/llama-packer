@@ -132,15 +132,46 @@ class VramBudget:
 
     # ── saved fit-params from frontmatter ──
 
-    @property
-    def saved(self) -> FitParams | None:
-        """Read validated fit-params block from model frontmatter."""
+    def saved_for(self, cache_type: str, parallel: int) -> FitParams | None:
+        """Return the persisted fit-params block when it matches the *requested*
+        cache type and parallel slot count.
+
+        Validating against the requested values (not the sidecar-declared ones)
+        is what makes a cache-type or parallel change invalidate a stale block
+        and force a re-derivation instead of reusing mismatched numbers.
+        """
         raw = self.model.frontmatter.get("fit-params")
         if raw is None:
             return None
-        cache_type = str(self.model.frontmatter.get("cache_type", "q8_0"))
-        parallel = int(self.model.frontmatter.get("parallel", 1))
         return FitParams.from_dict(raw, cache_type, parallel)
+
+    def _scale_ctx_factor(self, base: FitParams, cache_type: str) -> FitParams:
+        """Derive params for *cache_type* from *base* by scaling the KV factor.
+
+        KV-cache memory per token is linear in per-element bytes, so the
+        context factor scales by the byte ratio between the two precisions;
+        weights and compute are precision-independent.  Round the factor up
+        (never down) so the estimate errs toward reserving more.
+        """
+        ratio = utils._KV_CACHE_BYTES[cache_type] / utils._KV_CACHE_BYTES.get(base.cache_type, 1.0625)
+        ctx_factor = base.ctx_factor * ratio
+        return FitParams(
+            model_mib=base.model_mib,
+            ctx_factor=ctx_factor,
+            compute_mib=base.compute_mib,
+            source="fit-params-scaled",
+            cache_type=cache_type,
+            parallel=base.parallel,
+        )
+
+    def _saved_base(self, parallel: int) -> FitParams | None:
+        """Saved fit-params with a matching parallel count, any cache type."""
+        raw = self.model.frontmatter.get("fit-params")
+        if not isinstance(raw, dict):
+            return None
+        if int(raw.get("parallel", 1)) != int(parallel):
+            return None
+        return FitParams.from_dict(raw, str(raw.get("cache_type", "q8_0")), parallel)
 
     # ── raw fit-params binary call ──
 
@@ -238,11 +269,21 @@ class VramBudget:
         if cache_key in self._static_cache:
             return self._static_cache[cache_key]
 
-        # 1. Check saved values from frontmatter
-        saved = self.saved
+        # 1. Saved values from frontmatter.
+        saved = self.saved_for(cache_type, parallel)
         if saved is not None:
             self._static_cache[cache_key] = saved
             return saved
+
+        # 1b. A saved block for the same parallel but a different cache type is
+        #     re-used by scaling its KV factor (see _scale_ctx_factor) instead of
+        #     re-running the binary — KV-cache memory is linear in precision.
+        if cache_type in utils._KV_CACHE_BYTES:
+            base = self._saved_base(parallel)
+            if base is not None:
+                params = self._scale_ctx_factor(base, cache_type)
+                self._static_cache[cache_key] = params
+                return params
 
         # 2. vLLM backends: estimate from the HF repo (vllm-memory-estimator)
         #    or a local safetensors header — llama-fit-params only measures GGUF.

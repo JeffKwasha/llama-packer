@@ -1,19 +1,29 @@
 # llama_packer/writer.py
-"""Generate llama-swap config entries from Model objects."""
+"""Generate llama-swap config entries from Model objects.
+
+Responsibilities are split along a plan → emit seam:
+
+- :class:`Planner` turns models + VRAM budget into per-model
+  :class:`Variant` plans (context sizes, mmproj keep/drop, profile groups).
+- :func:`emit_config` renders those plans into llama-swap entry dicts —
+  no VRAM math, trivially testable.
+- :func:`build_config` composes: filter → plan → emit.
+"""
 
 from __future__ import annotations
 
 import copy
 import logging
-import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
-from llama_packer.model import Model, _CL_RE
+from llama_packer.model import Model
 from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
+from llama_packer.profiles import Profiles, parse_spare_mb
 from llama_packer.backends import (
     SETTING_KEYS,
     FRAMEWORK_CONSUMED,
@@ -23,8 +33,16 @@ from llama_packer.backends import (
 
 logger = logging.getLogger(__name__)
 
-# Profile key that controls spare VRAM (bytes)
-_SPARE_KEY = "spare"
+# llama-server ``--reasoning-format`` modes (see its CLI help).
+_REASONING_FORMATS = frozenset({"none", "deepseek", "deepseek-legacy", "auto"})
+_REASONING_FLAG_KEYS = ("reasoning-format", "reasoning-preserve")
+
+
+def _model_can_reason(model: Model) -> bool:
+    """True when the model is a chat model that advertises reasoning support."""
+    if model.role != "chat":
+        return False
+    return "reasoning" in [c.lower() for c in model.capabilities]
 
 
 def _strip_repeat_ws(text: str) -> str:
@@ -32,78 +50,55 @@ def _strip_repeat_ws(text: str) -> str:
     return " ".join(text.split())
 
 
-def _filter_supported(models: list[Model]) -> list[Model]:
-    """Drop models whose backend cannot serve them (format/role mismatch).
+def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> list[Model]:
+    """Final validation before any backend renders a command.
 
-    Models already flagged by ``apply_overrides`` (unknown backend, missing
-    chat-template/LoRA files) are skipped too.  Unsupported combos log an error;
-    settings a backend recognizes but cannot render (e.g. ``loras`` on vLLM) log
-    a warning.  Returns the supported subset.
+    Single place where a resolved model is validated (and, when an *option* is
+    wrong, cleaned): backend format/role compatibility, reasoning-flag value
+    and applicability, and cache-type knowability.  A rejected model is logged
+    as an error and skipped; a rejected option is dropped.  Returns the
+    supported subset.
     """
     supported: list[Model] = []
     for model in models:
-        err = getattr(model, "_override_error", None)
-        if err:
+        if getattr(model, "_override_error", None):
             # Already logged (and the model flagged) by apply_overrides.
             continue
+
         backend = get_backend(model.backend)
         reason = backend.unsupported_reason(model)
         if reason:
             logger.error("skipping %s: %s backend cannot serve it: %s",
                          model.stem, backend.name, reason)
             continue
-        declared = {k for k in SETTING_KEYS if k in model.frontmatter}
+
+        fm = model.frontmatter
+
+        # Reasoning flags must name a known mode and apply to a reasoning model.
+        rf = fm.get("reasoning-format")
+        if rf is not None and str(rf).lower() not in _REASONING_FORMATS:
+            logger.error("skipping %s: unknown reasoning-format %r (allowed: %s); ignored",
+                         model.stem, rf, ", ".join(sorted(_REASONING_FORMATS)))
+            fm.pop("reasoning-format")
+        if not _model_can_reason(model):
+            for k in _REASONING_FLAG_KEYS:
+                if k in fm:
+                    logger.error("skipping %s: %s declared on a non-reasoning model "
+                                 "(role=%r, capabilities=%s); ignored",
+                                 model.stem, k, model.role, model.capabilities)
+                    fm.pop(k)
+
+        # cache_type must be a precision we can size memory for.
+        cache_type = model.cache_type_for(default_cache_type)
+        if cache_type not in utils._KV_CACHE_BYTES:
+            logger.error("skipping %s: unknown cache_type %r (known: %s)",
+                         model.stem, cache_type, ", ".join(sorted(utils._KV_CACHE_BYTES)))
+            continue
+
+        declared = {k for k in SETTING_KEYS if k in fm}
         backend.warn_unhandled(declared - FRAMEWORK_CONSUMED - METADATA_ONLY)
         supported.append(model)
     return supported
-
-
-def _filter_profiles(profile_list: dict, allow_profiles) -> list[tuple[str, dict]]:
-    """Filter profiles according to allow_profiles frontmatter value."""
-    if allow_profiles is False:
-        return []
-    if allow_profiles is None or allow_profiles is True:
-        return list(profile_list.items())
-    if isinstance(allow_profiles, str):
-        try:
-            pattern = re.compile(allow_profiles)
-        except re.error:
-            logger.warning("invalid allow_profiles regex %r, returning all profiles", allow_profiles)
-            return list(profile_list.items())
-        return [(pname, pover) for pname, pover in profile_list.items() if pattern.search(pname)]
-    return list(profile_list.items())
-
-
-def _resolve_reasoning_cli_args(cli_args: str, reasoning: str | None) -> list[tuple[str, str]]:
-    """Resolve reasoning variants from frontmatter reasoning field.
-
-    Returns list of (cli_args_variant, variant_suffix).
-    """
-    if not reasoning:
-        return [(cli_args, "")]
-
-    _RE_REASONING = re.compile(r"--reasoning\s+\S+")
-
-    if reasoning is True:
-        return [(cli_args, "")]
-
-    if reasoning == "auto":
-        variants = []
-        for mode in ["none", "native", "openai"]:
-            suffix = f".reasoning.{mode}"
-            if mode == "none":
-                args = _RE_REASONING.sub("", cli_args).strip()
-            else:
-                args = _RE_REASONING.sub(f"--reasoning {mode}", cli_args).strip()
-                if "--reasoning" not in args:
-                    args = (args + f" --reasoning {mode}").strip()
-            variants.append((args, suffix))
-        return variants
-
-    args = _RE_REASONING.sub(f"--reasoning {reasoning}", cli_args).strip()
-    if "--reasoning" not in args:
-        args = (args + f" --reasoning {reasoning}").strip()
-    return [(args, "")]
 
 
 def _build_mode_params(model: Model) -> dict[str, dict]:
@@ -241,9 +236,9 @@ def _build_entry(
     # Expose declared sampling modes so clients (hermes, opencode, UIs) can
     # discover the per-request aliases ("<id>:<mode>") without hitting the
     # model list. Static discovery: metadata is passed through in /v1/models.
-    mode_params = model.modes
-    if mode_params:
-        metadata["modes"] = sorted(mode_params)
+    mode_params_keys = model.modes
+    if mode_params_keys:
+        metadata["modes"] = sorted(mode_params_keys)
         metadata["default_mode"] = model.default_mode
 
     entry: dict = {"cmd": cmd_str}
@@ -255,16 +250,21 @@ def _build_entry(
         entry["name"] = model.name + name_suffix
     if model.description:
         entry["description"] = model.description
+    # The VRAM-served -c limit (vs. capabilities.context = max trained).
+    metadata["ctx_size"] = ctx_size
     if metadata:
         entry["metadata"] = metadata
 
     # Native llama-swap capabilities block (shown in /v1/models).
+    # `context` is the model's maximum trained context (GGUF architectural max
+    # > sidecar context_length > default); the VRAM-served -c limit is exposed
+    # separately as metadata.ctx_size.
     entry["capabilities"] = {
         "in": modalities,
         "out": modalities,
         "tools": "tools" in caps,
         "reranker": "reranker" in caps or model.role == "rerank",
-        "context": ctx_size,
+        "context": context_length,
     }
 
     # Per-model GPU device pinning (multi-GPU). Emits the appropriate
@@ -282,6 +282,191 @@ def _build_entry(
     return entry_id, entry
 
 
+# ── Planning ──────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Variant:
+    """One planned llama-swap entry: resolved serving params + contexts.
+
+    ``vision_ctx`` is set only when mmproj was dropped from the main variant
+    but a companion exists — the emitter then adds a best-effort vision entry.
+    """
+    parallel: int
+    cache_type: str
+    spare_mb: int
+    profiles_group: list[tuple[str, dict]] = field(compare=False)
+    ctx_size: int
+    include_mmproj: bool
+    vision_ctx: int | None = None
+
+
+class Planner:
+    """Turn models + VRAM budget into per-model serving :class:`Variant`s.
+
+    Owns every context decision: the mmproj keep/drop pre-pass, the shared
+    matrix context solve, profile grouping, and the bounded-context clamp.
+    Depends only on models' ``VramBudget`` interfaces, so tests substitute
+    fake budgets instead of monkeypatching subprocesses.  Emission of
+    llama-swap dicts is a separate concern (:func:`emit_config`).
+    """
+
+    def __init__(
+        self,
+        models: list[Model],
+        profiles: Profiles,
+        fit_bin: str,
+        vram_total: int,
+        *,
+        spare: str | None = None,
+        max_context: int | None = None,
+        matrix_cfg: dict | None = None,
+        embed_model: Model | None = None,
+        rerank_model: Model | None = None,
+        baseline_mb: int = 0,
+        min_context: int = utils._MIN_USEFUL_CTX,
+    ):
+        self.models = models
+        self.profiles = profiles
+        self.fit_bin = fit_bin
+        self.vram_total = vram_total
+        self.spare = spare
+        self.max_context = max_context
+        self.matrix_cfg = matrix_cfg
+        self.embed_model = embed_model
+        self.rerank_model = rerank_model
+        self.baseline_mb = baseline_mb
+        self.min_context = min_context
+        self.chat_ctx: int | None = None  # matrix-solved shared context, if any
+
+    # ── bounded ctx: the single home of the clamp invariant ──
+
+    def _bounded_ctx(
+        self,
+        model: Model,
+        *,
+        parallel: int,
+        cache_type: str,
+        spare_mb: int,
+        include_mmproj: bool,
+        design_ctx: int | None = None,
+        context_length: int | None = None,
+    ) -> int:
+        """VRAM-solved context clamped to the model's max trained context
+        (*context_length*) and the CLI ``--max-context`` cap."""
+        ctx = model.vram.calc_ctx(
+            self.vram_total,
+            fit_bin=self.fit_bin,
+            parallel=parallel,
+            spare_mb=spare_mb,
+            include_mmproj=include_mmproj,
+            baseline_mb=self.baseline_mb,
+            cache_type=cache_type,
+            design_ctx=design_ctx,
+        )
+        if context_length is not None:
+            ctx = min(ctx, context_length)
+        if self.max_context is not None:
+            ctx = min(ctx, self.max_context)
+        return ctx
+
+    # ── planning passes ──
+
+    def _mmproj_drop_pass(self) -> dict[str, bool]:
+        """Decide per chat model whether the main entry keeps its mmproj.
+
+        A model keeps vision when it reaches the minimum useful context WITH
+        the projection loaded; otherwise the main entry drops it (a best-effort
+        vision variant is emitted later).  Uses the global spare and fleet
+        defaults; per-profile spare still bounds ctx per group.
+        """
+        drop: dict[str, bool] = {}
+        global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
+        for model in self.models:
+            if model.role in ("embeddings", "rerank"):
+                continue
+            if not (model.mmproj and model.mmproj.gguf_path):
+                continue
+            cache_type = model.cache_type_for(self.profiles.default_cache_type)
+            parallel = model.parallel_for(self.profiles.default_parallel)
+            ctx_with = self._bounded_ctx(
+                model, parallel=parallel, cache_type=cache_type,
+                spare_mb=global_spare_mb, include_mmproj=True)
+            if ctx_with >= self.min_context:
+                drop[model.stem] = False
+                logger.info("mmproj: keep for %s (ctx %d >= %d)",
+                            model.stem, ctx_with, self.min_context)
+                continue
+            ctx_without = self._bounded_ctx(
+                model, parallel=parallel, cache_type=cache_type,
+                spare_mb=global_spare_mb, include_mmproj=False)
+            drop[model.stem] = True
+            logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
+                        model.stem, ctx_with, self.min_context, ctx_without)
+            if ctx_without < self.min_context:
+                logger.warning("mmproj: %s cannot reach %d context even without "
+                               "vision (text ctx %d)",
+                               model.stem, self.min_context, ctx_without)
+        return drop
+
+    def _solve_matrix(self, drop_stems: set[str]) -> int | None:
+        """Shared chat context when a matrix section is configured."""
+        if not (self.matrix_cfg and self.embed_model and self.rerank_model):
+            return None
+        chat_ctx = _solve_matrix_context(
+            self.models, self.embed_model, self.rerank_model,
+            self.fit_bin, self.vram_total, self.spare, self.profiles,
+            baseline_mb=self.baseline_mb, drop_stems=drop_stems,
+        )
+        if chat_ctx is not None:
+            logger.info("matrix: solved chat_ctx=%d", chat_ctx)
+        return chat_ctx
+
+    def plan(self) -> dict[str, list[Variant]]:
+        """Plan serving variants for every model, keyed by stem.
+
+        Order matters: the mmproj drop decision runs first (its result feeds
+        the matrix solve), then per-model variants are grouped by profile.
+        """
+        drop_mmproj = self._mmproj_drop_pass()
+        self.chat_ctx = self._solve_matrix({s for s, d in drop_mmproj.items() if d})
+
+        plan: dict[str, list[Variant]] = {}
+        for model in self.models:
+            context_length = model.design_context
+            include_mmproj = not drop_mmproj.get(model.stem, False)
+
+            groups = self.profiles.groups_for(model, self.vram_total, self.spare)
+            variants: list[Variant] = []
+            for (parallel, cache_type, spare_mb), group in groups.items():
+                ctx_size = self._bounded_ctx(
+                    model, parallel=parallel, cache_type=cache_type,
+                    spare_mb=spare_mb, include_mmproj=include_mmproj,
+                    design_ctx=self.chat_ctx, context_length=context_length)
+
+                vision_ctx: int | None = None
+                if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
+                    vision_ctx = self._bounded_ctx(
+                        model, parallel=parallel, cache_type=cache_type,
+                        spare_mb=spare_mb, include_mmproj=True,
+                        design_ctx=self.chat_ctx, context_length=context_length)
+
+                variants.append(Variant(
+                    parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
+                    profiles_group=group, ctx_size=ctx_size,
+                    include_mmproj=include_mmproj, vision_ctx=vision_ctx))
+            plan[model.stem] = variants
+        return plan
+
+
+def _static_params(model: Model, fit_bin: str, cache_type: str,
+                   parallel: int) -> tuple[int, float, int] | None:
+    """(model_mib, ctx_factor, compute_mib) triple, or None when unmeasurable."""
+    fp = model.vram.fit_params_static(fit_bin, cache_type=cache_type,
+                                      parallel=parallel)
+    return (fp.model_mib, fp.ctx_factor, fp.compute_mib) if fp else None
+
+
 def _solve_matrix_context(
     chat_models: list[Model],
     embed_model: Model,
@@ -289,7 +474,7 @@ def _solve_matrix_context(
     fit_bin: str,
     vram_total: int,
     spare: str | None,
-    defaults: dict,
+    profiles: Profiles,
     baseline_mb: int = 0,
     drop_stems: set[str] | None = None,
 ) -> int | None:
@@ -305,18 +490,13 @@ def _solve_matrix_context(
     ``drop_stems`` is the set of chat-model stems whose mmproj is being skipped
     to reach the minimum useful context (their combined budget omits mmproj).
     """
-    # Resolve global spare
-    spare_mb = 0
-    if spare:
-        spare_mb = utils.parse_mem_mb(str(spare), vram_total)
+    spare_mb = parse_spare_mb(spare, vram_total)
 
     drop_stems = drop_stems or set()
-    cache_type = str(defaults.get("cache_type", "q8_0"))
-    parallel = int(defaults.get("parallel", 1))
 
     # Get static params for chat models (companion VRAM folded in).
     # The drop decision (mmproj skipped to reach the min useful context) is
-    # decided in build_config and threaded in via drop_stems.
+    # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     chat_params = []
     for m in chat_models:
         # Embed/rerank models are handled via the separate overhead terms below
@@ -325,6 +505,8 @@ def _solve_matrix_context(
         # chat context for the whole fleet.
         if m.role in ("embeddings", "rerank") or m.on_cpu:
             continue
+        cache_type = m.cache_type_for(profiles.default_cache_type)
+        parallel = m.parallel_for(profiles.default_parallel)
         fp = m.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
                                      include_mmproj=m.stem not in drop_stems)
         if fp is None:
@@ -338,12 +520,14 @@ def _solve_matrix_context(
     # Get static params for embed/rerank. CPU-resident models cost 0 VRAM.
     embed_params = None
     if not embed_model.on_cpu:
-        embed_fp = embed_model.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-        embed_params = (embed_fp.model_mib, embed_fp.ctx_factor, embed_fp.compute_mib) if embed_fp else None
+        embed_params = _static_params(embed_model, fit_bin,
+                                      profiles.default_cache_type,
+                                      profiles.default_parallel)
     rerank_params = None
     if not rerank_model.on_cpu:
-        rerank_fp = rerank_model.vram.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-        rerank_params = (rerank_fp.model_mib, rerank_fp.ctx_factor, rerank_fp.compute_mib) if rerank_fp else None
+        rerank_params = _static_params(rerank_model, fit_bin,
+                                       profiles.default_cache_type,
+                                       profiles.default_parallel)
 
     # Use conservative context defaults for embed/rerank if not specified
     embed_ctx = 8192  # typical embed context
@@ -361,9 +545,56 @@ def _solve_matrix_context(
     )
 
 
+# ── Emission ──────────────────────────────────────────────────────────────
+
+
+def emit_config(models: list[Model], plan: dict[str, list[Variant]],
+                profiles: Profiles, template_vars: dict) -> dict:
+    """Render planned :class:`Variant`s into the llama-swap config dict.
+
+    Pure transformation — no VRAM math, no I/O. Each variant becomes one
+    entry; a variant with ``vision_ctx`` additionally emits a best-effort
+    vision companion entry, id-suffixed ``-vision-<N>k`` where
+    ``N = vision_ctx // 1000`` (e.g. 92567 → ``-vision-92k``).
+    """
+    entries: dict[str, dict] = {}
+    for model in models:
+        context_length = model.design_context
+        for v in plan.get(model.stem, []):
+            entry_id, entry = _build_entry(
+                model, v.parallel, v.cache_type, v.profiles_group,
+                profiles.defaults, template_vars, context_length, v.ctx_size,
+                include_mmproj=v.include_mmproj,
+            )
+            entries[entry_id] = entry
+
+            if v.vision_ctx is None:
+                continue
+            n_k = v.vision_ctx // 1000
+            vision_id, vision_entry = _build_entry(
+                model, v.parallel, v.cache_type, v.profiles_group,
+                profiles.defaults, template_vars, context_length, v.vision_ctx,
+                include_mmproj=True,
+                name_suffix=f" [vision {n_k}k]",
+            )
+            entries[f"{vision_id}-vision-{n_k}k"] = vision_entry
+
+    config: dict = {}
+    config["models"] = {
+        eid: entries[eid]
+        for eid in sorted(entries, key=lambda e: (e.count("."), e))
+    }
+
+    # Present setParamsByID aliases (e.g. "<id>:<mode>") in the /v1/models
+    # listing so dynamic-list clients (OpenWebUI, OpenClaw, ...) can select
+    # them. Default in llama-swap is false and aliases would be invisible.
+    config["includeAliasesInList"] = True
+    return config
+
+
 def build_config(
     models: list[Model],
-    profiles_cfg: dict,
+    profiles_cfg: dict | Profiles,
     template_vars: dict,
     fit_bin: str,
     vram_total: int,
@@ -377,10 +608,13 @@ def build_config(
 ) -> dict:
     """Build llama-swap config from list of Model objects.
 
+    Composes the pipeline: validate/filter models, plan serving variants
+    (:class:`Planner`), render entries (:func:`emit_config`).
+
     Args:
         models: List of Model instances
-        profiles_cfg: Full profiles.yaml config
-        template_vars: Template variables (llama_bin, models_dir)
+        profiles_cfg: Full profiles.yaml config (or a prepared Profiles object)
+        template_vars: Template variables (llama_bin, models_dirs)
         fit_bin: Path to llama-fit-params binary
         vram_total: Total VRAM in MB
         spare: Global spare VRAM string (overridden by profile.spare if present)
@@ -394,185 +628,20 @@ def build_config(
             projection is dropped from the main entry (a ``vision-<N>k`` variant
             is emitted instead, still exposing vision at best-effort context).
     """
-    defaults = profiles_cfg.get("defaults", {})
-    profile_list = profiles_cfg.get("profiles", {})
+    profiles = profiles_cfg if isinstance(profiles_cfg, Profiles) else Profiles(profiles_cfg)
 
-    entries: dict[str, dict] = {}
-
-    # ── Pre-pass FIRST: drop unsupported / unresolvable models ──
-    # Must run before any VRAM work: rejected models must not consume
+    # Validate BEFORE any VRAM work: rejected models must not consume
     # fit-params runs or pollute the shared matrix context solve.
-    models = _filter_supported(models)
+    supported = _filter_supported(models, profiles.default_cache_type)
 
-    # ── Pre-pass: decide mmproj drop per chat model ──
-    # A chat model keeps mmproj if it can reach the minimum useful context WITH
-    # vision; otherwise the main entry drops it and a best-effort vision variant
-    # is emitted.  The decision uses the global spare and default cache/parallel;
-    # per-profile spare overrides still bound ctx via calc_ctx per group.
-    global_spare_mb = 0
-    global_spare_str = defaults.get("spare") or spare
-    if global_spare_str:
-        global_spare_mb = utils.parse_mem_mb(str(global_spare_str), vram_total)
-    default_cache_type = str(defaults.get("cache_type", "q8_0"))
-    default_parallel = int(defaults.get("parallel", 1))
-
-    # stem -> True when the main entry should omit mmproj
-    drop_mmproj: dict[str, bool] = {}
-    for model in models:
-        if model.role in ("embeddings", "rerank"):
-            continue
-        if not (model.mmproj and model.mmproj.gguf_path):
-            continue
-        ctx_with = model.vram.calc_ctx(
-            vram_total, fit_bin=fit_bin, parallel=default_parallel,
-            spare_mb=global_spare_mb, include_mmproj=True,
-            baseline_mb=baseline_mb, cache_type=default_cache_type,
-        )
-        if max_context is not None:
-            ctx_with = min(ctx_with, max_context)
-        if ctx_with >= min_context:
-            drop_mmproj[model.stem] = False
-            logger.info("mmproj: keep for %s (ctx %d >= %d)", model.stem, ctx_with, min_context)
-            continue
-        ctx_without = model.vram.calc_ctx(
-            vram_total, fit_bin=fit_bin, parallel=default_parallel,
-            spare_mb=global_spare_mb, include_mmproj=False,
-            baseline_mb=baseline_mb, cache_type=default_cache_type,
-        )
-        if max_context is not None:
-            ctx_without = min(ctx_without, max_context)
-        drop_mmproj[model.stem] = True
-        logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
-                    model.stem, ctx_with, min_context, ctx_without)
-        if ctx_without < min_context:
-            logger.warning("mmproj: %s cannot reach %d context even without vision "
-                           "(text ctx %d)", model.stem, min_context, ctx_without)
-
-    # ── Pre-pass: solve matrix context if configured ──
-    matrix_chat_ctx: int | None = None
-    if matrix_cfg and embed_model and rerank_model:
-        matrix_chat_ctx = _solve_matrix_context(
-            models, embed_model, rerank_model,
-            fit_bin, vram_total, spare, defaults,
-            baseline_mb=baseline_mb, drop_stems={s for s, d in drop_mmproj.items() if d},
-        )
-        if matrix_chat_ctx is not None:
-            logger.info("matrix: solved chat_ctx=%d", matrix_chat_ctx)
-
-    for model in models:
-        # Use GGUF architectural max as the effective context limit.
-        # Falls back to sidecar context_length, then default.
-        context_length = model.design_context
-
-        # Whether this model's main entry keeps or drops mmproj
-        include_mmproj = not drop_mmproj.get(model.stem, False)
-
-        # Filter profiles by model's allow_profiles
-        filtered_profiles = _filter_profiles(profile_list, model.allow_profiles)
-
-        # Resolve reasoning variants
-        reasoning_variants = _resolve_reasoning_cli_args(model.cli_args, model.reasoning)
-
-        for variant_cli_args, variant_suffix in reasoning_variants:
-            # Deep-copy frontmatter so each variant has independent cli_args
-            variant_fm = copy.deepcopy(model.frontmatter)
-            variant_fm["cli_args"] = variant_cli_args
-
-            # Group by (parallel, cache_type, spare_mb)
-            groups: dict[tuple, list] = {}
-            for pname, pover in filtered_profiles:
-                resolved_profile = utils.resolve_params(pover, defaults)
-                parallel_val = variant_fm.get("parallel", resolved_profile.get("parallel", 1))
-                cache_type_val = str(resolved_profile.get("cache_type", "q8_0"))
-
-                # Resolve spare for this profile
-                profile_spare_str = resolved_profile.get("spare") or spare
-                if profile_spare_str:
-                    profile_spare_mb = utils.parse_mem_mb(str(profile_spare_str), vram_total)
-                else:
-                    profile_spare_mb = 0
-
-                gkey = (int(parallel_val), cache_type_val, profile_spare_mb)
-                groups.setdefault(gkey, []).append((pname, resolved_profile))
-
-            # If no profiles matched, generate a single entry with defaults
-            if not groups:
-                default_spare_str = defaults.get("spare") or spare
-                default_spare_mb = utils.parse_mem_mb(str(default_spare_str), vram_total) if default_spare_str else 0
-                groups = {
-                    (int(variant_fm.get("parallel", 1)), str(defaults.get("cache_type", "q8_0")), default_spare_mb): [
-                        ("default", dict(defaults)),
-                    ],
-                }
-
-            for (parallel, cache_type, spare_mb), profiles_group in groups.items():
-                # Use matrix-solved context as design context if available
-                design_ctx = matrix_chat_ctx if matrix_chat_ctx else None
-
-                # Main entry (possibly without mmproj)
-                ctx_size = model.vram.calc_ctx(
-                    vram_total,
-                    fit_bin=fit_bin,
-                    parallel=parallel,
-                    spare_mb=spare_mb,
-                    include_mmproj=include_mmproj,
-                    baseline_mb=baseline_mb,
-                    cache_type=cache_type,
-                    design_ctx=design_ctx,
-                )
-                ctx_size = min(ctx_size, context_length)
-                if max_context is not None:
-                    ctx_size = min(ctx_size, max_context)
-
-                entry_id, entry = _build_entry(
-                    model, parallel, cache_type, profiles_group,
-                    defaults, template_vars, context_length, ctx_size,
-                    include_mmproj=include_mmproj,
-                )
-                if variant_suffix:
-                    entry_id = entry_id + variant_suffix
-                entries[entry_id] = entry
-
-                # Vision variant: emitted when mmproj was dropped from the main
-                # entry. Best-effort context WITH vision; id ``-vision-<N>k``
-                # where N = context // 1000 (e.g. 92567 -> vision-92k).
-                if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
-                    vision_ctx = model.vram.calc_ctx(
-                        vram_total,
-                        fit_bin=fit_bin,
-                        parallel=parallel,
-                        spare_mb=spare_mb,
-                        include_mmproj=True,
-                        baseline_mb=baseline_mb,
-                        cache_type=cache_type,
-                        design_ctx=design_ctx,
-                    )
-                    vision_ctx = min(vision_ctx, context_length)
-                    if max_context is not None:
-                        vision_ctx = min(vision_ctx, max_context)
-                    n_k = vision_ctx // 1000
-                    vision_id, vision_entry = _build_entry(
-                        model, parallel, cache_type, profiles_group,
-                        defaults, template_vars, context_length, vision_ctx,
-                        include_mmproj=True,
-                        name_suffix=f" [vision {n_k}k]",
-                    )
-                    vision_id = f"{vision_id}-vision-{n_k}k"
-                    if variant_suffix:
-                        vision_id = vision_id + variant_suffix
-                    entries[vision_id] = vision_entry
-
-    config: dict = {}
-    config["models"] = {
-        eid: entries[eid]
-        for eid in sorted(entries, key=lambda e: (e.count("."), e))
-    }
-
-    # Present setParamsByID aliases (e.g. "<id>:<mode>") in the /v1/models
-    # listing so dynamic-list clients (OpenWebUI, OpenClaw, ...) can select
-    # them. Default in llama-swap is false and aliases would be invisible.
-    config["includeAliasesInList"] = True
-    return config
+    planner = Planner(
+        supported, profiles, fit_bin, vram_total,
+        spare=spare, max_context=max_context,
+        matrix_cfg=matrix_cfg, embed_model=embed_model,
+        rerank_model=rerank_model, baseline_mb=baseline_mb,
+        min_context=min_context,
+    )
+    return emit_config(supported, planner.plan(), profiles, template_vars)
 
 
 def write_yaml(config: dict, path: Path | str) -> None:

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # metadata only (no server-side flag exists for it).
 SETTING_KEYS = frozenset({
     "backend", "hf_repo", "chat_template", "chat_template_kwargs",
-    "loras", "cli_args",
+    "loras", "cli_args", "reasoning-format", "reasoning-preserve",
 })
 FRAMEWORK_CONSUMED = frozenset({"backend"})
 METADATA_ONLY = frozenset({"chat_template_kwargs"})

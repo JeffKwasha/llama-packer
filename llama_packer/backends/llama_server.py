@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
@@ -19,7 +20,10 @@ class LlamaServerBackend(BaseBackend):
     name = "llama-server"
     formats = frozenset({".gguf"})
     roles = frozenset({"chat", "embeddings", "rerank"})
-    handles = frozenset({"cli_args", "chat_template", "loras"})
+    handles = frozenset({
+        "cli_args", "chat_template", "loras",
+        "reasoning-format", "reasoning-preserve",
+    })
 
     # Per-role server-mode flags, appended after the shared core arguments.
     _ROLE_FLAGS = {
@@ -54,37 +58,45 @@ class LlamaServerBackend(BaseBackend):
         tvars: dict,
         include_mmproj: bool = True,
     ) -> tuple[str, dict]:
-        parts = [
-            tvars.get("llama_bin", ""),
-            "--port ${PORT}",
+        flags = [
+            "--port", "${PORT}",
             "-m", str(model.gguf_path),
             "-c", str(ctx_size),
             "--parallel", str(parallel),
             "--cache-type-k", cache_type,
             "--cache-type-v", cache_type,
+            "--n-gpu-layers", ("0" if model.on_cpu else "999"),
         ]
-        n_gpu_layers = "--n-gpu-layers 0" if model.on_cpu else "--n-gpu-layers 999"
-        parts.append(n_gpu_layers)
 
         role_flags = self._ROLE_FLAGS.get(model.role)
         if role_flags:
-            parts.append(role_flags)
+            flags += shlex.split(role_flags)
 
         mtp_args, meta = self._mtp_args(model)
-        parts += mtp_args
+        flags += mtp_args
 
         if include_mmproj and model.mmproj and model.mmproj.gguf_path:
-            parts += ["--mmproj", str(model.mmproj.gguf_path)]
+            flags += ["--mmproj", str(model.mmproj.gguf_path)]
 
         ct = model.resolved_chat_template
         if ct is not None:
-            parts += ["--jinja", "--chat-template-file", str(ct)]
+            flags += ["--jinja", "--chat-template-file", str(ct)]
 
-        for lora in model.resolved_loras:
-            parts += ["--lora", str(lora)]
+        loras = model.resolved_loras
+        if loras:
+            # llama-server accepts a single --lora with comma-separated adapters.
+            flags += ["--lora", ",".join(str(l) for l in loras)]
+
+        # Reasoning flags are only meaningful for chat models.
+        if model.role == "chat":
+            rf = model.reasoning_format
+            if rf is not None:
+                flags += ["--reasoning-format", rf]
+            if model.reasoning_preserve:
+                flags += ["--reasoning-preserve"]
 
         cli_args = (model.frontmatter.get("cli_args") or "").strip()
-        if cli_args:
-            parts.append(cli_args)
-
-        return " ".join(p for p in parts if p), meta
+        cmd = utils.render_command(
+            [tvars.get("llama_bin", "")], flags, cli_args,
+        )
+        return cmd, meta

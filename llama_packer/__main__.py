@@ -16,9 +16,10 @@ import yaml
 
 from llama_packer import Model, __version__, find_bin_dir
 from llama_packer.hardware import GpuProfile
+from llama_packer.profiles import Profiles
 from llama_packer.utils import (
     _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
-    parse_mem_mb, _RESERVE_SYSTEM, _RESERVE_VIDEO,
+    _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
@@ -61,7 +62,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
                         help="Show llama-packer version and exit")
     parser.add_argument("--llama-server", help="Explicit path to llama-server binary")
-    parser.add_argument("--models-dir", default="models", help="Model directory (default: ./models)")
+    parser.add_argument("--models-dir", nargs="+", default=["models"],
+                        help="Model directory (default: ./models); pass multiple to scan several")
+    parser.add_argument("--hf-home", help="HF cache root for path grouping "
+                        "(overrides $HF_HOME / $HUGGINGFACE_HUB_CACHE; used to keep "
+                        "chat-template/LoRA paths out of ${MODELS_DIR})")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
     parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
     parser.add_argument("--agents", action="store_true",
@@ -127,7 +132,7 @@ def write_agents_md(models_dir: Path) -> None:
 
 
 def _apply_env_subst(config: dict, sub, raw_paths: list[str]) -> dict:
-    """Replace each raw emitted path in the generated cmds with its ${env.*} form."""
+    """Replace each raw emitted path in the generated cmds with its ${VAR} macro form."""
     subs = {raw: sub(raw) for raw in raw_paths}
     order = sorted(subs, key=len, reverse=True)
     for entry in config.get("models", {}).values():
@@ -183,6 +188,39 @@ def _build_matrix_vars(models: list, embed_model, rerank_model, logger) -> dict:
     return vars_
 
 
+def _health_check_timeout(models, args) -> int:
+    """Auto-calculated healthCheckTimeout when not set explicitly.
+
+    max(120, 1.2 * largest_model_mb / drive_speed_mb), raised to a 300s floor
+    when any model uses a vLLM backend (docker pull / HF download / model load
+    exceed the llama.cpp load path by minutes).
+    """
+    largest_mb = max(
+        (m.gguf_path.stat().st_size // (1024 * 1024)
+         for m in models if m.gguf_path and m.gguf_path.is_file()),
+        default=0,
+    )
+    # Resolve drive speed: CLI > env > auto-detect > default 100 MB/s
+    drive_speed = args.drive_speed
+    if drive_speed is None:
+        env_speed = os.environ.get("GEN_CONFIG_DRIVE_SPEED")
+        if env_speed:
+            try:
+                drive_speed = int(env_speed)
+            except ValueError:
+                logger.warning("GEN_CONFIG_DRIVE_SPEED=%r is not numeric; ignoring", env_speed)
+                drive_speed = None
+    if drive_speed is None:
+        model_paths = [m.gguf_path for m in models if m.gguf_path and m.gguf_path.is_file()]
+        drive_speed = _detect_drive_speed(model_paths)
+    hct = max(120, int(1.2 * largest_mb / drive_speed))
+    if any(m.backend in VLLM_BACKENDS for m in models):
+        hct = max(hct, 300)
+    logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)",
+                hct, largest_mb, drive_speed)
+    return hct
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     setup_logging(args.verbose)
@@ -190,13 +228,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.verbose:
         logger.info("llama-packer %s", __version__)
 
-    models_dir = Path(args.models_dir).absolute()
-    if not models_dir.is_dir():
-        logger.error("models directory not found: %s", models_dir)
+    models_dirs = [Path(d).absolute() for d in args.models_dir]
+    missing = [d for d in models_dirs if not d.is_dir()]
+    if missing:
+        for d in missing:
+            logger.error("models directory not found: %s", d)
         sys.exit(1)
 
     if args.agents:
-        write_agents_md(models_dir)
+        for d in models_dirs:
+            write_agents_md(d)
 
     profiles_path = Path(args.profiles).absolute()
     if not profiles_path.is_file():
@@ -211,7 +252,7 @@ def main(argv: list[str] | None = None) -> None:
     with open(profiles_path) as f:
         profiles_cfg = yaml.safe_load(f) or {}
 
-    if not profiles_cfg.get("profiles"):
+    if not Profiles(profiles_cfg).profile_list:
         logger.error("no profiles defined in profiles.yaml")
         sys.exit(1)
 
@@ -224,7 +265,11 @@ def main(argv: list[str] | None = None) -> None:
 
     fit_bin = str(Path.cwd() / bin_dir / "llama-fit-params")
 
-    template_vars = {"llama_bin": llama_bin, "models_dir": str(models_dir)}
+    template_vars = {
+        "llama_bin": llama_bin,
+        "models_dir": str(models_dirs[0]),
+        "models_dirs": [str(d) for d in models_dirs],
+    }
 
     max_ctx = None
     if args.max_context:
@@ -237,7 +282,7 @@ def main(argv: list[str] | None = None) -> None:
         min_ctx = parse_context_length(args.min_context)
 
     # Discover models
-    models = Model.from_dir(models_dir, generate_stubs=not args.no_stubs, extra_dirs=args.extra_dirs)
+    models = Model.from_dir(models_dirs, generate_stubs=not args.no_stubs, extra_dirs=args.extra_dirs)
     if not models:
         logger.error("no models found (create a .md sidecar file)")
         sys.exit(1)
@@ -254,38 +299,15 @@ def main(argv: list[str] | None = None) -> None:
     # This mutates each model's effective settings and flags invalid models
     # (unknown backend, missing files, no available backend for the format)
     # for the writer to skip.
-    apply_overrides(models, profiles_cfg, models_dir, avail={
+    apply_overrides(models, profiles_cfg, avail={
         "llama_bin": llama_bin,
         "vllm_image": vllm_image,
         "vllm_bin": vllm_bin,
     })
 
-    # Auto-calculate healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
+    # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
     if args.health_check_timeout is None:
-        largest_mb = max(
-            (m.gguf_path.stat().st_size // (1024 * 1024) for m in models if m.gguf_path and m.gguf_path.is_file()),
-            default=0,
-        )
-        # Resolve drive speed: CLI > env > auto-detect > default 100 MB/s
-        drive_speed = args.drive_speed
-        if drive_speed is None:
-            env_speed = os.environ.get("GEN_CONFIG_DRIVE_SPEED")
-            if env_speed:
-                try:
-                    drive_speed = int(env_speed)
-                except ValueError:
-                    logger.warning("GEN_CONFIG_DRIVE_SPEED=%r is not numeric; ignoring", env_speed)
-                    drive_speed = None
-        if drive_speed is None:
-            model_paths = [m.gguf_path for m in models if m.gguf_path and m.gguf_path.is_file()]
-            drive_speed = _detect_drive_speed(model_paths)
-        hct = max(120, int(1.2 * largest_mb / drive_speed))
-        # vLLM cold starts (docker image pull, HF download, model load) exceed
-        # the llama.cpp load path by minutes — raise the floor when any model
-        # uses a vLLM backend.
-        if any(m.backend in VLLM_BACKENDS for m in models):
-            hct = max(hct, 300)
-        logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)", hct, largest_mb, drive_speed)
+        hct = _health_check_timeout(models, args)
     else:
         hct = args.health_check_timeout
 
@@ -316,7 +338,7 @@ def main(argv: list[str] | None = None) -> None:
             raw_paths.append(str(ct))
         for _lora in _m.resolved_loras:
             raw_paths.append(str(_lora))
-    prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin)
+    prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin, hf_home=args.hf_home)
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
 
@@ -332,10 +354,7 @@ def main(argv: list[str] | None = None) -> None:
     if vllm_cfg.get("gpu_mem_util") is not None:
         template_vars["gpu_mem_util"] = str(vllm_cfg["gpu_mem_util"])
     else:
-        spare_mb = 0
-        global_spare = (profiles_cfg.get("defaults", {}).get("spare") or args.spare)
-        if global_spare:
-            spare_mb = parse_mem_mb(str(global_spare), gpu.vram_mb)
+        spare_mb = Profiles(profiles_cfg).global_spare_mb(args.spare, gpu.vram_mb)
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, gpu.baseline_mb)
         available = gpu.vram_mb - reserve - spare_mb
         if gpu.vram_mb > 0:
@@ -365,7 +384,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Build config
     config = build_config(
-        models, profiles_cfg, template_vars, fit_bin, gpu.vram_mb,
+        models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
         spare=args.spare, max_context=max_ctx,
         matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
         baseline_mb=gpu.baseline_mb,
