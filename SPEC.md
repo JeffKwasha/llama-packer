@@ -66,6 +66,19 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
 
+**Profile entries** (each value under `profiles:`) may set:
+
+- any **sampling key** from `SAMPLING_KEYS` (`temperature`, `top_p`, `top_k`,
+  `min_p`, `pres_pen`, `repeat_penalty`, `freq_pen`), including
+  `"base * N"` expressions resolved against `defaults`
+- `cache_type` — KV precision for this variant (see
+  [Cache precision](#cache-precision-cache_type)); differing values split a
+  model into separate entries
+- `parallel` — slot count for this variant (same splitting behavior)
+- `spare` — additional VRAM reserved for this variant (overrides CLI
+  `--spare`; see [Context calculation formula](#context-calculation-formula))
+- `description` — free-text label (documentation only)
+
 ## Hardware Detection
 
 VRAM is detected via a vendor-probe chain in `llama_packer/hardware.py`:
