@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, ClassVar
 import yaml
 
 from llama_packer import utils
+from llama_packer.backends import DEFAULT_BACKEND
 
 if TYPE_CHECKING:
     from llama_packer.vram import VramBudget
@@ -27,11 +28,12 @@ class Model:
 
     # Frontmatter keys this Model consumes (not passed through to metadata)
     FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "name", "template", "context_length", "description", "cli_args", "model",
+        "name", "context_length", "description", "cli_args", "model",
+        "backend", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
         "attention", "kv_cache", "tool_args", "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "role", "targets", "allow_profiles", "reasoning", "spare", "capabilities",
-        "ignore", "device", "concurrency", "fit-params",
+        "ignore", "device", "concurrency", "fit-params", "vllm_image",
         "modes", "default_mode",
     })
 
@@ -283,18 +285,32 @@ class Model:
         return self.frontmatter.get("name", self.stem)
 
     @property
-    def template(self) -> str:
-        # Prefer an explicit template, else derive from the role
-        # (e.g. role: embeddings -> "embeddings" template).
-        explicit = self.frontmatter.get("template")
-        if explicit:
-            return explicit
-        return self.role
+    def backend(self) -> str:
+        """Serving engine for this model.
+
+        Resolved from the sidecar / override ``backend:`` setting.  When
+        neither declares one, ``apply_overrides`` infers the backend from the
+        file format (GGUF → llama-server, safetensors/HF-repo → vLLM docker;
+        see ``backends.infer_backend``).  This property's fallback exists only
+        for Models used outside the normal pipeline.
+        """
+        return str(self.frontmatter.get("backend") or DEFAULT_BACKEND)
 
     @property
-    def is_vllm(self) -> bool:
-        """True when this model is served by a vLLM backend (binary or docker)."""
-        return self.template in ("vllm", "vllm-docker")
+    def resolved_chat_template(self) -> Path | None:
+        """Absolute path to the resolved chat-template file, or None."""
+        return getattr(self, "_resolved_chat_template", None)
+
+    @property
+    def resolved_loras(self) -> list:
+        """Absolute paths to resolved LoRA adapter files."""
+        return getattr(self, "_resolved_loras", [])
+
+    @property
+    def chat_template_kwargs(self) -> dict | None:
+        """Declared chat-template kwargs exposed to clients (per-request use)."""
+        kw = self.frontmatter.get("chat_template_kwargs")
+        return dict(kw) if isinstance(kw, dict) else None
 
     @property
     def parallel(self) -> int:
@@ -357,11 +373,6 @@ class Model:
         when the sidecar does not declare one explicitly.
         """
         return str(self.frontmatter.get("role") or "chat")
-
-    @property
-    def type(self) -> str:
-        """Model type used for selection/grouping: the model's role."""
-        return self.role
 
     @property
     def vllm_image(self) -> str | None:
@@ -474,7 +485,7 @@ class Model:
         """
         meta: dict = {}
         for k, v in self.frontmatter.items():
-            if k in self.FIELDS or k == "template" or _CL_RE.match(k):
+            if k in self.FIELDS or _CL_RE.match(k):
                 continue
             if v is None or v == "" or (isinstance(v, (list, dict)) and len(v) == 0):
                 continue

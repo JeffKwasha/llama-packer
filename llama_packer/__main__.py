@@ -23,6 +23,8 @@ from llama_packer.utils import (
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
 from llama_packer.writer import build_config, write_yaml
+from llama_packer.overrides import apply_overrides
+from llama_packer.backends import VLLM_BACKENDS
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -89,9 +91,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--verbose", "-V", action="count", default=0, help="Increase verbosity (-V: info, -VV: debug)")
     parser.add_argument("--embed", help="Substring selector for the embedder; else smallest embed-type model")
     parser.add_argument("--rerank", help="Substring selector for the reranker; else smallest rerank-type model")
-    parser.add_argument("--vllm-image", help="vLLM docker image for `template: vllm-docker` models "
+    parser.add_argument("--vllm-image", help="vLLM docker image for `vllm-docker` backend models "
                          "(overrides profiles.yaml vllm.image)")
-    parser.add_argument("--vllm-server", help="vLLM binary for `template: vllm` models "
+    parser.add_argument("--vllm-server", help="vLLM binary for `vllm` backend models "
                          "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
     return parser.parse_args(argv[1:] if argv else None)
 
@@ -241,6 +243,23 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     logger.info("models: %d found", len(models))
 
+    # vLLM resource configuration (CLI > profiles.yaml `vllm:` section >
+    # built-in constants).  Resolved *before* apply_overrides so backend
+    # inference knows whether a vLLM backend can actually run.
+    vllm_cfg = profiles_cfg.get("vllm") or {}
+    vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
+    vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
+
+    # Apply profile override rules (backend/chat-template/lora/hf_repo/cli_args).
+    # This mutates each model's effective settings and flags invalid models
+    # (unknown backend, missing files, no available backend for the format)
+    # for the writer to skip.
+    apply_overrides(models, profiles_cfg, models_dir, avail={
+        "llama_bin": llama_bin,
+        "vllm_image": vllm_image,
+        "vllm_bin": vllm_bin,
+    })
+
     # Auto-calculate healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
     if args.health_check_timeout is None:
         largest_mb = max(
@@ -264,7 +283,7 @@ def main(argv: list[str] | None = None) -> None:
         # vLLM cold starts (docker image pull, HF download, model load) exceed
         # the llama.cpp load path by minutes — raise the floor when any model
         # uses a vLLM backend.
-        if any(m.is_vllm for m in models):
+        if any(m.backend in VLLM_BACKENDS for m in models):
             hct = max(hct, 300)
         logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)", hct, largest_mb, drive_speed)
     else:
@@ -284,29 +303,27 @@ def main(argv: list[str] | None = None) -> None:
     # then substitute them into the binary path and post-process the config.
     raw_paths = [llama_bin, fit_bin]
     for _m in models:
+        if getattr(_m, "_override_error", None):
+            continue
         if _m.gguf_path:
             raw_paths.append(str(_m.gguf_path))
         if _m.mmproj and _m.mmproj.gguf_path:
             raw_paths.append(str(_m.mmproj.gguf_path))
         if _m.mtp and _m.mtp.gguf_path:
             raw_paths.append(str(_m.mtp.gguf_path))
+        ct = _m.resolved_chat_template
+        if ct is not None:
+            raw_paths.append(str(ct))
+        for _lora in _m.resolved_loras:
+            raw_paths.append(str(_lora))
     prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin)
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
 
-    # vLLM backend defaults: CLI --vllm-image / --vllm-server > profiles.yaml
-    # `vllm:` section > built-in constants.
-    vllm_cfg = profiles_cfg.get("vllm") or {}
-    if args.vllm_image:
-        template_vars["vllm_image"] = args.vllm_image
-    else:
-        template_vars["vllm_image"] = (
-            vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE
-        )
-    if args.vllm_server:
-        template_vars["vllm_bin"] = args.vllm_server
-    else:
-        template_vars["vllm_bin"] = str(vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
+    # vLLM backend defaults: already resolved above (CLI > profiles.yaml >
+    # built-in constants) for backend inference.
+    template_vars["vllm_image"] = vllm_image
+    template_vars["vllm_bin"] = vllm_bin
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
     # gpu_mem_util: explicit profiles.yaml value wins; otherwise derive the

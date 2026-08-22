@@ -1,5 +1,5 @@
 # llama_packer/vllm_estimate.py
-"""vLLM memory estimation for ``template: vllm`` / ``template: vllm-docker``.
+"""vLLM memory estimation for the ``vllm`` / ``vllm-docker`` backends.
 
 llama.cpp models are measured by ``llama-fit-params``; vLLM has no equivalent
 binary.  Instead we use the optional ``vllm-memory-estimator`` package, which

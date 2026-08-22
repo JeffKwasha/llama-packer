@@ -10,19 +10,22 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Modules
 
-- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`hf_repo`, `vllm_image`, `modes`, `role`, ...), companion resolution
-- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config`, `_build_entry`, full-`cmd` template branch, filters.setParamsByID/modes, matrix solver
+- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, ...), companion resolution
+- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config`, `_build_entry`, backend delegation, filters.setParamsByID/modes, matrix solver
+- [`llama_packer/backends/`](llama_packer/backends/) — backend package: `base` (ABC + support matrix + `is_available`), `llama_server`, `vllm` (host + docker); `BACKENDS` registry, `infer_backend`, `VLLM_BACKENDS`, `get_backend`
+- [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
 - [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` fit-params, `solve_matrix_ctx`
 - [`llama_packer/vllm_estimate.py`](llama_packer/vllm_estimate.py) — vLLM memory estimation via `vllm-memory-estimator` (+ safetensors fallback)
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
-- [`llama_packer/utils.py`](llama_packer/utils.py) — `_TARGET_TEMPLATES` (+ `vllm`, `vllm-docker`), `VLLM_DEFAULT_*`, sampling keys, discovery/slugify/params
+- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, discovery/slugify/params
 
-## Backends (templates)
+## Backends
 
-- llama-server — link roles `chat`/`embeddings`/`rerank` → `_TARGET_TEMPLATES`
-- vLLM — `template: vllm` on a chat sidecar → `vllm serve` (host binary)
-- vLLM docker — `template: vllm-docker` on a chat sidecar → `docker run ... vllm serve`
-- See SPEC.md "vLLM Backend" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
+- llama-server — GGUF chat/embeddings/rerank; role flags, MTP, mmproj, chat-template, LoRA
+- vLLM — safetensors / `hf_repo`; `vllm serve` (host binary)
+- vLLM docker — same, wrapped in `docker run` with bind-mounts for chat-template/lora dirs; per-model `vllm_image:` override
+- Backend selection: sidecar/override `backend:` wins; else inferred from file format (`.gguf` → llama-server, safetensors/HF-repo → vllm-docker) gated by configured resources (see SPEC.md "Override Rules")
+- See SPEC.md "vLLM Backend" + "Override Rules" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
 
 ## Docs
 

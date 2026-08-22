@@ -14,6 +14,12 @@ from llama_packer.model import Model, _CL_RE
 from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
+from llama_packer.backends import (
+    SETTING_KEYS,
+    FRAMEWORK_CONSUMED,
+    METADATA_ONLY,
+    get_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +30,32 @@ _SPARE_KEY = "spare"
 def _strip_repeat_ws(text: str) -> str:
     """Collapse runs of whitespace to single spaces (templates with | blocks)."""
     return " ".join(text.split())
+
+
+def _filter_supported(models: list[Model]) -> list[Model]:
+    """Drop models whose backend cannot serve them (format/role mismatch).
+
+    Models already flagged by ``apply_overrides`` (unknown backend, missing
+    chat-template/LoRA files) are skipped too.  Unsupported combos log an error;
+    settings a backend recognizes but cannot render (e.g. ``loras`` on vLLM) log
+    a warning.  Returns the supported subset.
+    """
+    supported: list[Model] = []
+    for model in models:
+        err = getattr(model, "_override_error", None)
+        if err:
+            # Already logged (and the model flagged) by apply_overrides.
+            continue
+        backend = get_backend(model.backend)
+        reason = backend.unsupported_reason(model)
+        if reason:
+            logger.error("skipping %s: %s backend cannot serve it: %s",
+                         model.stem, backend.name, reason)
+            continue
+        declared = {k for k in SETTING_KEYS if k in model.frontmatter}
+        backend.warn_unhandled(declared - FRAMEWORK_CONSUMED - METADATA_ONLY)
+        supported.append(model)
+    return supported
 
 
 def _filter_profiles(profile_list: dict, allow_profiles) -> list[tuple[str, dict]]:
@@ -72,53 +104,6 @@ def _resolve_reasoning_cli_args(cli_args: str, reasoning: str | None) -> list[tu
     if "--reasoning" not in args:
         args = (args + f" --reasoning {reasoning}").strip()
     return [(args, "")]
-
-
-def _build_mtp_args(
-    model: Model,
-) -> tuple[str, bool, int, str | None]:
-    """Build MTP CLI arguments for a model.
-
-    Returns:
-        (cli_arg_str, mtp_enabled, mtp_n_max, draft_path)
-    """
-    has_mtp = model.frontmatter.get("mtp")
-    speculative = model.frontmatter.get("speculative")
-
-    # If no MTP at all
-    if not has_mtp and not speculative:
-        return "", False, utils._MTP_DRAFT_N_MAX, None
-
-    # If baked-in MTP (no companion file)
-    if has_mtp and not speculative:
-        n_max = model.frontmatter.get("mtp_draft_n_max", utils._MTP_DRAFT_N_MAX)
-        spec_type = model.frontmatter.get("mtp_spec_type", utils._MTP_SPEC_TYPE)
-        args = f"--spec-type {spec_type} --spec-draft-n-max {n_max}"
-        return args, True, n_max, None
-
-    # If companion MTP
-    if speculative and "mtp" in Path(speculative).stem.lower():
-        if not model.gguf_path:
-            return "", False, utils._MTP_DRAFT_N_MAX, None
-        # Search in both .gguf parent and .md parent
-        companion = None
-        for d in [model.gguf_path.parent, model.md_path.parent]:
-            candidate = d / speculative
-            if candidate.is_file():
-                companion = candidate
-                break
-        if companion:
-            n_max = model.frontmatter.get("mtp_draft_n_max", utils._MTP_DRAFT_N_MAX)
-            spec_type = model.frontmatter.get("mtp_spec_type", utils._MTP_SPEC_TYPE)
-            draft_path = str(companion)
-            args = f"--spec-type {spec_type} --spec-draft-n-max {n_max} --spec-draft-model {draft_path}"
-            return args, True, n_max, draft_path
-        else:
-            logger.warning("mtp: companion %s missing for %s", speculative, model.stem)
-            return "", False, utils._MTP_DRAFT_N_MAX, None
-
-    # MTP with non-MTP companion name (unusual)
-    return "", False, utils._MTP_DRAFT_N_MAX, None
 
 
 def _build_mode_params(model: Model) -> dict[str, dict]:
@@ -182,49 +167,14 @@ def _build_entry(
     """
     base_id = utils.slugify(model.name)
 
-    # Build the launch command from the model's backend template (a full `cmd`
-    # string).  The sidecar may declare an explicit `template:` (e.g. vllm);
-    # otherwise the template follows the role.
-    target = model.template
-    t_conf = utils._TARGET_TEMPLATES.get(target, utils._TARGET_TEMPLATES["chat"])
-
-    # MTP args (llama-server only; vLLM MTP is not translated yet).
-    mtp_arg_str, mtp_enabled, mtp_n_max, _ = _build_mtp_args(model)
-    if model.is_vllm:
-        mtp_arg_str = ""
-        mtp_enabled = False
-        mtp_n_max = utils._MTP_DRAFT_N_MAX
-
-    # mmproj (llama-server only, omitted when the vision projection is dropped).
-    mmproj_args = ""
-    if not model.is_vllm and include_mmproj and model.mmproj and model.mmproj.gguf_path:
-        mmproj_args = f"--mmproj {model.mmproj.gguf_path}"
-
-    # Model source: HF repo for vLLM backends, local file for llama-server.
-    model_ref = (model.hf_repo or str(model.gguf_path)) if model.is_vllm else str(model.gguf_path)
-
-    vllm_image = model.vllm_image or template_vars.get("vllm_image", utils.VLLM_DEFAULT_IMAGE)
-    # GPU-resident models pin all layers to VRAM so the runtime matches the
-    # fit-params measurement; CPU-resident models (embed/rerank) stay on CPU.
-    n_gpu_layers = "--n-gpu-layers 0" if model.on_cpu else "--n-gpu-layers 999"
-
-    cmd_str = utils.resolve_template(t_conf["cmd"], {
-        "llama_bin": template_vars.get("llama_bin", ""),
-        "vllm_bin": template_vars.get("vllm_bin", utils.VLLM_DEFAULT_BIN),
-        "vllm_image": vllm_image,
-        "model_path": model_ref,
-        "ctx_size": str(ctx_size),
-        "parallel": str(parallel),
-        "cache_type": cache_type,
-        "n_gpu_layers": n_gpu_layers,
-        "mtp_args": mtp_arg_str,
-        "mmproj_args": mmproj_args,
-        "extra_args": model.cli_args.strip(),
-        "gpu_mem_util": str(template_vars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)),
-        "container_port": str(template_vars.get("container_port", utils.VLLM_DEFAULT_CONTAINER_PORT)),
-        "docker_args": template_vars.get("docker_args", utils.VLLM_DEFAULT_DOCKER_ARGS),
-        "models_dir": template_vars.get("models_dir", ""),
-    })
+    # Build the launch command via the model's backend.  The backend is chosen
+    # by override rules (model.backend), and validation/skip of unsupported
+    # format/role combos happens in build_config's pre-pass.
+    backend = get_backend(model.backend)
+    cmd_str, backend_meta = backend.build_cmd(
+        model, ctx_size, parallel, cache_type, template_vars,
+        include_mmproj=include_mmproj,
+    )
     cmd_str = _strip_repeat_ws(cmd_str)
 
     # Profile params → setParamsByID
@@ -273,9 +223,20 @@ def _build_entry(
     if tf is not None:
         metadata["throughput_factor"] = tf
 
-    metadata["mtp_enabled"] = mtp_enabled
-    if mtp_enabled:
-        metadata["mtp_draft_max"] = mtp_n_max
+    metadata["mtp_enabled"] = backend_meta.get("mtp_enabled", False)
+    if backend_meta.get("mtp_enabled"):
+        metadata["mtp_draft_max"] = backend_meta["mtp_draft_max"]
+
+    # Expose the resolved chat template so clients know which Jinja template
+    # drives the model, and which kwargs they may pass per-request
+    # (e.g. Qwen's enable_thinking).  These are client-facing only — no
+    # server-side flag exists for the kwargs.
+    ct = model.resolved_chat_template
+    if ct is not None:
+        metadata["chat_template"] = ct.stem
+    kwargs = model.chat_template_kwargs
+    if kwargs:
+        metadata["chat_template_kwargs"] = copy.deepcopy(kwargs)
 
     # Expose declared sampling modes so clients (hermes, opencode, UIs) can
     # discover the per-request aliases ("<id>:<mode>") without hitting the
@@ -437,6 +398,11 @@ def build_config(
     profile_list = profiles_cfg.get("profiles", {})
 
     entries: dict[str, dict] = {}
+
+    # ── Pre-pass FIRST: drop unsupported / unresolvable models ──
+    # Must run before any VRAM work: rejected models must not consume
+    # fit-params runs or pollute the shared matrix context solve.
+    models = _filter_supported(models)
 
     # ── Pre-pass: decide mmproj drop per chat model ──
     # A chat model keeps mmproj if it can reach the minimum useful context WITH

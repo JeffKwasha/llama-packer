@@ -25,7 +25,7 @@ profiles:
 #    parallel: 2
 
 # ── vLLM backend ───────────────────────────────────────
-# Defaults for models opted into the `template: vllm` / `template: vllm-docker`
+# Defaults for models whose override rules select the `vllm` / `vllm-docker`
 # backend. The image can be overridden per run via `llama-packer --vllm-image`,
 # the binary via `--vllm-server`.
 vllm:

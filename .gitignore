@@ -11,6 +11,7 @@ start.py
 
 # Generated config outputs
 config.yaml
+config.yaml.bak-*
 config.env
 docker-compose.yml
 

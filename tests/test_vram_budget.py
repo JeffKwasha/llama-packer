@@ -53,7 +53,7 @@ def test_calc_ctx_cpu_resident_returns_design(make_model):
 
 def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
     # vLLM model with no estimator and no local safetensors: graceful fallback.
-    model = make_model("f", template="vllm", hf_repo="org/model",
+    model = make_model("f", backend="vllm", hf_repo="org/model",
                        context_length=65536)
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
     assert ctx == 65536
