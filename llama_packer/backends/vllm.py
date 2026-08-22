@@ -32,7 +32,9 @@ def _speculative_config(model: "Model") -> dict | None:
     1. Explicit ``speculative_config:`` frontmatter (a raw mapping — full
        control over any vLLM method: eagle3, ngram, draft_model, ...).
     2. Baked-in MTP (``mtp: true``) → ``{"method": "mtp",
-       "num_speculative_tokens": N}`` (vLLM docs recommend N=1 to start).
+       "num_speculative_tokens": N}`` with N from the same
+       ``mtp_draft_n_max`` key and default the llama-server path uses —
+       one configuration, identical semantics on every backend.
 
     A GGUF ``speculative:`` companion cannot be loaded by vLLM (it needs an
     HF repo); that case is warned about and skipped — use
@@ -44,7 +46,7 @@ def _speculative_config(model: "Model") -> dict | None:
     if isinstance(cfg, dict) and cfg:
         return cfg
     if fm.get("mtp"):
-        n = int(fm.get("mtp_draft_n_max", utils.VLLM_DEFAULT_MTP_TOKENS))
+        n = int(fm.get("mtp_draft_n_max", utils._MTP_DRAFT_N_MAX))
         return {"method": "mtp", "num_speculative_tokens": n}
     if fm.get("speculative"):
         logger.warning("vllm: %s: GGUF speculative companion %r cannot be loaded "

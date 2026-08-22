@@ -104,7 +104,7 @@ explicitly to override.
 | `reasoning-preserve: true` | Emit `--reasoning-preserve`. Chat + reasoning-capable only |
 | `cache_type: <precision>` | KV-cache precision for `--cache-type-k/v` + VRAM sizing (f32, f16/bf16, q8_0/q8_1/q8_k, q6_0/q6_k, q5_0/q5_1/q5_k, q4_0/q4_1/q4_k, iq4_nl) |
 | `parallel: N` | Parallel slots (`--parallel`) and VRAM sizing |
-| `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2; vLLM depth default 1) |
+| `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2, same on every backend) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON, verbatim (eagle3/ngram/draft_model/...) |
 | `ignore: true` | Skip this model entirely |
 | `fit-params:` | Auto-written by llama-packer — do not edit |

@@ -106,8 +106,9 @@ def test_vllm_host_cmd(make_model):
 def test_vllm_baked_in_mtp_emits_speculative_config(make_model):
     m = make_model("v", hf_repo="org/model", mtp=True)
     cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
-    assert '--speculative-config {"method":"mtp","num_speculative_tokens":1}' in cmd
-    assert meta == {"mtp_enabled": True, "mtp_draft_max": 1}
+    assert '--speculative-config {"method":"mtp","num_speculative_tokens":2}' in cmd
+    # Same default depth as the llama-server path — one config, one meaning.
+    assert meta == {"mtp_enabled": True, "mtp_draft_max": 2}
 
 
 def test_vllm_mtp_depth_override(make_model):

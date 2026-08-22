@@ -253,9 +253,12 @@ Resolution order in `backends/vllm.py:_speculative_config`:
    Full control over any vLLM method, e.g. a cross-vocabulary draft model:
    `{method: draft_model, model: org/smoll-draft, num_speculative_tokens: 3}`
 2. **`mtp: true`** (baked-in MTP) → `{method: mtp, num_speculative_tokens: N}`
-   where N = `mtp_draft_n_max`, defaulting to **1** (`VLLM_DEFAULT_MTP_TOKENS`;
-   the llama.cpp-side default of 2 does not transfer — vLLM's MTP docs recommend
-   starting at 1).
+   where N comes from the **same** `mtp_draft_n_max` key and default the
+   llama-server path uses (`_MTP_DRAFT_N_MAX` = 2). One configuration, one
+   meaning on every backend. If a checkpoint ships a single MTP module, lower
+   `mtp_draft_n_max` per sidecar — depth beyond native MTP layers is rejected
+   at startup; vLLM's own "start at 1" advice is tuning onboarding, not a
+   semantic difference between backends.
 3. A GGUF **`speculative:` companion cannot be loaded by vLLM** (it needs an HF
    repo): warned and skipped — use `speculative_config:` with a draft HF repo.
 
