@@ -11,13 +11,14 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 ## Modules
 
 - [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, ...), companion resolution
-- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config`, `_build_entry`, backend delegation, filters.setParamsByID/modes, matrix solver
+- [`llama_packer/profiles.py`](llama_packer/profiles.py) — `Profiles` value object: defaults, spare precedence, `allow_profiles` filtering, per-model variant grouping
+- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj drop, matrix solve, bounded ctx) → `emit_config` (llama-swap entries), `_filter_supported`, `write_yaml`
 - [`llama_packer/backends/`](llama_packer/backends/) — backend package: `base` (ABC + support matrix + `is_available`), `llama_server`, `vllm` (host + docker); `BACKENDS` registry, `infer_backend`, `VLLM_BACKENDS`, `get_backend`
 - [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
 - [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` fit-params, `solve_matrix_ctx`
 - [`llama_packer/vllm_estimate.py`](llama_packer/vllm_estimate.py) — vLLM memory estimation via `vllm-memory-estimator` (+ safetensors fallback)
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
-- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, discovery/slugify/params
+- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, discovery/slugify/params, path-macro grouping (`compute_env_prefixes`, `hf_cache_root`)
 
 ## Backends
 
@@ -31,8 +32,8 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 - [README.md](README.md) — usage, sidecar example
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
+- [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
-- [docs/llama-server_help](docs/llama-server_help) — full llama-server CLI
 - [docs/plans/](docs/plans/) — design proposals (vllm-gb10)
 - [docs/reference.md](docs/reference.md) — external links
 

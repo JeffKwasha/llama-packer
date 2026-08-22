@@ -6,12 +6,13 @@
 
 **Entry point:** `llama-packer` (console script) → `llama_packer.__main__.main`
 
-**Models directory guide:** `llama-packer --agents` writes `models/AGENTS.md`
-from the bundled template (`llama_packer/templates/models_AGENTS.md`) when the
-file is missing — never overwriting an existing one, and logging (not aborting)
-on write failure. The guide documents discovery and sidecar conventions for AI
-agents. As a non-frontmatter `.md` (no leading `---`), `AGENTS.md` is skipped by
-model discovery.
+**Models directory guide:** `llama-packer --agents` writes `AGENTS.md` into
+each `--models-dir` from the bundled template
+(`llama_packer/templates/models_AGENTS.md`) when the file is missing — never
+overwriting an existing one, and logging (not aborting) on write failure. The
+guide documents discovery and sidecar conventions for AI agents. As a
+non-frontmatter `.md` (no leading `---`), `AGENTS.md` is skipped by model
+discovery.
 
 ## Output Format
 
@@ -30,15 +31,40 @@ Each model entry produces:
 | `concurrencyLimit` | Per-model concurrency cap (if declared) |
 
 Also emits:
-- **`config.env`** — sibling file with `${env.*}` variables for systemd `EnvironmentFile=` or docker `--env-file`.
+- **`config.env`** — sibling file with the path macros (`MODELS_DIR=...` etc.) for systemd `EnvironmentFile=` or docker `--env-file` (`--no-env` skips it).
+- **`macros:`** — top-level block mapping each `${VAR}` path macro to its absolute directory (see [Path Macros](#path-macros-macros-block-and-configenv)).
 - **`includeAliasesInList: true`** — presents the `${MODEL_ID}:<mode>`/`${MODEL_ID}:<profile>` aliases in `/v1/models` (llama-swap default is `false`).
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
 
 ### Writer module
 
-`llama_packer/writer.py` provides:
-- **`build_config()`** — builds the full llama-swap `models` dict from `Model` objects + profiles
-- **`write_yaml()`** — YAML output with literal block scalars
+`llama_packer/writer.py` composes the generation pipeline in three steps:
+
+1. **`_filter_supported()`** — the validation boundary (backend format/role,
+   reasoning flags, cache-type knowability); runs before any VRAM work.
+2. **`Planner.plan()`** — context decisions per model: mmproj keep/drop
+   pre-pass, shared matrix solve, profile grouping, bounded-context clamp.
+   Returns `Variant` values.
+3. **`emit_config()`** — pure rendering of plans into llama-swap entry dicts.
+
+`build_config()` composes the three; profiles.yaml is read exclusively through
+the `Profiles` value object (`llama_packer/profiles.py`). See
+[docs/architecture.md](docs/architecture.md) for component ownership,
+invariants, and testing seams. Also here: **`write_yaml()`** — YAML output
+with literal block scalars.
+
+## profiles.yaml
+
+The input config, resolved from `--profiles` (default `./profiles.yaml`, falling back to the bundled `llama_packer/profiles.yaml`). Top-level keys, all optional except `profiles:`:
+
+| Key | Purpose | Detailed in |
+|-----|---------|-------------|
+| `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
+| `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
+| `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
+| `matrix` | Shared embed/rerank/chat VRAM budget solving (`embed`/`rerank` model refs) | [Matrix Context Solving](#matrix-context-solving) |
+| `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
+| `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
 
 ## Hardware Detection
 
@@ -65,7 +91,24 @@ includes the slices we reserve, so used-vs-free is not counted twice.
 
 Precedence for VRAM value: `--vram` CLI flag > `profiles.yaml` `hardware.vram` > auto-detect.
 
+**GPU family**: `--gpu-family` or `profiles.yaml` `hardware.gpu_family` names the
+chip family on the resolved `GpuProfile`. It is currently an **inert annotation**
+(per-library calculation rules don't diverge today, so no behavior keys off it);
+it exists as the hook for future chip-specific sizing rules.
+
 GPU vendor also determines the device-pinning env var: `ROCR_VISIBLE_DEVICES` (AMD) or `CUDA_VISIBLE_DEVICES` (NVIDIA).
+
+## llama.cpp Build Selection
+
+When `--llama-server` is not given, the binary directory resolves via
+`utils.find_bin_dir`:
+
+1. `$LLAMA_BIN_DIR` — explicit build dir, wins over everything
+2. `-v/--llama-version N` → `./llama-bN` if it exists
+3. default (`latest`) → the highest-numbered `./llama-b[0-9]*` directory
+
+`llama-server` and `llama-fit-params` are both taken from the resolved
+directory; no match aborts with the available versions listed.
 
 ## Context Management
 
@@ -83,7 +126,15 @@ For each (model, cache_type, parallel) combination, the system runs `llama-fit-p
 
 Values are persisted to the model's `.md` sidecar as a `fit-params` block, avoiding re-measurement across runs. Values are invalidated when `cache_type` or `parallel` changes.
 
-**Fallback chain:** saved frontmatter → in-memory cache → `llama-fit-params` binary → safetensors header estimation.
+**Cache-type scaling.** The KV-cache component of `ctx_factor` is linear in
+cache precision (per-element bytes, `utils._KV_CACHE_BYTES`), while `model_mib`
+and `compute_mib` are precision-independent. So a `cache_type` change does
+**not** trigger a re-measure: the persisted `ctx_factor` is scaled by the
+byte ratio between the old and new precisions (`_scale_ctx_factor`), rounding
+up to avoid under-reserving. A `parallel` change still invalidates (batching
+buffers don't scale linearly).
+
+**Fallback chain:** saved frontmatter → cache-type-scaled derivation → in-memory cache → `llama-fit-params` binary → safetensors header estimation.
 
 `llama-fit-params` is always invoked with `--fit off` so it measures the explicit `-c` (or design) context rather than auto-adjusting arguments — `--fit on` (the default) would otherwise change `-ngl`/`-c` when the GPU is busy, corrupting the measurement.
 
@@ -179,17 +230,79 @@ If absent, the module-level defaults apply (see `llama_packer/utils.py`).
 - **Baked-in:** Draft heads are part of the main GGUF. Set `mtp: true` in frontmatter. No separate file needed.
 - **Companion:** A separate GGUF file containing draft heads. Set `speculative: <filename>` in frontmatter. The file is resolved by fuzzy match in the model directory.
 
-## Reasoning Variants
+## Reasoning
 
-When `reasoning` is set to `"auto"` in frontmatter, the system auto-generates multiple config entries — one per reasoning mode:
+Reasoning/thinking support is two layers: a **server-side default** that
+llama-packer emits, and a **per-request** control that clients drive.
 
-| Mode | Suffix | Effect |
-|------|--------|--------|
-| `none` | `.reasoning.none` | `--reasoning` flag omitted |
-| `native` | `.reasoning.native` | `--reasoning native` |
-| `openai` | `.reasoning.openai` | `--reasoning openai` |
+### Server-side defaults (emitted by llama-packer)
 
-Each variant gets its own llama-swap entry ID. A specific mode (e.g. `reasoning: native`) generates a single entry with that mode.
+Two sidecar/override settings control how llama-server surfaces reasoning
+(model's own chat template must emit thinking blocks; use the fixed Qwen
+template via the `chat_template` override):
+
+| Key | Flag | Values |
+|-----|------|--------|
+| `reasoning-format` | `--reasoning-format` | `none`, `deepseek`, `deepseek-legacy`, `auto` |
+| `reasoning-preserve` | `--reasoning-preserve` (bool) | emit when `true` |
+
+`--reasoning-format deepseek` is the key one: it makes llama-server extract
+`<think>` blocks into `message.reasoning_content` (OpenAI-style) instead of
+leaking them into `message.content` — which otherwise breaks tool-calling
+agents mid-loop. `deepseek-legacy` keeps the tags in `content` *and* fills
+`reasoning_content`; `none` leaves thoughts unparsed; `auto` is llama-server's
+default.
+
+These flags are **only meaningful on reasoning-capable chat models**: a model
+whose `role` is not `chat`, or whose `capabilities` do not include
+`reasoning`, is a non-reasoning model — declaring either key on it logs an
+error and the setting is ignored. An unknown `reasoning-format` value is
+likewise logged and dropped. (A `reasoning` capability in the sidecar is a
+descriptive signal; it never errors.)
+
+### Per-request control (client side)
+
+Reasoning **effort** (`enable_thinking`, `reasoning_effort`,
+`preserve_thinking`) is a *template kwarg*, sent per-request — llama-packer
+does not set it. llama-server accepts it via the request body's
+`chat_template_kwargs` (all builds, requires `--jinja`, which the backend
+already emits) or, on newer builds, top-level `reasoning_effort`. Clients
+configure it themselves:
+
+- **opencode** (`@ai-sdk/openai-compatible` provider): per-model
+  `options.reasoningEffort` (e.g. `"high"`), plus built-in variants
+  `none`/`minimal`/`low`/`medium`/`high`/`xhigh`:
+
+  ```jsonc
+  {
+    "provider": {
+      "llama.cpp": {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+        "models": {
+          "qwen3.8-27b": { "name": "Qwen3.8-27B (local)",
+                           "options": { "reasoningEffort": "medium" } }
+        }
+      }
+    }
+  }
+  ```
+
+- **hermes / pi / similar**: llama.cpp providers default to `reasoning: false`
+  and don't forward thinking params; they need a per-model override mapping
+  `chat_template_kwargs` (`enable_thinking` / `reasoning_effort` /
+  `preserve_thinking`) — see the pi `modelOverrides` pattern.
+
+The `chat_template_kwargs` frontmatter key is exposed in each entry's
+`metadata` (client-facing only) so UIs know which kwargs a model's template
+accepts. The fixed Qwen template defaults `reasoning_effort` to `medium`
+(safe); override per-request with `chat_template_kwargs: {reasoning_effort:
+high}`.
+
+Reference: [froggeric/Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+recommends `--jinja --chat-template-file chat_template.jinja --reasoning-format
+deepseek` for Qwen 3.5/3.6/3.8 — exactly the combo the `chat_template` +
+`reasoning-format` settings produce.
 
 ## Sampling Modes
 
@@ -226,6 +339,11 @@ modes:
   `repeat_penalty`, `freq_pen` (see `SAMPLING_KEYS`). Unknown or non-numeric values are
   ignored with a warning. Emission translates to the request-body JSON names llama-server
   parses (`pres_pen` → `presence_penalty`, `freq_pen` → `frequency_penalty`).
+- **Expressions**: a profile value of the form `"base * N"` (string starting with
+  `base *`) is evaluated against the `defaults:` value for that key — e.g.
+  `temperature: "base * 0.7"` with `defaults.temperature: 1.0` yields `0.7`.
+  Evaluation is sandboxed to the single name `base`; a failed expression warns
+  and falls back to the base value. Only keys present in `defaults:` can use it.
 - **Schema**: per llama-swap, `setParamsByID` is a *filter* and is always nested under
   `filters:` in each model entry — a top-level key is silently ignored.
 - **Alias visibility**: each mode/profile key (`${MODEL_ID}`, `${MODEL_ID}:<mode>`,
@@ -338,14 +456,26 @@ overrides:
     loras: [my-qwen36-uncensored-lora.gguf]
 ```
 
-**Matching.** `when` is **required** — a rule missing an empty/null `when`, or
-with no known settings, aborts the run (a silently-ignored rule would compound
-the misconfiguration). Each `when` is a map of `field: regex`; a model matches
-only if *every* field regex matches (`re.search`). Fields come from the sidecar
-frontmatter plus the synthetic `stem` and `name`. Use `when: true` to match
-every model. Regex literals are easiest in YAML **single-quoted** or unquoted
-scalars — only double quotes interpret backslashes (`\.` stays literal in
-single quotes).
+**Matching.** `when` is **required** — a rule that isn't a mapping, has an
+empty/null `when`, a non-mapping `when`, or no known settings, aborts the run
+(a silently-ignored rule would compound the misconfiguration). Each `when` is
+a map of `field: regex`; a model matches only if *every* field regex matches
+(`re.search`). Field semantics (`overrides.py:rule_matches`):
+
+- Fields come from the sidecar frontmatter plus the synthetic `stem` and
+  `name`.
+- **List-valued fields are joined with spaces** before matching, so
+  `capabilities: 'reasoning'` matches `[vision, tools, reasoning]`.
+- A field **absent from a model never matches** (there is nothing to search) —
+  to target "has no X", match a different field or invert in rule order.
+- An **invalid regex** logs a warning and that rule matches nothing (the run
+  continues; only structural problems abort).
+- Unknown settings keys in a rule log a warning and are ignored; if *no* key
+  is known, the rule aborts the run.
+
+Use `when: true` to match every model. Regex literals are easiest in YAML
+**single-quoted** or unquoted scalars — only double quotes interpret
+backslashes (`\.` stays literal in single quotes).
 
 **Merge semantics.** Settings seed from the model's own sidecar fields, then
 each matching rule is layered on top **last-match-wins per key** (CSS-like:
@@ -353,21 +483,28 @@ rules read top→bottom as increasing specificity). So a later rule that changes
 `backend` does not clobber a `chat_template` set by an earlier rule.
 
 **Settings keys** (all optional): `backend`, `hf_repo`, `chat_template`,
-`chat_template_kwargs`, `loras`, `cli_args`.
+`chat_template_kwargs`, `loras`, `cli_args`, `reasoning-format`,
+`reasoning-preserve`.
 
 **Backend inference.** When neither the sidecar nor any rule declares a
-`backend`, one is inferred from the model's file format: backends register the
-formats they load and are consulted in preference order, gated by whether each
-backend's required resources are configured (llama-server binary, vLLM image /
-binary). Today that means `.gguf` → `llama-server` and safetensors / `hf_repo`
-→ `vllm-docker` (falling back to host `vllm` when only the binary is
+`backend`, one is inferred from the model's file format (`backends.infer_backend`):
+the registry walks backends in **registration order** — `llama-server`,
+`vllm-docker`, `vllm` — and picks the first whose registered formats cover the
+model AND whose required resources are configured (llama-server binary, vLLM
+image / binary). For this purpose **a locally resolved model file's extension
+wins over `hf_repo`**: an HF repo id only drives selection when the model has
+no local file. Today that means `.gguf` → `llama-server` and safetensors /
+`hf_repo` → `vllm-docker` (falling back to host `vllm` when only the binary is
 configured). A format no available backend covers logs an error and the
-model's entries are skipped.
+model's entries are skipped; so does a rule or sidecar naming an unregistered
+`backend`.
 
 **Path resolution.** `chat_template` and `loras` values are paths resolved
-relative to the models directory. A missing file logs an error and the model's
-entries are skipped (fail loud). Resolved paths are written into the generated
-`cmd` and exposed for `${env.*}` substitution.
+relative to the sidecar's own directory (absolute refs pass through). A missing
+file logs an error and the model's entries are skipped (fail loud). Symlinks
+are preserved by name (not dereferenced), so a chat template symlinked into the
+HF cache stays under `${MODELS_DIR}` instead of widening it. Resolved paths are
+written into the generated `cmd` as `${VAR}` path macros.
 
 **Chat templates & client kwargs.** A declared `chat_template` makes the writer
 emit `--jinja --chat-template-file <path>` (llama-server) or `--chat-template
@@ -389,6 +526,81 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `vllm` | safetensors, `hf_repo` | chat |
 | `vllm-docker` | safetensors, `hf_repo` | chat |
 
+## Cache precision (`cache_type`)
+
+A single `cache_type:` line in a sidecar selects the KV-cache precision and is
+used for **both** the emitted `--cache-type-k`/`--cache-type-v` flags and the
+VRAM calculation (sidecar > profile `defaults.cache_type` > `q8_0`). K and V
+caches are assumed to share the same precision. `parallel` follows the same
+precedence (sidecar > profile > 1).
+
+**Valid values** are exactly the keys of `utils._KV_CACHE_BYTES` — the
+precisions llama-packer can size memory for. Anything else is logged as an
+error and the model is skipped (an unsizable cache would make every context
+calculation a guess):
+
+| Precision | Bytes/element (rounded up) |
+|-----------|---------------------------|
+| `f32` | 4.0 |
+| `f16`, `bf16` | 2.0 |
+| `q8_0`, `q8_1`, `q8_k` | 1.0625 |
+| `q6_0`, `q6_k` | 0.8125 |
+| `q5_0` | 0.6875 |
+| `q5_1` | 0.75 |
+| `q5_k` | 0.6875 |
+| `q4_0`, `q4_k`, `iq4_nl` | 0.5625 |
+| `q4_1` | 0.625 |
+
+### Cache memory math
+
+The KV cache is linear in tokens and in cache precision:
+
+```
+kv_bytes_per_token = 2 × Σ_layers (k_proj_out_dim + v_proj_out_dim) × bytes_per_element
+ctx_factor [MiB/token] = kv_bytes_per_token / 2²⁰   (+ attention scratch, measured)
+```
+
+- The per-layer K/V output dims come from a `llama-fit-params` measurement of
+  the main model; the safetensors fallback (`utils.estimate_safetensors`) reads
+  them from `k_proj`/`v_proj` tensor shapes in the header.
+- **Cache-type scaling**: only the `bytes_per_element` term depends on
+  precision, so a `cache_type` change reuses the persisted measurement and
+  rescales it — `ctx_factor_new = ctx_factor_old × bytes(new) / bytes(old)`
+  (`vram.py:_scale_ctx_factor`, rounding up so estimates err toward reserving
+  more). `model_mib` and `compute_mib` are precision-independent and carry
+  over unchanged. A `parallel` change still triggers a fresh measure.
+- Example: a model measured at `ctx_factor = 0.5` MiB/token under `f16`
+  serves `q8_0` at `0.5 × 1.0625/2 ≈ 0.266` MiB/token — roughly half the KV
+  footprint, doubling the affordable context for the same VRAM.
+
+## Model Discovery and Stub Sidecars
+
+Every `--models-dir` directory is scanned independently (`Model.from_dir`):
+
+- `.md` sidecar files are the entry points; each binds to the model file whose
+  stem matches its own (or the file named by `model:`).
+- Subdirectories named `embed` / `rerank` (configurable with `--extra-dirs`)
+  are scanned for orphan GGUFs, which get the matching role inferred.
+- Orphan GGUFs next to chat models are classified as companions (mmproj /
+  MTP draft), never as main models.
+- Symlinks resolving to the same model file are deduplicated across
+  directories (first wins).
+
+**Stub sidecars.** A model file without any sidecar gets a minimal one written
+next to it: `name` (stem), `parameters` and `quantization` inferred from the
+filename, and `_DEFAULT_CONTEXT_LENGTH`. This makes a directory of bare models
+work on first run. `--no-stubs` skips generation.
+
+## Path macros and HF_HOME
+
+Generated commands are emitted with absolute paths, then rewritten to
+`${LLAMA_DIR}` / `${MODELS_DIR}` / `${MODELS_DIR_2}`… macros via
+`compute_env_prefixes` (grouped by mount, longest common directory per group).
+Paths under the Hugging Face cache root (`--hf-home` > `$HF_HOME` >
+`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`) are pulled into their own
+`${HF_HOME}` macro so a chat template (or LoRA) living in the HF cache never
+widens `${MODELS_DIR}` up to a non-models directory.
+
 
 ## Health-Check Timeout
 
@@ -402,17 +614,25 @@ Drive speed is detected per-model via `lsblk` (NVMe → 1500 MB/s, SATA SSD → 
 
 Override via `--health-check-timeout`, `--drive-speed`, or the `GEN_CONFIG_DRIVE_SPEED` environment variable.
 
-## Env Variable Substitution
+## Path Macros (`macros:` block and `config.env`)
 
-All emitted paths (binary, GGUF files, mmproj, MTP companions) are grouped by filesystem mount. The longest common path prefix per mount group becomes a `${env.*}` variable:
+All emitted paths (binary, GGUF files, mmproj, MTP companions, chat templates,
+LoRAs) are grouped by filesystem mount via `utils.compute_env_prefixes`. The
+longest common directory per group becomes a llama-swap **macro**: paths in the
+generated `cmd` are rewritten to `${VAR}` form, and a top-level `macros:` block
+in `config.yaml` maps each macro to its absolute directory — so `-watch-config`
+reloads pick up moved/updated paths without a llama-swap restart.
 
-| Variable | Content |
-|----------|---------|
-| `LLAMA_DIR` | Mount group containing the llama-server binary |
-| `MODELS_DIR` | Mount group containing model files |
-| `MODELS_DIR_2` ... | Additional mount groups (sorted by mount path) |
+| Macro | Content |
+|-------|---------|
+| `LLAMA_DIR` | Group containing the llama-server binary |
+| `HF_HOME` | Paths under the HF cache root (`--hf-home` > `$HF_HOME` > `$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`) |
+| `MODELS_DIR` | First model mount group |
+| `MODELS_DIR_2` ... | Additional groups (sorted by mount path) |
 
-Written to `config.env` alongside the YAML for systemd/docker consumption.
+The same `NAME=value` pairs are also written to a sibling `config.env` for
+systemd `EnvironmentFile=` / docker `--env-file` consumption; skip it with
+`--no-env`.
 
 ## Model Metadata
 
@@ -426,16 +646,18 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 - **`metadata`** — the agent-choice descriptor: `freethought`, `strengths`, `weaknesses`,
   `license`, `base_model`, `finetune`, `type`, `parameters`, `quantization`, `hf_url`,
-  `context_length`, `mtp_enabled`, `mtp_draft_max`, `mtp_accuracy`, `throughput_factor`.
+  `ctx_size`, `mtp_enabled`, `mtp_draft_max`, `mtp_accuracy`, `throughput_factor`.
 - **Native `capabilities`** — `in`/`out` modalities, `tools`, `reranker`, `context` (derived, see below).
 - **Native `name` / `description`** — display fields in `/v1/models`.
 
 ### Builder-consumed keys (NOT passed through)
 
-`name`, `template`, `context_length`, `description`, `cli_args`, `model`, `attention`,
-`kv_cache`, `tool_args`, `speculative`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
-`mtp_draft_p_min`, `role`, `allow_profiles`, `reasoning`, `spare`, `capabilities`,
-`ignore`, `device`, `concurrency`, `fit-params`, `modes`, `default_mode`.
+`name`, `context_length`, `description`, `cli_args`, `model`, `backend`, `hf_repo`,
+`chat_template`, `chat_template_kwargs`, `loras`, `attention`, `kv_cache`, `tool_args`,
+`speculative`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
+`mtp_draft_p_min`, `role`, `targets`, `allow_profiles`, `spare`, `capabilities`,
+`ignore`, `device`, `concurrency`, `fit-params`, `vllm_image`, `modes`, `default_mode`,
+`reasoning-format`, `reasoning-preserve`, `cache_type`, `parallel`.
 
 ### Per-model config options
 
@@ -447,7 +669,10 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `allow_profiles` | str/list/bool | Restrict which profiles apply (regex string, list, or false to disable) |
 | `modes` | dict | Per-model sampling modes (full profiles): name → param dict. Replaces the global-profile sampling overrides for this model. Values use llama.cpp names; see [Sampling Modes](#sampling-modes) |
 | `default_mode` | str | Which declared `modes` entry is the model's default (maps to the bare `${MODEL_ID}` `setParamsByID` key). Falls back to the first mode |
-| `reasoning` | str/bool | `auto` → multi-variant generation; specific mode → single variant; `true`/absent → no change |
+| `reasoning-format` | str | llama-server `--reasoning-format` (`none`/`deepseek`/`deepseek-legacy`/`auto`). Chat + reasoning-capable models only; see [Reasoning](#reasoning) |
+| `reasoning-preserve` | bool | Emit `--reasoning-preserve`. Chat + reasoning-capable models only |
+| `cache_type` | str | KV-cache precision for `--cache-type-k/v` and VRAM sizing (sidecar > profile > `q8_0`); see [Cache precision](#cache-precision-cache_type) |
+| `parallel` | int | Parallel slots for `--parallel` and VRAM sizing (sidecar > profile > 1) |
 | `ignore` | bool | Skip this model entirely |
 
 ### Agent-selection fields (optional, recommended)
@@ -466,9 +691,9 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 ### Derived fields (computed, not authored)
 
-- **`capabilities`** (native block): `in`/`out` = `["text"]` + `"image"` if `vision` in capabilities + `"audio"` if `audio`; `tools`/`reranker` boolean flags; `context` = computed `ctx_size`.
+- **`capabilities`** (native block): `in`/`out` = `["text"]` + `"image"` if `vision` in capabilities + `"audio"` if `audio`; `tools`/`reranker` boolean flags; `context` = design context (the model's maximum trained context: GGUF architectural max > sidecar `context_length` > default).
 - **`throughput_factor`**: Heuristic relative speed index = `54 / (active_B × quant_bits)` × `(1 + draft_n × mtp_accuracy)` when MTP is on. Relative only — not real tok/s.
-- **`ctx_size`**: The computed context size for this model, exposed natively via `capabilities.context`.
+- **`ctx_size`**: The VRAM-served context limit (`-c` / `--max-model-len`), exposed via `metadata.ctx_size`. Distinct from `capabilities.context`, which advertises the model's max trained context rather than what the deployment can currently fit.
 
 ### GGUF architectural context
 
@@ -520,8 +745,6 @@ This block is:
 
 ## Constants
 
-All module-level constants are in `llama_packer/utils.py`.
-
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `_DEFAULT_CONTEXT_LENGTH` | 32768 | Fallback when no `.md` sidecar or GGUF context exists |
@@ -530,11 +753,17 @@ All module-level constants are in `llama_packer/utils.py`.
 | `_MIN_USEFUL_CTX` | 131072 | Min useful chat context; mmproj dropped below this (`--min-context`) |
 | `_RESERVE_SYSTEM` | 1024 | MB reserved for OS/driver/scratch buffers |
 | `_RESERVE_VIDEO` | 1024 | MB reserved for GPU video output framebuffer |
-| `_MMPROJ_COMPUTE_MB` | 150 | Fixed compute buffer for mmproj companions |
-| `_DRAFT_COMPUTE_MB` | 64 | Fixed compute overhead for MTP draft companions |
-| `_DRAFT_CTX_SAFETY` | 1.6 | Safety factor on the MTP draft per-token KV estimate |
-| `_MTP_SPEC_TYPE` | `"draft-mtp"` | Default MTP speculative type |
-| `_MTP_DRAFT_N_MAX` | 2 | Default max draft tokens for MTP |
+
+In `llama_packer/utils.py`; the companion/MTP and cache-precision constants live in `llama_packer/vram.py` / `utils.py`:
+
+| Constant | Defined in | Meaning |
+|----------|-----------|---------|
+| `_MMPROJ_COMPUTE_MB` | `vram.py` | Fixed compute buffer for mmproj companions (150) |
+| `_DRAFT_COMPUTE_MB` | `vram.py` | Fixed compute overhead for MTP draft companions (64) |
+| `_DRAFT_CTX_SAFETY` | `vram.py` | Safety factor on the MTP draft per-token KV estimate (1.6) |
+| `_KV_CACHE_BYTES` | `utils.py` | Bytes/element per KV-cache precision; the set of sizeable `cache_type` values (see [Cache precision](#cache-precision-cache_type)) |
+| `_MTP_SPEC_TYPE` | `utils.py` | Default MTP speculative type (`"draft-mtp"`) |
+| `_MTP_DRAFT_N_MAX` | `utils.py` | Default max draft tokens for MTP (2) |
 
 ## Future Work — Log-Derived Real Throughput (Phase 6)
 
