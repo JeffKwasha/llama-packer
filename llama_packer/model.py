@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -32,9 +33,10 @@ class Model:
         "backend", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
         "attention", "kv_cache", "tool_args", "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
-        "role", "targets", "allow_profiles", "reasoning", "spare", "capabilities",
+        "role", "targets", "allow_profiles", "spare", "capabilities",
         "ignore", "device", "concurrency", "fit-params", "vllm_image",
-        "modes", "default_mode",
+        "modes", "default_mode", "reasoning-format", "reasoning-preserve",
+        "cache_type", "parallel",
     })
 
     def __init__(self, md_path: Path, frontmatter: dict):
@@ -167,17 +169,24 @@ class Model:
     @classmethod
     def from_dir(
         cls,
-        models_dir: Path,
+        models_dirs,
         *,
         generate_stubs: bool = True,
         extra_dirs: list[str] | None = None,
     ) -> list[Model]:
-        """Discover all models in models_dir via .md sidecars.
+        """Discover all models across *models_dirs* via .md sidecars.
 
-        Returns list of instantiated Model objects (main models only).
+        *models_dirs* is a single directory or a list of them.  Symlinks that
+        resolve to the same underlying model file are deduplicated (first wins).
+        Returns a list of instantiated Model objects (main models only).
         """
+        if isinstance(models_dirs, (str, os.PathLike)):
+            models_dirs = [Path(models_dirs)]
+        else:
+            models_dirs = [Path(d) for d in models_dirs]
+
         # Single source of truth for role classification (see utils.classify_models).
-        classified = utils.classify_models(models_dir, extra_dirs)
+        classified = utils.classify_models(models_dirs, extra_dirs)
         md_items = {p: k for p, k in classified if p.suffix.lower() == ".md"}
         gguf_items = {p: k for p, k in classified if p.suffix.lower() in (".gguf", ".safetensors")}
 
@@ -223,7 +232,17 @@ class Model:
                 except Exception as e:
                     logger.warning("failed to create stub for %s: %s", gguf, e)
 
-        return models
+        # Deduplicate symlinks to the same model file (first wins).
+        deduped: list[Model] = []
+        seen: set[str] = set()
+        for model in models:
+            key = os.path.realpath(str(model.gguf_path)) if model.gguf_path else str(model.md_path)
+            if key in seen:
+                logger.info("duplicate model file (symlink) skipped: %s", model.stem)
+                continue
+            seen.add(key)
+            deduped.append(model)
+        return deduped
 
     @property
     def vram(self) -> VramBudget:
@@ -312,21 +331,33 @@ class Model:
         kw = self.frontmatter.get("chat_template_kwargs")
         return dict(kw) if isinstance(kw, dict) else None
 
-    @property
-    def parallel(self) -> int:
-        return self.frontmatter.get("parallel", 1)
+    def parallel_for(self, default: int) -> int:
+        """Sidecar ``parallel`` when declared, else *default*."""
+        return int(self.frontmatter.get("parallel", default))
 
-    @property
-    def cache_type(self) -> str:
-        return self.frontmatter.get("cache_type", "q8_0")
+    def cache_type_for(self, default: str) -> str:
+        """Sidecar ``cache_type`` when declared, else *default*."""
+        return str(self.frontmatter.get("cache_type", default))
 
     @property
     def cli_args(self) -> str:
         return self.frontmatter.get("cli_args", "")
 
     @property
-    def reasoning(self) -> str | None:
-        return self.frontmatter.get("reasoning")
+    def reasoning_format(self) -> str | None:
+        """llama-server ``--reasoning-format`` value (``reasoning-format:`` key).
+
+        Controls how thought tags are parsed/returned (``none``, ``deepseek``,
+        ``deepseek-legacy``, ``auto``).  Validated and gated to reasoning-capable
+        chat models by ``apply_overrides``.
+        """
+        v = self.frontmatter.get("reasoning-format")
+        return str(v) if v else None
+
+    @property
+    def reasoning_preserve(self) -> bool:
+        """Whether to emit ``--reasoning-preserve`` (``reasoning-preserve:`` key)."""
+        return bool(self.frontmatter.get("reasoning-preserve"))
 
     @property
     def allow_profiles(self) -> list[str] | None:

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -16,6 +17,63 @@ from pathlib import Path
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ── Command-line composition ──────────────────────────────────────────────
+# Launch commands are assembled from an ordered flag→value map so that a flag
+# can only ever appear once (a dict refuses duplicate keys).  Free-form
+# ``cli_args`` are parsed into the same map and merged last, so user-supplied
+# args override structured ones without ever duplicating a flag.
+
+def _is_number_token(tok: str) -> bool:
+    try:
+        float(tok)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _pair_flags(tokens: list[str]) -> dict[str, str]:
+    """Fold a flat ``[flag, value, flag, value, ...]`` list into an ordered map.
+
+    A ``--flag`` followed by a non-flag token consumes that token as its value;
+    otherwise it is valueless.  A token that parses as a number (e.g. ``-1``)
+    is treated as a value, not a flag, so ``--temperature -1`` stays intact.
+    """
+    flags: dict[str, str] = {}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("-") and not _is_number_token(tok):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            if nxt is not None and not (nxt.startswith("-") and not _is_number_token(nxt)):
+                flags[tok] = nxt
+                i += 2
+            else:
+                flags[tok] = ""
+                i += 1
+        else:
+            flags[tok] = ""
+            i += 1
+    return flags
+
+
+def render_command(head: list[str], flag_tokens: list[str], cli_args: str = "") -> str:
+    """Compose ``<head> <flags> <cli_args>`` with no duplicate flags.
+
+    Structured ``flag_tokens`` and free-form ``cli_args`` are both reduced to
+    an ordered flag→value map; ``cli_args`` merges last (last-write-wins per
+    flag), so a flag set both structurally and in ``cli_args`` is emitted once.
+    """
+    flags = _pair_flags(flag_tokens)
+    flags.update(_pair_flags(shlex.split(cli_args)))
+    out = list(head)
+    for flag, value in flags.items():
+        out.append(flag)
+        if value != "":
+            out.append(value)
+    return " ".join(out)
+
 
 # ── Defaults (can be overridden via profiles.yaml `defaults` section or env) ──
 _DEFAULT_CONTEXT_LENGTH = 32768
@@ -210,13 +268,16 @@ _SAFETENSORS_DTYPE_BYTES = {
     "F3": 0.375, "F2": 0.25, "F1": 0.125,
 }
 
-# Approx bytes per element for KV-cache quantization (incl. q8_0 block overhead).
+# Approx bytes per element for KV-cache quantization (incl. block overhead).
+# Values are rounded up so any derived memory estimate errs toward reserving
+# more (avoid OOM).  This is also the set of cache types llama-packer can size.
 _KV_CACHE_BYTES = {
     "q8_0": 1.0625, "q8_1": 1.0625, "q8_k": 1.0625,
     "f16": 2.0, "bf16": 2.0, "f32": 4.0,
-    "q4_0": 0.5625, "q4_1": 0.5625, "q4_k": 0.5625,
-    "q5_0": 0.6875, "q5_k": 0.6875,
+    "q4_0": 0.5625, "q4_1": 0.625, "q4_k": 0.5625,
+    "q5_0": 0.6875, "q5_1": 0.75, "q5_k": 0.6875,
     "q6_0": 0.8125, "q6_k": 0.8125,
+    "iq4_nl": 0.5625,
 }
 
 
@@ -464,21 +525,27 @@ def model_kind(path: str | os.PathLike, role: str | None = None) -> str:
 
 
 def classify_models(
-    models_dir: str | os.PathLike,
+    models_dirs: Sequence[str | os.PathLike],
     extra_dirs: list[str] | None = None,
 ) -> list[tuple[Path, str]]:
-    """Classify model files in ``models_dir`` (and ``extra_dirs``) by role.
+    """Classify model files across *models_dirs* (and their ``extra_dirs``).
 
-    Returns a list of ``(path, kind)`` tuples where ``kind`` is one of
-    :data:`MODEL_KINDS` (``chat``, ``embeddings``, ``rerank``, ``mmproj``,
-    ``mtp``).  ``model.py`` uses this as the single source of truth for
-    discovery, replacing the previously scattered inline heuristics.
+    Each models dir is scanned on its own; ``extra_dirs`` are subdirectories of
+    every models dir (e.g. ``embed``/``rerank``).  Returns a list of
+    ``(path, kind)`` tuples where ``kind`` is one of :data:`MODEL_KINDS`
+    (``chat``, ``embeddings``, ``rerank``, ``mmproj``, ``mtp``).
     """
-    roots: list[tuple[Path, str | None]] = [(Path(models_dir), None)]
-    for d in (extra_dirs or []):
-        extra = Path(models_dir) / d
-        if extra.is_dir():
-            roots.append((extra, _EXTRA_DIR_ROLE.get(d)))
+    if isinstance(models_dirs, (str, os.PathLike)):
+        models_dirs = [models_dirs]
+
+    roots: list[tuple[Path, str | None]] = []
+    for md in models_dirs:
+        base = Path(md)
+        roots.append((base, None))
+        for d in (extra_dirs or []):
+            extra = base / d
+            if extra.is_dir():
+                roots.append((extra, _EXTRA_DIR_ROLE.get(d)))
 
     out: list[tuple[Path, str]] = []
     for root, role in roots:
@@ -591,14 +658,35 @@ def mount_root(path: str | os.PathLike) -> str:
     return cur
 
 
-def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None):
-    """Compute ``${env.*}`` variable names for the longest common path of each
-    mount group among *paths*.
+def hf_cache_root(override: str | os.PathLike | None = None) -> str | None:
+    """Return the HF cache root, or None when it cannot be determined.
+
+    Resolution order: explicit *override* → ``HF_HOME`` → ``HUGGINGFACE_HUB_CACHE``
+    → ``~/.cache/huggingface`` (only when that directory exists).  Used to keep
+    HF-cache paths out of the models mount group so they don't widen
+    ``${MODELS_DIR}``.
+    """
+    root = override or os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if root:
+        return os.path.abspath(os.fspath(root))
+    default = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+    return default if os.path.isdir(default) else None
+
+
+def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None,
+                         hf_home: str | os.PathLike | None = None):
+    """Compute ``${VAR}`` macro names for the longest common path of each
+    group among *paths*.
 
     Paths are grouped by the mount they live on; within a group the deepest
     directory shared by all paths becomes the prefix. This yields the shortest
     possible substituted paths while keeping each prefix a real directory on a
     single mount (useful as a docker bind source).
+
+    Paths under the HF cache root are pulled into their own ``HF_HOME`` group
+    (prefix = the HF cache root) so they never widen the models group — a
+    chat-template symlink into the HF cache otherwise drags ``MODELS_DIR`` up
+    to a non-models directory.
 
     Returns ``(prefix_to_var, var_to_value)`` where:
 
@@ -606,17 +694,32 @@ def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str |
         var_to_value:  {VAR_NAME: abs_prefix}
 
     Naming: the group containing *project_hint* (e.g. the llama-server binary)
-    is named ``LLAMA_DIR``; remaining groups are ``MODELS_DIR``,
-    ``MODELS_DIR_2``, ... in sorted mount order. The number of variables is not
-    fixed — one per mount group.
+    is named ``LLAMA_DIR``; the HF group is ``HF_HOME``; remaining groups are
+    ``MODELS_DIR``, ``MODELS_DIR_2``, ... in sorted mount order.
     """
+    hf_root = hf_cache_root(hf_home)
+
+    def _in_hf(p: str) -> bool:
+        if not hf_root:
+            return False
+        return p == hf_root or p.startswith(hf_root + os.sep)
+
     groups: dict[str, list[str]] = {}
+    hf_paths: list[str] = []
     for p in paths:
         ap = os.path.abspath(os.fspath(p))
-        groups.setdefault(mount_root(ap), []).append(ap)
+        if _in_hf(ap):
+            hf_paths.append(ap)
+        else:
+            groups.setdefault(mount_root(ap), []).append(ap)
 
     prefix_to_var: dict[str, str] = {}
     var_to_value: dict[str, str] = {}
+
+    if hf_paths:
+        prefix_to_var[hf_root] = "HF_HOME"
+        var_to_value["HF_HOME"] = hf_root
+
     extra = 0
     for mount in sorted(groups):
         ps = groups[mount]

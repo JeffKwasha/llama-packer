@@ -94,19 +94,22 @@ def _compile_rules(profiles_cfg) -> list[tuple]:
     return compiled
 
 
-def resolve_setting_paths(model, models_dir) -> list[str]:
+def resolve_setting_paths(model) -> list[str]:
     """Resolve chat_template / loras refs to absolute files.
 
-    Returns a list of human-readable error strings (empty when all resolve).
-    Resolved paths are stored on ``model`` attributes the backends read.
+    Paths are resolved relative to the sidecar's own directory (the natural
+    "file next to the model" convention).  Absolute refs pass through.  Returns
+    a list of human-readable error strings (empty when all resolve); resolved
+    paths are stored on ``model`` attributes the backends read.
     """
     errors: list[str] = []
+    base = model.md_path.parent
 
     ct = model.frontmatter.get("chat_template")
     if isinstance(ct, str) and ct:
-        p = Path(models_dir) / ct
+        p = Path(ct) if Path(ct).is_absolute() else base / ct
         if p.is_file():
-            model._resolved_chat_template = p.resolve()
+            model._resolved_chat_template = p.absolute()
         else:
             errors.append(f"chat_template file not found: {ct}")
 
@@ -115,9 +118,10 @@ def resolve_setting_paths(model, models_dir) -> list[str]:
         loras = [loras]
     resolved: list[Path] = []
     for ref in loras:
-        p = Path(models_dir) / str(ref)
+        ref_path = Path(str(ref))
+        p = ref_path if ref_path.is_absolute() else base / ref_path
         if p.is_file():
-            resolved.append(p.resolve())
+            resolved.append(p.absolute())
         else:
             errors.append(f"lora file not found: {ref}")
     if resolved:
@@ -126,15 +130,14 @@ def resolve_setting_paths(model, models_dir) -> list[str]:
     return errors
 
 
-def apply_overrides(models, profiles_cfg, models_dir, avail: dict | None = None) -> None:
+def apply_overrides(models, profiles_cfg, avail: dict | None = None) -> None:
     """Apply profile override rules to *models* in place.
 
     Seeds each model from its own sidecar settings, layers matching rules
-    (last match wins per key), validates the chosen backend name, infers a
-    backend from the file format when none was declared (``avail`` describes
-    the configured resources) and resolves external file references.  Models
-    with unresolved errors are flagged with ``model._override_error`` (already
-    logged) and skipped by the writer.
+    (last match wins per key), infers a backend from the file format when none
+    was declared (``avail`` describes the configured resources) and resolves
+    external file references.  Models with unresolved errors are flagged with
+    ``model._override_error`` (already logged) and skipped by the writer.
     """
     compiled = _compile_rules(profiles_cfg)
 
@@ -171,7 +174,7 @@ def apply_overrides(models, profiles_cfg, models_dir, avail: dict | None = None)
         if merged:
             model.frontmatter.update(merged)
 
-        errors += resolve_setting_paths(model, models_dir)
+        errors += resolve_setting_paths(model)
 
         if errors:
             for e in errors:

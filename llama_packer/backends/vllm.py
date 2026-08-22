@@ -23,27 +23,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _map_paths_into(paths: list[Path], models_dir: str) -> tuple[list[str], list[str]]:
+def _map_paths_into(paths: list[Path], models_dirs) -> tuple[list[str], list[str]]:
     """Map host paths for use inside the vLLM container.
 
-    Paths under ``models_dir`` are rewritten under ``/models`` (which the
-    docker invocation already binds).  Other paths each get a dedicated
+    Paths under any of ``models_dirs`` are rewritten under that dir's container
+    target (``/models``, ``/models2``, ...).  Other paths each get a dedicated
     read-only bind mount (``-v <parent>:/extN``) and an ``/extN/<name>`` ref.
 
     Returns ``(container_refs, docker_mount_flags)``.
     """
-    models_root = Path(models_dir).resolve()
+    if isinstance(models_dirs, (str, Path)):
+        models_dirs = [str(models_dirs)]
+    roots = [
+        (Path(d).resolve(), "/models" if i == 0 else f"/models{i + 1}")
+        for i, d in enumerate(models_dirs) if d
+    ]
     refs: list[str] = []
     mounts: list[str] = []
     parent_targets: dict[Path, str] = {}
     for p in sorted(paths, key=str):
         rp = p.resolve()
-        try:
-            rel = rp.relative_to(models_root)
-            refs.append(f"/models/{rel}")
+        mapped = False
+        for root, target in roots:
+            try:
+                rel = rp.relative_to(root)
+            except ValueError:
+                continue
+            refs.append(f"{target}/{rel}")
+            mapped = True
+            break
+        if mapped:
             continue
-        except ValueError:
-            pass
         parent = rp.parent
         if parent not in parent_targets:
             idx = len(parent_targets)
@@ -65,17 +75,15 @@ class VllmHostBackend(BaseBackend):
     def _model_ref(self, model: "Model") -> str:
         return model.hf_repo or str(model.gguf_path)
 
-    def _serve_parts(
+    def _serve_flags(
         self,
         model: "Model",
         ctx_size: int,
         port: str,
         gpu_mem_util: str,
-        tvars: dict,
         map_path: Callable[[Path], str] | None = None,
     ) -> list[str]:
-        parts = [
-            tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN), "serve",
+        flags = [
             "--model", self._model_ref(model),
             "--served-model-name", "${MODEL_ID}",
             "--host", "0.0.0.0", "--port", str(port),
@@ -85,11 +93,8 @@ class VllmHostBackend(BaseBackend):
         ct = model.resolved_chat_template
         if ct is not None:
             ref = map_path(ct) if map_path else str(ct)
-            parts += ["--chat-template", ref]
-        cli_args = (model.frontmatter.get("cli_args") or "").strip()
-        if cli_args:
-            parts.append(cli_args)
-        return parts
+            flags += ["--chat-template", ref]
+        return flags
 
     def build_cmd(
         self,
@@ -101,8 +106,11 @@ class VllmHostBackend(BaseBackend):
         include_mmproj: bool = True,
     ) -> tuple[str, dict]:
         gpu_mem_util = tvars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)
-        parts = self._serve_parts(model, ctx_size, "${PORT}", str(gpu_mem_util), tvars)
-        return " ".join(parts), {"mtp_enabled": False}
+        vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
+        flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util))
+        cli_args = (model.frontmatter.get("cli_args") or "").strip()
+        cmd = utils.render_command([vllm_bin, "serve"], flags, cli_args)
+        return cmd, {"mtp_enabled": False}
 
 
 class VllmDockerBackend(VllmHostBackend):
@@ -125,30 +133,40 @@ class VllmDockerBackend(VllmHostBackend):
         container_port = tvars.get("container_port", utils.VLLM_DEFAULT_CONTAINER_PORT)
         docker_args = tvars.get("docker_args", utils.VLLM_DEFAULT_DOCKER_ARGS)
         image = model.vllm_image or tvars.get("vllm_image", utils.VLLM_DEFAULT_IMAGE)
-        models_dir = tvars.get("models_dir", "")
+        models_dirs = tvars.get("models_dirs") or [tvars.get("models_dir", "")]
+        models_dirs = [d for d in models_dirs if d]
 
         extra_paths: list[Path] = []
         ct = model.resolved_chat_template
         if ct is not None:
             extra_paths.append(ct)
 
-        refs, mounts = _map_paths_into(extra_paths, models_dir)
+        refs, mounts = _map_paths_into(extra_paths, models_dirs)
         container_ct_ref = refs[0] if (ct is not None and refs) else None
 
         def _map(p: Path) -> str:
             return container_ct_ref if (ct is not None and p == ct) else str(p)
 
-        serve_parts = self._serve_parts(
-            model, ctx_size, str(container_port), gpu_mem_util, tvars, map_path=_map
+        vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
+        serve_flags = self._serve_flags(
+            model, ctx_size, str(container_port), gpu_mem_util, map_path=_map
         )
+        serve = utils.render_command(
+            [vllm_bin, "serve"], serve_flags,
+            (model.frontmatter.get("cli_args") or "").strip(),
+        )
+        bind = [
+            f"-v {d}:{'/models' if i == 0 else f'/models{i + 1}'}"
+            for i, d in enumerate(models_dirs)
+        ]
         docker_parts = [
             "docker run --init --rm",
             docker_args,
             "--name ${MODEL_ID}",
-            f"-v {models_dir}:/models",
+            *bind,
             *mounts,
             f"-p ${{PORT}}:{container_port}",
             image,
         ]
-        cmd = " ".join(docker_parts) + " " + " ".join(serve_parts)
+        cmd = " ".join(docker_parts) + " " + serve
         return cmd, {"mtp_enabled": False}

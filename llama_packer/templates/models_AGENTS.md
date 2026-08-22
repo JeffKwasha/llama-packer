@@ -60,6 +60,14 @@ type: instruct              # descriptive label; type: embedding|rerank hints ro
 mtp_accuracy: 0.9           # MTP draft acceptance; feeds throughput estimate
 strengths: ["bash tool calling"]
 weaknesses: ["slow on 32GB"]
+# --- reasoning (chat models only) ---
+# Only meaningful on reasoning-capable chat models (capabilities includes
+# `reasoning`); on anything else it is logged and ignored.
+reasoning-format: deepseek  # none | deepseek | deepseek-legacy | auto
+reasoning-preserve: true    # --reasoning-preserve (keep thinking trace in history)
+# --- serving precision ---
+cache_type: q8_0            # KV-cache precision: f32/f16/bf16/q8_0/q8_1/q8_k/q6_0/q6_k/q5_0/q5_1/q5_k/q4_0/q4_1/q4_k/iq4_nl
+parallel: 1                 # parallel slots (usually left to profiles.yaml)
 # --- per-model sampling (replaces global profiles.yaml defaults) ---
 default_mode: instruct      # maps to the bare ${MODEL_ID} profile
 modes:                      # keys use llama.cpp names: temperature, top_p,
@@ -89,7 +97,10 @@ explicitly to override.
 | `device: N` | Pin to GPU N; `device: cpu` runs the model on CPU |
 | `concurrency: N` | Per-model concurrency limit |
 | `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
-| `reasoning: auto` | Emit one variant per reasoning mode |
+| `reasoning-format: <mode>` | llama-server `--reasoning-format` (none/deepseek/deepseek-legacy/auto). Chat + reasoning-capable only |
+| `reasoning-preserve: true` | Emit `--reasoning-preserve`. Chat + reasoning-capable only |
+| `cache_type: <precision>` | KV-cache precision for `--cache-type-k/v` + VRAM sizing (f32, f16/bf16, q8_0/q8_1/q8_k, q6_0/q6_k, q5_0/q5_1/q5_k, q4_0/q4_1/q4_k, iq4_nl) |
+| `parallel: N` | Parallel slots (`--parallel`) and VRAM sizing |
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / `2`) |
 | `ignore: true` | Skip this model entirely |
 | `fit-params:` | Auto-written by llama-packer — do not edit |

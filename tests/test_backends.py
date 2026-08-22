@@ -207,3 +207,54 @@ def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
     m._resolved_chat_template = tpl.resolve()
     cmd, _ = VllmDockerBackend().build_cmd(m, 8192, 1, "q8_0", tvars)
     assert "--chat-template /models/qwen.jinja" in cmd
+
+
+# ── reasoning flags + duplicate-free command composition ───────────────────
+
+
+def test_llama_server_reasoning_format(make_model):
+    m = make_model("m", **{"reasoning-format": "deepseek"})
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--reasoning-format deepseek" in cmd
+
+
+def test_llama_server_reasoning_preserve(make_model):
+    m = make_model("m", **{"reasoning-preserve": True})
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--reasoning-preserve" in cmd
+
+
+def test_llama_server_reasoning_flags_chat_only(make_model):
+    # embeddings/rerank never get reasoning flags (gated to the chat role).
+    m = make_model("e", role="embeddings", **{"reasoning-format": "deepseek"})
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--reasoning-format" not in cmd
+
+
+def test_cli_args_duplicate_flag_collapses(make_model):
+    # A flag set both structurally and in cli_args is emitted exactly once
+    # (the flag dict refuses duplicate keys); cli_args wins on value.
+    m = make_model("m", cli_args="--reasoning-format none",
+                   **{"reasoning-format": "deepseek"})
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert cmd.count("--reasoning-format") == 1
+    assert "--reasoning-format none" in cmd
+    assert "deepseek" not in cmd
+
+
+def test_llama_server_multiple_loras_comma_joined(make_model):
+    m = make_model("m")
+    m._resolved_loras = [Path("/a/x.gguf"), Path("/a/y.gguf")]
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert cmd.count("--lora") == 1
+    assert "--lora /a/x.gguf,/a/y.gguf" in cmd
+
+
+def test_vllm_warns_on_reasoning_format(make_model, caplog):
+    import logging
+    m = make_model("v", hf_repo="org/model", **{"reasoning-format": "deepseek"})
+    with caplog.at_level(logging.WARNING):
+        VllmHostBackend().warn_unhandled(
+            {k for k in SETTING_KEYS if k in m.frontmatter} - FRAMEWORK_CONSUMED - METADATA_ONLY
+        )
+    assert any("reasoning-format" in r.message for r in caplog.records)
