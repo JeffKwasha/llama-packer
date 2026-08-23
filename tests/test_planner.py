@@ -79,31 +79,48 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     assert v.vision_ctx == 4096
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vis", "vis-vision-4k"}
-    main = config["models"]["vis"]
+    # Auto-dropped main entry is renamed <id>-text (bare id always = vision).
+    assert set(config["models"]) == {"vis-text", "vis-vision-4k"}
+    main = config["models"]["vis-text"]
     vision = config["models"]["vis-vision-4k"]
     assert "--mmproj" not in main["cmd"]
+    assert main["name"].endswith("[text]")
     assert main["metadata"]["mmproj_skipped"] is True
     assert main["capabilities"]["in"] == ["text"]
     assert "--mmproj" in vision["cmd"]
     assert vision["name"].endswith("[vision 4k]")
 
 
-def test_planner_vision_kept_single_entry(make_model, profiles, tmp_path):
-    m = _vision_model(tmp_path, make_model, "vis")
-    _scripted_ctx(m, {True: 131072, False: 262144})
+def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
+    # Big design context so the design-clamp doesn't mask which budget was
+    # used; text ctx < vision ctx proves the variant was budgeted WITHOUT the
+    # mmproj (include_mmproj=False path).
+    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vis", mmproj="vis-mmproj.gguf", context_length=262144)
+    _scripted_ctx(m, {True: 131072, False: 100000})
 
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
                       min_context=131072)
     variants = planner.plan()["vis"]
-    assert len(variants) == 1
+    assert len(variants) == 2
     v = variants[0]
     assert v.include_mmproj is True
+    assert v.ctx_size == 131072
     assert v.vision_ctx is None
+    tv = variants[1]
+    assert tv.include_mmproj is False
+    assert tv.vision_ctx is None
+    assert tv.ctx_size == 100000
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vis"}
+    assert set(config["models"]) == {"vis", "vis-text"}
     assert "--mmproj" in config["models"]["vis"]["cmd"]
+    text = config["models"]["vis-text"]
+    assert "--mmproj" not in text["cmd"]
+    assert text["name"].endswith("[text]")
+    assert text["metadata"]["mmproj_skipped"] is True
+    assert text["metadata"]["ctx_size"] == 100000
+    assert text["capabilities"]["in"] == ["text"]
 
 
 def test_bounded_ctx_clamps_design_then_cli(make_model, profiles):

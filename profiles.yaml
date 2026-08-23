@@ -8,6 +8,23 @@ defaults:
   min_p: 0.01
   pres_pen: 0.0
 
+# Model roots (CLI --models-dir overrides this). Role is selected by the
+# first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →
+# embeddings, rerank/ → rerank; other subdirs (img/, misc/, tmp/…) are
+# ignored, and files at a root are chat.
+models_dirs:
+  - /mnt/ai/models
+  - ./models
+
+# HF cache root: sidecars with `hf_repo:` + `model:` resolve hub snapshots
+# directly from here (no symlinks into the models dirs needed).
+hf_home: /mnt/ai/huggingface
+
+overrides:
+  - when: {base_model: 'qwen3\.?[568]'}
+    chat_template: qwen_chat_template.jinja
+    chat_template_kwargs: {enable_thinking: true}
+
 # ── Profile definitions ────────────────────────────────
 profiles:
   default:

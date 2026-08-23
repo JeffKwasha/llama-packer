@@ -68,3 +68,21 @@ def test_apply_env_subst_leaves_unmatched_paths_alone():
     config = {"models": {"m": {"cmd": "run /elsewhere/m.gguf"}}}
     out = _apply_env_subst(config, sub, [])
     assert out["models"]["m"]["cmd"] == "run /elsewhere/m.gguf"
+
+
+def test_build_matrix_vars_includes_text_variants():
+    import logging
+    from llama_packer.__main__ import _build_matrix_vars
+
+    def m(role, tid):
+        return SimpleNamespace(role=role, template_id=tid)
+
+    models = [m("chat", "alpha"), m("chat", "beta"), m("embeddings", "emb-1"),
+              m("rerank", "rnk-1")]
+    # Only emitted entries become vars: alpha kept vision (has -text), beta
+    # was auto-dropped (its main entry IS beta-text), ghost never emitted.
+    entry_ids = {"alpha", "alpha-text", "beta-text"}
+    vars_ = _build_matrix_vars(models, m("embeddings", "emb-1"), m("rerank", "rnk-1"),
+                               entry_ids, logging.getLogger("test"))
+    assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
+                     "emb": "emb-1", "rnk": "rnk-1"}

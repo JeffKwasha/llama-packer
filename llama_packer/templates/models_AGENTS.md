@@ -10,17 +10,28 @@ matches the model file next to it:
 
 | File | Served as |
 |------|-----------|
-| `<name>.gguf` | chat model (llama-server) |
+| `<name>.gguf` | chat model at the root, or under `chat/` `t2t/` `vision/` `doc/` |
 | `<name>.safetensors` | chat model (vLLM backend) |
 | `<name>.md` | sidecar for the file above |
-| `embed/<name>.gguf` | embeddings model |
+| `chat/<name>.gguf` | chat model (canonical name; `t2t/` is its legacy alias) |
+| `vision/<name>.gguf` | vision-capable chat model + its `*mmproj*.gguf` companion (same role as chat, colocated) |
+| `doc/<name>.gguf` | OCR / extraction / file-format chat model (`ocr/` is the legacy alias) |
+| `embed/<name>.gguf` | embeddings model (nested dirs like `embed/jina-v5/` keep the role) |
 | `rerank/<name>.gguf` | rerank model |
+
+Orphan GGUFs under `embed/`/`rerank`/`doc/`/etc. get stubs automatically with the
+role baked in. Other subdirs (`img/` for stable-diffusion-only models, `misc/`,
+`tmp/`, `hf_hub/`, `s2t/`, …) are not served — extend via profiles.yaml `dirs:`.
+
+Hub-downloaded files need no symlink: sidecar declares `hf_repo: org/repo` (or
+a parseable `hf_url:`) alongside `model: file.gguf`, and the file resolves
+from `$HF_HOME/hub` (`hf_home: /mnt/ai/huggingface`); see SPEC.md.
 
 If the `.md` cannot share the model's stem, point at the file with
 `model: <filename>`.
 
-Companions sit next to their parent and are referenced by filename from the
-parent sidecar — they are never main models:
+Companions sit next to their parent (or in the same HF hub snapshot) and are
+referenced by filename from the parent sidecar — they are never main models:
 
 | Companion | Field |
 |-----------|-------|
@@ -85,12 +96,15 @@ modes:                      # keys use llama.cpp names: temperature, top_p,
 
 Any field not listed above still flows through to clients as `metadata`.
 
-## Roles
+## Roles and directories
 
 `role:` selects how a model is served — `chat` (default), `embeddings`
-(`--embedding`), or `rerank` (`--rerank`). It is inferred from the `embed/` /
-`rerank/` directory or a `type:` of `embedding` / `rerank`; declare `role:`
-explicitly to override.
+(`--embedding`), or `rerank` (`--rerank`). It is inferred from the top-level
+subdirectory under a `--models-dir` root (`chat/` `t2t/` `vision/` `doc/` →
+chat, `embed/` → embeddings, `rerank/` → rerank; files at the root default to
+chat) or from a `type:` of `embedding` / `rerank`; declare `role:` explicitly
+to override. Roots and role map are configured in profiles.yaml (`models_dirs:`
++ `dirs:`; see SPEC.md).
 
 ## Other fields
 
@@ -106,6 +120,7 @@ explicitly to override.
 | `parallel: N` | Parallel slots (`--parallel`) and VRAM sizing |
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2, same on every backend) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON, verbatim (eagle3/ngram/draft_model/...) |
+| `model: <file>` + `hf_repo: org/repo` | Hub-downloaded file resolved from the HF cache without a symlink into the models dir |
 | `ignore: true` | Skip this model entirely |
 | `fit-params:` | Auto-written by llama-packer — do not edit |
 

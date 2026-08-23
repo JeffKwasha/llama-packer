@@ -65,6 +65,9 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `matrix` | Shared embed/rerank/chat VRAM budget solving (`embed`/`rerank` model refs) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
+| `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
+| `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
+| `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
 
 **Profile entries** (each value under `profiles:`) may set:
 
@@ -185,11 +188,11 @@ max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-co
 
 Chat models target a minimum useful context (`_MIN_USEFUL_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without vision (at the global `--spare`):
 
-- `ctx_with ≥ min_context` → keep vision; a single entry is emitted with `--mmproj` and the `vision` capability.
-- `ctx_with < min_context` → the main entry **drops** mmproj: no `--mmproj`, the `vision` capability is removed, and `metadata.mmproj_skipped: true` is set. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
+- `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `vision` capability. An on-demand **text-only variant** `<id>-text` (no `--mmproj`, `vision` removed, `metadata.mmproj_skipped: true`, display name `[text]`) is emitted alongside so clients can pick the lower-memory serving.
+- `ctx_with < min_context` → the main entry **drops** mmproj and is renamed `<id>-text` — the invariant is that the bare `<id>` always serves vision when the model has one; every no-mmproj entry carries the `-text` suffix and `[text]` label so a client that knows nothing of server config can tell it is text-only from `/v1/models`. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
 - If even the text-only context is `< min_context`, a warning is logged (the main entry is still emitted).
 
-Both the main and vision-variant entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare.
+All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every `<id>-text` entry joins the same matrix co-loading sets as its parent `<id>` entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
 
 ## Matrix Context Solving
 
@@ -620,29 +623,64 @@ ctx_factor [MiB/token] = kv_bytes_per_token / 2²⁰   (+ attention scratch, mea
 
 ## Model Discovery and Stub Sidecars
 
-Every `--models-dir` directory is scanned independently (`Model.from_dir`):
+Every `--models-dir` directory is scanned independently and **recursively**
+(`Model.from_dir` → `utils.classify_models` → `utils.dir_role_map`):
 
 - `.md` sidecar files are the entry points; each binds to the model file whose
-  stem matches its own (or the file named by `model:`).
-- Subdirectories named `embed` / `rerank` (configurable with `--extra-dirs`)
-  are scanned for orphan GGUFs, which get the matching role inferred.
+  stem matches its own, or the file named by `model:`.
+- Within a models dir the **first relative path component** selects the role
+  via `dirs:` in profiles.yaml (case-insensitive). Defaults:
+
+  | Prefix | Role | Meaning |
+  |--------|------|---------|
+  | `chat` | `chat` | Chat — and its mmproj/MTP companions living next to it |
+  | `t2t` | `chat` | Legacy name for the chat dir |
+  | `vision` | `chat` | VLMs + mmproj (same role as chat, colocated) |
+  | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
+  | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
+  | `rerank` | `rerank` | Reranker models |
+
+  Files at the root itself default to `chat`; files under any other
+  subdirectory (`img/` for stable-diffusion-only models, `misc/`, `tmp/`,
+  `hf_hub/`, `s2t/`, …) are **skipped**. The whitelist is extendable via
+  profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and via CLI
+  `--extra-dirs` (backcompat for `embed`/`rerank`).
 - Orphan GGUFs next to chat models are classified as companions (mmproj /
   MTP draft), never as main models.
-- Symlinks resolving to the same model file are deduplicated across
-  directories (first wins).
+- Hardlinks and symlinks resolving to the same `(st_dev, st_ino)` are deduplicated
+  across directories (first `models_dirs` entry wins).
+
+`--models-dir` precedence: CLI `--models-dir` (when given) > profiles.yaml
+`models_dirs:` (a list) > `./models`.
+
+**HF hub cache resolution.** A sidecar can reference a hub-downloaded GGUF without
+symlinking it into a models dir: declare both `hf_repo: org/repo` (or a
+parseable `hf_url:`) **and** `model: file.gguf`. Resolution:
+
+1. `model:` relative to the sidecar's dir (and its parent), then
+2. `$HF_HOME/hub/models--org--repo/snapshots/<rev>/file.gguf`, revision from
+   `refs/main`, else the sole snapshot dir, else the newest by mtime.
+
+The HF cache root is `--hf-home` > profiles.yaml `hf_home:` >
+`$HF_HOME`/`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`. By default it
+points at your `/mnt/ai/huggingface`. With this, `hf download org/repo`
+followed by a small `.md` sidecar is sufficient — no symlink step and no
+widening of `${MODELS_DIR}` (HF cache paths get their own `${HF_HOME}` macro).
 
 **Stub sidecars.** A model file without any sidecar gets a minimal one written
 next to it: `name` (stem), `parameters` and `quantization` inferred from the
-filename, and `_DEFAULT_CONTEXT_LENGTH`. This makes a directory of bare models
-work on first run. `--no-stubs` skips generation.
+filename, `role` when discovered under an embeddings/rerank directory, and
+`_DEFAULT_CONTEXT_LENGTH`. This makes a directory of bare models and any
+new `embed/`/`rerank`/`doc/` orphans work on first run. `--no-stubs` skips generation.
 
 ## Path macros and HF_HOME
 
 Generated commands are emitted with absolute paths, then rewritten to
 `${LLAMA_DIR}` / `${MODELS_DIR}` / `${MODELS_DIR_2}`… macros via
 `compute_env_prefixes` (grouped by mount, longest common directory per group).
-Paths under the Hugging Face cache root (`--hf-home` > `$HF_HOME` >
-`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`) are pulled into their own
+Paths under the Hugging Face cache root (`--hf-home` > profiles.yaml `hf_home:`
+> `$HF_HOME` > `$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`, the default
+`hf_home: /mnt/ai/huggingface` in your profiles.yaml) are pulled into their own
 `${HF_HOME}` macro so a chat template (or LoRA) living in the HF cache never
 widens `${MODELS_DIR}` up to a non-models directory.
 

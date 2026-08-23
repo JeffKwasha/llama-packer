@@ -62,11 +62,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
                         help="Show llama-packer version and exit")
     parser.add_argument("--llama-server", help="Explicit path to llama-server binary")
-    parser.add_argument("--models-dir", nargs="+", default=["models"],
-                        help="Model directory (default: ./models); pass multiple to scan several")
-    parser.add_argument("--hf-home", help="HF cache root for path grouping "
-                        "(overrides $HF_HOME / $HUGGINGFACE_HUB_CACHE; used to keep "
-                        "chat-template/LoRA paths out of ${MODELS_DIR})")
+    parser.add_argument("--models-dir", nargs="+", default=None,
+                        help="Model directories (default: profiles.yaml models_dirs, "
+                             "else ./models); pass multiple to scan several")
+    parser.add_argument("--hf-home", help="HF cache root for hub snapshot resolution and path grouping "
+                        "(overrides profiles.yaml hf_home / $HF_HOME / $HUGGINGFACE_HUB_CACHE)")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
     parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
     parser.add_argument("--agents", action="store_true",
@@ -172,15 +172,23 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
     return min(cands, key=lambda m: m.vram_mb)
 
 
-def _build_matrix_vars(models: list, embed_model, rerank_model, logger) -> dict:
-    """Auto-collect matrix vars: chat models + selected embed/rerank."""
+def _build_matrix_vars(models: list, embed_model, rerank_model, entry_ids, logger) -> dict:
+    """Auto-collect matrix vars: chat entries + selected embed/rerank.
+
+    Each chat model contributes a var per emitted entry id (the bare id and,
+    when present, its ``<id>-text`` text-only variant), so text variants join
+    the same co-loading sets as their parent entry.
+    """
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
         if m.role in ("embeddings", "rerank"):
             continue
-        chat_idx += 1
-        vars_[f"c{chat_idx}"] = m.template_id
+        base = m.template_id
+        for eid in (base, f"{base}-text"):
+            if eid in entry_ids:
+                chat_idx += 1
+                vars_[f"c{chat_idx}"] = eid
     if embed_model is not None:
         vars_["emb"] = embed_model.template_id
     if rerank_model is not None:
@@ -228,17 +236,6 @@ def main(argv: list[str] | None = None) -> None:
     if args.verbose:
         logger.info("llama-packer %s", __version__)
 
-    models_dirs = [Path(d).absolute() for d in args.models_dir]
-    missing = [d for d in models_dirs if not d.is_dir()]
-    if missing:
-        for d in missing:
-            logger.error("models directory not found: %s", d)
-        sys.exit(1)
-
-    if args.agents:
-        for d in models_dirs:
-            write_agents_md(d)
-
     profiles_path = Path(args.profiles).absolute()
     if not profiles_path.is_file():
         bundled = importlib.resources.files("llama_packer").joinpath("profiles.yaml")
@@ -254,6 +251,36 @@ def main(argv: list[str] | None = None) -> None:
 
     if not Profiles(profiles_cfg).profile_list:
         logger.error("no profiles defined in profiles.yaml")
+        sys.exit(1)
+
+    # Models dirs: CLI --models-dir > profiles.yaml models_dirs: > ./models.
+    if args.models_dir:
+        models_dirs = [Path(d).absolute() for d in args.models_dir]
+    else:
+        models_dirs = [Path(d).absolute() for d in (profiles_cfg.get("models_dirs") or ["models"])]
+    missing = [d for d in models_dirs if not d.is_dir()]
+    if missing:
+        for d in missing:
+            logger.error("models directory not found: %s", d)
+        sys.exit(1)
+
+    if args.agents:
+        for d in models_dirs:
+            write_agents_md(d)
+
+    # HF cache root: CLI > profiles.yaml > env (used for hub snapshot
+    # resolution and ${HF_HOME} path grouping).
+    hf_home = args.hf_home or profiles_cfg.get("hf_home")
+
+    # Directory-name → role map extension from profiles.yaml `dirs:`.
+    dir_roles = profiles_cfg.get("dirs") or {}
+    if not isinstance(dir_roles, dict):
+        logger.error("profiles.yaml dirs: must be a mapping of directory name to role")
+        sys.exit(1)
+    bad_roles = {d: r for d, r in dir_roles.items() if r not in ("chat", "embeddings", "rerank")}
+    if bad_roles:
+        logger.error("profiles.yaml dirs: unknown roles %s (allowed: chat, embeddings, rerank)",
+                     bad_roles)
         sys.exit(1)
 
     if args.llama_server:
@@ -282,7 +309,9 @@ def main(argv: list[str] | None = None) -> None:
         min_ctx = parse_context_length(args.min_context)
 
     # Discover models
-    models = Model.from_dir(models_dirs, generate_stubs=not args.no_stubs, extra_dirs=args.extra_dirs)
+    models = Model.from_dir(models_dirs, generate_stubs=not args.no_stubs,
+                            extra_dirs=args.extra_dirs, dir_roles=dir_roles,
+                            hf_home=hf_home)
     if not models:
         logger.error("no models found (create a .md sidecar file)")
         sys.exit(1)
@@ -338,7 +367,7 @@ def main(argv: list[str] | None = None) -> None:
             raw_paths.append(str(ct))
         for _lora in _m.resolved_loras:
             raw_paths.append(str(_lora))
-    prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin, hf_home=args.hf_home)
+    prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin, hf_home=hf_home)
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
 
@@ -403,7 +432,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
-        vars_ = _build_matrix_vars(models, embed_model, rerank_model, logger)
+        vars_ = _build_matrix_vars(models, embed_model, rerank_model,
+                                   set(config.get("models") or {}), logger)
         # Expand the __CHAT_VARS__ placeholder in each set with the chat VAR
         # NAMES (c1 | c2 | ...), not the model IDs — llama-swap sets DSL
         # references var names, which map to model IDs via `vars`.

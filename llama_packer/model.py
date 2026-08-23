@@ -40,10 +40,11 @@ class Model:
         "cache_type", "parallel",
     })
 
-    def __init__(self, md_path: Path, frontmatter: dict):
+    def __init__(self, md_path: Path, frontmatter: dict, hf_home=None):
         self.md_path = md_path
         self.frontmatter = frontmatter
         self.stem = md_path.stem
+        self._hf_home = hf_home  # HF cache root override for hub snapshot resolution
         self._gguf_ctx_cache: int | None = None  # cached GGUF architectural context
         self._vram: VramBudget | None = None  # lazy VRAM budget calculator
 
@@ -52,6 +53,10 @@ class Model:
         self.gguf_path = self._resolve_gguf_path()
         if not self.gguf_path and self.hf_repo is None:
             raise ValueError(f"No GGUF/safetensors or hf_repo found for {md_path}")
+        if not self.gguf_path and self.frontmatter.get("model"):
+            raise ValueError(
+                f"model file {self.frontmatter['model']!r} for {md_path} not found "
+                f"locally or in the HF hub cache (hf download {self.hf_repo})")
 
         # Resolve companions (mmproj, MTP)
         self.mmproj: Model | None = None
@@ -64,7 +69,9 @@ class Model:
                     self.mtp.stem if self.mtp else "none")
 
     def _resolve_gguf_path(self) -> Path | None:
-        """Resolve the main model file (.gguf or .safetensors) from frontmatter or convention."""
+        """Resolve the main model file (.gguf or .safetensors): frontmatter
+        ``model:`` field (local dir, then the HF hub cache via ``hf_repo``),
+        then the same-stem convention."""
         parent = self.md_path.parent
 
         # 1. Check frontmatter `model` field
@@ -75,6 +82,13 @@ class Model:
                 model_file = parent.parent / file_ref
             if model_file.is_file():
                 return utils.smart_resolve(model_file)
+            # 1b. HF hub cache: a hub-downloaded file needs no symlink into
+            # the models dir — resolve it from `hf_repo` + `model:`.
+            repo = self.hf_repo
+            if repo:
+                hit = utils.hf_snapshot_file(repo, str(file_ref), self._hf_home)
+                if hit is not None:
+                    return utils.smart_resolve(hit)
 
         # 2. Convention: same stem, either .gguf or .safetensors
         for ext in (".gguf", ".safetensors"):
@@ -163,6 +177,7 @@ class Model:
         companion.stem = path.stem
         companion.gguf_path = utils.smart_resolve(path)
         companion._vram = None
+        companion._hf_home = None
         companion.mmproj = None
         companion.mtp = None
         return companion
@@ -174,11 +189,16 @@ class Model:
         *,
         generate_stubs: bool = True,
         extra_dirs: list[str] | None = None,
+        dir_roles: dict | None = None,
+        hf_home=None,
     ) -> list[Model]:
         """Discover all models across *models_dirs* via .md sidecars.
 
         *models_dirs* is a single directory or a list of them.  Symlinks that
         resolve to the same underlying model file are deduplicated (first wins).
+        *dir_roles* extends/overrides the directory-name → role map (see
+        ``utils.dir_role_map``); *hf_home* overrides the HF cache root used to
+        resolve ``hf_repo`` + ``model:`` sidecars from hub snapshots.
         Returns a list of instantiated Model objects (main models only).
         """
         if isinstance(models_dirs, (str, os.PathLike)):
@@ -187,7 +207,7 @@ class Model:
             models_dirs = [Path(d) for d in models_dirs]
 
         # Single source of truth for role classification (see utils.classify_models).
-        classified = utils.classify_models(models_dirs, extra_dirs)
+        classified = utils.classify_models(models_dirs, extra_dirs, dir_roles)
         md_items = {p: k for p, k in classified if p.suffix.lower() == ".md"}
         gguf_items = {p: k for p, k in classified if p.suffix.lower() in (".gguf", ".safetensors")}
 
@@ -209,35 +229,46 @@ class Model:
                 fm = {**fm, "role": kind}
             known_md.add(md_path)
             try:
-                model = cls(md_path, fm)
+                model = cls(md_path, fm, hf_home=hf_home)
                 models.append(model)
             except Exception as e:
                 logger.warning("failed to load model from %s: %s", md_path, e)
 
         if generate_stubs:
             for gguf, kind in gguf_items.items():
-                # Companions (mmproj/mtp) and embed/rerank models are never
-                # main-model (chat) stubs.
-                if kind in ("mmproj", "mtp", "embeddings", "rerank"):
+                # Companions (mmproj/mtp) are never main models.  Embed/rerank
+                # orphans DO get stubs, with the role baked in — discovering a
+                # new model is the whole point of dropping it in the dir.
+                if kind in ("mmproj", "mtp"):
                     continue
                 md_path = gguf.with_suffix(".md")
                 if md_path in md_items:
                     continue
                 if not gguf.is_file():
                     continue
-                fm = utils.generate_stub_md(md_path, gguf)
+                role = kind if kind in ("embeddings", "rerank") else None
+                fm = utils.generate_stub_md(md_path, gguf, role=role)
                 try:
-                    model = cls(md_path, fm)
+                    model = cls(md_path, fm, hf_home=hf_home)
                     models.append(model)
                     logger.info("stub: %s", md_path.name)
                 except Exception as e:
                     logger.warning("failed to create stub for %s: %s", gguf, e)
 
-        # Deduplicate symlinks to the same model file (first wins).
+        # Deduplicate links to the same model file (first wins): symlinks via
+        # realpath, hardlinks via (st_dev, st_ino).
         deduped: list[Model] = []
         seen: set[str] = set()
         for model in models:
-            key = os.path.realpath(str(model.gguf_path)) if model.gguf_path else str(model.md_path)
+            if model.gguf_path:
+                key = os.path.realpath(str(model.gguf_path))
+                try:
+                    st = os.stat(str(model.gguf_path))
+                    key = f"{key}|{st.st_dev}:{st.st_ino}"
+                except OSError:
+                    pass
+            else:
+                key = str(model.md_path)
             if key in seen:
                 logger.info("duplicate model file (symlink) skipped: %s", model.stem)
                 continue

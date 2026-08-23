@@ -291,6 +291,9 @@ class Variant:
 
     ``vision_ctx`` is set only when mmproj was dropped from the main variant
     but a companion exists — the emitter then adds a best-effort vision entry.
+    A variant with ``include_mmproj=False`` is emitted as the ``<id>-text``
+    entry (this is both the on-demand text-only variant of a vision-keeping
+    model and the renamed main entry of an auto-dropped model).
     """
     parallel: int
     cache_type: str
@@ -376,9 +379,10 @@ class Planner:
         """Decide per chat model whether the main entry keeps its mmproj.
 
         A model keeps vision when it reaches the minimum useful context WITH
-        the projection loaded; otherwise the main entry drops it (a best-effort
-        vision variant is emitted later).  Uses the global spare and fleet
-        defaults; per-profile spare still bounds ctx per group.
+        the projection loaded; otherwise the main entry drops it (and is
+        emitted as ``<id>-text``; a best-effort vision variant is emitted
+        alongside).  Uses the global spare and fleet defaults; per-profile
+        spare still bounds ctx per group.
         """
         drop: dict[str, bool] = {}
         global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
@@ -455,6 +459,22 @@ class Planner:
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                     profiles_group=group, ctx_size=ctx_size,
                     include_mmproj=include_mmproj, vision_ctx=vision_ctx))
+
+                # On-demand text-only variant: when the main entry keeps its
+                # mmproj, also plan a no-vision entry (``<id>-text``) so
+                # clients can pick the lower-memory serving.  When the main
+                # entry was auto-dropped it IS the ``-text`` entry, so no
+                # separate variant is needed.
+                if (include_mmproj and model.role == "chat"
+                        and model.mmproj and model.mmproj.gguf_path):
+                    text_ctx = self._bounded_ctx(
+                        model, parallel=parallel, cache_type=cache_type,
+                        spare_mb=spare_mb, include_mmproj=False,
+                        design_ctx=self.chat_ctx, context_length=context_length)
+                    variants.append(Variant(
+                        parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
+                        profiles_group=group, ctx_size=text_ctx,
+                        include_mmproj=False))
             plan[model.stem] = variants
         return plan
 
@@ -556,9 +576,13 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
-    entry; a variant with ``vision_ctx`` additionally emits a best-effort
-    vision companion entry, id-suffixed ``-vision-<N>k`` where
-    ``N = vision_ctx // 1000`` (e.g. 92567 → ``-vision-92k``).
+    entry.  Id invariant: the bare ``<id>`` always serves vision when the
+    model has an mmproj — every no-mmproj variant is emitted as
+    ``<id>-text`` (name suffix ``[text]``), whether it is the on-demand
+    text-only variant or the main entry of an auto-dropped model.  A variant
+    with ``vision_ctx`` additionally emits a best-effort vision companion
+    entry, id-suffixed ``-vision-<N>k`` where ``N = vision_ctx // 1000``
+    (e.g. 92567 → ``-vision-92k``).
     """
     entries: dict[str, dict] = {}
     for model in models:
@@ -568,7 +592,10 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 model, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
+                name_suffix="" if v.include_mmproj else " [text]",
             )
+            if not v.include_mmproj:
+                entry_id = f"{entry_id}-text"
             entries[entry_id] = entry
 
             if v.vision_ctx is None:
@@ -628,8 +655,9 @@ def build_config(
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
-            projection is dropped from the main entry (a ``vision-<N>k`` variant
-            is emitted instead, still exposing vision at best-effort context).
+            projection is dropped from the main entry, which is renamed
+            ``<id>-text`` (a ``vision-<N>k`` variant is emitted alongside,
+            still exposing vision at best-effort context).
     """
     profiles = profiles_cfg if isinstance(profiles_cfg, Profiles) else Profiles(profiles_cfg)
 

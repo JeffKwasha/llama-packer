@@ -439,7 +439,7 @@ def parse_frontmatter(md_path: Path) -> dict:
     return fm
 
 
-def generate_stub_md(md_path: Path, model_file: Path) -> dict:
+def generate_stub_md(md_path: Path, model_file: Path, role: str | None = None) -> dict:
     """Generate stub .md sidecar for an orphan model file (.gguf or .safetensors)."""
     stem = model_file.stem
     fm = {
@@ -449,6 +449,8 @@ def generate_stub_md(md_path: Path, model_file: Path) -> dict:
         "quantization": infer_quantization(stem),
         "hf_url": "",
     }
+    if role in ("embeddings", "rerank"):
+        fm["role"] = role
     content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---\n\n# " + stem + "\n"
     md_path.write_text(content, encoding="utf-8")
     try:
@@ -476,8 +478,24 @@ def _is_mtp_companion(stem: str) -> bool:
 
 MODEL_KINDS = ("chat", "embeddings", "rerank", "mmproj", "mtp")
 
-# Mapping from an ``extra_dir`` name to the role its contents play.  Files
-# discovered under ``embed/`` are embedding models, under ``rerank/`` rerankers.
+# Default directory-name → role map for discovery.  The FIRST path component
+# of a model file (relative to a models-dir root) selects the role; files at
+# the root itself are chat.  Subdirectories absent from this map are not
+# served at all (e.g. ``img/`` for stable-diffusion-only models, ``misc/``,
+# ``tmp/``).  Extend or override via the profiles.yaml ``dirs:`` mapping;
+# ``--extra-dirs`` entries merge in too (backcompat).  Keys are matched
+# case-insensitively.
+_DEFAULT_DIR_ROLES = {
+    "chat": "chat",
+    "t2t": "chat",  # legacy name for the chat dir
+    "vision": "chat",
+    "doc": "chat",
+    "ocr": "chat",  # legacy name for the doc dir
+    "embed": "embeddings",
+    "rerank": "rerank",
+}
+
+# Role inference for --extra-dirs names (pre-dates _DEFAULT_DIR_ROLES).
 _EXTRA_DIR_ROLE = {"embed": "embeddings", "rerank": "rerank"}
 
 
@@ -526,39 +544,55 @@ def model_kind(path: str | os.PathLike, role: str | None = None) -> str:
     return "chat"
 
 
+def dir_role_map(extra_dirs: list[str] | None = None,
+                 dir_roles: dict | None = None) -> dict[str, str]:
+    """Effective directory-name → role map: defaults + extra dirs + profiles.yaml ``dirs:``."""
+    role_map = dict(_DEFAULT_DIR_ROLES)
+    for d in (extra_dirs or []):
+        role_map.setdefault(str(d).lower(), _EXTRA_DIR_ROLE.get(str(d)) or "chat")
+    for d, r in (dir_roles or {}).items():
+        role_map[str(d).lower()] = str(r)
+    return role_map
+
+
 def classify_models(
     models_dirs: Sequence[str | os.PathLike],
     extra_dirs: list[str] | None = None,
+    dir_roles: dict | None = None,
 ) -> list[tuple[Path, str]]:
-    """Classify model files across *models_dirs* (and their ``extra_dirs``).
+    """Classify model files across *models_dirs*, recursively.
 
-    Each models dir is scanned on its own; ``extra_dirs`` are subdirectories of
-    every models dir (e.g. ``embed``/``rerank``).  Returns a list of
-    ``(path, kind)`` tuples where ``kind`` is one of :data:`MODEL_KINDS`
-    (``chat``, ``embeddings``, ``rerank``, ``mmproj``, ``mtp``).
+    Each models dir is scanned on its own.  Within a models dir, the first
+    relative path component selects the role via :func:`dir_role_map`
+    (``embed/`` → embeddings, ``rerank/`` → rerank, ``chat``/``t2t``/
+    ``vision``/``doc`` → chat); deeper nesting keeps the role, so
+    ``embed/org/model.gguf`` works.  Files at the root itself default to
+    chat; files under any other subdirectory are skipped (whitelist).
+    Returns a list of ``(path, kind)`` tuples where ``kind`` is one of
+    :data:`MODEL_KINDS` (``chat``, ``embeddings``, ``rerank``, ``mmproj``,
+    ``mtp``).
     """
     if isinstance(models_dirs, (str, os.PathLike)):
         models_dirs = [models_dirs]
-
-    roots: list[tuple[Path, str | None]] = []
-    for md in models_dirs:
-        base = Path(md)
-        roots.append((base, None))
-        for d in (extra_dirs or []):
-            extra = base / d
-            if extra.is_dir():
-                roots.append((extra, _EXTRA_DIR_ROLE.get(d)))
+    role_map = dir_role_map(extra_dirs, dir_roles)
 
     out: list[tuple[Path, str]] = []
-    for root, role in roots:
-        if not root.is_dir():
+    for md in models_dirs:
+        base = Path(md)
+        if not base.is_dir():
             continue
         for pattern in ("*.gguf", "*.safetensors", "*.md"):
-            recursive = pattern == "*.md"
-            walker = root.rglob(pattern) if recursive else root.glob(pattern)
-            for p in walker:
-                if p.is_file():
-                    out.append((p, model_kind(p, role)))
+            for p in base.rglob(pattern):
+                if not p.is_file():
+                    continue
+                parts = p.relative_to(base).parts
+                if len(parts) > 1:
+                    role = role_map.get(parts[0].lower())
+                    if role is None:
+                        continue  # subdirectory not in the role map: not served
+                else:
+                    role = None
+                out.append((p, model_kind(p, role)))
     return out
 
 
@@ -673,6 +707,63 @@ def hf_cache_root(override: str | os.PathLike | None = None) -> str | None:
         return os.path.abspath(os.fspath(root))
     default = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
     return default if os.path.isdir(default) else None
+
+
+def hf_hub_cache(override: str | os.PathLike | None = None) -> Path | None:
+    """Return the HF *hub* cache dir (the one holding ``models--org--repo/``).
+
+    Resolution order: explicit *override* (``--hf-home`` / profiles.yaml
+    ``hf_home:``, pointing at the HF_HOME-style root, or directly at the hub
+    dir) → ``$HF_HOME/hub`` → ``$HUGGINGFACE_HUB_CACHE`` →
+    ``~/.cache/huggingface/hub``.
+    """
+    if override:
+        base = Path(override)
+        hub = base / "hub"
+        return hub if hub.is_dir() else base
+    home = os.environ.get("HF_HOME")
+    if home:
+        return Path(home) / "hub"
+    env = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if env:
+        return Path(env)
+    default = Path.home() / ".cache" / "huggingface" / "hub"
+    return default if default.is_dir() else None
+
+
+def hf_snapshot_file(repo_id: str, filename: str,
+                     hf_home: str | os.PathLike | None = None) -> Path | None:
+    """Resolve ``filename`` inside the local HF hub snapshot of ``repo_id``.
+
+    Lets a sidecar reference a hub-downloaded GGUF (``hf_repo: org/repo`` +
+    ``model: file.gguf``) without symlinking it into a models dir.  Revision
+    selection: ``refs/main`` when present, else the sole snapshot dir, else
+    the newest by mtime (with a warning).  Returns None when unresolved.
+    """
+    hub = hf_hub_cache(hf_home)
+    if hub is None:
+        return None
+    repo_dir = hub / ("models--" + str(repo_id).replace("/", "--"))
+    snaps = repo_dir / "snapshots"
+    if not snaps.is_dir():
+        return None
+    snap: Path | None = None
+    ref = repo_dir / "refs" / "main"
+    if ref.is_file():
+        rev = ref.read_text(encoding="utf-8").strip()
+        if rev and (snaps / rev).is_dir():
+            snap = snaps / rev
+    if snap is None:
+        dirs = [d for d in snaps.iterdir() if d.is_dir()]
+        if not dirs:
+            return None
+        dirs.sort(key=lambda d: d.stat().st_mtime)
+        snap = dirs[-1]
+        if len(dirs) > 1:
+            logger.warning("hf: %s has %d snapshots and no refs/main; using newest (%s)",
+                           repo_id, len(dirs), snap.name)
+    candidate = snap / filename
+    return candidate if candidate.is_file() else None
 
 
 def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None,
