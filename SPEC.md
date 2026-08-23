@@ -589,11 +589,12 @@ calculation a guess):
 | `q4_1` | 0.625 |
 | `nvfp4` | 0.5625 |
 
-`nvfp4` is recognized **for VRAM sizing only** (4-bit E2M1 + FP8 block scales).
-vLLM's experimental `--kv-cache-dtype nvfp4` is SM100-only upstream — it
-crashes on SM120/SM121 (RTX 50-series, DGX Spark) — so llama-packer sizes for
-it but never emits the flag; force it via `cli_args` on B200-class hardware
-and know what you're doing (vllm#43562, NVIDIA/TensorRT-LLM#11799).
+**vLLM translation**: valid `--kv-cache-dtype` values pass through —
+`q8_*` → `fp8`, `f16`/`bf16`/`f32` → auto (no flag), `nvfp4` →
+`nvfp4` (experimental upstream; whether the serving build and hardware
+support it is the operator's call). The k-quants (`q4_*`, `q5_*`, `q6_*`,
+`iq4_nl`) have no vLLM equivalent: warned and the flag omitted, while VRAM
+sizing still uses the declared precision (conservative).
 
 ### Cache memory math
 

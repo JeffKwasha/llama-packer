@@ -167,20 +167,20 @@ def test_vllm_sub_byte_cache_type_warned_and_skipped(make_model, caplog):
     with caplog.at_level(logging.WARNING):
         cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q4_0", _tvars())
     assert "--kv-cache-dtype" not in cmd
-    assert any("no vLLM equivalent" in r.message for r in caplog.records)
+    assert any("no --kv-cache-dtype equivalent" in r.message
+               for r in caplog.records)
 
 
-def test_vllm_nvfp4_sized_but_flag_suppressed(make_model, caplog):
-    # nvfp4 KV is experimental upstream and SM100-only (crashes on SM120/121,
-    # i.e. RTX 50-series / DGX Spark): we size for it but never emit the flag.
+def test_vllm_nvfp4_flag_emitted_and_sized(make_model):
+    # nvfp4 is a valid --kv-cache-dtype value; whether the serving build
+    # supports it (experimental, hardware-gated) is the operator's call —
+    # we translate and size, we don't police.
     from llama_packer import utils
 
     assert utils._KV_CACHE_BYTES["nvfp4"] == pytest.approx(0.5625)
     m = make_model("v", hf_repo="org/model")
-    with caplog.at_level(logging.WARNING):
-        cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "nvfp4", _tvars())
-    assert "--kv-cache-dtype" not in cmd
-    assert any("SM100" in r.message for r in caplog.records)
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "nvfp4", _tvars())
+    assert "--kv-cache-dtype nvfp4" in cmd
 
 
 def test_vllm_parallel_maps_to_max_num_seqs(make_model):
