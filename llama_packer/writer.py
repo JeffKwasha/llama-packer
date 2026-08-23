@@ -529,9 +529,12 @@ def _solve_matrix_context(
                                        profiles.default_cache_type,
                                        profiles.default_parallel)
 
-    # Use conservative context defaults for embed/rerank if not specified
-    embed_ctx = 8192  # typical embed context
-    rerank_ctx = 8192  # typical rerank context
+    # Reserve for embed/rerank at their own declared context (sidecar
+    # context_length > GGUF architectural max), not an arbitrary constant —
+    # a 32k reranker costs ~4x the KV of an 8k one and must be budgeted as
+    # declared.
+    embed_ctx = embed_model.design_context
+    rerank_ctx = rerank_model.design_context
 
     return solve_matrix_ctx(
         vram_total_mb=vram_total,

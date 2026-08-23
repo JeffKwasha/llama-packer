@@ -23,6 +23,40 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Our cache_type values that map onto vLLM's --kv-cache-dtype. vLLM supports
+# only auto (f16/bf16/f32) and fp8 KV caches; our q8_* precisions are ~8-bit
+# and map to "fp8" (e4m3). Sub-byte block quants have no vLLM equivalent.
+_KV_DTYPE_FP8 = frozenset({"q8_0", "q8_1", "q8_k"})
+_KV_DTYPE_AUTO = frozenset({"f16", "bf16", "f32"})
+
+
+def _kv_cache_dtype_flags(cache_type: str) -> list[str]:
+    """Translate our cache_type into vLLM ``--kv-cache-dtype`` flags.
+
+    Single configuration means one cache precision decision drives both
+    backends where an equivalent exists; where none exists, say so loudly
+    instead of silently diverging from the llama-server rendering.
+    """
+    if cache_type in _KV_DTYPE_FP8:
+        return ["--kv-cache-dtype", "fp8"]
+    if cache_type in _KV_DTYPE_AUTO:
+        return []  # vLLM "auto" already serves at half/full precision
+    if cache_type == "nvfp4":
+        # Experimental upstream, absent from stable docs, and hard-wired to
+        # the SM100 trtllm-gen path: crashes at first request on SM120/SM121
+        # (RTX 50-series / DGX Spark) — vllm#43562, NVIDIA/TensorRT-LLM#11799.
+        # We size memory for it (see utils._KV_CACHE_BYTES) but do not emit
+        # the flag; force it via cli_args on B200-class hardware if needed.
+        logger.warning("vllm: cache_type %r is experimental upstream and only "
+                       "works on SM100 (B100/B200); not emitting "
+                       "--kv-cache-dtype (force via cli_args if you know)",
+                       cache_type)
+        return []
+    logger.warning("vllm: sub-byte cache_type %r has no vLLM equivalent "
+                   "(supported: auto/fp8); serving at auto instead",
+                   cache_type)
+    return []
+
 
 def _speculative_config(model: "Model") -> dict | None:
     """The ``--speculative-config`` JSON dict for *model*, or None.
@@ -124,6 +158,8 @@ class VllmHostBackend(BaseBackend):
         ctx_size: int,
         port: str,
         gpu_mem_util: str,
+        cache_type: str = "q8_0",
+        parallel: int = 1,
         map_path: Callable[[Path], str] | None = None,
     ) -> list[str]:
         flags = [
@@ -131,8 +167,12 @@ class VllmHostBackend(BaseBackend):
             "--served-model-name", "${MODEL_ID}",
             "--host", "0.0.0.0", "--port", str(port),
             "--max-model-len", str(ctx_size),
+            # Aligned with llama-server's --parallel: same sidecar/profile
+            # key, same slot-count meaning on every backend.
+            "--max-num-seqs", str(parallel),
             "--gpu-memory-utilization", str(gpu_mem_util),
         ]
+        flags += _kv_cache_dtype_flags(cache_type)
         ct = model.resolved_chat_template
         if ct is not None:
             ref = map_path(ct) if map_path else str(ct)
@@ -153,7 +193,8 @@ class VllmHostBackend(BaseBackend):
     ) -> tuple[str, dict]:
         gpu_mem_util = tvars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)
         vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
-        flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util))
+        flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util),
+                                  cache_type=cache_type, parallel=parallel)
         cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command([vllm_bin, "serve"], flags, cli_args)
         return cmd, _spec_meta(model)
@@ -195,7 +236,8 @@ class VllmDockerBackend(VllmHostBackend):
 
         vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
         serve_flags = self._serve_flags(
-            model, ctx_size, str(container_port), gpu_mem_util, map_path=_map
+            model, ctx_size, str(container_port), gpu_mem_util,
+            cache_type=cache_type, parallel=parallel, map_path=_map
         )
         serve = utils.render_command(
             [vllm_bin, "serve"], serve_flags,

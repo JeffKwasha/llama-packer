@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from llama_packer.backends import (
     FRAMEWORK_CONSUMED,
@@ -16,6 +19,7 @@ from llama_packer.backends import (
 )
 from llama_packer.backends.llama_server import LlamaServerBackend
 from llama_packer.backends.vllm import VllmDockerBackend, VllmHostBackend
+from llama_packer.profiles import Profiles
 
 
 def _tvars():
@@ -146,6 +150,74 @@ def test_vllm_docker_mtp_flag(make_model):
     cmd, meta = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--speculative-config" in cmd
     assert meta["mtp_enabled"] is True
+
+
+def test_vllm_cache_type_maps_to_kv_cache_dtype(make_model):
+    # q8_* -> fp8 (single configuration: same precision decision both backends)
+    m = make_model("v", hf_repo="org/model")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--kv-cache-dtype fp8" in cmd
+    # f16/bf16/f32 -> vLLM auto; no flag
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "f16", _tvars())
+    assert "--kv-cache-dtype" not in cmd
+
+
+def test_vllm_sub_byte_cache_type_warned_and_skipped(make_model, caplog):
+    m = make_model("v", hf_repo="org/model")
+    with caplog.at_level(logging.WARNING):
+        cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q4_0", _tvars())
+    assert "--kv-cache-dtype" not in cmd
+    assert any("no vLLM equivalent" in r.message for r in caplog.records)
+
+
+def test_vllm_nvfp4_sized_but_flag_suppressed(make_model, caplog):
+    # nvfp4 KV is experimental upstream and SM100-only (crashes on SM120/121,
+    # i.e. RTX 50-series / DGX Spark): we size for it but never emit the flag.
+    from llama_packer import utils
+
+    assert utils._KV_CACHE_BYTES["nvfp4"] == pytest.approx(0.5625)
+    m = make_model("v", hf_repo="org/model")
+    with caplog.at_level(logging.WARNING):
+        cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "nvfp4", _tvars())
+    assert "--kv-cache-dtype" not in cmd
+    assert any("SM100" in r.message for r in caplog.records)
+
+
+def test_vllm_parallel_maps_to_max_num_seqs(make_model):
+    m = make_model("v", hf_repo="org/model")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 4, "q8_0", _tvars())
+    assert "--max-num-seqs 4" in cmd
+    docker_cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 4, "q8_0", _tvars())
+    assert "--max-num-seqs 4" in docker_cmd
+
+
+def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
+                                                          monkeypatch):
+    from llama_packer import writer
+
+    chat = make_model("chat", context_length=32768)
+    embed = make_model("e", role="embeddings", context_length=32768)
+    rerank = make_model("r", role="rerank", context_length=16384)
+
+    def fake_effective_static(fit_bin, cache_type="q8_0", parallel=1, **kw):
+        return (1000.0, 0.05, 50.0)
+
+    def fake_fp(fit_bin, cache_type="q8_0", parallel=1, **kw):
+        return SimpleNamespace(model_mib=1000.0, ctx_factor=0.05,
+                               compute_mib=50.0)
+
+    for m in (chat, embed, rerank):
+        m.vram.effective_static = fake_effective_static
+        m.vram.fit_params_static = fake_fp
+
+    captured = {}
+    monkeypatch.setattr(writer, "solve_matrix_ctx",
+                        lambda **kw: captured.update(kw) or 8192)
+    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
+    writer._solve_matrix_context([chat], embed, rerank, "unused", 48000,
+                                 None, profiles)
+    assert captured["embed_ctx"] == 32768   # declared, not hardcoded 8192
+    assert captured["rerank_ctx"] == 16384
 
 
 def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
