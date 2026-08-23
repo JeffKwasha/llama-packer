@@ -279,8 +279,6 @@ _KV_CACHE_BYTES = {
     "q6_0": 0.8125, "q6_k": 0.8125,
     "iq4_nl": 0.5625,
     # 4-bit E2M1 + FP8 E4M3 block scales per 16 elements ≈ 0.5625 B/elem.
-    # Recognized for VRAM sizing; see backends/vllm.py for why the serving
-    # flag is NOT emitted (upstream is SM100-only today).
     "nvfp4": 0.5625,
 }
 

@@ -34,26 +34,18 @@ def _kv_cache_dtype_flags(cache_type: str) -> list[str]:
     """Translate our cache_type into vLLM ``--kv-cache-dtype`` flags.
 
     Single configuration means one cache precision decision drives both
-    backends where an equivalent exists; where none exists, say so loudly
-    instead of silently diverging from the llama-server rendering.
+    backends wherever a valid flag exists — including experimental values;
+    whether the serving build supports them is the operator's call.  Only a
+    cache_type with *no* valid upstream flag is warned about and skipped.
     """
     if cache_type in _KV_DTYPE_FP8:
         return ["--kv-cache-dtype", "fp8"]
     if cache_type in _KV_DTYPE_AUTO:
         return []  # vLLM "auto" already serves at half/full precision
     if cache_type == "nvfp4":
-        # Experimental upstream, absent from stable docs, and hard-wired to
-        # the SM100 trtllm-gen path: crashes at first request on SM120/SM121
-        # (RTX 50-series / DGX Spark) — vllm#43562, NVIDIA/TensorRT-LLM#11799.
-        # We size memory for it (see utils._KV_CACHE_BYTES) but do not emit
-        # the flag; force it via cli_args on B200-class hardware if needed.
-        logger.warning("vllm: cache_type %r is experimental upstream and only "
-                       "works on SM100 (B100/B200); not emitting "
-                       "--kv-cache-dtype (force via cli_args if you know)",
-                       cache_type)
-        return []
-    logger.warning("vllm: sub-byte cache_type %r has no vLLM equivalent "
-                   "(supported: auto/fp8); serving at auto instead",
+        return ["--kv-cache-dtype", "nvfp4"]
+    logger.warning("vllm: cache_type %r has no --kv-cache-dtype equivalent "
+                   "(valid values: auto/fp8/nvfp4); serving at auto instead",
                    cache_type)
     return []
 
