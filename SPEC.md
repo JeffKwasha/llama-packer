@@ -587,6 +587,13 @@ calculation a guess):
 | `q5_k` | 0.6875 |
 | `q4_0`, `q4_k`, `iq4_nl` | 0.5625 |
 | `q4_1` | 0.625 |
+| `nvfp4` | 0.5625 |
+
+`nvfp4` is recognized **for VRAM sizing only** (4-bit E2M1 + FP8 block scales).
+vLLM's experimental `--kv-cache-dtype nvfp4` is SM100-only upstream — it
+crashes on SM120/SM121 (RTX 50-series, DGX Spark) — so llama-packer sizes for
+it but never emits the flag; force it via `cli_args` on B200-class hardware
+and know what you're doing (vllm#43562, NVIDIA/TensorRT-LLM#11799).
 
 ### Cache memory math
 
