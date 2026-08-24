@@ -156,9 +156,8 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
 
 
 def _effective_role(fm: dict, role: str | None) -> str | None:
-    """Role for a sidecar, mirroring ``utils.model_kind`` precedence: an
-    embeddings/rerank *directory* wins, then the explicit ``role:``, then a
-    ``type:`` field containing embed/rerank."""
+    """Role for a sidecar: an embeddings/rerank *directory* wins, then the
+    explicit ``role:``, then a ``type:`` field containing embed/rerank."""
     if role in ("embeddings", "rerank"):
         return role
     explicit = str(fm.get("role") or "")

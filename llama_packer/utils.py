@@ -454,13 +454,9 @@ def _is_mtp_companion(stem: str) -> bool:
 
 # ── Role classification ────────────────────────────────────────────────
 #
-# A model directory mixes several roles that discovery previously
-# distinguished with ad-hoc inline checks ("mmproj" in stem,
-# _is_mtp_companion, targets[0]).  classify_models() is the single source of
-# truth: it walks the directory and returns (path, kind) tuples keyed by role
-# (chat / embeddings / rerank) plus the companion kinds (mmproj / mtp).
-
-MODEL_KINDS = ("chat", "embeddings", "rerank", "mmproj", "mtp")
+# Discovery (llama_packer.discover) owns traversal; these helpers supply the
+# pieces of its classification: companion detection by filename
+# (companion_kind), the directory-name → role map, and .modelignore parsing.
 
 # Per-models-dir exclusion file: <root>/.modelignore.  One glob per line
 # (blank lines and #-comments ignored); a file is skipped when the pattern
@@ -534,41 +530,6 @@ def companion_kind(stem: str) -> str | None:
     return None
 
 
-def model_kind(path: str | os.PathLike, role: str | None = None) -> str:
-    """Classify a single model file by role.
-
-    Companions are detected by filename regardless of any sidecar/companion
-    metadata:
-      * ``mmproj``  — vision projection (``*mmproj*`` on a .gguf)
-      * ``mtp``     — MTP speculative-draft head
-
-    For everything else the role is resolved in priority order:
-      1. an explicit ``role:`` field in the ``.md`` sidecar,
-      2. ``role`` passed by the caller (the directory a file was found in,
-         e.g. ``embed``/``rerank``),
-      3. a ``type:`` field of ``embedding``/``rerank``,
-      4. default ``chat``.
-    """
-    p = Path(path)
-    if p.suffix.lower() == ".gguf":
-        ck = companion_kind(p.stem)
-        if ck:
-            return ck
-    if role in ("embeddings", "rerank"):
-        return role
-    md = p.with_suffix(".md")
-    fm = parse_frontmatter(md) if md.is_file() else {}
-    explicit = fm.get("role")
-    if explicit:
-        return str(explicit)
-    typ = str(fm.get("type") or "").lower()
-    if "rerank" in typ:
-        return "rerank"
-    if "embed" in typ:
-        return "embeddings"
-    return "chat"
-
-
 def dir_role_map(extra_dirs: list[str] | None = None,
                  dir_roles: dict | None = None) -> dict[str, str]:
     """Effective directory-name → role map: defaults + extra dirs + profiles.yaml ``dirs:``."""
@@ -578,61 +539,6 @@ def dir_role_map(extra_dirs: list[str] | None = None,
     for d, r in (dir_roles or {}).items():
         role_map[str(d).lower()] = str(r)
     return role_map
-
-
-def classify_models(
-    models_dirs: Sequence[str | os.PathLike],
-    extra_dirs: list[str] | None = None,
-    dir_roles: dict | None = None,
-) -> list[tuple[Path, str]]:
-    """Classify model files across *models_dirs*, recursively.
-
-    Each models dir is scanned on its own.  Within a models dir, the first
-    relative path component selects the role via :func:`dir_role_map`
-    (``embed/`` → embeddings, ``rerank/`` → rerank, ``chat``/``t2t``/
-    ``vision``/``doc`` → chat); deeper nesting keeps the role, so
-    ``embed/org/model.gguf`` works.  Files at the root itself default to
-    chat; files under any other subdirectory are skipped (whitelist).
-    Returns a list of ``(path, kind)`` tuples where ``kind`` is one of
-    :data:`MODEL_KINDS` (``chat``, ``embeddings``, ``rerank``, ``mmproj``,
-    ``mtp``).
-    """
-    if isinstance(models_dirs, (str, os.PathLike)):
-        models_dirs = [models_dirs]
-    role_map = dir_role_map(extra_dirs, dir_roles)
-
-    out: list[tuple[Path, str]] = []
-    for md in models_dirs:
-        base = Path(md)
-        if not base.is_dir():
-            continue
-        skipped: set[str] = set()
-        ignore = load_model_ignore(base)
-        ignored_count = 0
-        for pattern in ("*.gguf", "*.safetensors", "*.md"):
-            for p in base.rglob(pattern):
-                if not p.is_file():
-                    continue
-                rel = p.relative_to(base)
-                if ignore and _is_ignored(rel.parts, rel.as_posix(), ignore):
-                    ignored_count += 1
-                    continue
-                parts = rel.parts
-                if len(parts) > 1:
-                    role = role_map.get(parts[0].lower())
-                    if role is None:
-                        skipped.add(parts[0])
-                        continue  # subdirectory not in the role map: not served
-                else:
-                    role = None
-                out.append((p, model_kind(p, role)))
-        if ignored_count:
-            logger.info("modelignore: %d file(s) under %s excluded",
-                        ignored_count, base)
-        if skipped:
-            logger.info("skipping %s (not in dirs map; extend via profiles.yaml dirs:)",
-                        ", ".join(f"{base / d}/" for d in sorted(skipped)))
-    return out
 
 
 # ── Directory-scoped models.yaml ──────────────────────────────────────

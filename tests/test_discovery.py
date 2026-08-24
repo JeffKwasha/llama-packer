@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 
 from llama_packer.model import Model
-from llama_packer.utils import classify_models, hf_snapshot_file
+from llama_packer.utils import hf_snapshot_file
 
 
 def _sidecar(name: str) -> str:
@@ -39,12 +39,12 @@ def test_from_dir_dedupes_symlinks_to_same_file(tmp_path):
     assert [m.stem for m in models] == ["foo"]
 
 
-def test_classify_role_dirs_and_whitelist(tmp_path):
+def test_role_dirs_whitelist_and_companions(tmp_path):
     root = tmp_path / "models"
     for sub, files in {
         "": ["plain.gguf"],
         "chat": ["c1.gguf"],
-        "vision": ["v1.gguf", "v1-mmproj.gguf"],
+        "vision": ["v1.gguf", "v1-mmproj.gguf"],  # mmproj is a companion, not a main
         "doc": ["d1.gguf"],
         "embed": ["e1.gguf"],
         "embed/jina-v5": ["e2.gguf"],  # nested keeps the top-level role
@@ -53,37 +53,32 @@ def test_classify_role_dirs_and_whitelist(tmp_path):
         "misc": ["junk.gguf"],           # not in the map: skipped
     }.items():
         d = root / sub
-        d.mkdir(parents=True)
+        d.mkdir(parents=True, exist_ok=True)
         for f in files:
             (d / f).write_bytes(b"x")
 
-    classified = dict()
-    for p, kind in classify_models([root]):
-        classified[str(p.relative_to(root))] = kind
-
-    assert classified["plain.gguf"] == "chat"          # root-level default
-    assert classified["chat/c1.gguf"] == "chat"
-    assert classified["vision/v1.gguf"] == "chat"
-    assert classified["vision/v1-mmproj.gguf"] == "mmproj"
-    assert classified["doc/d1.gguf"] == "chat"
-    assert classified["embed/e1.gguf"] == "embeddings"
-    assert classified["embed/jina-v5/e2.gguf"] == "embeddings"
-    assert classified["rerank/r1.gguf"] == "rerank"
-    assert "img/sd-checkpoint.gguf" not in classified
-    assert "misc/junk.gguf" not in classified
+    models = Model.from_dir(root, generate_stubs=False)
+    by_stem = {m.stem: m for m in models}
+    assert set(by_stem) == {"plain", "c1", "v1", "d1", "e1", "e2", "r1"}
+    assert by_stem["plain"].role == "chat"      # root-level default
+    assert by_stem["v1"].role == "chat"         # vision colocates with chat
+    assert by_stem["e1"].role == "embeddings"
+    assert by_stem["e2"].role == "embeddings"   # nested keeps top-level role
+    assert by_stem["r1"].role == "rerank"
 
 
-def test_classify_dir_roles_override(tmp_path):
+def test_dir_roles_override(tmp_path):
+    from llama_packer.discover import discover
     root = tmp_path / "models"
     (root / "ocr").mkdir(parents=True)
     (root / "ocr" / "o1.gguf").write_bytes(b"x")
     (root / "img").mkdir()
     (root / "img" / "sd.gguf").write_bytes(b"x")
 
-    classified = {str(p.relative_to(root)): k
-                  for p, k in classify_models([root], dir_roles={"ocr": "chat", "img": "chat"})}
-    assert classified["ocr/o1.gguf"] == "chat"
-    assert classified["img/sd.gguf"] == "chat"
+    models = discover([root], generate_stubs=False,
+                      dir_roles={"ocr": "chat", "img": "chat"})
+    assert sorted(m.stem for m in models) == ["o1", "sd"]
+    assert all(m.role == "chat" for m in models)
 
 
 def test_embed_rerank_orphans_get_role_stubs(tmp_path):
@@ -250,20 +245,21 @@ def test_model_speculative_from_hub(tmp_path):
 
 
 def test_modelignore_excludes_files(tmp_path):
+    from llama_packer.discover import discover
     from llama_packer.utils import load_model_ignore
     root = tmp_path / "models"
     (root / "vision").mkdir(parents=True)
     (root / ".modelignore").write_text(
         "# comment\nR3-rerank\nadetailer*\n*.tmp.gguf\n\n")
+    (root / "vision" / "keep.gguf").write_bytes(b"x")
     (root / "vision" / "keep.md").write_text(_sidecar("Keep"))
+    (root / "vision" / "adetailer-x.gguf").write_bytes(b"x")
     (root / "vision" / "adetailer-x.md").write_text(_sidecar("Bad"))
     sub = root / "vision" / "R3-rerank"
     sub.mkdir()
+    (sub / "model.gguf").write_bytes(b"x")
     (sub / "model.md").write_text(_sidecar("Bad2"))
 
     assert load_model_ignore(root) == ["R3-rerank", "adetailer*", "*.tmp.gguf"]
-    kinds = classify_models(root)
-    names = {p.name for p, _ in kinds}
-    assert "keep.md" in names
-    assert "adetailer-x.md" not in names
-    assert "model.md" not in names
+    models = discover([root], generate_stubs=False)
+    assert {m.stem for m in models} == {"keep"}
