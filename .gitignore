@@ -19,16 +19,14 @@ docker-compose.yml
 profiles.yaml
 
 # Scratch / temp
-_help_
-sha
-tunableop_results*.csv
+~*
+*.bak
 
 # Large build artifacts / model weights (not source)
 .old/
-tmp/
 llama-b*/
 llama-swap
-models
+chat
 
 # uv / setuptools build artifacts
 build/
