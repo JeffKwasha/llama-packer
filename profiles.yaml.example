@@ -15,6 +15,12 @@ defaults:
 # models.yaml with subtree-scoped `defaults:` and `overrides:`.
 models_dirs:
   - models
+  # - /mnt/ai/models  # multiple roots allowed
+
+# Extra directory roles (extend the built-ins). Keys matched case-insensitively;
+# values must be chat | embeddings | rerank. CLI --extra-dirs merges similarly.
+# dirs:
+#   it2t: chat
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -29,6 +35,10 @@ models_dirs:
 #   - vllm-docker
 
 # ── Profile definitions ────────────────────────────────
+# Each profile overlays `defaults` and emits llama-swap setParamsByID
+# overrides. `allow_profiles` in a model sidecar can filter which profiles
+# apply to that model. Sidecar `modes:` fully replace profile sampling params
+# per-model when present.
 profiles:
   default:
 
@@ -36,19 +46,83 @@ profiles:
     description: "Optimized for code generation and bash commands"
     temperature: "base * 0.7"
 
-  creative:
-    description: "Higher temperature for creative and writing tasks"
-    temperature: "base * 1.2"
+  # creative:
+  #   description: "Higher temperature for creative and writing tasks"
+  #   temperature: "base * 1.2"
 
-#  server:
-#    description: "concurrency"
-#    parallel: 2
+  # ── Sampling params ──────────────────────────────────
+  # Keys: temperature, top_p, top_k, min_p, pres_pen, repeat_penalty,
+  # freq_pen. Any key also present in `defaults` may use a "base * N"
+  # expression (e.g. "base * 0.6"); otherwise set a literal. Values differing
+  # from defaults are emitted as setParamsByID (request keys: pres_pen →
+  # presence_penalty, freq_pen → frequency_penalty).
+  # precise:
+  #   description: "Low variance for extraction / QA"
+  #   temperature: "base * 0.3"
+  #   top_p: 0.9
+  #   top_k: 10
+  #   repeat_penalty: 1.1
+
+  # story:
+  #   description: "More diverse sampling for storytelling"
+  #   temperature: "base * 1.3"
+  #   min_p: 0.02
+  #   pres_pen: 0.4
+  #   freq_pen: 0.2
+
+  # ── Grouping / placement params ──────────────────────
+  # Distinct (parallel, cache_type, spare) combos get their own VRAM solve
+  # and llama-swap entry; profile names within a group become setParamsByID
+  # keys. `spare` reserves VRAM headroom (e.g. "512m", "6G").
+  # server:
+  #   description: "Concurrency-tuned"
+  #   parallel: 2
+  #   cache_type: q4_K_M
+  #   spare: 6G
+
+  # low-mem:
+  #   description: "Smaller KV cache for tight VRAM budgets"
+  #   cache_type: q4_0
+  #   spare: 1G
+
+# ── vLLM backend (optional) ────────────────────────────
+# Defaults for `backend: vllm` / `vllm-docker` via overrides.
+# CLI --vllm-image / --vllm-server win over this.
+# vllm:
+#   image: vllm/vllm-openai:latest
+#   bin: vllm
+#   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
+#   container_port: 8000
+#   # gpu_mem_util: 0.9  # derived from spare/reserve when omitted
+
+# ── Hardware (optional) ─────────────────────────────────
+# Override auto-detected VRAM pool. CLI --vram / --unified-system-mb win.
+# hardware:
+#   vram: 48G
+#   # baseline_mb: 512m        # extra reserve on top of fixed 2 GiB (default 0)
+#   # unified_system_mb: 8192  # system slice on unified hosts (default 8192)
+
+# ── Override rules (optional) ────────────────────────────
+# Pattern-scoped serving choices. `when` is required; `when: true` matches all.
+# `when` is map of frontmatter field → regex (re.search); list fields joined with spaces.
+# Later matching rules win per-key; dir models.yaml overrides win over global.
+# overrides:
+#   - when: {base_model: 'qwen3'}
+#     chat_template: qwen_chat_template.jinja
+#     reasoning-format: deepseek
+#   - when: {stem: 'Qwen3-32B.*safetensors'}
+#     backend: vllm-docker
+#     hf_repo: Qwen/Qwen3-32B
 
 # ── Swap matrix (optional) ──────────────────────────────
 # Enables the llama-swap matrix router: every chat model shares a set with the
 # CPU-resident embed (emb) and rerank (rnk) models, so RAG models stay loaded
 # alongside whatever chat model is active. __CHAT_VARS__ is expanded to the
 # generated (c1 | c2 | ...) var expression at build time.
+# `emb` / `rnk` are fixed var names (hardcoded in _build_matrix_vars,
+# llama_packer/__main__.py:195 — not configurable) bound to the selected
+# embed/rerank models (CLI --embed / --rerank selectors, else smallest-VRAM
+# pick). Reference them literally in `sets:` expressions.
 #
 # matrix:
 #   evict_costs:

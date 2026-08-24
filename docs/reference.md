@@ -4,4 +4,6 @@
 - [SPEC.md](SPEC.md) — model metadata schema (capabilities, freethought, strengths/weaknesses, throughput), the llama-swap metadata channel, and the vLLM backend (`backend: vllm` / `backend: vllm-docker` via override rules)
 - [gguf_model_analysis.md](gguf_model_analysis.md)
 - [plans/vllm-gb10.md](plans/vllm-gb10.md) — vLLM / DGX Spark design and progress
+- [plans/comfyui-sd.md](plans/comfyui-sd.md) — ComfyUI + stable-diffusion.cpp backend findings (`sd-server` flags, `/comfyui/` endpoint, `compat.ignoreWebsockets`)
+- [plans/matrix-categories.md](plans/matrix-categories.md) — configurable matrix categories (beyond hardcoded `emb`/`rnk`)
 - [vllm-memory-estimator](https://github.com/ashishkamra/vllm-memory-estimator) — CPU-only safetensor memory estimator (planned fit-params analog for vLLM)
