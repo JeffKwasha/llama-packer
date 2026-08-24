@@ -77,18 +77,9 @@ class Model:
         # 1. Check frontmatter `model` field
         file_ref = self.frontmatter.get("model")
         if file_ref:
-            model_file = parent / file_ref
-            if not model_file.is_file():
-                model_file = parent.parent / file_ref
-            if model_file.is_file():
-                return utils.smart_resolve(model_file)
-            # 1b. HF hub cache: a hub-downloaded file needs no symlink into
-            # the models dir — resolve it from `hf_repo` + `model:`.
-            repo = self.hf_repo
-            if repo:
-                hit = utils.hf_snapshot_file(repo, str(file_ref), self._hf_home)
-                if hit is not None:
-                    return utils.smart_resolve(hit)
+            hit = self._resolve_ref(str(file_ref))
+            if hit is not None:
+                return utils.smart_resolve(hit)
 
         # 2. Convention: same stem, either .gguf or .safetensors
         for ext in (".gguf", ".safetensors"):
@@ -98,6 +89,47 @@ class Model:
 
         # 3. No model file found by stem -> give up
         return None
+
+    def _resolve_ref(self, ref: str) -> Path | None:
+        """Resolve a file reference: sidecar dir, its parent, then HF hub.
+
+        ``repo:``-relative references use the sidecar's ``hf_repo`` (snapshot
+        filenames are readable — no blob hashes needed) and may be globs
+        (``mmproj*.gguf``).  The ``hub:<org>/<repo>:<file>`` form addresses
+        any cached repo explicitly.  Returns an absolute path or None.
+        """
+        parent = self.md_path.parent
+        for d in (parent, parent.parent):
+            candidate = d / ref
+            if candidate.is_file():
+                return candidate
+        repo = self.hf_repo
+        if repo:
+            return utils.hf_snapshot_file(repo, ref, self._hf_home)
+        return None
+
+    def _resolve_hub_ref(self, ref: str,
+                         pattern_hint: str | None = None) -> Path | None:
+        """Hub-only resolution of *ref* (companion fallback).
+
+        ``hub:<org>/<repo>:<file-or-glob>`` addresses any cached repo;
+        anything else resolves against this sidecar's ``hf_repo``.  With
+        *pattern_hint* (e.g. ``*mmproj*.gguf``), an unresolvable exact name
+        falls back to a single glob match in the snapshot.
+        """
+        repo = self.hf_repo
+        if ref.startswith("hub:"):
+            rest = ref[len("hub:"):]
+            repo, _, ref = rest.rpartition(":")
+            if not repo:
+                logger.warning("hf: malformed %r (expected hub:org/repo:file)", ref)
+                return None
+        if not repo:
+            return None
+        hit = utils.hf_snapshot_file(repo, ref, self._hf_home)
+        if hit is None and pattern_hint:
+            hit = utils.hf_snapshot_file(repo, pattern_hint, self._hf_home)
+        return hit
 
     def _resolve_companions(self) -> None:
         """Resolve mmproj and MTP companions from frontmatter or fuzzy match."""
@@ -122,19 +154,24 @@ class Model:
             # Explicit disable
             self.mmproj = None
         elif mmproj_val:
-            # Explicit path in frontmatter — search both directories
+            # Explicit path in frontmatter — search both directories, then the
+            # hf_repo snapshot (readable snapshot filenames; globs allowed).
             companion = None
             for d in search_dirs:
                 candidate = d / mmproj_val
                 if candidate.is_file():
                     companion = candidate
                     break
+            if companion is None:
+                companion = self._resolve_hub_ref(str(mmproj_val),
+                                                  pattern_hint="*mmproj*.gguf")
             if companion:
                 self.mmproj = Model._get_or_create_companion(companion)
             else:
                 logger.warning("mmproj: configured %s missing for %s", mmproj_val, self.stem)
         else:
-            # Fuzzy match: look for *mmproj*.gguf with same family prefix
+            # Fuzzy match: look for *mmproj*.gguf with same family prefix —
+            # next to the model, then inside the hf_repo snapshot.
             family = utils._gguf_family(self.gguf_path.stem).lower()
             for d in search_dirs:
                 for f in sorted(d.glob("*mmproj*.gguf")):
@@ -144,6 +181,14 @@ class Model:
                         break
                 if self.mmproj:
                     break
+            if self.mmproj is None and self.hf_repo:
+                snap = utils.hf_snapshot_dir(self.hf_repo, self._hf_home)
+                if snap is not None:
+                    for f in sorted(snap.glob("*mmproj*.gguf")):
+                        mmproj_family = utils._gguf_family(f.stem).lower()
+                        if mmproj_family.startswith(family) or family.startswith(mmproj_family):
+                            self.mmproj = Model._get_or_create_companion(f)
+                            break
 
         # --- MTP (speculative) ---
         # Check frontmatter flags
@@ -158,6 +203,8 @@ class Model:
                     if candidate.is_file():
                         companion = candidate
                         break
+                if companion is None:
+                    companion = self._resolve_hub_ref(str(speculative))
                 if companion:
                     self.mtp = Model._get_or_create_companion(companion)
                 else:

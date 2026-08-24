@@ -820,14 +820,12 @@ def hf_hub_cache(override: str | os.PathLike | None = None) -> Path | None:
     return default if default.is_dir() else None
 
 
-def hf_snapshot_file(repo_id: str, filename: str,
-                     hf_home: str | os.PathLike | None = None) -> Path | None:
-    """Resolve ``filename`` inside the local HF hub snapshot of ``repo_id``.
+def hf_snapshot_dir(repo_id: str, hf_home: str | os.PathLike | None = None) -> Path | None:
+    """Locate the local HF hub snapshot directory for ``repo_id``.
 
-    Lets a sidecar reference a hub-downloaded GGUF (``hf_repo: org/repo`` +
-    ``model: file.gguf``) without symlinking it into a models dir.  Revision
-    selection: ``refs/main`` when present, else the sole snapshot dir, else
-    the newest by mtime (with a warning).  Returns None when unresolved.
+    Revision selection: ``refs/main`` when present, else the sole snapshot
+    dir, else the newest by mtime (with a warning).  Returns None when the
+    repo is not in the hub cache.
     """
     hub = hf_hub_cache(hf_home)
     if hub is None:
@@ -836,23 +834,48 @@ def hf_snapshot_file(repo_id: str, filename: str,
     snaps = repo_dir / "snapshots"
     if not snaps.is_dir():
         return None
-    snap: Path | None = None
     ref = repo_dir / "refs" / "main"
     if ref.is_file():
         rev = ref.read_text(encoding="utf-8").strip()
         if rev and (snaps / rev).is_dir():
-            snap = snaps / rev
+            return snaps / rev
+    dirs = [d for d in snaps.iterdir() if d.is_dir()]
+    if not dirs:
+        return None
+    dirs.sort(key=lambda d: d.stat().st_mtime)
+    snap = dirs[-1]
+    if len(dirs) > 1:
+        logger.warning("hf: %s has %d snapshots and no refs/main; using newest (%s)",
+                       repo_id, len(dirs), snap.name)
+    return snap
+
+
+def hf_snapshot_file(repo_id: str, filename: str,
+                     hf_home: str | os.PathLike | None = None) -> Path | None:
+    """Resolve ``filename`` inside the local HF hub snapshot of ``repo_id``.
+
+    Lets a sidecar reference a hub-downloaded GGUF (``hf_repo: org/repo`` +
+    ``model: file.gguf``) without symlinking it into a models dir — readable
+    snapshot filenames, no blob hashes, and it keeps working when sidecars
+    move.  ``filename`` may be a glob pattern (``mmproj*.gguf``): an exact
+    file wins; otherwise a single glob match resolves and an ambiguous match
+    warns and fails.  Returns None when unresolved.
+    """
+    snap = hf_snapshot_dir(repo_id, hf_home)
     if snap is None:
-        dirs = [d for d in snaps.iterdir() if d.is_dir()]
-        if not dirs:
-            return None
-        dirs.sort(key=lambda d: d.stat().st_mtime)
-        snap = dirs[-1]
-        if len(dirs) > 1:
-            logger.warning("hf: %s has %d snapshots and no refs/main; using newest (%s)",
-                           repo_id, len(dirs), snap.name)
+        return None
     candidate = snap / filename
-    return candidate if candidate.is_file() else None
+    if candidate.is_file():
+        return candidate
+    if any(ch in filename for ch in "*?["):
+        matches = sorted(snap.glob(filename))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
+                           filename, repo_id, len(matches),
+                           ", ".join(m.name for m in matches))
+    return None
 
 
 def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None,

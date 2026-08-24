@@ -702,11 +702,21 @@ models.yaml](#directory-scoped-modelsyaml).
 
 **HF hub cache resolution.** A sidecar can reference a hub-downloaded GGUF without
 symlinking it into a models dir: declare both `hf_repo: org/repo` (or a
-parseable `hf_url:`) **and** `model: file.gguf`. Resolution:
+parseable `hf_url:`) **and** `model: file.gguf`. Snapshot filenames are
+readable — blob hashes never appear in sidecars. Resolution:
 
 1. `model:` relative to the sidecar's dir (and its parent), then
 2. `$HF_HOME/hub/models--org--repo/snapshots/<rev>/file.gguf`, revision from
    `refs/main`, else the sole snapshot dir, else the newest by mtime.
+
+Companions resolve the same way after the local search misses:
+`mmproj:` / `speculative:` values are looked up in the sidecar's repo
+snapshot, with a single-glob fallback (`mmproj*.gguf`) covering HF's naming
+variants (`mmproj-F16.gguf`, `mmproj-model-f16.gguf`, …). When no `mmproj:`
+is declared at all, the snapshot is fuzzy-scanned for a family-matching
+`*mmproj*.gguf`, mirroring the local-directory behavior. A value may also
+address another cached repo explicitly: `hub:<org>/<repo>:<file-or-glob>`.
+An ambiguous glob logs a warning and does not resolve.
 
 The HF cache root is `--hf-home` > profiles.yaml `hf_home:` >
 `$HF_HOME`/`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`. By default it

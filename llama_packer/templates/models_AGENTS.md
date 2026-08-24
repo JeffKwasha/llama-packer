@@ -43,8 +43,10 @@ overrides:
 Inner scopes beat outer ones beat global profiles.yaml `overrides:`.
 
 Hub-downloaded files need no symlink: sidecar declares `hf_repo: org/repo` (or
-a parseable `hf_url:`) alongside `model: file.gguf`, and the file resolves
-from `$HF_HOME/hub`; see SPEC.md.
+a parseable `hf_url:`) alongside `model: <snapshot filename>`, and the file
+resolves from `$HF_HOME/hub`. Companions resolve from the same snapshot when
+the local search misses — exact name, single glob (`mmproj*.gguf`), or a
+family fuzzy-match; use `hub:<org>/<repo>:<file>` for another repo. See SPEC.md.
 
 If the `.md` cannot share the model's stem, point at the file with
 `model: <filename>`.

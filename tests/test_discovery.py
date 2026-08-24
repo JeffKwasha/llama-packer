@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from llama_packer.model import Model
 from llama_packer.utils import classify_models, hf_snapshot_file
 
@@ -146,3 +148,65 @@ def test_model_explicit_model_missing_everywhere_raises(tmp_path):
     fm = {"name": "qwen", "model": "nope.gguf", "hf_repo": "org/repo"}
     with pytest.raises(ValueError, match="not found"):
         Model(md_path, fm, hf_home=hf_home)
+
+
+def test_hf_snapshot_file_glob_exact_wins(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("model.gguf", "mmproj-F16.gguf"))
+    assert hf_snapshot_file("org/repo", "model.gguf", hf_home).name == "model.gguf"
+    assert hf_snapshot_file("org/repo", "mmproj*.gguf", hf_home).name == "mmproj-F16.gguf"
+
+
+def test_hf_snapshot_file_ambiguous_glob_is_none(tmp_path, caplog):
+    from llama_packer.utils import hf_snapshot_dir
+    hf_home = _hf_tree(tmp_path, files=("mmproj-F16.gguf", "mmproj-BF16.gguf"))
+    with caplog.at_level(logging.WARNING):
+        assert hf_snapshot_file("org/repo", "mmproj*.gguf", hf_home) is None
+    assert any("ambiguous" in r.message for r in caplog.records)
+    assert hf_snapshot_dir("org/repo", hf_home).is_dir()
+
+
+def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
+    # Sidecar references the snapshot filename (not a local symlink name).
+    hf_home = _hf_tree(tmp_path, files=("Dirk-Q4_K_M.gguf", "mmproj-F16.gguf"))
+    md_path = tmp_path / "dirk.md"
+    fm = {"name": "dirk", "model": "Dirk-Q4_K_M.gguf",
+          "mmproj": "mmproj-F16.gguf", "hf_repo": "org/repo"}
+    m = Model(md_path, fm, hf_home=hf_home)
+    assert m.mmproj is not None and m.mmproj.gguf_path.name == "mmproj-F16.gguf"
+
+    # Same via glob — covers repos that name it mmproj-model-f16 etc.
+    fm2 = {**fm, "name": "dirk2", "mmproj": "mmproj*.gguf"}
+    m2 = Model(md_path.parent / "dirk2.md", fm2, hf_home=hf_home)
+    assert m2.mmproj is not None
+
+
+def test_model_companion_fuzzy_from_hub_when_local_absent(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj.gguf"))
+    md_path = tmp_path / "qwen.md"
+    fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
+    m = Model(md_path, fm, hf_home=hf_home)
+    assert m.mmproj is not None and m.mmproj.gguf_path.name == "Qwen-x-mmproj.gguf"
+
+
+def test_model_companion_cross_repo_hub_ref(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("model.gguf",))
+    _hf_tree(tmp_path / "x", repo="other/vision-proj", files=("mmproj-F16.gguf",))
+    import shutil
+    shutil.move(tmp_path / "x" / "hf" / "hub" / "models--other--vision-proj",
+                tmp_path / "hf" / "hub" / "models--other--vision-proj")
+    md_path = tmp_path / "m.md"
+    fm = {"name": "m", "model": "model.gguf", "hf_repo": "org/repo",
+          "mmproj": "hub:other/vision-proj:mmproj-F16.gguf"}
+    m = Model(md_path, fm, hf_home=hf_home)
+    assert m.mmproj is not None
+    assert "models--other--vision-proj" in str(m.mmproj.gguf_path)
+
+
+def test_model_speculative_from_hub(tmp_path):
+    hf_home = _hf_tree(tmp_path,
+                       files=("big-Q4_K_M.gguf", "big-mtp.gguf"))
+    md_path = tmp_path / "big.md"
+    fm = {"name": "big", "model": "big-Q4_K_M.gguf", "hf_repo": "org/repo",
+          "speculative": "big-mtp.gguf"}
+    m = Model(md_path, fm, hf_home=hf_home)
+    assert m.mtp is not None
