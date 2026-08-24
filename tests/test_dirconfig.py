@@ -9,8 +9,8 @@ import logging
 import pytest
 
 from llama_packer.model import Model
-from llama_packer.overrides import apply_overrides, compile_scoped_rules
-from llama_packer.utils import collect_dir_configs, load_dir_config, validate_dir_roles
+from llama_packer.scope import ScopeStack
+from llama_packer.utils import load_dir_config, validate_dir_roles
 
 from conftest import make_model  # noqa: F401  (fixture via pytest, direct import for emit test)
 
@@ -25,6 +25,14 @@ def _clear_dir_config_cache():
     utils._dir_config_cache.clear()
     yield
     utils._dir_config_cache.clear()
+
+
+def _discover(root, profiles_cfg=None):
+    """Run full discovery with optional global (profiles.yaml) rules."""
+    stack = ScopeStack()
+    stack.push({"overrides": (profiles_cfg or {}).get("overrides")},
+               origin="profiles.yaml")
+    return Model.from_dir(root, generate_stubs=False, stack=stack)
 
 
 # ── Frontmatter defaults inheritance ──────────────────────────────────────
@@ -59,16 +67,13 @@ def test_forbidden_default_keys_rejected(tmp_path):
 
 # ── Scoped override rules ──────────────────────────────────────────────────
 
-def _model_in(tmp_path, rel: str):
-    p = tmp_path / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    (p.with_suffix(".gguf")).write_bytes(b"x")
-    from llama_packer.utils import parse_frontmatter
-    fm = parse_frontmatter(p.with_suffix(".md")) if p.with_suffix(".md").is_file() else {}
-    if not fm.get("name"):
-        fm = {"name": p.stem, "context_length": 32768}
-        p.with_suffix(".md").write_text(_sidecar(p.stem))
-    return Model(p.with_suffix(".md"), fm)
+def _pair_in(tmp_path, rel: str):
+    """Write an <rel>.gguf + authored sidecar; return the sidecar path."""
+    md = tmp_path / rel
+    md.parent.mkdir(parents=True, exist_ok=True)
+    md.with_suffix(".gguf").write_bytes(b"x")
+    md.write_text(_sidecar(md.stem))
+    return md
 
 
 def test_scoped_rule_applies_only_within_subtree(tmp_path):
@@ -78,15 +83,13 @@ def test_scoped_rule_applies_only_within_subtree(tmp_path):
     (qwen / "models.yaml").write_text(
         "overrides:\n  - when: true\n    chat_template: qwen.jinja\n")
 
-    inside = _model_in(qwen, "chat/qwen3/a.md")
-    outside = _model_in(root / "chat", "chat/b.md")
+    inside = _pair_in(qwen, "chat/qwen3/a.md")
+    outside = _pair_in(root / "chat", "chat/b.md")
 
-    dir_cfgs = collect_dir_configs([root])
-    scoped = compile_scoped_rules(dir_cfgs)
-    apply_overrides([inside, outside], {}, scoped_rules=scoped)
-
-    assert inside.frontmatter["chat_template"] == "qwen.jinja"
-    assert "chat_template" not in outside.frontmatter
+    by_stem = {m.stem: m for m in _discover(root)}
+    assert by_stem["a"].frontmatter["chat_template"] == "qwen.jinja"
+    assert "chat_template" not in by_stem[outside.with_suffix("").stem].frontmatter
+    del inside
 
 
 def test_inner_scope_and_global_precedence(tmp_path):
@@ -99,11 +102,9 @@ def test_inner_scope_and_global_precedence(tmp_path):
         {"when": True, "chat_template": "global.jinja"},
         {"when": True, "cli_args": "--seed 7"},
     ]}
+    _pair_in(qwen, "chat/qwen3/a.md")
 
-    m = _model_in(qwen, "chat/qwen3/a.md")
-    scoped = compile_scoped_rules(collect_dir_configs([root]))
-    apply_overrides([m], global_profiles, scoped_rules=scoped)
-
+    m = next(m for m in _discover(root, global_profiles) if m.stem == "a")
     # Inner scope beats global; untouched global keys still land.
     assert m.frontmatter["chat_template"] == "inner.jinja"
     assert m.frontmatter["cli_args"] == "--seed 7"
@@ -119,20 +120,40 @@ def test_outer_scope_between_global_and_inner(tmp_path):
     (inner / "models.yaml").write_text(
         "overrides:\n  - when: true\n    chat_template: inner.jinja\n")
 
-    m = _model_in(inner, "chat/qwen3/a.md")
-    scoped = compile_scoped_rules(collect_dir_configs([root]))
-    apply_overrides([m], {}, scoped_rules=scoped)
-    assert m.frontmatter["chat_template"] == "inner.jinja"
+    _pair_in(inner, "chat/qwen3/a.md")
+    _pair_in(outer, "chat/b.md")
 
-    sibling = _model_in(outer, "chat/b.md")
-    apply_overrides([sibling], {}, scoped_rules=scoped)
-    assert sibling.frontmatter["chat_template"] == "outer.jinja"
+    by_stem = {m.stem: m for m in _discover(root)}
+    assert by_stem["a"].frontmatter["chat_template"] == "inner.jinja"
+    assert by_stem["b"].frontmatter["chat_template"] == "outer.jinja"
 
 
-def test_malformed_scoped_rule_names_models_yaml():
-    cfgs = {"/x/chat": {"overrides": [{"chat_template": "a.jinja"}]}}
+def test_malformed_scoped_rule_names_models_yaml(tmp_path):
+    d = tmp_path / "chat"
+    d.mkdir()
+    (d / "models.yaml").write_text(
+        "overrides:\n  - chat_template: a.jinja\n")  # missing 'when'
     with pytest.raises(SystemExit, match="models.yaml"):
-        compile_scoped_rules(cfgs)
+        _discover(tmp_path)
+
+
+def test_defaults_and_rules_both_support_mmproj_false(tmp_path):
+    # The same key works at both precedence levels via the same engine:
+    # directory defaults and pattern rules both disable the vision companion.
+    root = tmp_path / "models"
+    for sub in ("d", "r"):
+        (root / "vision" / sub).mkdir(parents=True)
+        gguf = root / "vision" / sub / f"{sub}.gguf"
+        gguf.write_bytes(b"x")
+        mm = root / "vision" / sub / f"{sub}-mmproj.gguf"
+        mm.write_bytes(b"x")
+    (root / "vision" / "d" / "models.yaml").write_text("defaults:\n  mmproj: false\n")
+    (root / "vision" / "r" / "models.yaml").write_text(
+        "overrides:\n  - when: true\n    mmproj: false\n")
+
+    by_stem = {m.stem: m for m in _discover(root)}
+    assert by_stem["d"].mmproj is None
+    assert by_stem["r"].mmproj is None
 
 
 # ── validate_dir_roles ─────────────────────────────────────────────────────

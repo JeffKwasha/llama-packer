@@ -174,18 +174,6 @@ def parse_context_length(s: str) -> int:
     return int(s)
 
 
-def infer_param_count(stem: str) -> str | None:
-    """Extract parameter count from stem (e.g., '7B', '13B')."""
-    m = re.search(r"(\d+(?:\.\d+)?[BbMm])", stem)
-    return m.group(1).upper() if m else None
-
-
-def infer_quantization(stem: str) -> str | None:
-    """Extract quantization from stem (e.g., 'Q4_K', 'Q8_0')."""
-    m = re.search(r"(?:[-_.](?:i)?(?P<quant>Q\d+(?:_[A-Z0-9]+){0,2}))", stem)
-    return m.group("quant") if m else None
-
-
 def _gguf_family(stem: str) -> str:
     """Extract GGUF family base name (strip quant, version, MTP suffixes)."""
     s = stem
@@ -439,19 +427,16 @@ def parse_frontmatter(md_path: Path) -> dict:
     return fm
 
 
-def generate_stub_md(md_path: Path, model_file: Path, role: str | None = None) -> dict:
-    """Generate stub .md sidecar for an orphan model file (.gguf or .safetensors)."""
-    stem = model_file.stem
-    fm = {
-        "name": stem,
-        "parameters": infer_param_count(stem),
-        "context_length": _DEFAULT_CONTEXT_LENGTH,
-        "quantization": infer_quantization(stem),
-        "hf_url": "",
-    }
-    if role in ("embeddings", "rerank"):
-        fm["role"] = role
-    content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---\n\n# " + stem + "\n"
+def write_stub_md(md_path: Path) -> None:
+    """Write an *empty* sidecar for an orphan model file.
+
+    Stubs carry no data: identity falls back to the file stem, context to the
+    built-in default, role to the model's directory.  The empty file exists
+    purely as the human's editing surface ("drop in a gguf, get a placeholder
+    to fill in").  Never called for paths inside an HF blobs tree — see
+    ``discover._materialize_sidecar``.
+    """
+    content = "---\n---\n\n# " + md_path.stem + "\n"
     md_path.write_text(content, encoding="utf-8")
     try:
         md_path.chmod(0o644)
@@ -459,7 +444,6 @@ def generate_stub_md(md_path: Path, model_file: Path, role: str | None = None) -
         # File may be owned by another user on a shared volume; content is
         # already written, so a chmod failure is non-fatal.
         pass
-    return fm
 
 
 def _is_mtp_companion(stem: str) -> bool:
@@ -657,6 +641,7 @@ def classify_models(
 # only to models beneath it: ``defaults`` merge into each sidecar's
 # frontmatter (sidecar wins), ``overrides`` are standard override rules whose
 # scope is that subtree.  Inner directories beat outer ones beat global.
+# Both are folded by the ScopeStack during discovery (llama_packer.discover).
 
 DIR_CONFIG_NAME = "models.yaml"
 
@@ -691,38 +676,6 @@ def load_dir_config(d: Path) -> dict | None:
                 f"(per-model keys)")
     _dir_config_cache[d] = cfg
     return cfg
-
-
-def dir_config_chain(md_path: Path, root: Path) -> list[Path]:
-    """Ancestor dirs of *md_path* under *root* carrying a ``models.yaml``.
-
-    Ordered outermost → innermost.  The root itself may carry one too.
-    """
-    try:
-        rel = md_path.parent.relative_to(root)
-    except ValueError:
-        return []
-    dirs = [root, *(root / p for p in rel.parts)]  # outermost … innermost
-    return [d for d in dirs if load_dir_config(d)]
-
-
-def collect_dir_configs(models_dirs) -> dict[Path, dict]:
-    """Find every ``models.yaml`` under the given roots (cached parses).
-
-    Roots are resolved first so a symlinked models dir (e.g. ``./models ->
-    /mnt/ai/models`` scanned alongside its target) does not produce duplicate
-    or unmatchable scope directories.
-    """
-    found: dict[Path, dict] = {}
-    for md in models_dirs:
-        base = Path(md).resolve()
-        if not base.is_dir():
-            continue
-        for p in base.rglob(DIR_CONFIG_NAME):
-            cfg = load_dir_config(p.parent)
-            if cfg:
-                found[p.parent.resolve()] = cfg
-    return found
 
 
 def _eval_expr(expr: str, base_val: float) -> float:

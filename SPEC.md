@@ -545,7 +545,8 @@ rules read top→bottom as increasing specificity). So a later rule that changes
 
 **Precedence across scopes.** Global rules apply first, then directory-scoped
 rules outermost → innermost — so a closer scope beats a broader one beats
-global for the same key (`overrides.py:apply_overrides`).
+global for the same key (the flat rule list accumulated by
+`scope.ScopeStack` during discovery's walk).
 
 ### Directory-scoped models.yaml
 
@@ -566,10 +567,9 @@ overrides:
 
 - **Scope**: both keys apply only to models under that directory.
 - **`defaults:`**: merged into each subtree sidecar's frontmatter, outermost →
-  innermost; authored sidecar values always win. Generated stubs are
-  placeholders, so explicit directory defaults override them. The per-model
-  identity keys `name`, `model`, `ignore` may not be defaulted (validation
-  error).
+  innermost; authored sidecar values always win. Empty stub sidecars carry no
+  data, so defaults fill them naturally. The per-model identity keys `name`,
+  `model`, `ignore` may not be defaulted (validation error).
 - **`overrides:`**: standard rules (same validation and matching); applied
   after global rules, outer scopes first — innermost wins per key.
 - **Paths**: `chat_template:` / `loras:` resolve relative to each *sidecar's*
@@ -579,7 +579,10 @@ overrides:
 
 **Settings keys** (all optional): `backend`, `hf_repo`, `chat_template`,
 `chat_template_kwargs`, `loras`, `cli_args`, `reasoning-format`,
-`reasoning-preserve`.
+`reasoning-preserve`, plus the serving/companion choices `cache_type`,
+`parallel`, `mmproj`, `speculative`. Rules setting `mmproj`/`speculative`
+re-trigger companion resolution, so a rule can add or remove vision /
+speculative decoding per pattern.
 
 **Backend inference.** When neither the sidecar nor any rule declares a
 `backend`, one is inferred from the model's file format (`backends.infer_backend`):
@@ -698,8 +701,10 @@ ctx_factor [MiB/token] = kv_bytes_per_token / 2²⁰   (+ attention scratch, mea
 
 ## Model Discovery and Stub Sidecars
 
-Every `--models-dir` directory is scanned independently and **recursively**
-(`Model.from_dir` → `utils.classify_models` → `utils.dir_role_map`):
+Every `--models-dir` directory is scanned independently via a depth-first
+walk (`discover.discover` → `scope.ScopeStack`; role mapping via
+`utils.dir_role_map`). At each level the directory's `models.yaml` scope is
+pushed, its models are built, then children are visited:
 
 - `.md` sidecar files are the entry points; each binds to the model file whose
   stem matches its own, or the file named by `model:`.
@@ -766,11 +771,20 @@ points at your `/mnt/ai/huggingface`. With this, `hf download org/repo`
 followed by a small `.md` sidecar is sufficient — no symlink step and no
 widening of `${MODELS_DIR}` (HF cache paths get their own `${HF_HOME}` macro).
 
-**Stub sidecars.** A model file without any sidecar gets a minimal one written
-next to it: `name` (stem), `parameters` and `quantization` inferred from the
-filename, `role` when discovered under an embeddings/rerank directory, and
-`_DEFAULT_CONTEXT_LENGTH`. This makes a directory of bare models and any
-new `embed/`/`rerank`/`doc/` orphans work on first run. `--no-stubs` skips generation.
+**Stub sidecars.** A model file without any sidecar gets an **empty** one
+written next to it — just frontmatter delimiters and a title, nothing more.
+Identity falls back to the file stem, context to the built-in default, role to
+the model's directory, so a stub and an authored sidecar behave identically;
+the empty file exists purely as the human's editing surface ("drop in a gguf,
+get a placeholder to fill in"). This makes a directory of bare models and any
+new `embed/`/`rerank`/`doc/` orphans work on first run; `--no-stubs` skips
+generation.
+
+Sidecars are never written inside an HF hub `blobs/` tree (blob hashes are not
+human-readable names). An orphan discovered there gets its stub beside the
+human-named snapshot entry that points at the blob; if none resolves, discovery
+creates its own symlink named after the repo in the category directory and puts
+the stub next to it.
 
 ## Path macros and HF_HOME
 

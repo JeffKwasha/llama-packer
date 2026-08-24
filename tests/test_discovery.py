@@ -97,9 +97,40 @@ def test_embed_rerank_orphans_get_role_stubs(tmp_path):
     by_stem = {m.stem: m for m in models}
     assert by_stem["e1"].role == "embeddings"
     assert by_stem["r1"].role == "rerank"
-    # Stub files were written with the role baked into frontmatter.
-    assert "role: embeddings" in (root / "embed" / "e1.md").read_text()
-    assert "role: rerank" in (root / "rerank" / "r1.md").read_text()
+    # Stub sidecars are EMPTY (no inferred data) — role is derived from the
+    # directory at discovery time, not baked into the file.
+    assert (root / "embed" / "e1.md").read_text() == "---\n---\n\n# e1\n"
+    assert (root / "rerank" / "r1.md").read_text() == "---\n---\n\n# r1\n"
+
+
+def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "e.gguf").write_bytes(b"x")
+    (root / "chat" / "e.md").write_text(
+        "---\nname: E\ntype: embedding\n---\n")
+
+    models = Model.from_dir([root], generate_stubs=False)
+    assert [m.role for m in models] == ["embeddings"]
+
+
+def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
+    import logging
+    from llama_packer.discover import discover
+    root = tmp_path / "models"
+    for sub, served in (("chat", True), ("img", False), ("misc", False)):
+        d = root / sub
+        d.mkdir(parents=True)
+        (d / f"{sub}.gguf").write_bytes(b"x")
+    (root / "chat" / "img").mkdir()          # nested unmapped name is fine:
+    (root / "chat" / "img" / "deep.gguf").write_bytes(b"x")  # depth-1 decides
+
+    with caplog.at_level(logging.INFO):
+        models = discover(root, generate_stubs=False)
+    stems = {m.stem for m in models}
+    assert stems == {"chat", "deep"}
+    assert any("img/, misc/" in r.message or "misc/, img/" in r.message
+               for r in caplog.records)
 
 
 def _hf_tree(tmp_path, repo="org/repo", rev="abc123", files=("model.gguf",), with_ref=True):
@@ -135,6 +166,7 @@ def test_model_resolves_gguf_from_hf_cache(tmp_path):
     md_path = tmp_path / "qwen.md"
     fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
     m = Model(md_path, fm, hf_home=hf_home)
+    m.resolve_companions()
     assert m.gguf_path is not None
     assert m.gguf_path.name == "Qwen-x.Q4_K_M.gguf"
     # Companion resolution searches the HF snapshot dir too.
@@ -172,11 +204,13 @@ def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
     fm = {"name": "dirk", "model": "Dirk-Q4_K_M.gguf",
           "mmproj": "mmproj-F16.gguf", "hf_repo": "org/repo"}
     m = Model(md_path, fm, hf_home=hf_home)
+    m.resolve_companions()
     assert m.mmproj is not None and m.mmproj.gguf_path.name == "mmproj-F16.gguf"
 
     # Same via glob — covers repos that name it mmproj-model-f16 etc.
     fm2 = {**fm, "name": "dirk2", "mmproj": "mmproj*.gguf"}
     m2 = Model(md_path.parent / "dirk2.md", fm2, hf_home=hf_home)
+    m2.resolve_companions()
     assert m2.mmproj is not None
 
 
@@ -185,6 +219,7 @@ def test_model_companion_fuzzy_from_hub_when_local_absent(tmp_path):
     md_path = tmp_path / "qwen.md"
     fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
     m = Model(md_path, fm, hf_home=hf_home)
+    m.resolve_companions()
     assert m.mmproj is not None and m.mmproj.gguf_path.name == "Qwen-x-mmproj.gguf"
 
 
@@ -198,6 +233,7 @@ def test_model_companion_cross_repo_hub_ref(tmp_path):
     fm = {"name": "m", "model": "model.gguf", "hf_repo": "org/repo",
           "mmproj": "hub:other/vision-proj:mmproj-F16.gguf"}
     m = Model(md_path, fm, hf_home=hf_home)
+    m.resolve_companions()
     assert m.mmproj is not None
     assert "models--other--vision-proj" in str(m.mmproj.gguf_path)
 
@@ -209,6 +245,7 @@ def test_model_speculative_from_hub(tmp_path):
     fm = {"name": "big", "model": "big-Q4_K_M.gguf", "hf_repo": "org/repo",
           "speculative": "big-mtp.gguf"}
     m = Model(md_path, fm, hf_home=hf_home)
+    m.resolve_companions()
     assert m.mtp is not None
 
 

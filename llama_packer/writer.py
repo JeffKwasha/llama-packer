@@ -62,7 +62,7 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
     supported: list[Model] = []
     for model in models:
         if getattr(model, "_override_error", None):
-            # Already logged (and the model flagged) by apply_overrides.
+            # Already logged (and the model flagged) during scope finalization.
             continue
 
         backend = get_backend(model.backend)

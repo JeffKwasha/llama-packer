@@ -243,7 +243,7 @@ def test_warn_unhandled(caplog):
 def test_setting_keys_partition():
     # framework-consumed and metadata-only keys are disjoint from each other
     # and from what a backend would render.
-    assert FRAMEWORK_CONSUMED == {"backend"}
+    assert FRAMEWORK_CONSUMED == {"backend", "hf_repo"}
     assert METADATA_ONLY == {"chat_template_kwargs"}
     assert VLLM_BACKENDS == {"vllm", "vllm-docker"}
     assert "backend" in SETTING_KEYS and "chat_template" in SETTING_KEYS
@@ -269,7 +269,7 @@ def test_filter_supported_skips_flagged_override(make_model):
     from llama_packer.writer import _filter_supported
 
     m = make_model("q", backend="vllm", hf_repo="org/model")
-    m._override_error = "unknown backend"  # simulate apply_overrides flag
+    m._override_error = "unknown backend"  # simulate finalize() flag
     assert _filter_supported([m]) == []
 
 
@@ -392,11 +392,13 @@ def test_infer_backend_allowed_reorders_and_disables(make_model):
 
 
 def test_apply_overrides_pinned_backend_disabled(make_model):
-    from llama_packer.overrides import apply_overrides
+    from llama_packer.scope import ScopeStack
     m = make_model("p", backend="vllm-docker")
-    apply_overrides([m], {"backends": ["llama-server"]},
-                    avail={"llama_bin": "/opt/llama-server",
-                           "vllm_image": "img"})
+    stack = ScopeStack(avail={"llama_bin": "/opt/llama-server",
+                              "vllm_image": "img"},
+                       allowed=["llama-server"])
+    m.resolve_companions()
+    stack.finalize(m)
     assert getattr(m, "_override_error", None) and "disabled" in m._override_error
 
 

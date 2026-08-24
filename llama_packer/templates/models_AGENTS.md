@@ -19,8 +19,9 @@ matches the model file next to it:
 | `embed/<name>.gguf` | embeddings model (nested dirs like `embed/jina-v5/` keep the role) |
 | `rerank/<name>.gguf` | rerank model |
 
-Orphan files under `embed/`/`rerank`/`doc/` get stubs automatically with the
-role baked in. Other subdirs (`img/`, `misc/`, `tmp/`, `hf_hub/`, `s2t/`, …)
+Orphan files under `embed/`/`rerank`/`doc/` get empty stub sidecars automatically
+(the role comes from the directory, not the stub). Other subdirs (`img/`,
+`misc/`, `tmp/`, `hf_hub/`, `s2t/`, …)
 are not served — extend via profiles.yaml `dirs:` (skipped dirs are listed in
 the run log). A `.modelignore` at a models root excludes files/subtrees in
 place (one glob per line, `#` comments).

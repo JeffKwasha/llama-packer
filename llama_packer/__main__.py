@@ -17,15 +17,16 @@ import yaml
 from llama_packer import Model, __version__, find_bin_dir
 from llama_packer.hardware import GpuProfile
 from llama_packer.profiles import Profiles
+from llama_packer.scope import ScopeStack
+from llama_packer.discover import discover
 from llama_packer.utils import (
     _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
     _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
-    collect_dir_configs, validate_dir_roles,
+    validate_dir_roles,
 )
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
-from llama_packer.overrides import apply_overrides, compile_scoped_rules
 from llama_packer.backends import VLLM_BACKENDS, validate_backend_names
 
 
@@ -325,37 +326,35 @@ def main(argv: list[str] | None = None) -> None:
         from llama_packer.utils import parse_context_length
         min_ctx = parse_context_length(args.min_context)
 
-    # Discover models
-    models = Model.from_dir(models_dirs, generate_stubs=not args.no_stubs,
-                            extra_dirs=args.extra_dirs, dir_roles=dir_roles,
-                            hf_home=hf_home)
-    if not models:
-        logger.error("no models found (create a .md sidecar file)")
-        sys.exit(1)
-    logger.info("models: %d found", len(models))
-
     # vLLM resource configuration (CLI > profiles.yaml `vllm:` section >
-    # built-in constants).  Resolved *before* apply_overrides so backend
-    # inference knows whether a vLLM backend can actually run.
+    # built-in constants).  Resolved *before* discovery so backend inference
+    # knows whether a vLLM backend can actually run.
     vllm_cfg = profiles_cfg.get("vllm") or {}
     vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
     vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
 
-    # Apply profile override rules (backend/chat-template/lora/hf_repo/cli_args).
-    # Global rules from profiles.yaml run first, then directory-scoped ones
-    # from ``models.yaml`` files (outermost → innermost, closest wins).  This
-    # mutates each model's effective settings and flags invalid models
-    # (unknown backend, missing files, no available backend for the format)
-    # for the writer to skip.
-    scoped_rules = compile_scoped_rules(collect_dir_configs(models_dirs))
-    if scoped_rules:
-        logger.info("dir configs: %d scoped override rule(s) from models.yaml",
-                    len(scoped_rules))
-    apply_overrides(models, profiles_cfg, avail={
-        "llama_bin": llama_bin,
-        "vllm_image": vllm_image,
-        "vllm_bin": vllm_bin,
-    }, scoped_rules=scoped_rules)
+    # Discover models via a depth-first walk.  The scope stack carries the
+    # global override rules (bottom scope); each directory's models.yaml is
+    # pushed/popped around its level.  Defaults, rules, companion resolution
+    # and backend finalization all happen inside discover().
+    stack = ScopeStack(
+        avail={
+            "llama_bin": llama_bin,
+            "vllm_image": vllm_image,
+            "vllm_bin": vllm_bin,
+        },
+        allowed=[str(b) for b in backends_cfg] or None,
+    )
+    stack.push({"overrides": profiles_cfg.get("overrides")},
+               origin=str(profiles_path))
+    models = discover(models_dirs, stack=stack,
+                      generate_stubs=not args.no_stubs,
+                      extra_dirs=args.extra_dirs, dir_roles=dir_roles,
+                      hf_home=hf_home)
+    if not models:
+        logger.error("no models found (create a .md sidecar file)")
+        sys.exit(1)
+    logger.info("models: %d found", len(models))
 
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
     if args.health_check_timeout is None:
