@@ -25,7 +25,9 @@ def make_model(tmp_path):
         md_path = tmp_path / f"{stem}.md"
         fm: dict = {"name": stem, "context_length": 32768}
         fm.update(frontmatter)
-        return Model(md_path, fm)
+        model = Model(md_path, fm)
+        model.resolve_companions()
+        return model
 
     return _make
 

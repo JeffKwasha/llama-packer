@@ -174,18 +174,6 @@ def parse_context_length(s: str) -> int:
     return int(s)
 
 
-def infer_param_count(stem: str) -> str | None:
-    """Extract parameter count from stem (e.g., '7B', '13B')."""
-    m = re.search(r"(\d+(?:\.\d+)?[BbMm])", stem)
-    return m.group(1).upper() if m else None
-
-
-def infer_quantization(stem: str) -> str | None:
-    """Extract quantization from stem (e.g., 'Q4_K', 'Q8_0')."""
-    m = re.search(r"(?:[-_.](?:i)?(?P<quant>Q\d+(?:_[A-Z0-9]+){0,2}))", stem)
-    return m.group("quant") if m else None
-
-
 def _gguf_family(stem: str) -> str:
     """Extract GGUF family base name (strip quant, version, MTP suffixes)."""
     s = stem
@@ -439,17 +427,16 @@ def parse_frontmatter(md_path: Path) -> dict:
     return fm
 
 
-def generate_stub_md(md_path: Path, model_file: Path) -> dict:
-    """Generate stub .md sidecar for an orphan model file (.gguf or .safetensors)."""
-    stem = model_file.stem
-    fm = {
-        "name": stem,
-        "parameters": infer_param_count(stem),
-        "context_length": _DEFAULT_CONTEXT_LENGTH,
-        "quantization": infer_quantization(stem),
-        "hf_url": "",
-    }
-    content = "---\n" + yaml.dump(fm, sort_keys=False).rstrip() + "\n---\n\n# " + stem + "\n"
+def write_stub_md(md_path: Path) -> None:
+    """Write an *empty* sidecar for an orphan model file.
+
+    Stubs carry no data: identity falls back to the file stem, context to the
+    built-in default, role to the model's directory.  The empty file exists
+    purely as the human's editing surface ("drop in a gguf, get a placeholder
+    to fill in").  Never called for paths inside an HF blobs tree — see
+    ``discover._materialize_sidecar``.
+    """
+    content = "---\n---\n\n# " + md_path.stem + "\n"
     md_path.write_text(content, encoding="utf-8")
     try:
         md_path.chmod(0o644)
@@ -457,7 +444,6 @@ def generate_stub_md(md_path: Path, model_file: Path) -> dict:
         # File may be owned by another user on a shared volume; content is
         # already written, so a chmod failure is non-fatal.
         pass
-    return fm
 
 
 def _is_mtp_companion(stem: str) -> bool:
@@ -468,17 +454,70 @@ def _is_mtp_companion(stem: str) -> bool:
 
 # ── Role classification ────────────────────────────────────────────────
 #
-# A model directory mixes several roles that discovery previously
-# distinguished with ad-hoc inline checks ("mmproj" in stem,
-# _is_mtp_companion, targets[0]).  classify_models() is the single source of
-# truth: it walks the directory and returns (path, kind) tuples keyed by role
-# (chat / embeddings / rerank) plus the companion kinds (mmproj / mtp).
+# Discovery (llama_packer.discover) owns traversal; these helpers supply the
+# pieces of its classification: companion detection by filename
+# (companion_kind), the directory-name → role map, and .modelignore parsing.
 
-MODEL_KINDS = ("chat", "embeddings", "rerank", "mmproj", "mtp")
+# Per-models-dir exclusion file: <root>/.modelignore.  One glob per line
+# (blank lines and #-comments ignored); a file is skipped when the pattern
+# matches its path relative to the root or any single path component — so
+# `R3-rerank` excludes that subtree, `*.safetensors` a format, `adetailer*`
+# everything named like it.
+MODEL_IGNORE_NAME = ".modelignore"
 
-# Mapping from an ``extra_dir`` name to the role its contents play.  Files
-# discovered under ``embed/`` are embedding models, under ``rerank/`` rerankers.
-_EXTRA_DIR_ROLE = {"embed": "embeddings", "rerank": "rerank"}
+
+def load_model_ignore(root: Path) -> list[str]:
+    """Parse ``<root>/.modelignore`` into a pattern list (empty when absent)."""
+    path = Path(root) / MODEL_IGNORE_NAME
+    if not path.is_file():
+        return []
+    patterns: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return patterns
+
+
+def _is_ignored(rel_parts: tuple[str, ...], rel_path: str,
+                patterns: list[str]) -> bool:
+    import fnmatch
+    for pat in patterns:
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+        if any(fnmatch.fnmatch(part, pat) for part in rel_parts):
+            return True
+    return False
+
+# Default directory-name → role map for discovery.  The FIRST path component
+# of a model file (relative to a models-dir root) selects the role; files at
+# the root itself are chat.  Subdirectories absent from this map are not
+# served at all (e.g. ``img/`` for stable-diffusion-only models, ``misc/``,
+# ``tmp/``).  Extend or override via the profiles.yaml ``dirs:`` mapping;
+# ``--extra-dirs`` entries merge in too (backcompat).  Keys are matched
+# case-insensitively.
+_DEFAULT_DIR_ROLES = {
+    "chat": "chat",
+    "t2t": "chat",  # legacy name for the chat dir
+    "vision": "chat",
+    "doc": "chat",
+    "ocr": "chat",  # legacy name for the doc dir
+    "embed": "embeddings",
+    "rerank": "rerank",
+}
+
+# Roles a served directory may map to (companions are detected by filename,
+# never by directory).
+SERVED_ROLES = ("chat", "embeddings", "rerank")
+
+
+def validate_dir_roles(dir_roles: dict) -> str | None:
+    """Validate a profiles.yaml ``dirs:`` mapping; return an error message or None."""
+    for d, r in dir_roles.items():
+        if r not in SERVED_ROLES:
+            return (f"dirs: {d!r}: unknown role {r!r} "
+                    f"(allowed: {', '.join(SERVED_ROLES)})")
+    return None
 
 
 def companion_kind(stem: str) -> str | None:
@@ -491,75 +530,58 @@ def companion_kind(stem: str) -> str | None:
     return None
 
 
-def model_kind(path: str | os.PathLike, role: str | None = None) -> str:
-    """Classify a single model file by role.
-
-    Companions are detected by filename regardless of any sidecar/companion
-    metadata:
-      * ``mmproj``  — vision projection (``*mmproj*`` on a .gguf)
-      * ``mtp``     — MTP speculative-draft head
-
-    For everything else the role is resolved in priority order:
-      1. an explicit ``role:`` field in the ``.md`` sidecar,
-      2. ``role`` passed by the caller (the directory a file was found in,
-         e.g. ``embed``/``rerank``),
-      3. a ``type:`` field of ``embedding``/``rerank``,
-      4. default ``chat``.
-    """
-    p = Path(path)
-    if p.suffix.lower() == ".gguf":
-        ck = companion_kind(p.stem)
-        if ck:
-            return ck
-    if role in ("embeddings", "rerank"):
-        return role
-    md = p.with_suffix(".md")
-    fm = parse_frontmatter(md) if md.is_file() else {}
-    explicit = fm.get("role")
-    if explicit:
-        return str(explicit)
-    typ = str(fm.get("type") or "").lower()
-    if "rerank" in typ:
-        return "rerank"
-    if "embed" in typ:
-        return "embeddings"
-    return "chat"
+def dir_role_map(extra_dirs: list[str] | None = None,
+                 dir_roles: dict | None = None) -> dict[str, str]:
+    """Effective directory-name → role map: defaults + extra dirs + profiles.yaml ``dirs:``."""
+    role_map = dict(_DEFAULT_DIR_ROLES)
+    for d in (extra_dirs or []):
+        role_map.setdefault(str(d).lower(), _DEFAULT_DIR_ROLES.get(str(d).lower()) or "chat")
+    for d, r in (dir_roles or {}).items():
+        role_map[str(d).lower()] = str(r)
+    return role_map
 
 
-def classify_models(
-    models_dirs: Sequence[str | os.PathLike],
-    extra_dirs: list[str] | None = None,
-) -> list[tuple[Path, str]]:
-    """Classify model files across *models_dirs* (and their ``extra_dirs``).
+# ── Directory-scoped models.yaml ──────────────────────────────────────
+#
+# Any subdirectory of a models root may carry a ``models.yaml`` that applies
+# only to models beneath it: ``defaults`` merge into each sidecar's
+# frontmatter (sidecar wins), ``overrides`` are standard override rules whose
+# scope is that subtree.  Inner directories beat outer ones beat global.
+# Both are folded by the ScopeStack during discovery (llama_packer.discover).
 
-    Each models dir is scanned on its own; ``extra_dirs`` are subdirectories of
-    every models dir (e.g. ``embed``/``rerank``).  Returns a list of
-    ``(path, kind)`` tuples where ``kind`` is one of :data:`MODEL_KINDS`
-    (``chat``, ``embeddings``, ``rerank``, ``mmproj``, ``mtp``).
-    """
-    if isinstance(models_dirs, (str, os.PathLike)):
-        models_dirs = [models_dirs]
+DIR_CONFIG_NAME = "models.yaml"
 
-    roots: list[tuple[Path, str | None]] = []
-    for md in models_dirs:
-        base = Path(md)
-        roots.append((base, None))
-        for d in (extra_dirs or []):
-            extra = base / d
-            if extra.is_dir():
-                roots.append((extra, _EXTRA_DIR_ROLE.get(d)))
+# Frontmatter keys a directory config may NOT default (identity/skip semantics
+# must stay per-model).
+_DIR_CONFIG_FORBIDDEN_DEFAULTS = ("name", "model", "ignore")
 
-    out: list[tuple[Path, str]] = []
-    for root, role in roots:
-        if not root.is_dir():
-            continue
-        for pattern in ("*.gguf", "*.safetensors", "*.md"):
-            recursive = pattern == "*.md"
-            walker = root.rglob(pattern) if recursive else root.glob(pattern)
-            for p in walker:
-                if p.is_file():
-                    out.append((p, model_kind(p, role)))
-    return out
+_dir_config_cache: dict[Path, dict | None] = {}
+
+
+def load_dir_config(d: Path) -> dict | None:
+    """Parse ``models.yaml`` in *d* (cached).  Returns None when absent/empty."""
+    d = Path(d)
+    if d in _dir_config_cache:
+        return _dir_config_cache[d]
+    path = d / DIR_CONFIG_NAME
+    cfg: dict | None = None
+    if path.is_file():
+        try:
+            cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            raise SystemExit(f"error: {path}: invalid YAML: {e}") from e
+        if not isinstance(cfg, dict):
+            raise SystemExit(f"error: {path}: must be a mapping")
+        defaults = cfg.get("defaults")
+        if defaults is not None and not isinstance(defaults, dict):
+            raise SystemExit(f"error: {path}: 'defaults' must be a mapping")
+        bad = [k for k in (defaults or {}) if k in _DIR_CONFIG_FORBIDDEN_DEFAULTS]
+        if bad:
+            raise SystemExit(
+                f"error: {path}: defaults may not set {', '.join(sorted(bad))} "
+                f"(per-model keys)")
+    _dir_config_cache[d] = cfg
+    return cfg
 
 
 def _eval_expr(expr: str, base_val: float) -> float:
@@ -673,6 +695,86 @@ def hf_cache_root(override: str | os.PathLike | None = None) -> str | None:
         return os.path.abspath(os.fspath(root))
     default = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
     return default if os.path.isdir(default) else None
+
+
+def hf_hub_cache(override: str | os.PathLike | None = None) -> Path | None:
+    """Return the HF *hub* cache dir (the one holding ``models--org--repo/``).
+
+    Resolution order: explicit *override* (``--hf-home`` / profiles.yaml
+    ``hf_home:``, pointing at the HF_HOME-style root, or directly at the hub
+    dir) → ``$HF_HOME/hub`` → ``$HUGGINGFACE_HUB_CACHE`` →
+    ``~/.cache/huggingface/hub``.
+    """
+    if override:
+        base = Path(override)
+        hub = base / "hub"
+        return hub if hub.is_dir() else base
+    home = os.environ.get("HF_HOME")
+    if home:
+        return Path(home) / "hub"
+    env = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if env:
+        return Path(env)
+    default = Path.home() / ".cache" / "huggingface" / "hub"
+    return default if default.is_dir() else None
+
+
+def hf_snapshot_dir(repo_id: str, hf_home: str | os.PathLike | None = None) -> Path | None:
+    """Locate the local HF hub snapshot directory for ``repo_id``.
+
+    Revision selection: ``refs/main`` when present, else the sole snapshot
+    dir, else the newest by mtime (with a warning).  Returns None when the
+    repo is not in the hub cache.
+    """
+    hub = hf_hub_cache(hf_home)
+    if hub is None:
+        return None
+    repo_dir = hub / ("models--" + str(repo_id).replace("/", "--"))
+    snaps = repo_dir / "snapshots"
+    if not snaps.is_dir():
+        return None
+    ref = repo_dir / "refs" / "main"
+    if ref.is_file():
+        rev = ref.read_text(encoding="utf-8").strip()
+        if rev and (snaps / rev).is_dir():
+            return snaps / rev
+    dirs = [d for d in snaps.iterdir() if d.is_dir()]
+    if not dirs:
+        return None
+    dirs.sort(key=lambda d: d.stat().st_mtime)
+    snap = dirs[-1]
+    if len(dirs) > 1:
+        logger.warning("hf: %s has %d snapshots and no refs/main; using newest (%s)",
+                       repo_id, len(dirs), snap.name)
+    return snap
+
+
+def hf_snapshot_file(repo_id: str, filename: str,
+                     hf_home: str | os.PathLike | None = None) -> Path | None:
+    """Resolve ``filename`` inside the local HF hub snapshot of ``repo_id``.
+
+    Lets a sidecar reference a hub-downloaded GGUF (``hf_repo: org/repo`` +
+    ``model: file.gguf``) without symlinking it into a models dir — readable
+    snapshot filenames, no blob hashes, and it keeps working when sidecars
+    move.  ``filename`` may be a glob pattern (``mmproj*.gguf``): an exact
+    file wins; otherwise a single glob match resolves and an ambiguous match
+    warns and fails.  Returns None when unresolved.
+    """
+    snap = hf_snapshot_dir(repo_id, hf_home)
+    if snap is None:
+        return None
+    candidate = snap / filename
+    if candidate.is_file():
+        return candidate
+    if any(ch in filename for ch in "*?["):
+        matches = sorted(snap.glob(filename))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
+                           filename, repo_id, len(matches),
+                           ", ".join(m.name for m in matches))
+    return None
 
 
 def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None,

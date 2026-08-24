@@ -1,11 +1,11 @@
 # llama_packer/backends/vllm.py
 """vLLM backends: host-binary and containerized serving.
 
-Both serve safetensors / HF-repo models.  vLLM renders chat models only in
-this version; embeddings/rerank selection for vLLM is left for a later
-release, so the support matrix rejects those roles (the framework then logs
-the error and skips that combo).  LoRA is not yet wired into vLLM's module
-registry, so a declared ``loras`` setting is warned about and skipped.
+Both serve safetensors / HF-repo models.  Roles map onto vLLM's serving
+tasks: chat (generation), embeddings (``--task embed``) and rerank
+(``--task score``, exposing /v1/rerank and /v1/score).  Speculative
+decoding applies to generation only.  LoRA is not yet wired into vLLM's
+module registry, so a declared ``loras`` setting is warned about and skipped.
 """
 
 from __future__ import annotations
@@ -84,6 +84,8 @@ def _speculative_config(model: "Model") -> dict | None:
 
 def _spec_meta(model: "Model") -> dict:
     """Backend metadata for the writer's mtp_* metadata keys."""
+    if model.role != "chat":
+        return {"mtp_enabled": False}
     spec = _speculative_config(model)
     if not spec:
         return {"mtp_enabled": False}
@@ -135,7 +137,7 @@ def _map_paths_into(paths: list[Path], models_dirs) -> tuple[list[str], list[str
 class VllmHostBackend(BaseBackend):
     name = "vllm"
     formats = frozenset({".safetensors", "hf_repo"})
-    roles = frozenset({"chat"})
+    roles = frozenset({"chat", "embeddings", "rerank"})
     handles = frozenset({"cli_args", "chat_template", "hf_repo"})
 
     def is_available(self, avail: dict) -> bool:
@@ -143,6 +145,12 @@ class VllmHostBackend(BaseBackend):
 
     def _model_ref(self, model: "Model") -> str:
         return model.hf_repo or str(model.gguf_path)
+
+    # Per-role serving task (mirrors llama-server's _ROLE_FLAGS symmetry).
+    _ROLE_TASK = {
+        "embeddings": ["--task", "embed"],
+        "rerank": ["--task", "score"],
+    }
 
     def _serve_flags(
         self,
@@ -165,13 +173,16 @@ class VllmHostBackend(BaseBackend):
             "--gpu-memory-utilization", str(gpu_mem_util),
         ]
         flags += _kv_cache_dtype_flags(cache_type)
+        flags += self._ROLE_TASK.get(model.role, [])
         ct = model.resolved_chat_template
         if ct is not None:
             ref = map_path(ct) if map_path else str(ct)
             flags += ["--chat-template", ref]
-        spec = _speculative_config(model)
-        if spec:
-            flags += ["--speculative-config", json.dumps(spec, separators=(",", ":"))]
+        if model.role == "chat":
+            # Speculative decoding is a generation-only feature.
+            spec = _speculative_config(model)
+            if spec:
+                flags += ["--speculative-config", json.dumps(spec, separators=(",", ":"))]
         return flags
 
     def build_cmd(

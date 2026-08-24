@@ -26,14 +26,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Settings keys that override rules / sidecars may declare.  Each backend
-# declares which it renders via ``handles``.  ``backend`` is consumed by the
-# framework (selection itself); ``chat_template_kwargs`` is client-facing
-# metadata only (no server-side flag exists for it).
+# declares which it renders via ``handles``.  ``FRAMEWORK_CONSUMED`` keys are
+# consumed by the framework, not rendered per-backend: ``backend`` is the
+# selection itself; ``hf_repo`` drives hub-cache resolution of the model file
+# and companions (Model layer), so declaring it alongside any backend is fine.
+# ``METADATA_ONLY`` keys are client-facing metadata only (no server flag).
 SETTING_KEYS = frozenset({
     "backend", "hf_repo", "chat_template", "chat_template_kwargs",
     "loras", "cli_args", "reasoning-format", "reasoning-preserve",
 })
-FRAMEWORK_CONSUMED = frozenset({"backend"})
+FRAMEWORK_CONSUMED = frozenset({"backend", "hf_repo"})
 METADATA_ONLY = frozenset({"chat_template_kwargs"})
 
 

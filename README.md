@@ -27,7 +27,7 @@ uv run llama-packer --dry-run
 
 `llama-packer` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. Point it elsewhere with `--models-dir` (accepts several directories, each scanned independently), `--profiles`, and `--llama-server` (or `LLAMA_BIN_DIR`). Pass `--hf-home` to keep Hugging Face cache paths in their own `${HF_HOME}` macro instead of widening `${MODELS_DIR}`.
 
-GGUF/safetensors files without a `.md` sidecar get a minimal stub sidecar generated automatically (name, parameter count and quantization inferred from the filename), so a directory of bare models works out of the box — skip with `--no-stubs`.
+GGUF/safetensors files without a `.md` sidecar get an empty stub sidecar written automatically, so a directory of bare models works out of the box — fill it in whenever you like (until then identity comes from the filename, context from the default, role from the directory). Skip with `--no-stubs`. Stubs never land in HF `blobs/` trees; they sit beside the human-readable snapshot entry instead.
 
 Output goes to `config.yaml` (`--output` overrides the path) and a sibling `config.env` in the current directory. Print the version with `llama-packer --version`.
 
