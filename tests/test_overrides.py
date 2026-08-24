@@ -206,3 +206,12 @@ def test_known_cache_type_kept(make_model):
     from llama_packer.writer import _filter_supported
     m = make_model("q", backend="llama-server", cache_type="f16")
     assert [x.stem for x in _filter_supported([m])] == ["q"]
+
+
+def test_infer_backend_respects_allowed_list(make_model):
+    from llama_packer.backends import infer_backend
+    m = make_model("g")
+    # gguf + only llama-server enabled -> served
+    assert infer_backend(m, {"llama_bin": "/opt/ls"}, allowed=["llama-server"]) == "llama-server"
+    # llama-server disabled -> nothing can serve a gguf
+    assert infer_backend(m, {"llama_bin": "/opt/ls"}, allowed=["vllm"]) is None

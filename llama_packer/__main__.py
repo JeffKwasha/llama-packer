@@ -26,7 +26,7 @@ from llama_packer.utils import (
 )
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
 from llama_packer.overrides import apply_overrides, compile_scoped_rules
-from llama_packer.backends import VLLM_BACKENDS
+from llama_packer.backends import VLLM_BACKENDS, validate_backend_names
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -286,6 +286,16 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("profiles.yaml dirs: must be a mapping of directory name to role")
         sys.exit(1)
     err = validate_dir_roles(dir_roles)
+    if err:
+        logger.error("profiles.yaml %s", err)
+        sys.exit(1)
+
+    # Backend enable/prefer list (ordered; absent = all registered).
+    backends_cfg = profiles_cfg.get("backends") or []
+    if not isinstance(backends_cfg, list):
+        logger.error("profiles.yaml backends: must be a list of backend names")
+        sys.exit(1)
+    err = validate_backend_names(backends_cfg)
     if err:
         logger.error("profiles.yaml %s", err)
         sys.exit(1)

@@ -4,6 +4,13 @@
 
 `llama-packer` generates `config.yaml` for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. It scans model directories, detects GPU hardware, measures per-model VRAM costs via `llama-fit-params`, budgets context windows, resolves companion files, applies sampling profiles, and writes ready-to-run server configurations.
 
+**Assumptions:** llama-packer targets the **current stable release** of every
+external tool it drives (llama.cpp/llama-server, vLLM, llama-swap), and adopts
+features from newer releases freely; generated commands carry no compatibility
+shims or version detection. Running an older stack is the operator's trade-off —
+failures surface as obvious upstream errors (e.g. a 404 on an endpoint your
+vLLM doesn't have).
+
 **Entry point:** `llama-packer` (console script) → `llama_packer.__main__.main`
 
 **Models directory guide:** `llama-packer --agents` writes `AGENTS.md` into
@@ -65,6 +72,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `matrix` | Shared embed/rerank/chat VRAM budget solving (`embed`/`rerank` model refs) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
+| `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
@@ -396,11 +404,19 @@ modes:
 
 ## vLLM Backend
 
-A chat model can be served with vLLM instead of llama-server by an override
+A model can be served with vLLM instead of llama-server by an override
 rule (see below) that sets `backend: vllm` (host binary) or `backend: vllm-docker`
 (container). The emitted entry runs `vllm serve`, published to llama-swap's `${PORT}`
 host macro. Everything else works identically: aliases/modes (`filters.setParamsByID`),
 `metadata`, capabilities, matrix routing.
+
+All three roles are supported, mapped onto vLLM's pooling interface:
+
+| Role | Task flag | Endpoints |
+|------|-----------|-----------|
+| `chat` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
+| `embeddings` | `--task embed` | `/v1/embeddings` |
+| `rerank` | `--task score` | `/v1/rerank`, `/v1/score` |
 
 Sidecars themselves carry no backend key — backend selection, chat templates and
 LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`.
@@ -604,6 +620,26 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `llama-server` | `.gguf` | chat, embeddings, rerank |
 | `vllm` | safetensors, `hf_repo` | chat |
 | `vllm-docker` | safetensors, `hf_repo` | chat |
+
+## Backend Selection
+
+profiles.yaml's ordered `backends:` list both **enables** and **prioritizes**
+backends; when absent, every registered backend is usable in registration
+order (`llama-server`, `vllm-docker`, `vllm`):
+
+```yaml
+# profiles.yaml
+backends:
+  - llama-server    # tried first for everything it can serve
+  - vllm-docker     # enabled, second preference
+  # vllm            # absent = disabled, even with resources configured
+```
+
+Inference walks this list (availability still filters: an entry without its
+binary/image configured is skipped) and picks the first backend whose formats
+and roles cover the model. An explicit sidecar/override `backend:` pin to a
+disabled name is an error that skips that model — pinning bypasses *inference*,
+never policy.
 
 ## Cache precision (`cache_type`)
 

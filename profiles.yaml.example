@@ -21,6 +21,13 @@ models_dirs:
 # ~/.cache/huggingface.
 # hf_home: /mnt/data/huggingface
 
+# Backend enable/prefer list — ordered; a backend absent from the list is
+# disabled even when its resources are configured.  Omit the key to use all
+# registered backends in default order (llama-server, vllm-docker, vllm).
+# backends:
+#   - llama-server
+#   - vllm-docker
+
 # ── Profile definitions ────────────────────────────────
 profiles:
   default:

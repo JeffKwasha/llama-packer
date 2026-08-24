@@ -170,6 +170,10 @@ def apply_overrides(models, profiles_cfg, avail: dict | None = None,
     compiled = _compile_rules(profiles_cfg)
     scoped = sorted(scoped_rules or [],
                     key=lambda sr: len(sr[0].parts))  # outermost first
+    # profiles.yaml `backends:` — ordered enable/prefer list; absent = all.
+    allowed = (profiles_cfg or {}).get("backends") or None
+    if allowed is not None:
+        allowed = [str(b) for b in allowed]
 
     for model in models:
         merged = {k: model.frontmatter[k] for k in SETTING_KEYS
@@ -198,10 +202,14 @@ def apply_overrides(models, profiles_cfg, avail: dict | None = None,
         backend_name = merged.get("backend")
         if backend_name is not None and backend_name not in BACKENDS:
             errors.append(f"unknown backend {backend_name!r}")
+        elif backend_name is not None and allowed is not None and backend_name not in allowed:
+            errors.append(f"backend {backend_name!r} is disabled by "
+                          f"profiles.yaml backends: {allowed}")
         elif backend_name is None:
             # Nothing declared (sidecar or rule): infer from the file format,
-            # gated by which backends' resources are actually configured.
-            inferred = infer_backend(model, avail)
+            # gated by which backends are enabled (profiles.yaml backends:)
+            # and whose resources are actually configured.
+            inferred = infer_backend(model, avail, allowed=allowed)
             if inferred is not None:
                 logger.debug("override: %s: inferred backend %r", model.stem, inferred)
                 merged["backend"] = inferred

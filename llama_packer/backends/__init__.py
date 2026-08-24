@@ -51,7 +51,8 @@ def get_backend(name: str) -> BaseBackend:
         ) from None
 
 
-def infer_backend(model: "Model", avail: dict | None = None) -> str | None:
+def infer_backend(model: "Model", avail: dict | None = None,
+                  allowed: list[str] | None = None) -> str | None:
     """Infer a backend name from the model's file format and configuration.
 
     Backends register the formats they can load (``formats``); the registry
@@ -59,8 +60,12 @@ def infer_backend(model: "Model", avail: dict | None = None) -> str | None:
     the model AND whose required resources are configured (``is_available``).
     A locally resolved model file's extension wins over ``hf_repo``.
 
-    Returns None when no registered backend can serve the model with the
-    current configuration — the caller logs and skips the model.
+    *allowed* (from profiles.yaml ``backends:``) both reorders inference and
+    disables unlisted backends; None keeps every registered backend in
+    registration order.
+
+    Returns None when no backend can serve the model with the current
+    configuration — the caller logs and skips the model.
     """
     if model.gguf_path is not None:
         fmt = model.gguf_path.suffix.lower()
@@ -69,9 +74,22 @@ def infer_backend(model: "Model", avail: dict | None = None) -> str | None:
     else:
         return None
     avail = avail or {}
-    for backend in BACKENDS.values():
+    if allowed is None:
+        candidates = list(BACKENDS.values())
+    else:
+        candidates = [BACKENDS[n] for n in allowed if n in BACKENDS]
+    for backend in candidates:
         if fmt in backend.formats and backend.is_available(avail):
             return backend.name
+    return None
+
+
+def validate_backend_names(names) -> str | None:
+    """Validate a profiles.yaml ``backends:`` list; error message or None."""
+    for name in names:
+        if name not in BACKENDS:
+            return (f"backends: unknown backend {name!r} "
+                    f"(available: {', '.join(sorted(BACKENDS))})")
     return None
 
 
@@ -85,4 +103,5 @@ __all__ = [
     "BaseBackend",
     "get_backend",
     "infer_backend",
+    "validate_backend_names",
 ]
