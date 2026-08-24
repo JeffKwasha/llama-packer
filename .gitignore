@@ -17,6 +17,8 @@ docker-compose.yml
 
 # Local (machine-specific) profiles — profiles.yaml.example is the template
 profiles.yaml
+chat/
+@chat
 
 # Scratch / temp
 ~*
@@ -26,7 +28,6 @@ profiles.yaml
 .old/
 llama-b*/
 llama-swap
-chat
 
 # uv / setuptools build artifacts
 build/
