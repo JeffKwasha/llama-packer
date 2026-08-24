@@ -45,4 +45,3 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - `/mnt/ai/models` — canonical model root (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); configured via profiles.yaml `models_dirs:` + `dirs:` / `hf_home:`
 - `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
-- `model_cfg/` — legacy (superseded by llama_packer)
