@@ -5,7 +5,19 @@ from __future__ import annotations
 
 import pytest
 
-from llama_packer.overrides import apply_overrides, rule_matches, resolve_setting_paths
+from llama_packer.overrides import rule_matches, resolve_setting_paths
+from llama_packer.scope import ScopeStack
+
+
+def _run(models, profiles_cfg=None, avail=None):
+    """Push *profiles_cfg* override rules and run the full model pipeline."""
+    stack = ScopeStack(avail=avail)
+    stack.push(profiles_cfg or {}, origin="profiles.yaml")
+    for m in models:
+        stack.apply_rules(m)
+        m.resolve_companions()
+        stack.finalize(m)
+    return models
 
 
 def test_rule_matches_regex_on_base_model(make_model):
@@ -39,7 +51,7 @@ def test_apply_overrides_last_wins_per_key(make_model, tmp_path):
         ],
     }
     m = make_model("qwen3-27b", base_model="qwen3.6", name="qwen3-27b")
-    apply_overrides([m], profiles)
+    _run([m], profiles)
     assert m.backend == "vllm-docker"          # first rule set it
     assert m.hf_repo == "org/new"             # last-wins per key (name rule)
 
@@ -48,7 +60,7 @@ def test_apply_overrides_sidecar_seed(make_model, tmp_path):
     # A sidecar-declared setting survives when no rule overrides it.
     profiles = {"overrides": [{"when": {"base_model": "qwen"}, "backend": "vllm"}]}
     m = make_model("q", base_model="qwen3.8", name="qwen3-8", cli_args="--seed 1")
-    apply_overrides([m], profiles)
+    _run([m], profiles)
     assert m.backend == "vllm"
     assert m.frontmatter["cli_args"] == "--seed 1"
 
@@ -58,7 +70,7 @@ def test_apply_overrides_unknown_backend_skips(make_model, tmp_path, caplog):
     profiles = {"overrides": [{"when": {"base_model": "qwen"}, "backend": "bogus"}]}
     m = make_model("q", base_model="qwen3.8", name="qwen3-8")
     with caplog.at_level(logging.ERROR):
-        apply_overrides([m], profiles)
+        _run([m], profiles)
     assert getattr(m, "_override_error", None) is not None
     assert any("unknown backend" in r.message for r in caplog.records)
 
@@ -77,20 +89,20 @@ def test_missing_when_stops_run(make_model, tmp_path):
         {"when": {}, "backend": "vllm"},           # empty when
     ):
         with pytest.raises(SystemExit, match="missing 'when'"):
-            apply_overrides([make_model("q")], {"overrides": [bad]})
+            _run([make_model("q")], {"overrides": [bad]})
 
 
 def test_non_mapping_when_stops_run(make_model):
     with pytest.raises(SystemExit, match="'when' must be a mapping"):
-        apply_overrides(
-            [make_model("q")],
-            {"overrides": [{"when": "qwen", "backend": "vllm"}]},
+        _run(
+        [make_model("q")],
+        {"overrides": [{"when": "qwen", "backend": "vllm"}]},
         )
 
 
 def test_infer_backend_gguf_defaults_llama_server(make_model, tmp_path):
     m = make_model("g")
-    apply_overrides([m], {}, avail={"llama_bin": "/opt/llama-server"})
+    _run([m], avail={"llama_bin": "/opt/llama-server"})
     assert m.backend == "llama-server"
     assert m.frontmatter["backend"] == "llama-server"
 
@@ -98,14 +110,14 @@ def test_infer_backend_gguf_defaults_llama_server(make_model, tmp_path):
 def test_infer_backend_safetensors_prefers_docker(make_model, tmp_path):
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".safetensors")
-    apply_overrides([m], {}, avail={"vllm_image": "img:1"})
+    _run([m], avail={"vllm_image": "img:1"})
     assert m.backend == "vllm-docker"
 
 
 def test_infer_backend_safetensors_falls_back_to_host(make_model, tmp_path):
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".safetensors")
-    apply_overrides([m], {}, avail={"vllm_bin": "vllm"})
+    _run([m], avail={"vllm_bin": "vllm"})
     assert m.backend == "vllm"
 
 
@@ -114,7 +126,7 @@ def test_infer_backend_no_available_backend_skips(make_model, tmp_path, caplog):
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".onnx")
     with caplog.at_level(logging.ERROR):
-        apply_overrides([m], {})
+        _run([m])
     assert getattr(m, "_override_error", None) is not None
     assert any("no available backend" in r.message for r in caplog.records)
 
@@ -123,7 +135,7 @@ def test_declared_backend_beats_inference(make_model, tmp_path):
     profiles = {"overrides": [{"when": True, "backend": "vllm",
                                "hf_repo": "org/m"}]}
     m = make_model("g")  # local gguf would infer llama-server
-    apply_overrides([m], profiles)
+    _run([m], profiles)
     assert m.backend == "vllm"
 
 
@@ -206,3 +218,12 @@ def test_known_cache_type_kept(make_model):
     from llama_packer.writer import _filter_supported
     m = make_model("q", backend="llama-server", cache_type="f16")
     assert [x.stem for x in _filter_supported([m])] == ["q"]
+
+
+def test_infer_backend_respects_allowed_list(make_model):
+    from llama_packer.backends import infer_backend
+    m = make_model("g")
+    # gguf + only llama-server enabled -> served
+    assert infer_backend(m, {"llama_bin": "/opt/ls"}, allowed=["llama-server"]) == "llama-server"
+    # llama-server disabled -> nothing can serve a gguf
+    assert infer_backend(m, {"llama_bin": "/opt/ls"}, allowed=["vllm"]) is None

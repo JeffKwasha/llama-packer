@@ -10,8 +10,8 @@ is about *structure* — which component owns what, and why.
 main()                                        (__main__.py — thin orchestration)
   ├─ find_bin_dir          → llama_bin, fit_bin        (utils.py)
   ├─ GpuProfile.from_args  → VRAM pool + reserve       (hardware.py)
-  ├─ Model.from_dir        → models (+ companions)     (model.py / utils.classify_models)
-  ├─ apply_overrides       → backend/template/lora/cli_args merged onto models   (overrides.py)
+  ├─ discover.discover     → DFS walk + ScopeStack      (discover.py / scope.py)
+  │                          defaults ⊕ sidecar → rules → resolve_companions → finalize
   ├─ _health_check_timeout → healthCheckTimeout        (__main__.py)
   ├─ compute_env_prefixes  → ${VAR} path macros        (utils.py)
   └─ build_config          = _filter_supported         (writer.py — validation boundary)
@@ -25,6 +25,7 @@ main()                                        (__main__.py — thin orchestratio
 | Component | Module | Owns |
 |-----------|--------|------|
 | `Model` | `model.py` | Sidecar aggregate: frontmatter accessors, companion resolution (mmproj/MTP), design context, pass-through metadata. One instance per servable model |
+| `ScopeStack` | `scope.py` | The single select-and-set engine for sidecar data: folds `models.yaml` defaults outermost→innermost, applies override rules last-match-wins per key, finalizes backend inference + path refs |
 | `Profiles` | `profiles.py` | The profiles.yaml mapping as a typed view: fleet defaults (`cache_type`, `parallel`, spare), `allow_profiles` gating, expression resolution (`base * N`), per-model variant grouping |
 | `Planner` | `writer.py` | Every *context decision*: mmproj keep/drop pre-pass, shared matrix solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx |
@@ -32,7 +33,7 @@ main()                                        (__main__.py — thin orchestratio
 | `_filter_supported` | `writer.py` | **The** validation boundary: backend format/role compatibility, reasoning-flag value/applicability, cache-type knowability. Runs before any VRAM work so rejected models never consume measurements |
 | Backends | `backends/` | Registry + ABC; each renders a resolved `Model` into a `cmd`. Selection: sidecar/override `backend:` > format inference gated by configured resources |
 | `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `calc_ctx`, matrix solver primitives |
-| Override engine | `overrides.py` | Pattern-scoped rule matching (`when`) and last-match-wins merging; path resolution for templates/LoRAs |
+| Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
 ## Invariants (and their single homes)

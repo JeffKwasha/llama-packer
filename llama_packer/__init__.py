@@ -1,6 +1,6 @@
 """llama-packer: Generate llama-swap config from GGUF model metadata."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 from llama_packer.model import Model
 from llama_packer.utils import find_bin_dir

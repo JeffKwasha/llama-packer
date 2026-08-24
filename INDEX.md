@@ -12,20 +12,22 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 - [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, ...), companion resolution
 - [`llama_packer/profiles.py`](llama_packer/profiles.py) — `Profiles` value object: defaults, spare precedence, `allow_profiles` filtering, per-model variant grouping
-- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj drop, matrix solve, bounded ctx) → `emit_config` (llama-swap entries), `_filter_supported`, `write_yaml`
+- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + always-on `-text` variant, renamed auto-dropped main, matrix solve, bounded ctx) → `emit_config` (llama-swap entries with bare `<id>` = vision / `<id>-text` = text-only), `_filter_supported`, `write_yaml`
 - [`llama_packer/backends/`](llama_packer/backends/) — backend package: `base` (ABC + support matrix + `is_available`), `llama_server`, `vllm` (host + docker); `BACKENDS` registry, `infer_backend`, `VLLM_BACKENDS`, `get_backend`
-- [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
+- [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules (global profiles.yaml + directory-scoped `models.yaml`, inner scope wins) → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
 - [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` fit-params, `solve_matrix_ctx`
 - [`llama_packer/vllm_estimate.py`](llama_packer/vllm_estimate.py) — vLLM memory estimation via `vllm-memory-estimator` (+ safetensors fallback)
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
-- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, discovery/slugify/params, path-macro grouping (`compute_env_prefixes`, `hf_cache_root`)
+- [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)
+- [`llama_packer/discover.py`](llama_packer/discover.py) — depth-first model discovery, empty stub sidecars, HF-blobs guard
+- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, dir-role map (`_DEFAULT_DIR_ROLES`, `dir_role_map`), HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`)
 
 ## Backends
 
 - llama-server — GGUF chat/embeddings/rerank; role flags, MTP, mmproj, chat-template, LoRA
-- vLLM — safetensors / `hf_repo`; `vllm serve` (host binary)
+- vLLM — safetensors / `hf_repo`; all roles (`--task embed`/`--task score` for pooling); `vllm serve` (host binary)
 - vLLM docker — same, wrapped in `docker run` with bind-mounts for chat-template/lora dirs; per-model `vllm_image:` override
-- Backend selection: sidecar/override `backend:` wins; else inferred from file format (`.gguf` → llama-server, safetensors/HF-repo → vllm-docker) gated by configured resources (see SPEC.md "Override Rules")
+- Backend selection: sidecar/override `backend:` wins (validated against profiles.yaml `backends:` enable list); else inferred from file format + roles, gated by the enable list and configured resources (see SPEC.md "Backend Selection")
 - See SPEC.md "vLLM Backend" + "Override Rules" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
 
 ## Docs
@@ -39,6 +41,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Data dirs
 
-- `models/` — GGUF + `.md` sidecars (+ `embed/`, `rerank/`); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
+- `models/` — GGUF + `.md` sidecars (`chat/` `vision/` `doc/` `embed/` `rerank/` by use-case; `img/` etc. ignored; optional per-directory `models.yaml`; see SPEC.md "Model Discovery"); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
+- `/mnt/ai/models` — canonical model root (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); configured via profiles.yaml `models_dirs:` + `dirs:` / `hf_home:`
+- `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
-- `model_cfg/` — legacy (superseded by llama_packer)

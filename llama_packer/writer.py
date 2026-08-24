@@ -62,7 +62,7 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
     supported: list[Model] = []
     for model in models:
         if getattr(model, "_override_error", None):
-            # Already logged (and the model flagged) by apply_overrides.
+            # Already logged (and the model flagged) during scope finalization.
             continue
 
         backend = get_backend(model.backend)
@@ -285,12 +285,21 @@ def _build_entry(
 # ── Planning ──────────────────────────────────────────────────────────────
 
 
+# Entry-id suffix of every no-mmproj variant.  Invariant: the bare ``<id>``
+# always serves vision when the model has an mmproj; the text-only serving is
+# always ``<id>-text`` (see :func:`emit_config`).
+TEXT_SUFFIX = "-text"
+
+
 @dataclass(frozen=True)
 class Variant:
     """One planned llama-swap entry: resolved serving params + contexts.
 
     ``vision_ctx`` is set only when mmproj was dropped from the main variant
     but a companion exists — the emitter then adds a best-effort vision entry.
+    A variant with ``include_mmproj=False`` is emitted as the ``<id>-text``
+    entry (this is both the on-demand text-only variant of a vision-keeping
+    model and the renamed main entry of an auto-dropped model).
     """
     parallel: int
     cache_type: str
@@ -376,8 +385,11 @@ class Planner:
         """Decide per chat model whether the main entry keeps its mmproj.
 
         A model keeps vision when it reaches the minimum useful context WITH
-        the projection loaded; otherwise the main entry drops it (a best-effort
-        vision variant is emitted later).  Uses the global spare and fleet
+        the projection loaded; otherwise the main entry drops it (and is
+        emitted as ``<id>-text``; a best-effort vision variant is emitted
+        alongside) — but only when dropping actually helps: a model whose
+        design context is below the minimum even text-only keeps its vision,
+        since sacrificing it buys nothing.  Uses the global spare and fleet
         defaults; per-profile spare still bounds ctx per group.
         """
         drop: dict[str, bool] = {}
@@ -400,13 +412,16 @@ class Planner:
             ctx_without = self._bounded_ctx(
                 model, parallel=parallel, cache_type=cache_type,
                 spare_mb=global_spare_mb, include_mmproj=False)
+            if ctx_without < self.min_context:
+                # Below the minimum either way — no configuration fixes this;
+                # dropping vision would only degrade the model. Keep it.
+                logger.info("mmproj: %s design ctx %d is below min-context %d "
+                            "with or without vision; keeping vision",
+                            model.stem, ctx_with, self.min_context)
+                continue
             drop[model.stem] = True
             logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
                         model.stem, ctx_with, self.min_context, ctx_without)
-            if ctx_without < self.min_context:
-                logger.warning("mmproj: %s cannot reach %d context even without "
-                               "vision (text ctx %d)",
-                               model.stem, self.min_context, ctx_without)
         return drop
 
     def _solve_matrix(self, drop_stems: set[str]) -> int | None:
@@ -455,6 +470,22 @@ class Planner:
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                     profiles_group=group, ctx_size=ctx_size,
                     include_mmproj=include_mmproj, vision_ctx=vision_ctx))
+
+                # On-demand text-only variant: when the main entry keeps its
+                # mmproj, also plan a no-vision entry (``<id>-text``) so
+                # clients can pick the lower-memory serving.  When the main
+                # entry was auto-dropped it IS the ``-text`` entry, so no
+                # separate variant is needed.
+                if (include_mmproj and model.role == "chat"
+                        and model.mmproj and model.mmproj.gguf_path):
+                    text_ctx = self._bounded_ctx(
+                        model, parallel=parallel, cache_type=cache_type,
+                        spare_mb=spare_mb, include_mmproj=False,
+                        design_ctx=self.chat_ctx, context_length=context_length)
+                    variants.append(Variant(
+                        parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
+                        profiles_group=group, ctx_size=text_ctx,
+                        include_mmproj=False))
             plan[model.stem] = variants
         return plan
 
@@ -556,20 +587,41 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
-    entry; a variant with ``vision_ctx`` additionally emits a best-effort
+    entry.  Id invariant: the bare ``<id>`` always serves vision when the
+    model has an mmproj — every no-mmproj variant is emitted as
+    ``<id>`` + :data:`TEXT_SUFFIX` (name suffix ``[text]``), whether it is
+    the on-demand text-only variant or the main entry of an auto-dropped
+    model.  A variant with ``vision_ctx`` additionally emits a best-effort
     vision companion entry, id-suffixed ``-vision-<N>k`` where
     ``N = vision_ctx // 1000`` (e.g. 92567 → ``-vision-92k``).
+
+    Raises ValueError on duplicate entry ids (two models slugging to the same
+    id); callers surface it as a fatal configuration error.  Returns an
+    :class:`EmittedConfig` whose ``entry_ids_by_stem`` maps each model stem to
+    the ids it produced.
     """
     entries: dict[str, dict] = {}
+    owner: dict[str, str] = {}  # entry id → model stem (collision detection)
+    ids_by_stem: dict[str, list[str]] = {}
     for model in models:
         context_length = model.design_context
         for v in plan.get(model.stem, []):
+            text_only = not v.include_mmproj
             entry_id, entry = _build_entry(
                 model, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
+                name_suffix=" [text]" if text_only else "",
             )
+            if text_only:
+                entry_id += TEXT_SUFFIX
+            if entry_id in entries:
+                raise ValueError(
+                    f"duplicate entry id {entry_id!r}: model {model.stem!r} "
+                    f"collides with {owner[entry_id]!r} — rename one of them")
             entries[entry_id] = entry
+            owner[entry_id] = model.stem
+            ids_by_stem.setdefault(model.stem, []).append(entry_id)
 
             if v.vision_ctx is None:
                 continue
@@ -580,19 +632,42 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 include_mmproj=True,
                 name_suffix=f" [vision {n_k}k]",
             )
-            entries[f"{vision_id}-vision-{n_k}k"] = vision_entry
+            vision_id += f"-vision-{n_k}k"
+            if vision_id in entries:
+                raise ValueError(
+                    f"duplicate entry id {vision_id!r}: model {model.stem!r} "
+                    f"collides with {owner[vision_id]!r} — rename one of them")
+            entries[vision_id] = vision_entry
+            owner[vision_id] = model.stem
 
-    config: dict = {}
+    config = EmittedConfig(entry_ids_by_stem=ids_by_stem)
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
     }
-
     # Present setParamsByID aliases (e.g. "<id>:<mode>") in the /v1/models
     # listing so dynamic-list clients (OpenWebUI, OpenClaw, ...) can select
     # them. Default in llama-swap is false and aliases would be invisible.
     config["includeAliasesInList"] = True
     return config
+
+
+class EmittedConfig(dict):
+    """Emitted llama-swap config plus the stem → emitted entry-ids mapping.
+
+    A plain ``dict`` everywhere YAML/serialization is concerned (convert with
+    ``EmittedConfig.plain()`` before dumping — a dict subclass would otherwise
+    emit a ``!!python/object`` tag); carries ``entry_ids_by_stem`` so callers
+    (e.g. matrix-var construction) can map a model to the entry ids it
+    actually produced instead of re-deriving id naming conventions.
+    """
+
+    def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
+
+    def plain(self) -> dict:
+        return dict(self)
 
 
 def build_config(
@@ -628,8 +703,9 @@ def build_config(
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
-            projection is dropped from the main entry (a ``vision-<N>k`` variant
-            is emitted instead, still exposing vision at best-effort context).
+            projection is dropped from the main entry, which is renamed
+            ``<id>-text`` (a ``vision-<N>k`` variant is emitted alongside,
+            still exposing vision at best-effort context).
     """
     profiles = profiles_cfg if isinstance(profiles_cfg, Profiles) else Profiles(profiles_cfg)
 
@@ -649,5 +725,6 @@ def build_config(
 
 def write_yaml(config: dict, path: Path | str) -> None:
     """Write config to YAML file."""
+    payload = config.plain() if isinstance(config, EmittedConfig) else config
     with open(path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        yaml.dump(payload, f, default_flow_style=False, sort_keys=False, allow_unicode=True)

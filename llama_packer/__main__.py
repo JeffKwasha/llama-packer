@@ -17,15 +17,17 @@ import yaml
 from llama_packer import Model, __version__, find_bin_dir
 from llama_packer.hardware import GpuProfile
 from llama_packer.profiles import Profiles
+from llama_packer.scope import ScopeStack
+from llama_packer.discover import discover
 from llama_packer.utils import (
     _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
     _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
+    validate_dir_roles,
 )
-from llama_packer.writer import build_config, write_yaml
-from llama_packer.overrides import apply_overrides
-from llama_packer.backends import VLLM_BACKENDS
+from llama_packer.writer import build_config, write_yaml, EmittedConfig
+from llama_packer.backends import VLLM_BACKENDS, validate_backend_names
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -62,11 +64,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
                         help="Show llama-packer version and exit")
     parser.add_argument("--llama-server", help="Explicit path to llama-server binary")
-    parser.add_argument("--models-dir", nargs="+", default=["models"],
-                        help="Model directory (default: ./models); pass multiple to scan several")
-    parser.add_argument("--hf-home", help="HF cache root for path grouping "
-                        "(overrides $HF_HOME / $HUGGINGFACE_HUB_CACHE; used to keep "
-                        "chat-template/LoRA paths out of ${MODELS_DIR})")
+    parser.add_argument("--models-dir", nargs="+", default=None,
+                        help="Model directories (default: profiles.yaml models_dirs, "
+                             "else ./models); pass multiple to scan several")
+    parser.add_argument("--hf-home", help="HF cache root for hub snapshot resolution and path grouping "
+                        "(overrides profiles.yaml hf_home / $HF_HOME / $HUGGINGFACE_HUB_CACHE)")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
     parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
     parser.add_argument("--agents", action="store_true",
@@ -172,19 +174,29 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
     return min(cands, key=lambda m: m.vram_mb)
 
 
-def _build_matrix_vars(models: list, embed_model, rerank_model, logger) -> dict:
-    """Auto-collect matrix vars: chat models + selected embed/rerank."""
+def _build_matrix_vars(models: list, embed_model, rerank_model,
+                       entry_ids_by_stem: dict[str, list[str]], logger) -> dict:
+    """Auto-collect matrix vars: chat entries + selected embed/rerank.
+
+    Each chat model contributes a var per emitted entry id (the bare id and,
+    when present, its text-only variant — see writer.TEXT_SUFFIX), so text
+    variants join the same co-loading sets as their parent entry.  The
+    stem → ids mapping comes from the emitter (EmittedConfig) so naming is
+    owned in exactly one place.
+    """
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
         if m.role in ("embeddings", "rerank"):
             continue
-        chat_idx += 1
-        vars_[f"c{chat_idx}"] = m.template_id
+        for eid in entry_ids_by_stem.get(m.stem, []):
+            chat_idx += 1
+            vars_[f"c{chat_idx}"] = eid
     if embed_model is not None:
         vars_["emb"] = embed_model.template_id
     if rerank_model is not None:
         vars_["rnk"] = rerank_model.template_id
+    logger.info("matrix vars: %d chat + emb + rnk", chat_idx)
     return vars_
 
 
@@ -228,7 +240,33 @@ def main(argv: list[str] | None = None) -> None:
     if args.verbose:
         logger.info("llama-packer %s", __version__)
 
-    models_dirs = [Path(d).absolute() for d in args.models_dir]
+    profiles_path = Path(args.profiles).absolute()
+    if not profiles_path.is_file():
+        bundled = importlib.resources.files("llama_packer").joinpath("profiles.yaml")
+        if bundled.is_file():
+            logger.warning(
+                "no profiles file at %s — proceeding with bundled defaults. "
+                "Copy profiles.yaml.example (%s) to that location to configure "
+                "models_dirs, hf_home, overrides and sampling profiles.",
+                profiles_path, Path(str(bundled)).parent)
+            profiles_path = Path(str(bundled))
+        else:
+            logger.error("profiles file not found: %s (see profiles.yaml.example)",
+                         profiles_path)
+            sys.exit(1)
+
+    with open(profiles_path) as f:
+        profiles_cfg = yaml.safe_load(f) or {}
+
+    if not Profiles(profiles_cfg).profile_list:
+        logger.error("no profiles defined in profiles.yaml")
+        sys.exit(1)
+
+    # Models dirs: CLI --models-dir > profiles.yaml models_dirs: > ./models.
+    if args.models_dir:
+        models_dirs = [Path(d).absolute() for d in args.models_dir]
+    else:
+        models_dirs = [Path(d).absolute() for d in (profiles_cfg.get("models_dirs") or ["models"])]
     missing = [d for d in models_dirs if not d.is_dir()]
     if missing:
         for d in missing:
@@ -239,21 +277,28 @@ def main(argv: list[str] | None = None) -> None:
         for d in models_dirs:
             write_agents_md(d)
 
-    profiles_path = Path(args.profiles).absolute()
-    if not profiles_path.is_file():
-        bundled = importlib.resources.files("llama_packer").joinpath("profiles.yaml")
-        if bundled.is_file():
-            profiles_path = Path(str(bundled))
-            logger.info("using bundled profiles: %s", profiles_path)
-        else:
-            logger.error("profiles file not found: %s", profiles_path)
-            sys.exit(1)
+    # HF cache root: CLI > profiles.yaml > env (used for hub snapshot
+    # resolution and ${HF_HOME} path grouping).
+    hf_home = args.hf_home or profiles_cfg.get("hf_home")
 
-    with open(profiles_path) as f:
-        profiles_cfg = yaml.safe_load(f) or {}
+    # Directory-name → role map extension from profiles.yaml `dirs:`.
+    dir_roles = profiles_cfg.get("dirs") or {}
+    if not isinstance(dir_roles, dict):
+        logger.error("profiles.yaml dirs: must be a mapping of directory name to role")
+        sys.exit(1)
+    err = validate_dir_roles(dir_roles)
+    if err:
+        logger.error("profiles.yaml %s", err)
+        sys.exit(1)
 
-    if not Profiles(profiles_cfg).profile_list:
-        logger.error("no profiles defined in profiles.yaml")
+    # Backend enable/prefer list (ordered; absent = all registered).
+    backends_cfg = profiles_cfg.get("backends") or []
+    if not isinstance(backends_cfg, list):
+        logger.error("profiles.yaml backends: must be a list of backend names")
+        sys.exit(1)
+    err = validate_backend_names(backends_cfg)
+    if err:
+        logger.error("profiles.yaml %s", err)
         sys.exit(1)
 
     if args.llama_server:
@@ -281,29 +326,35 @@ def main(argv: list[str] | None = None) -> None:
         from llama_packer.utils import parse_context_length
         min_ctx = parse_context_length(args.min_context)
 
-    # Discover models
-    models = Model.from_dir(models_dirs, generate_stubs=not args.no_stubs, extra_dirs=args.extra_dirs)
-    if not models:
-        logger.error("no models found (create a .md sidecar file)")
-        sys.exit(1)
-    logger.info("models: %d found", len(models))
-
     # vLLM resource configuration (CLI > profiles.yaml `vllm:` section >
-    # built-in constants).  Resolved *before* apply_overrides so backend
-    # inference knows whether a vLLM backend can actually run.
+    # built-in constants).  Resolved *before* discovery so backend inference
+    # knows whether a vLLM backend can actually run.
     vllm_cfg = profiles_cfg.get("vllm") or {}
     vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
     vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
 
-    # Apply profile override rules (backend/chat-template/lora/hf_repo/cli_args).
-    # This mutates each model's effective settings and flags invalid models
-    # (unknown backend, missing files, no available backend for the format)
-    # for the writer to skip.
-    apply_overrides(models, profiles_cfg, avail={
-        "llama_bin": llama_bin,
-        "vllm_image": vllm_image,
-        "vllm_bin": vllm_bin,
-    })
+    # Discover models via a depth-first walk.  The scope stack carries the
+    # global override rules (bottom scope); each directory's models.yaml is
+    # pushed/popped around its level.  Defaults, rules, companion resolution
+    # and backend finalization all happen inside discover().
+    stack = ScopeStack(
+        avail={
+            "llama_bin": llama_bin,
+            "vllm_image": vllm_image,
+            "vllm_bin": vllm_bin,
+        },
+        allowed=[str(b) for b in backends_cfg] or None,
+    )
+    stack.push({"overrides": profiles_cfg.get("overrides")},
+               origin=str(profiles_path))
+    models = discover(models_dirs, stack=stack,
+                      generate_stubs=not args.no_stubs,
+                      extra_dirs=args.extra_dirs, dir_roles=dir_roles,
+                      hf_home=hf_home)
+    if not models:
+        logger.error("no models found (create a .md sidecar file)")
+        sys.exit(1)
+    logger.info("models: %d found", len(models))
 
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
     if args.health_check_timeout is None:
@@ -338,7 +389,7 @@ def main(argv: list[str] | None = None) -> None:
             raw_paths.append(str(ct))
         for _lora in _m.resolved_loras:
             raw_paths.append(str(_lora))
-    prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin, hf_home=args.hf_home)
+    prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin, hf_home=hf_home)
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
 
@@ -383,13 +434,17 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("matrix rerank: %s", rerank_model.stem)
 
     # Build config
-    config = build_config(
-        models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
-        spare=args.spare, max_context=max_ctx,
-        matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
-        baseline_mb=gpu.baseline_mb,
-        min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
-    )
+    try:
+        config = build_config(
+            models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
+            spare=args.spare, max_context=max_ctx,
+            matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
+            baseline_mb=gpu.baseline_mb,
+            min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
+        )
+    except ValueError as e:
+        logger.error("%s", e)
+        sys.exit(1)
     config = _apply_env_subst(config, sub, raw_paths)
     if not config.get("models"):
         logger.error("no model entries generated")
@@ -403,7 +458,8 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
-        vars_ = _build_matrix_vars(models, embed_model, rerank_model, logger)
+        vars_ = _build_matrix_vars(models, embed_model, rerank_model,
+                                   config.entry_ids_by_stem, logger)
         # Expand the __CHAT_VARS__ placeholder in each set with the chat VAR
         # NAMES (c1 | c2 | ...), not the model IDs — llama-swap sets DSL
         # references var names, which map to model IDs via `vars`.
@@ -432,7 +488,8 @@ def main(argv: list[str] | None = None) -> None:
     output_path = Path(args.output).absolute()
 
     if args.dry_run:
-        sys.stdout.write(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        payload = config.plain() if isinstance(config, EmittedConfig) else config
+        sys.stdout.write(yaml.dump(payload, default_flow_style=False, sort_keys=False, allow_unicode=True))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
     else:

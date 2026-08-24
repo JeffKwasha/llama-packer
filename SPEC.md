@@ -4,6 +4,13 @@
 
 `llama-packer` generates `config.yaml` for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF model metadata. It scans model directories, detects GPU hardware, measures per-model VRAM costs via `llama-fit-params`, budgets context windows, resolves companion files, applies sampling profiles, and writes ready-to-run server configurations.
 
+**Assumptions:** llama-packer targets the **current stable release** of every
+external tool it drives (llama.cpp/llama-server, vLLM, llama-swap), and adopts
+features from newer releases freely; generated commands carry no compatibility
+shims or version detection. Running an older stack is the operator's trade-off —
+failures surface as obvious upstream errors (e.g. a 404 on an endpoint your
+vLLM doesn't have).
+
 **Entry point:** `llama-packer` (console script) → `llama_packer.__main__.main`
 
 **Models directory guide:** `llama-packer --agents` writes `AGENTS.md` into
@@ -65,6 +72,10 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `matrix` | Shared embed/rerank/chat VRAM budget solving (`embed`/`rerank` model refs) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
+| `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
+| `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
+| `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
+| `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
 
 **Profile entries** (each value under `profiles:`) may set:
 
@@ -185,11 +196,11 @@ max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-co
 
 Chat models target a minimum useful context (`_MIN_USEFUL_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without vision (at the global `--spare`):
 
-- `ctx_with ≥ min_context` → keep vision; a single entry is emitted with `--mmproj` and the `vision` capability.
-- `ctx_with < min_context` → the main entry **drops** mmproj: no `--mmproj`, the `vision` capability is removed, and `metadata.mmproj_skipped: true` is set. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
-- If even the text-only context is `< min_context`, a warning is logged (the main entry is still emitted).
+- `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `vision` capability. An on-demand **text-only variant** `<id>-text` (no `--mmproj`, `vision` removed, `metadata.mmproj_skipped: true`, display name `[text]`) is emitted alongside so clients can pick the lower-memory serving.
+- `ctx_with < min_context` → the main entry **drops** mmproj and is renamed `<id>-text` — the invariant is that the bare `<id>` always serves vision when the model has one; every no-mmproj entry carries the `-text` suffix and `[text]` label so a client that knows nothing of server config can tell it is text-only from `/v1/models`. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
+- `ctx_without < min_context` too → **vision is kept**: dropping the projection cannot reach the minimum either way, so sacrificing it buys nothing (a small VLM stays a full VLM). Informational log only — no warning, since no configuration can fix a design-context limit.
 
-Both the main and vision-variant entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare.
+All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every `<id>-text` entry joins the same matrix co-loading sets as its parent `<id>` entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
 
 ## Matrix Context Solving
 
@@ -393,11 +404,19 @@ modes:
 
 ## vLLM Backend
 
-A chat model can be served with vLLM instead of llama-server by an override
+A model can be served with vLLM instead of llama-server by an override
 rule (see below) that sets `backend: vllm` (host binary) or `backend: vllm-docker`
 (container). The emitted entry runs `vllm serve`, published to llama-swap's `${PORT}`
 host macro. Everything else works identically: aliases/modes (`filters.setParamsByID`),
 `metadata`, capabilities, matrix routing.
+
+All three roles are supported, mapped onto vLLM's pooling interface:
+
+| Role | Task flag | Endpoints |
+|------|-----------|-----------|
+| `chat` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
+| `embeddings` | `--task embed` | `/v1/embeddings` |
+| `rerank` | `--task score` | `/v1/rerank`, `/v1/score` |
 
 Sidecars themselves carry no backend key — backend selection, chat templates and
 LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`.
@@ -474,6 +493,11 @@ Sidecars carry model-intrinsic data. Cross-cutting serving choices —
 `profiles.yaml` (a sidecar may still pin a `backend:` for one-off exceptions,
 but fleet-level policy belongs here).
 
+Rules can also live in a **directory-scoped** `models.yaml`: any subdirectory
+of a models root may carry one whose `overrides:` apply only to models in
+that subtree, and whose `defaults:` seed each subtree sidecar's frontmatter
+(see [Directory-scoped models.yaml](#directory-scoped-modelsyaml) below).
+
 ```yaml
 # profiles.yaml
 overrides:
@@ -519,9 +543,46 @@ each matching rule is layered on top **last-match-wins per key** (CSS-like:
 rules read top→bottom as increasing specificity). So a later rule that changes
 `backend` does not clobber a `chat_template` set by an earlier rule.
 
+**Precedence across scopes.** Global rules apply first, then directory-scoped
+rules outermost → innermost — so a closer scope beats a broader one beats
+global for the same key (the flat rule list accumulated by
+`scope.ScopeStack` during discovery's walk).
+
+### Directory-scoped models.yaml
+
+Any subdirectory of a models root may carry a `models.yaml`. It makes the
+directory itself the filter — useful when HF naming makes regexes brittle
+(drop models in a folder instead of writing `when: {base_model: …}`):
+
+```yaml
+# <models-root>/chat/qwen3/models.yaml
+defaults:
+  context_length: 16384          # frontmatter defaults for subtree sidecars
+
+overrides:
+  - when: true                   # full filter syntax available; true = all
+    chat_template: ../qwen_chat_template.jinja
+    chat_template_kwargs: {enable_thinking: true}
+```
+
+- **Scope**: both keys apply only to models under that directory.
+- **`defaults:`**: merged into each subtree sidecar's frontmatter, outermost →
+  innermost; authored sidecar values always win. Empty stub sidecars carry no
+  data, so defaults fill them naturally. The per-model identity keys `name`,
+  `model`, `ignore` may not be defaulted (validation error).
+- **`overrides:`**: standard rules (same validation and matching); applied
+  after global rules, outer scopes first — innermost wins per key.
+- **Paths**: `chat_template:` / `loras:` resolve relative to each *sidecar's*
+  directory (not the models.yaml), so reference shared files with `../`.
+- **Entry-id collisions** are fatal: if two models slug to the same llama-swap
+  entry id, the run logs an error and exits — rename one of them.
+
 **Settings keys** (all optional): `backend`, `hf_repo`, `chat_template`,
 `chat_template_kwargs`, `loras`, `cli_args`, `reasoning-format`,
-`reasoning-preserve`.
+`reasoning-preserve`, plus the serving/companion choices `cache_type`,
+`parallel`, `mmproj`, `speculative`. Rules setting `mmproj`/`speculative`
+re-trigger companion resolution, so a rule can add or remove vision /
+speculative decoding per pattern.
 
 **Backend inference.** When neither the sidecar nor any rule declares a
 `backend`, one is inferred from the model's file format (`backends.infer_backend`):
@@ -562,6 +623,26 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `llama-server` | `.gguf` | chat, embeddings, rerank |
 | `vllm` | safetensors, `hf_repo` | chat |
 | `vllm-docker` | safetensors, `hf_repo` | chat |
+
+## Backend Selection
+
+profiles.yaml's ordered `backends:` list both **enables** and **prioritizes**
+backends; when absent, every registered backend is usable in registration
+order (`llama-server`, `vllm-docker`, `vllm`):
+
+```yaml
+# profiles.yaml
+backends:
+  - llama-server    # tried first for everything it can serve
+  - vllm-docker     # enabled, second preference
+  # vllm            # absent = disabled, even with resources configured
+```
+
+Inference walks this list (availability still filters: an entry without its
+binary/image configured is skipped) and picks the first backend whose formats
+and roles cover the model. An explicit sidecar/override `backend:` pin to a
+disabled name is an error that skips that model — pinning bypasses *inference*,
+never policy.
 
 ## Cache precision (`cache_type`)
 
@@ -620,29 +701,99 @@ ctx_factor [MiB/token] = kv_bytes_per_token / 2²⁰   (+ attention scratch, mea
 
 ## Model Discovery and Stub Sidecars
 
-Every `--models-dir` directory is scanned independently (`Model.from_dir`):
+Every `--models-dir` directory is scanned independently via a depth-first
+walk (`discover.discover` → `scope.ScopeStack`; role mapping via
+`utils.dir_role_map`). At each level the directory's `models.yaml` scope is
+pushed, its models are built, then children are visited:
 
 - `.md` sidecar files are the entry points; each binds to the model file whose
-  stem matches its own (or the file named by `model:`).
-- Subdirectories named `embed` / `rerank` (configurable with `--extra-dirs`)
-  are scanned for orphan GGUFs, which get the matching role inferred.
+  stem matches its own, or the file named by `model:`.
+- Within a models dir the **first relative path component** selects the role
+  via `dirs:` in profiles.yaml (case-insensitive). Defaults:
+
+  | Prefix | Role | Meaning |
+  |--------|------|---------|
+  | `chat` | `chat` | Chat — and its mmproj/MTP companions living next to it |
+  | `t2t` | `chat` | Legacy name for the chat dir |
+  | `vision` | `chat` | VLMs + mmproj (same role as chat, colocated) |
+  | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
+  | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
+  | `rerank` | `rerank` | Reranker models |
+
+  Files at the root itself default to `chat`; files under any other
+  subdirectory (`img/` for stable-diffusion-only models, `misc/`, `tmp/`,
+  `hf_hub/`, `s2t/`, …) are **skipped** — one summary line per run names the
+  skipped directories so nothing disappears silently. The whitelist is
+  extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
+  via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).
+
+  A `<models-root>/.modelignore` file excludes individual files/subtrees in
+  place (no moving or deleting): one glob per line, `#` comments; a pattern
+  matches the path relative to the root or any single path component, so
+  `R3-rerank` hides that subtree and `adetailer*` hides everything named like
+  it. Matched files are summarized in one log line.
 - Orphan GGUFs next to chat models are classified as companions (mmproj /
   MTP draft), never as main models.
-- Symlinks resolving to the same model file are deduplicated across
-  directories (first wins).
+- Hardlinks and symlinks resolving to the same `(st_dev, st_ino)` are deduplicated
+  across directories (first `models_dirs` entry wins).
 
-**Stub sidecars.** A model file without any sidecar gets a minimal one written
-next to it: `name` (stem), `parameters` and `quantization` inferred from the
-filename, and `_DEFAULT_CONTEXT_LENGTH`. This makes a directory of bare models
-work on first run. `--no-stubs` skips generation.
+`--models-dir` precedence: CLI `--models-dir` (when given) > profiles.yaml
+`models_dirs:` (a list) > `./models`. The tracked `profiles.yaml.example` is
+the template; the live `profiles.yaml` is machine-local (gitignored). When no
+profiles file exists, llama-packer logs a warning pointing at the example and
+proceeds with the bundled defaults.
+
+**Directory-scoped config.** Any subdirectory may carry a `models.yaml`
+applying only to its subtree — see [Override Rules → Directory-scoped
+models.yaml](#directory-scoped-modelsyaml).
+
+**HF hub cache resolution.** A sidecar can reference a hub-downloaded GGUF without
+symlinking it into a models dir: declare both `hf_repo: org/repo` (or a
+parseable `hf_url:`) **and** `model: file.gguf`. Snapshot filenames are
+readable — blob hashes never appear in sidecars. Resolution:
+
+1. `model:` relative to the sidecar's dir (and its parent), then
+2. `$HF_HOME/hub/models--org--repo/snapshots/<rev>/file.gguf`, revision from
+   `refs/main`, else the sole snapshot dir, else the newest by mtime.
+
+Companions resolve the same way after the local search misses:
+`mmproj:` / `speculative:` values are looked up in the sidecar's repo
+snapshot, with a single-glob fallback (`mmproj*.gguf`) covering HF's naming
+variants (`mmproj-F16.gguf`, `mmproj-model-f16.gguf`, …). When no `mmproj:`
+is declared at all, the snapshot is fuzzy-scanned for a family-matching
+`*mmproj*.gguf`, mirroring the local-directory behavior. A value may also
+address another cached repo explicitly: `hub:<org>/<repo>:<file-or-glob>`.
+An ambiguous glob logs a warning and does not resolve.
+
+The HF cache root is `--hf-home` > profiles.yaml `hf_home:` >
+`$HF_HOME`/`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`. By default it
+points at your `/mnt/ai/huggingface`. With this, `hf download org/repo`
+followed by a small `.md` sidecar is sufficient — no symlink step and no
+widening of `${MODELS_DIR}` (HF cache paths get their own `${HF_HOME}` macro).
+
+**Stub sidecars.** A model file without any sidecar gets an **empty** one
+written next to it — just frontmatter delimiters and a title, nothing more.
+Identity falls back to the file stem, context to the built-in default, role to
+the model's directory, so a stub and an authored sidecar behave identically;
+the empty file exists purely as the human's editing surface ("drop in a gguf,
+get a placeholder to fill in"). This makes a directory of bare models and any
+new `embed/`/`rerank`/`doc/` orphans work on first run; `--no-stubs` skips
+generation.
+
+Sidecars are never written inside an HF hub `blobs/` tree (blob hashes are not
+human-readable names). An orphan discovered there gets its stub beside the
+human-named snapshot entry that points at the blob; if none resolves, discovery
+creates its own symlink named after the repo in the category directory and puts
+the stub next to it.
 
 ## Path macros and HF_HOME
 
 Generated commands are emitted with absolute paths, then rewritten to
 `${LLAMA_DIR}` / `${MODELS_DIR}` / `${MODELS_DIR_2}`… macros via
 `compute_env_prefixes` (grouped by mount, longest common directory per group).
-Paths under the Hugging Face cache root (`--hf-home` > `$HF_HOME` >
-`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`) are pulled into their own
+Paths under the Hugging Face cache root (`--hf-home` > profiles.yaml `hf_home:`
+> `$HF_HOME` > `$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`, the default
+`hf_home: /mnt/ai/huggingface` in your profiles.yaml) are pulled into their own
 `${HF_HOME}` macro so a chat template (or LoRA) living in the HF cache never
 widens `${MODELS_DIR}` up to a non-models directory.
 

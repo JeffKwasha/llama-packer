@@ -15,6 +15,9 @@ config.yaml.bak-*
 config.env
 docker-compose.yml
 
+# Local (machine-specific) profiles — profiles.yaml.example is the template
+profiles.yaml
+
 # Scratch / temp
 _help_
 sha

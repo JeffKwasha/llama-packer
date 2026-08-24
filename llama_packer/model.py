@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -40,10 +39,11 @@ class Model:
         "cache_type", "parallel",
     })
 
-    def __init__(self, md_path: Path, frontmatter: dict):
+    def __init__(self, md_path: Path, frontmatter: dict, hf_home=None):
         self.md_path = md_path
         self.frontmatter = frontmatter
         self.stem = md_path.stem
+        self._hf_home = hf_home  # HF cache root override for hub snapshot resolution
         self._gguf_ctx_cache: int | None = None  # cached GGUF architectural context
         self._vram: VramBudget | None = None  # lazy VRAM budget calculator
 
@@ -52,41 +52,27 @@ class Model:
         self.gguf_path = self._resolve_gguf_path()
         if not self.gguf_path and self.hf_repo is None:
             raise ValueError(f"No GGUF/safetensors or hf_repo found for {md_path}")
+        if not self.gguf_path and self.frontmatter.get("model"):
+            raise ValueError(
+                f"model file {self.frontmatter['model']!r} for {md_path} not found "
+                f"locally or in the HF hub cache (hf download {self.hf_repo})")
 
-        # Resolve companions (mmproj, MTP)
+        # Resolve companions later — resolve_companions() is called by
+        # discovery after scope defaults and override rules have had their
+        # say (frontmatter must be final before companion resolution).
         self.mmproj: Model | None = None
         self.mtp: Model | None = None
-        self._resolve_companions()
 
-        logger.info("model: %s (gguf=%s, mmproj=%s, mtp=%s)",
-                    self.stem, self.gguf_path.name if self.gguf_path else self.hf_repo,
-                    self.mmproj.stem if self.mmproj else "none",
-                    self.mtp.stem if self.mtp else "none")
+    def resolve_companions(self) -> None:
+        """Resolve mmproj and MTP companions from final frontmatter.
 
-    def _resolve_gguf_path(self) -> Path | None:
-        """Resolve the main model file (.gguf or .safetensors) from frontmatter or convention."""
-        parent = self.md_path.parent
-
-        # 1. Check frontmatter `model` field
-        file_ref = self.frontmatter.get("model")
-        if file_ref:
-            model_file = parent / file_ref
-            if not model_file.is_file():
-                model_file = parent.parent / file_ref
-            if model_file.is_file():
-                return utils.smart_resolve(model_file)
-
-        # 2. Convention: same stem, either .gguf or .safetensors
-        for ext in (".gguf", ".safetensors"):
-            candidate = parent / f"{self.stem}{ext}"
-            if candidate.is_file():
-                return utils.smart_resolve(candidate)
-
-        # 3. No model file found by stem -> give up
-        return None
-
-    def _resolve_companions(self) -> None:
-        """Resolve mmproj and MTP companions from frontmatter or fuzzy match."""
+        Idempotent: re-running discards previously resolved companions and
+        re-derives both from the current frontmatter.  Callers must invoke
+        this once frontmatter is final (defaults merged, rules applied) —
+        see llama_packer.discover.
+        """
+        self.mmproj = None
+        self.mtp = None
         if not self.gguf_path:
             logger.debug("no gguf_path, skipping companion resolution for %s", self.stem)
             return
@@ -108,19 +94,24 @@ class Model:
             # Explicit disable
             self.mmproj = None
         elif mmproj_val:
-            # Explicit path in frontmatter — search both directories
+            # Explicit path in frontmatter — search both directories, then the
+            # hf_repo snapshot (readable snapshot filenames; globs allowed).
             companion = None
             for d in search_dirs:
                 candidate = d / mmproj_val
                 if candidate.is_file():
                     companion = candidate
                     break
+            if companion is None:
+                companion = self._resolve_hub_ref(str(mmproj_val),
+                                                  pattern_hint="*mmproj*.gguf")
             if companion:
                 self.mmproj = Model._get_or_create_companion(companion)
             else:
                 logger.warning("mmproj: configured %s missing for %s", mmproj_val, self.stem)
         else:
-            # Fuzzy match: look for *mmproj*.gguf with same family prefix
+            # Fuzzy match: look for *mmproj*.gguf with same family prefix —
+            # next to the model, then inside the hf_repo snapshot.
             family = utils._gguf_family(self.gguf_path.stem).lower()
             for d in search_dirs:
                 for f in sorted(d.glob("*mmproj*.gguf")):
@@ -130,6 +121,14 @@ class Model:
                         break
                 if self.mmproj:
                     break
+            if self.mmproj is None and self.hf_repo:
+                snap = utils.hf_snapshot_dir(self.hf_repo, self._hf_home)
+                if snap is not None:
+                    for f in sorted(snap.glob("*mmproj*.gguf")):
+                        mmproj_family = utils._gguf_family(f.stem).lower()
+                        if mmproj_family.startswith(family) or family.startswith(mmproj_family):
+                            self.mmproj = Model._get_or_create_companion(f)
+                            break
 
         # --- MTP (speculative) ---
         # Check frontmatter flags
@@ -144,6 +143,8 @@ class Model:
                     if candidate.is_file():
                         companion = candidate
                         break
+                if companion is None:
+                    companion = self._resolve_hub_ref(str(speculative))
                 if companion:
                     self.mtp = Model._get_or_create_companion(companion)
                 else:
@@ -151,6 +152,74 @@ class Model:
             else:
                 # Baked-in MTP (no separate file)
                 self.mtp = None  # baked-in, no separate file
+
+        logger.info("model: %s (gguf=%s, mmproj=%s, mtp=%s)",
+                    self.stem, self.gguf_path.name if self.gguf_path else self.hf_repo,
+                    self.mmproj.stem if self.mmproj else "none",
+                    self.mtp.stem if self.mtp else "none")
+
+    def _resolve_gguf_path(self) -> Path | None:
+        """Resolve the main model file (.gguf or .safetensors): frontmatter
+        ``model:`` field (local dir, then the HF hub cache via ``hf_repo``),
+        then the same-stem convention."""
+        parent = self.md_path.parent
+
+        # 1. Check frontmatter `model` field
+        file_ref = self.frontmatter.get("model")
+        if file_ref:
+            hit = self._resolve_ref(str(file_ref))
+            if hit is not None:
+                return utils.smart_resolve(hit)
+
+        # 2. Convention: same stem, either .gguf or .safetensors
+        for ext in (".gguf", ".safetensors"):
+            candidate = parent / f"{self.stem}{ext}"
+            if candidate.is_file():
+                return utils.smart_resolve(candidate)
+
+        # 3. No model file found by stem -> give up
+        return None
+
+    def _resolve_ref(self, ref: str) -> Path | None:
+        """Resolve a file reference: sidecar dir, its parent, then HF hub.
+
+        ``repo:``-relative references use the sidecar's ``hf_repo`` (snapshot
+        filenames are readable — no blob hashes needed) and may be globs
+        (``mmproj*.gguf``).  The ``hub:<org>/<repo>:<file>`` form addresses
+        any cached repo explicitly.  Returns an absolute path or None.
+        """
+        parent = self.md_path.parent
+        for d in (parent, parent.parent):
+            candidate = d / ref
+            if candidate.is_file():
+                return candidate
+        repo = self.hf_repo
+        if repo:
+            return utils.hf_snapshot_file(repo, ref, self._hf_home)
+        return None
+
+    def _resolve_hub_ref(self, ref: str,
+                         pattern_hint: str | None = None) -> Path | None:
+        """Hub-only resolution of *ref* (companion fallback).
+
+        ``hub:<org>/<repo>:<file-or-glob>`` addresses any cached repo;
+        anything else resolves against this sidecar's ``hf_repo``.  With
+        *pattern_hint* (e.g. ``*mmproj*.gguf``), an unresolvable exact name
+        falls back to a single glob match in the snapshot.
+        """
+        repo = self.hf_repo
+        if ref.startswith("hub:"):
+            rest = ref[len("hub:"):]
+            repo, _, ref = rest.rpartition(":")
+            if not repo:
+                logger.warning("hf: malformed %r (expected hub:org/repo:file)", ref)
+                return None
+        if not repo:
+            return None
+        hit = utils.hf_snapshot_file(repo, ref, self._hf_home)
+        if hit is None and pattern_hint:
+            hit = utils.hf_snapshot_file(repo, pattern_hint, self._hf_home)
+        return hit
 
     @staticmethod
     def _get_or_create_companion(path: Path) -> Model:
@@ -163,6 +232,7 @@ class Model:
         companion.stem = path.stem
         companion.gguf_path = utils.smart_resolve(path)
         companion._vram = None
+        companion._hf_home = None
         companion.mmproj = None
         companion.mtp = None
         return companion
@@ -174,76 +244,23 @@ class Model:
         *,
         generate_stubs: bool = True,
         extra_dirs: list[str] | None = None,
+        dir_roles: dict | None = None,
+        hf_home=None,
+        stack=None,
     ) -> list[Model]:
-        """Discover all models across *models_dirs* via .md sidecars.
+        """Discover all models across *models_dirs* (thin delegate).
 
-        *models_dirs* is a single directory or a list of them.  Symlinks that
-        resolve to the same underlying model file are deduplicated (first wins).
-        Returns a list of instantiated Model objects (main models only).
+        The real work lives in :func:`llama_packer.discover.discover` — the
+        depth-first walk that layers scope defaults, applies override rules,
+        materializes empty stub sidecars, and resolves companions once the
+        frontmatter is final.  ``stack`` is an optional
+        :class:`llama_packer.scope.ScopeStack` carrying global rules; when
+        omitted, only directory-scoped configuration applies.
         """
-        if isinstance(models_dirs, (str, os.PathLike)):
-            models_dirs = [Path(models_dirs)]
-        else:
-            models_dirs = [Path(d) for d in models_dirs]
-
-        # Single source of truth for role classification (see utils.classify_models).
-        classified = utils.classify_models(models_dirs, extra_dirs)
-        md_items = {p: k for p, k in classified if p.suffix.lower() == ".md"}
-        gguf_items = {p: k for p, k in classified if p.suffix.lower() in (".gguf", ".safetensors")}
-
-        known_md: set[Path] = set()
-        models: list[Model] = []
-
-        for md_path, kind in md_items.items():
-            if md_path in known_md:
-                continue
-            fm = utils.parse_frontmatter(md_path)
-            if not fm.get("name"):
-                continue
-            if fm.get("ignore"):
-                logger.info("ignore: skipping %s", md_path.name)
-                continue
-            # Classification drives role: an embed/rerank file whose sidecar
-            # does not declare `role:` inherits it from its location/type.
-            if kind in ("embeddings", "rerank") and str(fm.get("role") or "") not in ("embeddings", "rerank"):
-                fm = {**fm, "role": kind}
-            known_md.add(md_path)
-            try:
-                model = cls(md_path, fm)
-                models.append(model)
-            except Exception as e:
-                logger.warning("failed to load model from %s: %s", md_path, e)
-
-        if generate_stubs:
-            for gguf, kind in gguf_items.items():
-                # Companions (mmproj/mtp) and embed/rerank models are never
-                # main-model (chat) stubs.
-                if kind in ("mmproj", "mtp", "embeddings", "rerank"):
-                    continue
-                md_path = gguf.with_suffix(".md")
-                if md_path in md_items:
-                    continue
-                if not gguf.is_file():
-                    continue
-                fm = utils.generate_stub_md(md_path, gguf)
-                try:
-                    model = cls(md_path, fm)
-                    models.append(model)
-                    logger.info("stub: %s", md_path.name)
-                except Exception as e:
-                    logger.warning("failed to create stub for %s: %s", gguf, e)
-
-        # Deduplicate symlinks to the same model file (first wins).
-        deduped: list[Model] = []
-        seen: set[str] = set()
-        for model in models:
-            key = os.path.realpath(str(model.gguf_path)) if model.gguf_path else str(model.md_path)
-            if key in seen:
-                logger.info("duplicate model file (symlink) skipped: %s", model.stem)
-                continue
-            seen.add(key)
-            deduped.append(model)
-        return deduped
+        from llama_packer.discover import discover
+        return discover(models_dirs, stack=stack,
+                        generate_stubs=generate_stubs, extra_dirs=extra_dirs,
+                        dir_roles=dir_roles, hf_home=hf_home)
 
     @property
     def vram(self) -> VramBudget:
@@ -309,10 +326,11 @@ class Model:
         """Serving engine for this model.
 
         Resolved from the sidecar / override ``backend:`` setting.  When
-        neither declares one, ``apply_overrides`` infers the backend from the
-        file format (GGUF → llama-server, safetensors/HF-repo → vLLM docker;
-        see ``backends.infer_backend``).  This property's fallback exists only
-        for Models used outside the normal pipeline.
+        neither declares one, discovery finalization infers the backend from
+        the file format (GGUF → llama-server, safetensors/HF-repo → vLLM
+        docker; see ``backends.infer_backend`` via ``scope.ScopeStack.finalize``).
+        This property's fallback exists only for Models used outside the
+        normal pipeline.
         """
         return str(self.frontmatter.get("backend") or DEFAULT_BACKEND)
 
@@ -350,7 +368,7 @@ class Model:
 
         Controls how thought tags are parsed/returned (``none``, ``deepseek``,
         ``deepseek-legacy``, ``auto``).  Validated and gated to reasoning-capable
-        chat models by ``apply_overrides``.
+        chat models by ``writer._filter_supported``.
         """
         v = self.frontmatter.get("reasoning-format")
         return str(v) if v else None

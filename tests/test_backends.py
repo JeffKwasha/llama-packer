@@ -243,7 +243,7 @@ def test_warn_unhandled(caplog):
 def test_setting_keys_partition():
     # framework-consumed and metadata-only keys are disjoint from each other
     # and from what a backend would render.
-    assert FRAMEWORK_CONSUMED == {"backend"}
+    assert FRAMEWORK_CONSUMED == {"backend", "hf_repo"}
     assert METADATA_ONLY == {"chat_template_kwargs"}
     assert VLLM_BACKENDS == {"vllm", "vllm-docker"}
     assert "backend" in SETTING_KEYS and "chat_template" in SETTING_KEYS
@@ -269,7 +269,7 @@ def test_filter_supported_skips_flagged_override(make_model):
     from llama_packer.writer import _filter_supported
 
     m = make_model("q", backend="vllm", hf_repo="org/model")
-    m._override_error = "unknown backend"  # simulate apply_overrides flag
+    m._override_error = "unknown backend"  # simulate finalize() flag
     assert _filter_supported([m]) == []
 
 
@@ -376,3 +376,67 @@ def test_vllm_warns_on_reasoning_format(make_model, caplog):
             {k for k in SETTING_KEYS if k in m.frontmatter} - FRAMEWORK_CONSUMED - METADATA_ONLY
         )
     assert any("reasoning-format" in r.message for r in caplog.records)
+
+
+def test_infer_backend_allowed_reorders_and_disables(make_model):
+    from llama_packer.backends import infer_backend
+    m = make_model("s", hf_repo="org/model")
+    m.gguf_path = Path("/models/s.safetensors")
+    avail = {"vllm_image": "img", "vllm_bin": "vllm"}
+    # Preference reorder: host binary beats docker when listed first.
+    assert infer_backend(m, avail, allowed=["vllm", "vllm-docker"]) == "vllm"
+    # Disable: unlisted backends are not usable even with resources present.
+    assert infer_backend(m, avail, allowed=["llama-server"]) is None
+    # Unknown names in the list are ignored defensively.
+    assert infer_backend(m, avail, allowed=["nope", "vllm"]) == "vllm"
+
+
+def test_apply_overrides_pinned_backend_disabled(make_model):
+    from llama_packer.scope import ScopeStack
+    m = make_model("p", backend="vllm-docker")
+    stack = ScopeStack(avail={"llama_bin": "/opt/llama-server",
+                              "vllm_image": "img"},
+                       allowed=["llama-server"])
+    m.resolve_companions()
+    stack.finalize(m)
+    assert getattr(m, "_override_error", None) and "disabled" in m._override_error
+
+
+def test_vllm_role_task_flags(make_model):
+    host = VllmHostBackend()
+    rerank = make_model("r", hf_repo="org/reranker", role="rerank")
+    cmd, _ = host.build_cmd(rerank, 8192, 1, "q8_0", _tvars())
+    assert "--task score" in cmd
+    embed = make_model("e", hf_repo="org/embedder", role="embeddings")
+    cmd, _ = host.build_cmd(embed, 8192, 1, "q8_0", _tvars())
+    assert "--task embed" in cmd
+    chat = make_model("c", hf_repo="org/chat")
+    cmd, _ = host.build_cmd(chat, 8192, 1, "q8_0", _tvars())
+    assert "--task" not in cmd
+
+
+def test_vllm_docker_rerank_task_flag(make_model):
+    m = make_model("dr", hf_repo="org/reranker", role="rerank")
+    cmd, _ = VllmDockerBackend().build_cmd(m, 8192, 1, "q8_0", _tvars())
+    assert "--task score" in cmd
+
+
+def test_vllm_speculative_suppressed_off_chat(make_model):
+    # mtp: true must not leak --speculative-config into a pooling model's cmd.
+    r = make_model("mr", hf_repo="org/reranker", role="rerank", mtp=True)
+    cmd, meta = VllmHostBackend().build_cmd(r, 8192, 1, "q8_0", _tvars())
+    assert "--speculative-config" not in cmd
+    assert meta["mtp_enabled"] is False
+    # ...but chat models keep it.
+    c = make_model("mc", hf_repo="org/chat", mtp=True)
+    cmd, meta = VllmHostBackend().build_cmd(c, 8192, 1, "q8_0", _tvars())
+    assert "--speculative-config" in cmd
+    assert meta["mtp_enabled"] is True
+
+
+def test_unsupported_reason_accepts_vllm_rerank(make_model):
+    from llama_packer.backends import infer_backend
+    m = make_model("r3", role="rerank")
+    m.gguf_path = None
+    m.frontmatter["hf_url"] = "https://huggingface.co/org/R3-rerank"
+    assert infer_backend(m, {"vllm_image": "img"}) == "vllm-docker"

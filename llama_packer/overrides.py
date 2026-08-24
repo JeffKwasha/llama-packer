@@ -1,21 +1,16 @@
 # llama_packer/overrides.py
-"""Pattern-scoped settings applied to discovered models.
+"""Pattern-scoped override rules: matching, compilation, path resolution.
 
-Override rules live under ``overrides:`` in profiles.yaml.  Each rule matches
-a model by one or more field→regex pairs (``when``) and sets settings keys
-(last match wins per key).  This is the single mechanism for selecting a
-backend, a chat template, LoRA adapters, ``hf_repo`` and ``cli_args``.
+A *rule* matches a model by one or more field→regex pairs (``when``) and sets
+settings keys.  Rules come from ``profiles.yaml`` (global) and ``models.yaml``
+files inside the models tree; :class:`llama_packer.scope.ScopeStack` applies
+them during discovery's walk (last match wins per key).  This module owns the
+rule primitives only — selection/merging lives in the scope stack.
 
 ``when`` is required — a rule without one stops the run (the intended
 configuration would otherwise be silently ignored).  Use the regexes against
 frontmatter fields plus the synthetic ``stem``/``name``, or ``when: true`` to
 match every model.
-
-Models that end up with no ``backend`` after sidecar + rules get one inferred
-from their file format (see ``backends.infer_backend``): GGUF → llama-server,
-safetensors / HF-repo → vLLM docker, gated by each backend's configured
-resources.  Models whose format no available backend covers are logged and
-skipped.
 
 Regex literals are easiest in YAML single-quoted or unquoted scalars — only
 double quotes interpret backslashes.
@@ -27,9 +22,27 @@ import logging
 import re
 from pathlib import Path
 
-from llama_packer.backends import BACKENDS, SETTING_KEYS, infer_backend
+from llama_packer.backends import SETTING_KEYS
 
 logger = logging.getLogger(__name__)
+
+# Settings keys an override *rule* may set: everything a sidecar/backend can
+# declare plus the serving/companion choices that are pure frontmatter data.
+# (Deliberately separate from backends.SETTING_KEYS, which drives the
+# backends' own "unhandled setting" warnings.)
+OVERRIDE_KEYS = frozenset({
+    *SETTING_KEYS,
+    "cache_type", "parallel", "mmproj", "speculative",
+})
+
+# Frontmatter keys a rule may not set (identity/skip semantics stay per-model):
+# same forbidden set as directory defaults.
+FORBIDDEN_RULE_KEYS = frozenset({"name", "model", "ignore"})
+
+# Frontmatter keys whose change invalidates resolved companion models —
+# ScopeStack.apply_rules callers re-run Model.resolve_companions() when any of
+# these were touched by a rule.
+COMPANION_KEYS = frozenset({"mmproj", "speculative", "mtp", "hf_repo"})
 
 
 def _field_value(model, field: str) -> str | None:
@@ -62,34 +75,38 @@ def rule_matches(when, model) -> bool:
     return True
 
 
-def _compile_rules(profiles_cfg) -> list[tuple]:
-    """Validate and compile override rules; stop the run on malformed ones."""
-    raw_rules = (profiles_cfg or {}).get("overrides") or []
+def compile_rule_list(raw_rules, origin: str) -> list[tuple]:
+    """Validate and compile override *raw_rules*; stop the run on malformed ones."""
     compiled: list[tuple] = []
     for i, rule in enumerate(raw_rules):
         if not isinstance(rule, dict):
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: must be a mapping "
+                f"error: {origin} overrides[{i}]: must be a mapping "
                 f"(got {type(rule).__name__}) — fix the rule")
         if "when" not in rule or rule["when"] is None or rule["when"] == {} or rule["when"] == "":
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: missing 'when' — every "
+                f"error: {origin} overrides[{i}]: missing 'when' — every "
                 f"rule must declare what it matches (use 'when: true' for all "
                 f"models)")
         when = rule["when"]
         if when is not True and not isinstance(when, dict):
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: 'when' must be a mapping "
+                f"error: {origin} overrides[{i}]: 'when' must be a mapping "
                 f"of field→regex pairs, or true")
         settings = {k: v for k, v in rule.items() if k != "when"}
-        unknown = set(settings) - SETTING_KEYS
+        unknown = set(settings) - OVERRIDE_KEYS
         for k in unknown:
-            logger.warning("overrides[%d]: unknown setting %r (ignored)", i, k)
-        settings = {k: v for k, v in settings.items() if k in SETTING_KEYS}
+            logger.warning("%s overrides[%d]: unknown setting %r (ignored)", origin, i, k)
+        settings = {k: v for k, v in settings.items() if k in OVERRIDE_KEYS}
+        bad = [k for k in settings if k in FORBIDDEN_RULE_KEYS]
+        if bad:
+            raise SystemExit(
+                f"error: {origin} overrides[{i}]: may not set {', '.join(sorted(bad))} "
+                f"(per-model keys)")
         if not settings:
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: no known settings — "
-                f"valid keys: {', '.join(sorted(SETTING_KEYS))}")
+                f"error: {origin} overrides[{i}]: no known settings — "
+                f"valid keys: {', '.join(sorted(OVERRIDE_KEYS))}")
         compiled.append((when, settings))
     return compiled
 
@@ -128,56 +145,3 @@ def resolve_setting_paths(model) -> list[str]:
         model._resolved_loras = resolved
 
     return errors
-
-
-def apply_overrides(models, profiles_cfg, avail: dict | None = None) -> None:
-    """Apply profile override rules to *models* in place.
-
-    Seeds each model from its own sidecar settings, layers matching rules
-    (last match wins per key), infers a backend from the file format when none
-    was declared (``avail`` describes the configured resources) and resolves
-    external file references.  Models with unresolved errors are flagged with
-    ``model._override_error`` (already logged) and skipped by the writer.
-    """
-    compiled = _compile_rules(profiles_cfg)
-
-    for model in models:
-        merged = {k: model.frontmatter[k] for k in SETTING_KEYS
-                  if k in model.frontmatter}
-        for when, settings in compiled:
-            if rule_matches(when, model):
-                for k, v in settings.items():
-                    prev = merged.get(k)
-                    if prev is not None and prev != v:
-                        logger.debug("override: %s: %s %r -> %r",
-                                     model.stem, k, prev, v)
-                    merged[k] = v
-
-        errors: list[str] = []
-        backend_name = merged.get("backend")
-        if backend_name is not None and backend_name not in BACKENDS:
-            errors.append(f"unknown backend {backend_name!r}")
-        elif backend_name is None:
-            # Nothing declared (sidecar or rule): infer from the file format,
-            # gated by which backends' resources are actually configured.
-            inferred = infer_backend(model, avail)
-            if inferred is not None:
-                logger.debug("override: %s: inferred backend %r", model.stem, inferred)
-                merged["backend"] = inferred
-            else:
-                fmt = (model.gguf_path.suffix.lower() if model.gguf_path
-                       else "hf_repo" if model.hf_repo else "none")
-                errors.append(f"no available backend supports format {fmt!r}")
-
-        # Commit merged settings to frontmatter *before* resolving external file
-        # references, so chat_template/loras values are present for resolution.
-        if merged:
-            model.frontmatter.update(merged)
-
-        errors += resolve_setting_paths(model)
-
-        if errors:
-            for e in errors:
-                logger.error("override: skipping %s: %s", model.stem, e)
-            model._override_error = errors[0]
-            continue
