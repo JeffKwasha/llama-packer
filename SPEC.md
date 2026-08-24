@@ -77,6 +77,8 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
 
+`profiles.yaml.example` provides a commented starter with one brief example per category — copy to `profiles.yaml` (gitignored) and uncomment what you need. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present.
+
 **Profile entries** (each value under `profiles:`) may set:
 
 - any **sampling key** from `SAMPLING_KEYS` (`temperature`, `top_p`, `top_k`,
@@ -88,7 +90,17 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 - `parallel` — slot count for this variant (same splitting behavior)
 - `spare` — additional VRAM reserved for this variant (overrides CLI
   `--spare`; see [Context calculation formula](#context-calculation-formula))
-- `description` — free-text label (documentation only)
+- `description` — free-text label (documentation only, never emitted)
+
+All `profiles.yaml` keys are **builder-consumed** — they tune generation,
+placement, or routing and are never forwarded to clients (unknown top-level keys
+are silently ignored; `profiles:` itself is required and the build aborts if
+empty). This contrasts with sidecar frontmatter, where any key *not* in the
+[builder-consumed list](#builder-consumed-keys-not-passed-through) is
+pass-through `metadata` for agents (see [Model Metadata](#model-metadata)).
+Within `profiles`, sampling deltas become `filters.setParamsByID` and
+`parallel`/`cache_type`/`spare` differences split a model into separate
+variants/entries; `description` is the only inert key.
 
 ## Hardware Detection
 
