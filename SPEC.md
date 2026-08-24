@@ -477,6 +477,11 @@ Sidecars carry model-intrinsic data. Cross-cutting serving choices —
 `profiles.yaml` (a sidecar may still pin a `backend:` for one-off exceptions,
 but fleet-level policy belongs here).
 
+Rules can also live in a **directory-scoped** `models.yaml`: any subdirectory
+of a models root may carry one whose `overrides:` apply only to models in
+that subtree, and whose `defaults:` seed each subtree sidecar's frontmatter
+(see [Directory-scoped models.yaml](#directory-scoped-modelsyaml) below).
+
 ```yaml
 # profiles.yaml
 overrides:
@@ -521,6 +526,40 @@ backslashes (`\.` stays literal in single quotes).
 each matching rule is layered on top **last-match-wins per key** (CSS-like:
 rules read top→bottom as increasing specificity). So a later rule that changes
 `backend` does not clobber a `chat_template` set by an earlier rule.
+
+**Precedence across scopes.** Global rules apply first, then directory-scoped
+rules outermost → innermost — so a closer scope beats a broader one beats
+global for the same key (`overrides.py:apply_overrides`).
+
+### Directory-scoped models.yaml
+
+Any subdirectory of a models root may carry a `models.yaml`. It makes the
+directory itself the filter — useful when HF naming makes regexes brittle
+(drop models in a folder instead of writing `when: {base_model: …}`):
+
+```yaml
+# <models-root>/chat/qwen3/models.yaml
+defaults:
+  context_length: 16384          # frontmatter defaults for subtree sidecars
+
+overrides:
+  - when: true                   # full filter syntax available; true = all
+    chat_template: ../qwen_chat_template.jinja
+    chat_template_kwargs: {enable_thinking: true}
+```
+
+- **Scope**: both keys apply only to models under that directory.
+- **`defaults:`**: merged into each subtree sidecar's frontmatter, outermost →
+  innermost; authored sidecar values always win. Generated stubs are
+  placeholders, so explicit directory defaults override them. The per-model
+  identity keys `name`, `model`, `ignore` may not be defaulted (validation
+  error).
+- **`overrides:`**: standard rules (same validation and matching); applied
+  after global rules, outer scopes first — innermost wins per key.
+- **Paths**: `chat_template:` / `loras:` resolve relative to each *sidecar's*
+  directory (not the models.yaml), so reference shared files with `../`.
+- **Entry-id collisions** are fatal: if two models slug to the same llama-swap
+  entry id, the run logs an error and exits — rename one of them.
 
 **Settings keys** (all optional): `backend`, `hf_repo`, `chat_template`,
 `chat_template_kwargs`, `loras`, `cli_args`, `reasoning-format`,
@@ -642,16 +681,24 @@ Every `--models-dir` directory is scanned independently and **recursively**
 
   Files at the root itself default to `chat`; files under any other
   subdirectory (`img/` for stable-diffusion-only models, `misc/`, `tmp/`,
-  `hf_hub/`, `s2t/`, …) are **skipped**. The whitelist is extendable via
-  profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and via CLI
-  `--extra-dirs` (backcompat for `embed`/`rerank`).
+  `hf_hub/`, `s2t/`, …) are **skipped** — one summary line per run names the
+  skipped directories so nothing disappears silently. The whitelist is
+  extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
+  via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).
 - Orphan GGUFs next to chat models are classified as companions (mmproj /
   MTP draft), never as main models.
 - Hardlinks and symlinks resolving to the same `(st_dev, st_ino)` are deduplicated
   across directories (first `models_dirs` entry wins).
 
 `--models-dir` precedence: CLI `--models-dir` (when given) > profiles.yaml
-`models_dirs:` (a list) > `./models`.
+`models_dirs:` (a list) > `./models`. The tracked `profiles.yaml.example` is
+the template; the live `profiles.yaml` is machine-local (gitignored). When no
+profiles file exists, llama-packer logs a warning pointing at the example and
+proceeds with the bundled defaults.
+
+**Directory-scoped config.** Any subdirectory may carry a `models.yaml`
+applying only to its subtree — see [Override Rules → Directory-scoped
+models.yaml](#directory-scoped-modelsyaml).
 
 **HF hub cache resolution.** A sidecar can reference a hub-downloaded GGUF without
 symlinking it into a models dir: declare both `hf_repo: org/repo` (or a

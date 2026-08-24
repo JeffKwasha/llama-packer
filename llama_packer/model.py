@@ -211,6 +211,30 @@ class Model:
         md_items = {p: k for p, k in classified if p.suffix.lower() == ".md"}
         gguf_items = {p: k for p, k in classified if p.suffix.lower() in (".gguf", ".safetensors")}
 
+        def _root_of(md_path: Path) -> Path:
+            """Models-dir root containing *md_path* (longest matching prefix)."""
+            best = None
+            for d in models_dirs:
+                if md_path.is_relative_to(d) and (best is None or len(d.parts) > len(best.parts)):
+                    best = d
+            return best or md_path.parent
+
+        def _merge_dir_defaults(md_path: Path, fm: dict, defaults_win: bool = False) -> dict:
+            """Layer ancestor ``models.yaml`` defaults into a sidecar's
+            frontmatter (outermost → innermost).
+
+            Authored sidecar values win over directory defaults; for generated
+            stubs (``defaults_win=True``) the stub's values are placeholders,
+            so explicit directory defaults override them.
+            """
+            merged: dict = {}
+            for anc in utils.dir_config_chain(md_path, _root_of(md_path)):
+                cfg = utils.load_dir_config(anc)
+                merged.update(cfg.get("defaults") or {})
+            if not merged:
+                return fm
+            return {**fm, **merged} if defaults_win else {**merged, **fm}
+
         known_md: set[Path] = set()
         models: list[Model] = []
 
@@ -229,7 +253,7 @@ class Model:
                 fm = {**fm, "role": kind}
             known_md.add(md_path)
             try:
-                model = cls(md_path, fm, hf_home=hf_home)
+                model = cls(md_path, _merge_dir_defaults(md_path, fm), hf_home=hf_home)
                 models.append(model)
             except Exception as e:
                 logger.warning("failed to load model from %s: %s", md_path, e)
@@ -246,10 +270,10 @@ class Model:
                     continue
                 if not gguf.is_file():
                     continue
-                role = kind if kind in ("embeddings", "rerank") else None
-                fm = utils.generate_stub_md(md_path, gguf, role=role)
+                fm = utils.generate_stub_md(md_path, gguf, role=kind)
                 try:
-                    model = cls(md_path, fm, hf_home=hf_home)
+                    model = cls(md_path, _merge_dir_defaults(md_path, fm, defaults_win=True),
+                                hf_home=hf_home)
                     models.append(model)
                     logger.info("stub: %s", md_path.name)
                 except Exception as e:
@@ -260,17 +284,15 @@ class Model:
         deduped: list[Model] = []
         seen: set[str] = set()
         for model in models:
+            key = str(model.md_path)
             if model.gguf_path:
-                key = os.path.realpath(str(model.gguf_path))
                 try:
                     st = os.stat(str(model.gguf_path))
-                    key = f"{key}|{st.st_dev}:{st.st_ino}"
+                    key = f"{os.path.realpath(str(model.gguf_path))}|{st.st_dev}:{st.st_ino}"
                 except OSError:
-                    pass
-            else:
-                key = str(model.md_path)
+                    key = os.path.realpath(str(model.gguf_path))
             if key in seen:
-                logger.info("duplicate model file (symlink) skipped: %s", model.stem)
+                logger.info("duplicate model file (symlink/hardlink) skipped: %s", model.stem)
                 continue
             seen.add(key)
             deduped.append(model)

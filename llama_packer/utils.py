@@ -495,8 +495,18 @@ _DEFAULT_DIR_ROLES = {
     "rerank": "rerank",
 }
 
-# Role inference for --extra-dirs names (pre-dates _DEFAULT_DIR_ROLES).
-_EXTRA_DIR_ROLE = {"embed": "embeddings", "rerank": "rerank"}
+# Roles a served directory may map to (companions are detected by filename,
+# never by directory).
+SERVED_ROLES = ("chat", "embeddings", "rerank")
+
+
+def validate_dir_roles(dir_roles: dict) -> str | None:
+    """Validate a profiles.yaml ``dirs:`` mapping; return an error message or None."""
+    for d, r in dir_roles.items():
+        if r not in SERVED_ROLES:
+            return (f"dirs: {d!r}: unknown role {r!r} "
+                    f"(allowed: {', '.join(SERVED_ROLES)})")
+    return None
 
 
 def companion_kind(stem: str) -> str | None:
@@ -549,7 +559,7 @@ def dir_role_map(extra_dirs: list[str] | None = None,
     """Effective directory-name → role map: defaults + extra dirs + profiles.yaml ``dirs:``."""
     role_map = dict(_DEFAULT_DIR_ROLES)
     for d in (extra_dirs or []):
-        role_map.setdefault(str(d).lower(), _EXTRA_DIR_ROLE.get(str(d)) or "chat")
+        role_map.setdefault(str(d).lower(), _DEFAULT_DIR_ROLES.get(str(d).lower()) or "chat")
     for d, r in (dir_roles or {}).items():
         role_map[str(d).lower()] = str(r)
     return role_map
@@ -581,6 +591,7 @@ def classify_models(
         base = Path(md)
         if not base.is_dir():
             continue
+        skipped: set[str] = set()
         for pattern in ("*.gguf", "*.safetensors", "*.md"):
             for p in base.rglob(pattern):
                 if not p.is_file():
@@ -589,11 +600,89 @@ def classify_models(
                 if len(parts) > 1:
                     role = role_map.get(parts[0].lower())
                     if role is None:
+                        skipped.add(parts[0])
                         continue  # subdirectory not in the role map: not served
                 else:
                     role = None
                 out.append((p, model_kind(p, role)))
+        if skipped:
+            logger.info("skipping %s (not in dirs map; extend via profiles.yaml dirs:)",
+                        ", ".join(f"{base / d}/" for d in sorted(skipped)))
     return out
+
+
+# ── Directory-scoped models.yaml ──────────────────────────────────────
+#
+# Any subdirectory of a models root may carry a ``models.yaml`` that applies
+# only to models beneath it: ``defaults`` merge into each sidecar's
+# frontmatter (sidecar wins), ``overrides`` are standard override rules whose
+# scope is that subtree.  Inner directories beat outer ones beat global.
+
+DIR_CONFIG_NAME = "models.yaml"
+
+# Frontmatter keys a directory config may NOT default (identity/skip semantics
+# must stay per-model).
+_DIR_CONFIG_FORBIDDEN_DEFAULTS = ("name", "model", "ignore")
+
+_dir_config_cache: dict[Path, dict | None] = {}
+
+
+def load_dir_config(d: Path) -> dict | None:
+    """Parse ``models.yaml`` in *d* (cached).  Returns None when absent/empty."""
+    d = Path(d)
+    if d in _dir_config_cache:
+        return _dir_config_cache[d]
+    path = d / DIR_CONFIG_NAME
+    cfg: dict | None = None
+    if path.is_file():
+        try:
+            cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            raise SystemExit(f"error: {path}: invalid YAML: {e}") from e
+        if not isinstance(cfg, dict):
+            raise SystemExit(f"error: {path}: must be a mapping")
+        defaults = cfg.get("defaults")
+        if defaults is not None and not isinstance(defaults, dict):
+            raise SystemExit(f"error: {path}: 'defaults' must be a mapping")
+        bad = [k for k in (defaults or {}) if k in _DIR_CONFIG_FORBIDDEN_DEFAULTS]
+        if bad:
+            raise SystemExit(
+                f"error: {path}: defaults may not set {', '.join(sorted(bad))} "
+                f"(per-model keys)")
+    _dir_config_cache[d] = cfg
+    return cfg
+
+
+def dir_config_chain(md_path: Path, root: Path) -> list[Path]:
+    """Ancestor dirs of *md_path* under *root* carrying a ``models.yaml``.
+
+    Ordered outermost → innermost.  The root itself may carry one too.
+    """
+    try:
+        rel = md_path.parent.relative_to(root)
+    except ValueError:
+        return []
+    dirs = [root, *(root / p for p in rel.parts)]  # outermost … innermost
+    return [d for d in dirs if load_dir_config(d)]
+
+
+def collect_dir_configs(models_dirs) -> dict[Path, dict]:
+    """Find every ``models.yaml`` under the given roots (cached parses).
+
+    Roots are resolved first so a symlinked models dir (e.g. ``./models ->
+    /mnt/ai/models`` scanned alongside its target) does not produce duplicate
+    or unmatchable scope directories.
+    """
+    found: dict[Path, dict] = {}
+    for md in models_dirs:
+        base = Path(md).resolve()
+        if not base.is_dir():
+            continue
+        for p in base.rglob(DIR_CONFIG_NAME):
+            cfg = load_dir_config(p.parent)
+            if cfg:
+                found[p.parent.resolve()] = cfg
+    return found
 
 
 def _eval_expr(expr: str, base_val: float) -> float:

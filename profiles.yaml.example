@@ -11,19 +11,15 @@ defaults:
 # Model roots (CLI --models-dir overrides this). Role is selected by the
 # first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →
 # embeddings, rerank/ → rerank; other subdirs (img/, misc/, tmp/…) are
-# ignored, and files at a root are chat.
+# ignored, and files at a root are chat.  Any subdirectory may also carry a
+# models.yaml with subtree-scoped `defaults:` and `overrides:`.
 models_dirs:
-  - /mnt/ai/models
-  - ./models
+  - models
 
-# HF cache root: sidecars with `hf_repo:` + `model:` resolve hub snapshots
-# directly from here (no symlinks into the models dirs needed).
-hf_home: /mnt/ai/huggingface
-
-overrides:
-  - when: {base_model: 'qwen3\.?[568]'}
-    chat_template: qwen_chat_template.jinja
-    chat_template_kwargs: {enable_thinking: true}
+# HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
+# the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
+# ~/.cache/huggingface.
+# hf_home: /mnt/data/huggingface
 
 # ── Profile definitions ────────────────────────────────
 profiles:
@@ -41,15 +37,15 @@ profiles:
 #    description: "concurrency"
 #    parallel: 2
 
-# ── Swap matrix ─────────────────────────────────────────
+# ── Swap matrix (optional) ──────────────────────────────
 # Enables the llama-swap matrix router: every chat model shares a set with the
 # CPU-resident embed (emb) and rerank (rnk) models, so RAG models stay loaded
 # alongside whatever chat model is active. __CHAT_VARS__ is expanded to the
 # generated (c1 | c2 | ...) var expression at build time.
-matrix:
-  evict_costs:
-    emb: 100
-    rnk: 100
-  sets:
-    rag: "__CHAT_VARS__ & emb & rnk"
-
+#
+# matrix:
+#   evict_costs:
+#     emb: 100
+#     rnk: 100
+#   sets:
+#     rag: "__CHAT_VARS__ & emb & rnk"

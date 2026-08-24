@@ -21,11 +21,30 @@ matches the model file next to it:
 
 Orphan GGUFs under `embed/`/`rerank`/`doc/`/etc. get stubs automatically with the
 role baked in. Other subdirs (`img/` for stable-diffusion-only models, `misc/`,
-`tmp/`, `hf_hub/`, `s2t/`, …) are not served — extend via profiles.yaml `dirs:`.
+`tmp/`, `hf_hub/`, `s2t/`, …) are not served — extend via profiles.yaml `dirs:`
+(skipped dirs are listed in the run log).
+
+## Directory-scoped `models.yaml`
+
+Any subdirectory may carry a `models.yaml` that applies only to models beneath
+it — the directory is the filter, so per-vendor settings need no regexes
+against HF names:
+
+```yaml
+# chat/qwen3/models.yaml
+defaults:
+  context_length: 16384        # fills gaps in subtree sidecars (sidecar wins)
+overrides:
+  - when: true                 # full rule syntax; scoped to this subtree
+    chat_template: ../qwen_chat_template.jinja   # relative to each sidecar
+    chat_template_kwargs: {enable_thinking: true}
+```
+
+Inner scopes beat outer ones beat global profiles.yaml `overrides:`.
 
 Hub-downloaded files need no symlink: sidecar declares `hf_repo: org/repo` (or
 a parseable `hf_url:`) alongside `model: file.gguf`, and the file resolves
-from `$HF_HOME/hub` (`hf_home: /mnt/ai/huggingface`); see SPEC.md.
+from `$HF_HOME/hub`; see SPEC.md.
 
 If the `.md` cannot share the model's stem, point at the file with
 `model: <filename>`.

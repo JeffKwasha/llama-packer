@@ -75,14 +75,14 @@ def test_build_matrix_vars_includes_text_variants():
     from llama_packer.__main__ import _build_matrix_vars
 
     def m(role, tid):
-        return SimpleNamespace(role=role, template_id=tid)
+        return SimpleNamespace(role=role, template_id=tid, stem=tid)
 
     models = [m("chat", "alpha"), m("chat", "beta"), m("embeddings", "emb-1"),
               m("rerank", "rnk-1")]
     # Only emitted entries become vars: alpha kept vision (has -text), beta
     # was auto-dropped (its main entry IS beta-text), ghost never emitted.
-    entry_ids = {"alpha", "alpha-text", "beta-text"}
+    entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"], "beta": ["beta-text"]}
     vars_ = _build_matrix_vars(models, m("embeddings", "emb-1"), m("rerank", "rnk-1"),
-                               entry_ids, logging.getLogger("test"))
+                               entry_ids_by_stem, logging.getLogger("test"))
     assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
                      "emb": "emb-1", "rnk": "rnk-1"}

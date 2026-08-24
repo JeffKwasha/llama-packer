@@ -22,9 +22,10 @@ from llama_packer.utils import (
     _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
+    collect_dir_configs, validate_dir_roles,
 )
-from llama_packer.writer import build_config, write_yaml
-from llama_packer.overrides import apply_overrides
+from llama_packer.writer import build_config, write_yaml, EmittedConfig
+from llama_packer.overrides import apply_overrides, compile_scoped_rules
 from llama_packer.backends import VLLM_BACKENDS
 
 
@@ -172,27 +173,29 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
     return min(cands, key=lambda m: m.vram_mb)
 
 
-def _build_matrix_vars(models: list, embed_model, rerank_model, entry_ids, logger) -> dict:
+def _build_matrix_vars(models: list, embed_model, rerank_model,
+                       entry_ids_by_stem: dict[str, list[str]], logger) -> dict:
     """Auto-collect matrix vars: chat entries + selected embed/rerank.
 
     Each chat model contributes a var per emitted entry id (the bare id and,
-    when present, its ``<id>-text`` text-only variant), so text variants join
-    the same co-loading sets as their parent entry.
+    when present, its text-only variant — see writer.TEXT_SUFFIX), so text
+    variants join the same co-loading sets as their parent entry.  The
+    stem → ids mapping comes from the emitter (EmittedConfig) so naming is
+    owned in exactly one place.
     """
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
         if m.role in ("embeddings", "rerank"):
             continue
-        base = m.template_id
-        for eid in (base, f"{base}-text"):
-            if eid in entry_ids:
-                chat_idx += 1
-                vars_[f"c{chat_idx}"] = eid
+        for eid in entry_ids_by_stem.get(m.stem, []):
+            chat_idx += 1
+            vars_[f"c{chat_idx}"] = eid
     if embed_model is not None:
         vars_["emb"] = embed_model.template_id
     if rerank_model is not None:
         vars_["rnk"] = rerank_model.template_id
+    logger.info("matrix vars: %d chat + emb + rnk", chat_idx)
     return vars_
 
 
@@ -240,10 +243,15 @@ def main(argv: list[str] | None = None) -> None:
     if not profiles_path.is_file():
         bundled = importlib.resources.files("llama_packer").joinpath("profiles.yaml")
         if bundled.is_file():
+            logger.warning(
+                "no profiles file at %s — proceeding with bundled defaults. "
+                "Copy profiles.yaml.example (%s) to that location to configure "
+                "models_dirs, hf_home, overrides and sampling profiles.",
+                profiles_path, Path(str(bundled)).parent)
             profiles_path = Path(str(bundled))
-            logger.info("using bundled profiles: %s", profiles_path)
         else:
-            logger.error("profiles file not found: %s", profiles_path)
+            logger.error("profiles file not found: %s (see profiles.yaml.example)",
+                         profiles_path)
             sys.exit(1)
 
     with open(profiles_path) as f:
@@ -277,10 +285,9 @@ def main(argv: list[str] | None = None) -> None:
     if not isinstance(dir_roles, dict):
         logger.error("profiles.yaml dirs: must be a mapping of directory name to role")
         sys.exit(1)
-    bad_roles = {d: r for d, r in dir_roles.items() if r not in ("chat", "embeddings", "rerank")}
-    if bad_roles:
-        logger.error("profiles.yaml dirs: unknown roles %s (allowed: chat, embeddings, rerank)",
-                     bad_roles)
+    err = validate_dir_roles(dir_roles)
+    if err:
+        logger.error("profiles.yaml %s", err)
         sys.exit(1)
 
     if args.llama_server:
@@ -325,14 +332,20 @@ def main(argv: list[str] | None = None) -> None:
     vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
 
     # Apply profile override rules (backend/chat-template/lora/hf_repo/cli_args).
-    # This mutates each model's effective settings and flags invalid models
+    # Global rules from profiles.yaml run first, then directory-scoped ones
+    # from ``models.yaml`` files (outermost → innermost, closest wins).  This
+    # mutates each model's effective settings and flags invalid models
     # (unknown backend, missing files, no available backend for the format)
     # for the writer to skip.
+    scoped_rules = compile_scoped_rules(collect_dir_configs(models_dirs))
+    if scoped_rules:
+        logger.info("dir configs: %d scoped override rule(s) from models.yaml",
+                    len(scoped_rules))
     apply_overrides(models, profiles_cfg, avail={
         "llama_bin": llama_bin,
         "vllm_image": vllm_image,
         "vllm_bin": vllm_bin,
-    })
+    }, scoped_rules=scoped_rules)
 
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
     if args.health_check_timeout is None:
@@ -412,13 +425,17 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("matrix rerank: %s", rerank_model.stem)
 
     # Build config
-    config = build_config(
-        models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
-        spare=args.spare, max_context=max_ctx,
-        matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
-        baseline_mb=gpu.baseline_mb,
-        min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
-    )
+    try:
+        config = build_config(
+            models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
+            spare=args.spare, max_context=max_ctx,
+            matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
+            baseline_mb=gpu.baseline_mb,
+            min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
+        )
+    except ValueError as e:
+        logger.error("%s", e)
+        sys.exit(1)
     config = _apply_env_subst(config, sub, raw_paths)
     if not config.get("models"):
         logger.error("no model entries generated")
@@ -433,7 +450,7 @@ def main(argv: list[str] | None = None) -> None:
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
         vars_ = _build_matrix_vars(models, embed_model, rerank_model,
-                                   set(config.get("models") or {}), logger)
+                                   config.entry_ids_by_stem, logger)
         # Expand the __CHAT_VARS__ placeholder in each set with the chat VAR
         # NAMES (c1 | c2 | ...), not the model IDs — llama-swap sets DSL
         # references var names, which map to model IDs via `vars`.
@@ -462,7 +479,8 @@ def main(argv: list[str] | None = None) -> None:
     output_path = Path(args.output).absolute()
 
     if args.dry_run:
-        sys.stdout.write(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        payload = config.plain() if isinstance(config, EmittedConfig) else config
+        sys.stdout.write(yaml.dump(payload, default_flow_style=False, sort_keys=False, allow_unicode=True))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
     else:

@@ -1,10 +1,13 @@
 # llama_packer/overrides.py
 """Pattern-scoped settings applied to discovered models.
 
-Override rules live under ``overrides:`` in profiles.yaml.  Each rule matches
-a model by one or more field→regex pairs (``when``) and sets settings keys
-(last match wins per key).  This is the single mechanism for selecting a
-backend, a chat template, LoRA adapters, ``hf_repo`` and ``cli_args``.
+Override rules live under ``overrides:`` in profiles.yaml (global) and in
+``models.yaml`` files inside the models tree (directory-scoped — they apply
+only to models beneath their directory, and a closer directory beats an
+outer one beats global).  Each rule matches a model by one or more field→regex
+pairs (``when``) and sets settings keys (last match wins per key).  This is
+the single mechanism for selecting a backend, a chat template, LoRA adapters,
+``hf_repo`` and ``cli_args``.
 
 ``when`` is required — a rule without one stops the run (the intended
 configuration would otherwise be silently ignored).  Use the regexes against
@@ -27,6 +30,7 @@ import logging
 import re
 from pathlib import Path
 
+from llama_packer import utils
 from llama_packer.backends import BACKENDS, SETTING_KEYS, infer_backend
 
 logger = logging.getLogger(__name__)
@@ -62,36 +66,54 @@ def rule_matches(when, model) -> bool:
     return True
 
 
-def _compile_rules(profiles_cfg) -> list[tuple]:
-    """Validate and compile override rules; stop the run on malformed ones."""
-    raw_rules = (profiles_cfg or {}).get("overrides") or []
+def _compile_rule_list(raw_rules, origin: str) -> list[tuple]:
+    """Validate and compile override *raw_rules*; stop the run on malformed ones."""
     compiled: list[tuple] = []
     for i, rule in enumerate(raw_rules):
         if not isinstance(rule, dict):
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: must be a mapping "
+                f"error: {origin} overrides[{i}]: must be a mapping "
                 f"(got {type(rule).__name__}) — fix the rule")
         if "when" not in rule or rule["when"] is None or rule["when"] == {} or rule["when"] == "":
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: missing 'when' — every "
+                f"error: {origin} overrides[{i}]: missing 'when' — every "
                 f"rule must declare what it matches (use 'when: true' for all "
                 f"models)")
         when = rule["when"]
         if when is not True and not isinstance(when, dict):
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: 'when' must be a mapping "
+                f"error: {origin} overrides[{i}]: 'when' must be a mapping "
                 f"of field→regex pairs, or true")
         settings = {k: v for k, v in rule.items() if k != "when"}
         unknown = set(settings) - SETTING_KEYS
         for k in unknown:
-            logger.warning("overrides[%d]: unknown setting %r (ignored)", i, k)
+            logger.warning("%s overrides[%d]: unknown setting %r (ignored)", origin, i, k)
         settings = {k: v for k, v in settings.items() if k in SETTING_KEYS}
         if not settings:
             raise SystemExit(
-                f"error: profiles.yaml overrides[{i}]: no known settings — "
+                f"error: {origin} overrides[{i}]: no known settings — "
                 f"valid keys: {', '.join(sorted(SETTING_KEYS))}")
         compiled.append((when, settings))
     return compiled
+
+
+def _compile_rules(profiles_cfg) -> list[tuple]:
+    """Compile global ``overrides`` from profiles.yaml."""
+    return _compile_rule_list((profiles_cfg or {}).get("overrides") or [], "profiles.yaml")
+
+
+def compile_scoped_rules(dir_cfgs: dict) -> list[tuple]:
+    """Compile directory-scoped ``models.yaml`` rules.
+
+    *dir_cfgs* maps a scope directory to its parsed ``models.yaml``; returns
+    ``(scope_dir, when, settings)`` tuples for :func:`apply_overrides`.
+    """
+    out: list[tuple] = []
+    for scope, cfg in (dir_cfgs or {}).items():
+        origin = str(Path(scope) / utils.DIR_CONFIG_NAME)
+        for when, settings in _compile_rule_list(cfg.get("overrides") or [], origin):
+            out.append((Path(scope).resolve(), when, settings))
+    return out
 
 
 def resolve_setting_paths(model) -> list[str]:
@@ -130,7 +152,8 @@ def resolve_setting_paths(model) -> list[str]:
     return errors
 
 
-def apply_overrides(models, profiles_cfg, avail: dict | None = None) -> None:
+def apply_overrides(models, profiles_cfg, avail: dict | None = None,
+                    scoped_rules: list | None = None) -> None:
     """Apply profile override rules to *models* in place.
 
     Seeds each model from its own sidecar settings, layers matching rules
@@ -138,8 +161,15 @@ def apply_overrides(models, profiles_cfg, avail: dict | None = None) -> None:
     was declared (``avail`` describes the configured resources) and resolves
     external file references.  Models with unresolved errors are flagged with
     ``model._override_error`` (already logged) and skipped by the writer.
+
+    *scoped_rules* carries directory-scoped rules from ``models.yaml`` files
+    as ``(scope_dir, when, settings)`` tuples; a rule applies only to models
+    inside *scope_dir*.  Application order is global rules first, then scoped
+    outermost → innermost, so the closest scope wins per key.
     """
     compiled = _compile_rules(profiles_cfg)
+    scoped = sorted(scoped_rules or [],
+                    key=lambda sr: len(sr[0].parts))  # outermost first
 
     for model in models:
         merged = {k: model.frontmatter[k] for k in SETTING_KEYS
@@ -151,6 +181,17 @@ def apply_overrides(models, profiles_cfg, avail: dict | None = None) -> None:
                     if prev is not None and prev != v:
                         logger.debug("override: %s: %s %r -> %r",
                                      model.stem, k, prev, v)
+                    merged[k] = v
+        parent = model.md_path.parent.resolve()
+        for scope, when, settings in scoped:
+            if parent != scope and scope not in parent.parents:
+                continue  # model outside this models.yaml's subtree
+            if rule_matches(when, model):
+                for k, v in settings.items():
+                    prev = merged.get(k)
+                    if prev is not None and prev != v:
+                        logger.debug("override: %s: %s %r -> %r (%s)",
+                                     model.stem, k, prev, v, scope)
                     merged[k] = v
 
         errors: list[str] = []
