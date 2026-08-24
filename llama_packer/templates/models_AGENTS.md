@@ -22,7 +22,8 @@ matches the model file next to it:
 Orphan GGUFs under `embed/`/`rerank`/`doc/`/etc. get stubs automatically with the
 role baked in. Other subdirs (`img/` for stable-diffusion-only models, `misc/`,
 `tmp/`, `hf_hub/`, `s2t/`, …) are not served — extend via profiles.yaml `dirs:`
-(skipped dirs are listed in the run log).
+(skipped dirs are listed in the run log). A `.modelignore` at a models root
+excludes files/subtrees in place (one glob per line, `#` comments).
 
 ## Directory-scoped `models.yaml`
 

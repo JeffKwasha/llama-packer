@@ -190,7 +190,7 @@ Chat models target a minimum useful context (`_MIN_USEFUL_CTX`, default 131072 =
 
 - `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `vision` capability. An on-demand **text-only variant** `<id>-text` (no `--mmproj`, `vision` removed, `metadata.mmproj_skipped: true`, display name `[text]`) is emitted alongside so clients can pick the lower-memory serving.
 - `ctx_with < min_context` → the main entry **drops** mmproj and is renamed `<id>-text` — the invariant is that the bare `<id>` always serves vision when the model has one; every no-mmproj entry carries the `-text` suffix and `[text]` label so a client that knows nothing of server config can tell it is text-only from `/v1/models`. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
-- If even the text-only context is `< min_context`, a warning is logged (the main entry is still emitted).
+- `ctx_without < min_context` too → **vision is kept**: dropping the projection cannot reach the minimum either way, so sacrificing it buys nothing (a small VLM stays a full VLM). Informational log only — no warning, since no configuration can fix a design-context limit.
 
 All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every `<id>-text` entry joins the same matrix co-loading sets as its parent `<id>` entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
 
@@ -685,6 +685,12 @@ Every `--models-dir` directory is scanned independently and **recursively**
   skipped directories so nothing disappears silently. The whitelist is
   extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
   via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).
+
+  A `<models-root>/.modelignore` file excludes individual files/subtrees in
+  place (no moving or deleting): one glob per line, `#` comments; a pattern
+  matches the path relative to the root or any single path component, so
+  `R3-rerank` hides that subtree and `adetailer*` hides everything named like
+  it. Matched files are summarized in one log line.
 - Orphan GGUFs next to chat models are classified as companions (mmproj /
   MTP draft), never as main models.
 - Hardlinks and symlinks resolving to the same `(st_dev, st_ino)` are deduplicated

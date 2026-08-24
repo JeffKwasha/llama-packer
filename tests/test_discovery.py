@@ -210,3 +210,23 @@ def test_model_speculative_from_hub(tmp_path):
           "speculative": "big-mtp.gguf"}
     m = Model(md_path, fm, hf_home=hf_home)
     assert m.mtp is not None
+
+
+def test_modelignore_excludes_files(tmp_path):
+    from llama_packer.utils import load_model_ignore
+    root = tmp_path / "models"
+    (root / "vision").mkdir(parents=True)
+    (root / ".modelignore").write_text(
+        "# comment\nR3-rerank\nadetailer*\n*.tmp.gguf\n\n")
+    (root / "vision" / "keep.md").write_text(_sidecar("Keep"))
+    (root / "vision" / "adetailer-x.md").write_text(_sidecar("Bad"))
+    sub = root / "vision" / "R3-rerank"
+    sub.mkdir()
+    (sub / "model.md").write_text(_sidecar("Bad2"))
+
+    assert load_model_ignore(root) == ["R3-rerank", "adetailer*", "*.tmp.gguf"]
+    kinds = classify_models(root)
+    names = {p.name for p, _ in kinds}
+    assert "keep.md" in names
+    assert "adetailer-x.md" not in names
+    assert "model.md" not in names

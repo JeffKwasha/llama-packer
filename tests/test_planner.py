@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -65,8 +66,11 @@ def test_profiles_groups_by_cache_type(make_model):
 
 
 def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_path):
-    m = _vision_model(tmp_path, make_model, "vis")
-    _scripted_ctx(m, {True: 4096, False: 65536})
+    # Design ctx 256k so only the budget clamps: vision misses min-context,
+    # text-only reaches it → mmproj is dropped and vision kept as a variant.
+    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vis", mmproj="vis-mmproj.gguf", context_length=262144)
+    _scripted_ctx(m, {True: 65536, False: 200000})
 
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
                       min_context=131072)
@@ -74,21 +78,35 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     assert len(variants) == 1
     v = variants[0]
     assert v.include_mmproj is False
-    # text ctx clamped to the sidecar's max trained context (32768)
-    assert v.ctx_size == 32768
-    assert v.vision_ctx == 4096
+    assert v.ctx_size == 200000
+    assert v.vision_ctx == 65536
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
     # Auto-dropped main entry is renamed <id>-text (bare id always = vision).
-    assert set(config["models"]) == {"vis-text", "vis-vision-4k"}
+    assert set(config["models"]) == {"vis-text", "vis-vision-65k"}
     main = config["models"]["vis-text"]
-    vision = config["models"]["vis-vision-4k"]
+    vision = config["models"]["vis-vision-65k"]
     assert "--mmproj" not in main["cmd"]
     assert main["name"].endswith("[text]")
     assert main["metadata"]["mmproj_skipped"] is True
     assert main["capabilities"]["in"] == ["text"]
     assert "--mmproj" in vision["cmd"]
-    assert vision["name"].endswith("[vision 4k]")
+    assert vision["name"].endswith("[vision 65k]")
+
+
+def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_path,
+                                                   caplog):
+    # Small design ctx: below min-context with AND without vision — dropping
+    # buys nothing, so vision is kept and only an info line is logged.
+    m = _vision_model(tmp_path, make_model, "tiny")
+    _scripted_ctx(m, {True: 32768, False: 32768})
+
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
+                      min_context=131072)
+    variants = planner.plan()["tiny"]
+    assert len(variants) == 2  # bare (vision) + on-demand -text, per group
+    assert variants[0].include_mmproj is True   # main entry keeps vision
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):

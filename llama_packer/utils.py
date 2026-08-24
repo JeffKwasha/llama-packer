@@ -478,6 +478,37 @@ def _is_mtp_companion(stem: str) -> bool:
 
 MODEL_KINDS = ("chat", "embeddings", "rerank", "mmproj", "mtp")
 
+# Per-models-dir exclusion file: <root>/.modelignore.  One glob per line
+# (blank lines and #-comments ignored); a file is skipped when the pattern
+# matches its path relative to the root or any single path component — so
+# `R3-rerank` excludes that subtree, `*.safetensors` a format, `adetailer*`
+# everything named like it.
+MODEL_IGNORE_NAME = ".modelignore"
+
+
+def load_model_ignore(root: Path) -> list[str]:
+    """Parse ``<root>/.modelignore`` into a pattern list (empty when absent)."""
+    path = Path(root) / MODEL_IGNORE_NAME
+    if not path.is_file():
+        return []
+    patterns: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return patterns
+
+
+def _is_ignored(rel_parts: tuple[str, ...], rel_path: str,
+                patterns: list[str]) -> bool:
+    import fnmatch
+    for pat in patterns:
+        if fnmatch.fnmatch(rel_path, pat):
+            return True
+        if any(fnmatch.fnmatch(part, pat) for part in rel_parts):
+            return True
+    return False
+
 # Default directory-name → role map for discovery.  The FIRST path component
 # of a model file (relative to a models-dir root) selects the role; files at
 # the root itself are chat.  Subdirectories absent from this map are not
@@ -592,11 +623,17 @@ def classify_models(
         if not base.is_dir():
             continue
         skipped: set[str] = set()
+        ignore = load_model_ignore(base)
+        ignored_count = 0
         for pattern in ("*.gguf", "*.safetensors", "*.md"):
             for p in base.rglob(pattern):
                 if not p.is_file():
                     continue
-                parts = p.relative_to(base).parts
+                rel = p.relative_to(base)
+                if ignore and _is_ignored(rel.parts, rel.as_posix(), ignore):
+                    ignored_count += 1
+                    continue
+                parts = rel.parts
                 if len(parts) > 1:
                     role = role_map.get(parts[0].lower())
                     if role is None:
@@ -605,6 +642,9 @@ def classify_models(
                 else:
                     role = None
                 out.append((p, model_kind(p, role)))
+        if ignored_count:
+            logger.info("modelignore: %d file(s) under %s excluded",
+                        ignored_count, base)
         if skipped:
             logger.info("skipping %s (not in dirs map; extend via profiles.yaml dirs:)",
                         ", ".join(f"{base / d}/" for d in sorted(skipped)))

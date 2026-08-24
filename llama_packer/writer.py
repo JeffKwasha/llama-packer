@@ -387,8 +387,10 @@ class Planner:
         A model keeps vision when it reaches the minimum useful context WITH
         the projection loaded; otherwise the main entry drops it (and is
         emitted as ``<id>-text``; a best-effort vision variant is emitted
-        alongside).  Uses the global spare and fleet defaults; per-profile
-        spare still bounds ctx per group.
+        alongside) — but only when dropping actually helps: a model whose
+        design context is below the minimum even text-only keeps its vision,
+        since sacrificing it buys nothing.  Uses the global spare and fleet
+        defaults; per-profile spare still bounds ctx per group.
         """
         drop: dict[str, bool] = {}
         global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
@@ -410,13 +412,16 @@ class Planner:
             ctx_without = self._bounded_ctx(
                 model, parallel=parallel, cache_type=cache_type,
                 spare_mb=global_spare_mb, include_mmproj=False)
+            if ctx_without < self.min_context:
+                # Below the minimum either way — no configuration fixes this;
+                # dropping vision would only degrade the model. Keep it.
+                logger.info("mmproj: %s design ctx %d is below min-context %d "
+                            "with or without vision; keeping vision",
+                            model.stem, ctx_with, self.min_context)
+                continue
             drop[model.stem] = True
             logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
                         model.stem, ctx_with, self.min_context, ctx_without)
-            if ctx_without < self.min_context:
-                logger.warning("mmproj: %s cannot reach %d context even without "
-                               "vision (text ctx %d)",
-                               model.stem, self.min_context, ctx_without)
         return drop
 
     def _solve_matrix(self, drop_stems: set[str]) -> int | None:
