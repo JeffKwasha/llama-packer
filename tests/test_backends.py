@@ -489,4 +489,87 @@ def test_infer_backend_whisper(make_model):
 
 def test_fixed_overhead_backends_include_whisper():
     from llama_packer.backends import FIXED_OVERHEAD_BACKENDS
-    assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server"}
+    assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server", "kokoro-podman"}
+
+
+# ── kokoro-podman backend ─────────────────────────────────────────────────
+
+def test_kokoro_registered():
+    b = get_backend("kokoro-podman")
+    assert b.formats == {".onnx", "hf_repo"}
+    assert b.roles == {"t2s"}
+    assert b.proxied is True
+
+
+def test_kokoro_requires_image():
+    from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES
+    b = get_backend("kokoro-podman")
+    assert not b.is_available({})
+    assert b.is_available({"kokoro_image": KOKORO_DEFAULT_IMAGES["nvidia"]})
+
+
+def _kokoro_model(tmp_path, **fm):
+    """hf_repo-only t2s Model (weights baked into the container image)."""
+    from llama_packer.model import Model
+    md = tmp_path / "k.md"
+    md.write_text("---\nname: k\n---\n")
+    fm.setdefault("role", "t2s")
+    fm.setdefault("hf_repo", "hexgrad/Kokoro-82M")
+    return Model(md, fm)
+
+
+def test_kokoro_cmd_nvidia(tmp_path):
+    m = _kokoro_model(tmp_path)
+    assert m.gguf_path is None and m.hf_repo  # image-baked: no local file
+    cmd, meta = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "ghcr.io/remsky/kokoro-fastapi-gpu:latest",
+        "kokoro_vendor": "nvidia",
+        "kokoro_container_port": 8880,
+    })
+    assert cmd.startswith("podman run --init --rm --name ${MODEL_ID}")
+    assert "-p ${PORT}:8880" in cmd
+    assert "--device nvidia.com/gpu=all" in cmd
+    assert cmd.endswith("ghcr.io/remsky/kokoro-fastapi-gpu:latest")
+    assert meta == {}
+
+
+def test_kokoro_cmd_amd_uses_native_rocm_devices(tmp_path):
+    m = _kokoro_model(tmp_path)
+    cmd, _ = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "ghcr.io/remsky/kokoro-fastapi-rocm:latest",
+        "kokoro_vendor": "amd",
+    })
+    assert "--device /dev/kfd --device /dev/dri" in cmd
+    assert "--group-add video" in cmd and "--group-add render" in cmd
+    assert "kokoro-fastapi-rocm:latest" in cmd
+
+
+def test_kokoro_cmd_cpu_has_no_device_flags(tmp_path):
+    m = _kokoro_model(tmp_path)
+    cmd, _ = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "ghcr.io/remsky/kokoro-fastapi-cpu:latest",
+        "kokoro_vendor": "cpu",
+    })
+    assert "--device" not in cmd
+
+
+def test_kokoro_podman_args_and_voices_override(tmp_path):
+    m = _kokoro_model(tmp_path)
+    cmd, _ = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "img",
+        "kokoro_vendor": "nvidia",
+        "podman_args": "--device /dev/mygpu",
+        "voices_dir": "/mnt/ai/models/t2s/voices",
+    })
+    # podman_args replaces the auto device flags entirely.
+    assert "--device /dev/mygpu" in cmd
+    assert "nvidia.com/gpu" not in cmd
+    # Voices mount is read-write so combined voicepacks persist.
+    assert "-v /mnt/ai/models/t2s/voices:/app/api/src/voices/v1_0" in cmd
+
+
+def test_infer_backend_kokoro(tmp_path):
+    from llama_packer.backends import infer_backend
+    # Weights are baked into the image — hf_repo-only sidecars are typical.
+    m = _kokoro_model(tmp_path)
+    assert infer_backend(m, {"kokoro_image": "img"}) == "kokoro-podman"

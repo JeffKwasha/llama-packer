@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer import vllm_estimate
-from llama_packer.backends import FIXED_OVERHEAD_BACKENDS, VLLM_BACKENDS
+from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
+                                   SD_BACKENDS, VLLM_BACKENDS,
+                                   WHISPER_BACKENDS)
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -34,9 +36,15 @@ _MMPROJ_COMPUTE_MB = 150
 # MTP draft: fixed compute overhead + per-token KV factor estimate safety margin.
 _DRAFT_COMPUTE_MB = 64
 _DRAFT_CTX_SAFETY = 1.6
-# sd-server: fixed VRAM overhead for diffusion models (file sizes + this buffer).
+# sd-server/whisper: fixed VRAM overhead (file sizes + this buffer).
 # No per-token KV factor (ctx_factor=0) — calc_ctx returns design_ctx.
 _SD_COMPUTE_MB = 512
+# kokoro-podman: weights are baked into the container image (~330 MB), but the
+# PyTorch/CUDA runtime floors around 2.4 GiB and peaks near 4 GiB under load
+# (upstream /dev/unload benchmarks) — charge a conservative fixed buffer.
+_KOKORO_COMPUTE_MB = 3072
+_FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS | WHISPER_BACKENDS},
+                     **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
 
 
 @dataclass
@@ -466,10 +474,10 @@ class VramBudget:
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
-        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t):
-        # VRAM = weights (file size) + fixed buffer, no per-token KV factor.
-        # These models range from ~150 MB (whisper base) to 40 GB (flux) and
-        # are excluded from the shared chat matrix, so precise ctx_factor is
+        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t,
+        # kokoro-podman t2s): VRAM = weights (file size, 0 when baked into the
+        # image) + a fixed runtime buffer, no per-token KV factor.  These are
+        # excluded from the shared chat matrix, so precise ctx_factor is
         # irrelevant; calc_ctx will return design_ctx when ctx_factor==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             main_mb = 0
@@ -479,13 +487,14 @@ class VramBudget:
             except OSError:
                 main_mb = 0
             # Try fit-params static size when available for a more accurate weight
-            # estimate — GGUF only; a whisper GGML .bin cannot be measured and a
+            # estimate — GGUF only; GGML .bin / ONNX cannot be measured and a
             # subprocess attempt would just fail noisily. ctx_factor stays 0.
             if self.model.gguf_path and str(self.model.gguf_path).endswith(".gguf"):
                 fit = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
                 if fit is not None and fit.model_mib > 0:
                     main_mb = fit.model_mib
-            params = (main_mb, 0.0, _SD_COMPUTE_MB)
+            params = (main_mb, 0.0,
+                      _FIXED_COMPUTE_MB.get(self.model.backend, _SD_COMPUTE_MB))
             self._effective_cache[cache_key] = params
             return params
 

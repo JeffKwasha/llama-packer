@@ -18,15 +18,18 @@ models_dirs:
   # - /mnt/ai/models  # multiple roots allowed
 
 # Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank | image | s2t. CLI --extra-dirs
+# values must be chat | embeddings | rerank | image | s2t | t2s. CLI --extra-dirs
 # merges similarly.
 # Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
 # Speech-to-text (whisper.cpp) is opt-in: add `s2t: s2t` to serve .bin weights
 # via whisper-server (requires an authored same-stem sidecar per model).
+# Text-to-speech (kokoro) is opt-in: add `t2s: t2s` to serve via kokoro-podman
+# (weights are baked into the image — an hf_repo-only sidecar suffices).
 # dirs:
 #   it2t: chat
 #   img: image
 #   s2t: s2t
+#   t2s: t2s
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -36,13 +39,15 @@ models_dirs:
 # Backend enable/prefer list — ordered; a backend absent from the list is
 # disabled even when its resources are configured.  Omit the key to use all
 # registered backends in default order (llama-server, vllm-docker, vllm,
-# sd-server, whisper-server).  sd-server is opt-in for image generation and
-# whisper-server for speech-to-text; see the sd:/whisper: sections below.
+# sd-server, whisper-server, kokoro-podman).  sd-server is opt-in for image
+# generation, whisper-server for speech-to-text, and kokoro-podman for
+# text-to-speech; see the sd:/whisper:/t2s: sections below.
 # backends:
 #   - llama-server
 #   - vllm-docker
 #   - sd-server
 #   - whisper-server
+#   - kokoro-podman
 
 # ── Profile definitions ────────────────────────────────
 # Each profile overlays `defaults` and emits llama-swap setParamsByID
@@ -53,11 +58,11 @@ profiles:
   default:
 
   coder:
-    description: "Optimized for code generation and bash commands"
+    description: "coding and agentic work"
     temperature: "base * 0.7"
 
   # creative:
-  #   description: "Higher temperature for creative and writing tasks"
+  #   description: "creative writing"
   #   temperature: "base * 1.2"
 
   # ── Sampling params ──────────────────────────────────
@@ -88,7 +93,7 @@ profiles:
   #   description: "Concurrency-tuned"
   #   parallel: 2
   #   cache_type: q4_K_M
-  #   spare: 6G
+  #   spare: 2G
 
   # low-mem:
   #   description: "Smaller KV cache for tight VRAM budgets"
@@ -123,6 +128,31 @@ profiles:
 # excluded from the shared chat matrix.
 # whisper:
 #   bin: whisper-server
+
+# ── kokoro-podman backend (optional, text-to-speech) ──────
+# Kokoro-82M TTS via remsky/Kokoro-FastAPI in rootless podman
+# (OpenAI-compatible /v1/audio/speech; container port 8880).  Opt-in: add
+# `t2s: t2s` under `dirs:`; weights + ~50 voices are baked into the image,
+# so a sidecar only needs `hf_repo: hexgrad/Kokoro-82M`.  Fixed ~3 GiB
+# VRAM (PyTorch runtime floor), excluded from the chat matrix.
+#
+# vendor: auto-detected (nvidia | amd | cpu) — picks the default image tag
+# AND device pass-through flags:
+#   nvidia → ghcr.io/remsky/kokoro-fastapi-gpu:latest   --device nvidia.com/gpu=all
+#            (-cu128 tag for RTX 50-series / Blackwell)
+#   amd    → ghcr.io/remsky/kokoro-fastapi-rocm:latest  --device /dev/kfd --device /dev/dri
+#            (native ROCm build — experimental upstream, amd64 only)
+#   cpu    → ghcr.io/remsky/kokoro-fastapi-cpu:latest   (no device flags)
+# Pin to a release tag instead of :latest for stability. CLI --kokoro-image
+# overrides the tag only; podman_args replaces the auto device flags entirely;
+# voices_dir bind-mounts a persistent voicepack directory (read-write: the
+# server saves combined voices there).
+# t2s:
+#   vendor: auto
+#   image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+#   podman_args: ""
+#   container_port: 8880
+#   voices_dir: /mnt/ai/models/t2s/voices
 
 # ── Hardware (optional) ─────────────────────────────────
 # Override auto-detected VRAM pool. CLI --vram / --unified-system-mb win.

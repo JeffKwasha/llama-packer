@@ -133,9 +133,13 @@ class ScopeStack:
                              model.stem, inferred)
                 model.frontmatter["backend"] = inferred
             else:
+                # Expected in ordinary fleets (e.g. safetensors models with
+                # vLLM unconfigured) — a warning, not an operator error.
                 fmt = (model.gguf_path.suffix.lower() if model.gguf_path
                        else "hf_repo" if model.hf_repo else "none")
-                errors.append(f"no available backend supports format {fmt!r}")
+                reason = f"no available backend supports format {fmt!r}"
+                logger.warning("skipping %s: %s", model.stem, reason)
+                model._override_error = reason
 
         errors += resolve_setting_paths(model)
 

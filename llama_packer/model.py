@@ -172,9 +172,10 @@ class Model:
             if hit is not None:
                 return utils.smart_resolve(hit)
 
-        # 2. Convention: same stem, .gguf / .safetensors / whisper GGML .bin
-        # (.bin only resolves for s2t models — discovery requires the s2t dir)
-        for ext in (".gguf", ".safetensors", ".bin"):
+        # 2. Convention: same stem, .gguf / .safetensors / whisper GGML .bin /
+        # kokoro ONNX (.bin and .onnx resolve only for their audio roles —
+        # discovery requires the s2t/t2s directory)
+        for ext in (".gguf", ".safetensors", ".bin", ".onnx"):
             candidate = parent / f"{self.stem}{ext}"
             if candidate.is_file():
                 return utils.smart_resolve(candidate)

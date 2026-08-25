@@ -1,6 +1,6 @@
 # Plan: Audio backends — whisper-server (Part 1) + kokoro t2s (Part 2)
 
-Status: **Part 1 implemented**; Part 2 (t2s) planned. Recorded 2026-08-25.
+Status: **both implemented**. Recorded 2026-08-25.
 Related: `docs/plans/comfyui-sd.md` (the sd-server precedent this mirrors).
 
 ## Decisions
@@ -28,23 +28,30 @@ Related: `docs/plans/comfyui-sd.md` (the sd-server precedent this mirrors).
 the sd-server name-match for proxy/checkEndpoint emission. `utils.NON_CHAT_ROLES`
 consolidates the scattered role-exclusion tuple.
 
-## Part 2 — kokoro via rootless podman (planned)
+## Part 2 — kokoro via rootless podman (implemented)
 
 * Role `t2s`, dirs `{t2s: t2s}`; capabilities `in: [text], out: [audio]`;
-  endpoint `POST /v1/audio/speech` (+ `GET /v1/audio/voices`).
-* Backend `kokoro-podman`: rootless **podman** (not docker), image
-  `ghcr.io/remsky/kokoro-fastapi-gpu` (OpenAI-compatible).
-* GPU pass-through by vendor (from existing hardware detection):
-  * NVIDIA: CDI — `--device nvidia.com/gpu=all` (podman ≥4; fallback
-    `--gpus all` + `-e NVIDIA_VISIBLE_DEVICES=all`).
-  * AMD: known-working CUDA→ROCm translation of the CUDA image;
-    `--device /dev/kfd --device /dev/dri --group-add video --group-add render`.
-    Document as translation, not native; allow per-model image override.
-  * Override hatch: profiles.yaml `t2s.podman_args`.
-* Reuse `_map_paths_into` (backends/vllm.py) for model/voices bind mounts;
-  container port default 8000 mapped to `${PORT}`.
-* Formats: `.onnx` (+ voices), `hf_repo`; fixed VRAM overhead (~512 MiB buffer)
-  added to `FIXED_OVERHEAD_BACKENDS`.
+  endpoint `POST /v1/audio/speech` (+ `GET /v1/audio/voices`, health `/`,
+  container port 8880).
+* Backend `kokoro-podman`: rootless **podman**, upstream images from
+  remsky/Kokoro-FastAPI. Correction found during research: a **native ROCm
+  image exists** (`kokoro-fastapi-rocm`) — no CUDA→ROCm translation needed.
+  Vendor detection picks tag + flags:
+  * NVIDIA → `kokoro-fastapi-gpu` + `--device nvidia.com/gpu=all` (CDI)
+  * AMD → `kokoro-fastapi-rocm` + `--device /dev/kfd --device /dev/dri
+    --group-add video --group-add render`
+  * CPU → `kokoro-fastapi-cpu`, no flags
+* Overrides: CLI `--kokoro-image` > profiles.yaml `t2s.image` > vendor default;
+  `t2s.vendor:` overrides detection for tag+flags; `t2s.podman_args` replaces
+  auto flags; `t2s.voices_dir` rw-mounts persistent voicepacks at
+  `/app/api/src/voices/v1_0` (verified against upstream paths.py).
+* Weights are baked into the image — sidecars are typically `hf_repo:`-only;
+  formats include `.onnx` for local copies (stem resolution extended).
+* VRAM correction: PyTorch runtime floors ~2.4 GiB / peaks ~4 GiB, so fixed
+  compute buffer is 3072 MiB (`_KOKORO_COMPUTE_MB`), not the sd/whisper 512.
+* No host-binary variant shipped: no standalone binary exists upstream (the
+  uv-run path is a source checkout needing espeak-ng); a future variant would
+  follow the vLLM two-thin-classes-over-shared-helpers pattern.
 
 ## References
 

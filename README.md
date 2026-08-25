@@ -52,6 +52,7 @@ UI badges from these), driven by `role:` plus declared capabilities:
 | `embeddings` | `embed/` | text → vectors | llama-server / vLLM | `/v1/embeddings` |
 | `rerank` | `rerank/` | query+docs → scores | llama-server / vLLM | `/v1/rerank` |
 | `s2t` | `s2t/` (opt-in) | audio → text | whisper-server | `/v1/audio/transcriptions` |
+| `t2s` | `t2s/` (opt-in) | text → audio | kokoro-podman | `/v1/audio/speech` |
 | `image` | `img/` (opt-in) | text+image → image | sd-server | `/sdapi/v1/txt2img` |
 
 On a **chat** model, `capabilities: [vision]` adds image *input*,
@@ -128,6 +129,6 @@ Serve a model with vLLM instead of llama-server via an override rule in `profile
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
 - Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [SPEC.md](SPEC.md#image-backend-sd-server) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
 - Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [SPEC.md → Audio Backend](SPEC.md#audio-backend-whisper-server)
-- Text-to-speech (`t2s`, e.g. kokoro via rootless podman with CUDA + ROCm device pass-through) — planned; see [docs/plans/audio.md](docs/plans/audio.md)
+- Text-to-speech via `kokoro-podman` (Kokoro-82M in rootless podman, NVIDIA + AMD/ROCm) — **available** as `role: t2s` with `dirs: {t2s: t2s}` and `backends: [kokoro-podman]` (opt-in; weights baked into the image — an `hf_repo`-only sidecar suffices; fixed ~3 GiB VRAM); see [SPEC.md → Audio Backend (kokoro-podman)](SPEC.md#audio-backend-kokoro-podman)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
 - Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)

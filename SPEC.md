@@ -609,6 +609,76 @@ for s2t roles. VRAM is fixed overhead like sd-server: `model_mib = file-size`,
 excluded from the shared chat matrix solve. The emitted `--parallel` maps the
 sidecar/profile slot count to concurrent transcription workers.
 
+## Audio Backend (kokoro-podman)
+
+A model with `role: t2s` (opt-in: a `t2s/` directory plus `dirs: {t2s: t2s}` in
+`profiles.yaml`) is served with **kokoro-podman** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+text-to-speech via [remsky/Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI)
+in **rootless podman** (OpenAI-compatible `POST /v1/audio/speech`,
+`GET /v1/audio/voices`, health on `/`, container port 8880).
+
+```yaml
+# profiles.yaml
+dirs: {t2s: t2s}
+backends: [llama-server, kokoro-podman]
+```
+
+```yaml
+# sidecar: t2s/kokoro-v1.md — weights and ~50 voicepacks are baked into the
+# image, so hf_repo alone identifies the model; no local file required.
+---
+name: kokoro-v1
+hf_repo: hexgrad/Kokoro-82M
+description: "Kokoro-82M text-to-speech"
+---
+```
+
+Emitted entry (NVIDIA example):
+
+```yaml
+kokoro-v1:
+  cmd: podman run --init --rm --name ${MODEL_ID} -p ${PORT}:8880 --device nvidia.com/gpu=all ghcr.io/remsky/kokoro-fastapi-gpu:latest
+  proxy: http://127.0.0.1:${PORT}
+  checkEndpoint: /
+  capabilities: {in: [text], out: [audio]}
+```
+
+### Vendor selection
+
+The GPU vendor picks both the default image tag and device pass-through flags:
+
+| vendor | default image | podman flags |
+|--------|--------------|--------------|
+| nvidia | `ghcr.io/remsky/kokoro-fastapi-gpu:latest` | `--device nvidia.com/gpu=all` |
+| amd | `ghcr.io/remsky/kokoro-fastapi-rocm:latest` | `--device /dev/kfd --device /dev/dri --group-add video --group-add render` |
+| cpu | `ghcr.io/remsky/kokoro-fastapi-cpu:latest` | *(none)* |
+
+Detection probes `amd-smi`/`rocminfo` then `nvidia-smi`. Precedence for the
+image: CLI `--kokoro-image` > profiles.yaml `t2s.image:` > vendor default.
+`t2s.vendor:` (`auto|nvidia|amd|cpu`) overrides detection for tag *and* flags;
+`t2s.podman_args:` replaces the auto flags entirely; `t2s.container_port`
+overrides 8880; `t2s.voices_dir:` bind-mounts a persistent voicepack directory
+(read-write — the server loads `.pt` packs per request and saves combined
+voices back). Pin to an upstream release tag rather than `:latest` for
+stability (`gpu:-cu128` for RTX 50-series / Blackwell).
+
+### Voices
+
+No per-model configuration: voices live server-side in the image (~50 packs),
+selected per request via the JSON body (`"voice": "af_heart"`, weighted mixes
+like `"af_bella(2)+af_sky(1)"`) and listed at `/v1/audio/voices`.
+
+### Capabilities and VRAM
+
+`role: t2s` emits `capabilities: {in: [text], out: [audio]}` (Speech badge).
+VRAM is fixed overhead: weights are baked into the image so `model_mib` is 0
+unless a local file resolves, plus a conservative 3072 MiB runtime buffer (the
+PyTorch/CUDA floor is ~2.4 GiB, peaks near 4 GiB under load — upstream
+`/dev/unload` benchmarks). The entry is excluded from the shared chat matrix
+solve. A local `.onnx` copy may resolve by same-stem sidecar convention inside
+the `t2s/` dir.
+
+
 
 ## Override Rules
 
@@ -750,6 +820,7 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `vllm-docker` | safetensors, `hf_repo` | chat |
 | `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | image |
 | `whisper-server` | `.bin` (s2t dir only) | s2t |
+| `kokoro-podman` | `.onnx`, `hf_repo` | t2s |
 
 ## Backend Selection
 
@@ -771,7 +842,7 @@ binary/image configured is skipped) and picks the first backend whose formats
 and roles cover the model. An explicit sidecar/override `backend:` pin to a
 disabled name is an error that skips that model — pinning bypasses *inference*,
 never policy. Registration order: `llama-server`, `vllm-docker`, `vllm`,
-`sd-server`, `whisper-server`.
+`sd-server`, `whisper-server`, `kokoro-podman`.
 
 ## Cache precision (`cache_type`)
 
@@ -849,11 +920,12 @@ pushed, its models are built, then children are visited:
 | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
 | `rerank` | `rerank` | Reranker models |
 | `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
+| `t2s` | `t2s` | Text-to-speech (kokoro via podman; opt-in via `dirs: {t2s: t2s}`) |
 | `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
 
   Files at the root itself default to `chat`; files under any other
   subdirectory (`img/` when not opted in, `misc/`, `tmp/`,
-  `hf_hub/`, … — and `s2t/`, `img/` when not opted in) are **skipped** — one summary line per run names the
+  `hf_hub/`, … — and `s2t/`, `t2s/`, `img/` when not opted in) are **skipped** — one summary line per run names the
   skipped directories so nothing disappears silently. The whitelist is
   extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
   via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).

@@ -29,12 +29,14 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - vLLM docker — same, wrapped in `docker run` with bind-mounts for chat-template/lora dirs; per-model `vllm_image:` override
 - sd-server — stable-diffusion.cpp image generation (`role: image`, opt-in via `dirs: {img: image}`)
 - whisper-server — whisper.cpp speech-to-text (`role: s2t`, opt-in via `dirs: {s2t: s2t}`; GGML `.bin` + authored sidecar)
+- kokoro-podman — Kokoro-82M text-to-speech in rootless podman (`role: t2s`, opt-in via `dirs: {t2s: t2s}`; vendor-detected NVIDIA/AMD/CPU image)
 - Backend selection: sidecar/override `backend:` wins (validated against profiles.yaml `backends:` enable list); else inferred from file format + roles, gated by the enable list and configured resources (see SPEC.md "Backend Selection")
 - See SPEC.md "vLLM Backend" + "Override Rules" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
 
 ## Docs
 
-- [README.md](README.md) — usage, sidecar example
+- [README.md](README.md) — usage, sidecar example, directional modalities
+- [FAQ.md](FAQ.md) — why HF-hub models don't show up and how to serve them (sidecar `model:`+`hf_repo:` vs symlinks)
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes

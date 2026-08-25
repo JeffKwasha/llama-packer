@@ -507,13 +507,14 @@ _DEFAULT_DIR_ROLES = {
 }
 
 # Roles a served directory may map to (companions are detected by filename,
-# never by directory).  ``s2t`` (whisper.cpp speech-to-text) is opt-in via
-# profiles.yaml ``dirs: {s2t: s2t}``, mirroring ``img: image``.
-SERVED_ROLES = ("chat", "embeddings", "rerank", "image", "s2t")
+# never by directory).  ``s2t`` (whisper.cpp speech-to-text) and ``t2s``
+# (kokoro text-to-speech) are opt-in via profiles.yaml ``dirs:``, mirroring
+# ``img: image``.
+SERVED_ROLES = ("chat", "embeddings", "rerank", "image", "s2t", "t2s")
 
 # Roles excluded from chat-specific passes: mmproj keep/drop, the shared
 # chat+emb+rnk matrix solve, and matrix var collection.
-NON_CHAT_ROLES = ("embeddings", "rerank", "image", "s2t")
+NON_CHAT_ROLES = ("embeddings", "rerank", "image", "s2t", "t2s")
 
 
 def validate_dir_roles(dir_roles: dict) -> str | None:

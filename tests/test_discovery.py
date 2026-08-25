@@ -357,15 +357,55 @@ def test_s2t_not_opted_in_is_skipped(tmp_path):
 def test_bin_outside_s2t_never_served(tmp_path, caplog):
     # A .bin next to a sidecar in a non-s2t role resolves by stem (ordered
     # last), but no backend supports .bin outside whisper-server's s2t role —
-    # finalize flags it and _filter_supported drops it from the config.
+    # finalize flags it (warning: expected in ordinary fleets, not an
+    # operator error) and _filter_supported drops it from the config.
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "mysterious.bin").write_bytes(b"x")
     (root / "chat" / "mysterious.md").write_text(_sidecar("Mystery"))
 
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.WARNING):
         models = Model.from_dir(root, generate_stubs=False)
     assert len(models) == 1
     assert getattr(models[0], "_override_error", None) is not None
     assert any("no available backend supports format '.bin'" in r.message
                for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR
+                   and "no available backend" in r.message
+                   for r in caplog.records)
+
+
+# ── t2s (kokoro) discovery ────────────────────────────────────────────────
+
+def test_t2s_optin_hf_repo_only_sidecar(tmp_path, caplog):
+    # Kokoro weights are baked into the container image: a t2s sidecar needs
+    # no local model file at all — hf_repo alone identifies it.
+    from llama_packer.backends import infer_backend
+    root = tmp_path / "models"
+    (root / "t2s").mkdir(parents=True)
+    (root / "t2s" / "kokoro-v1.md").write_text(
+        "---\nname: kokoro-v1\nhf_repo: hexgrad/Kokoro-82M\n---\n")
+
+    with caplog.at_level(logging.ERROR):
+        models = Model.from_dir(root, generate_stubs=False,
+                                dir_roles={"t2s": "t2s"})
+    assert len(models) == 1
+    m = models[0]
+    assert m.role == "t2s"
+    # Backend inference needs the configured image (from_dir passes no avail,
+    # so availability gating happens at pack time, not discovery time).
+    assert infer_backend(m, {"kokoro_image": "img"}) == "kokoro-podman"
+
+
+def test_t2s_onnx_sidecar_stem_resolves(tmp_path):
+    # A locally downloaded .onnx copy resolves by same-stem convention.
+    root = tmp_path / "models"
+    (root / "t2s").mkdir(parents=True)
+    (root / "t2s" / "kokoro-v1.onnx").write_bytes(b"x")
+    (root / "t2s" / "kokoro-v1.md").write_text(_sidecar("Kokoro v1"))
+
+    models = Model.from_dir(root, generate_stubs=False,
+                            dir_roles={"t2s": "t2s"})
+    assert len(models) == 1
+    assert models[0].gguf_path is not None
+    assert models[0].gguf_path.name == "kokoro-v1.onnx"

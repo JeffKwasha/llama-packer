@@ -213,6 +213,9 @@ def _build_entry(
     elif model.role == "s2t":
         in_mods = ["audio"]
         out_mods = ["text"]
+    elif model.role == "t2s":
+        in_mods = ["text"]
+        out_mods = ["audio"]
     else:
         in_mods = ["text"]
         out_mods = ["text"]

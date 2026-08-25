@@ -20,11 +20,12 @@ matches the model file next to it:
 | `rerank/<name>.gguf` | rerank model |
 | `img/<name>.gguf` | image model (sd-server; opt-in via `dirs: {img: image}` in `profiles.yaml`) |
 | `s2t/<name>.bin` | speech-to-text model (whisper-server; opt-in via `dirs: {s2t: s2t}`; requires an authored same-stem `.md`) |
+| `t2s/<name>.md` | text-to-speech model (kokoro-podman; opt-in via `dirs: {t2s: t2s}`; weights are baked into the image — `hf_repo: hexgrad/Kokoro-82M` alone suffices) |
 
 Orphan files under `embed/`/`rerank`/`doc/` get empty stub sidecars automatically
 (the role comes from the directory, not the stub). Whisper `.bin` models are
 never stubbed — write the sidecar yourself. Other subdirs (`misc/`,
-`tmp/`, `hf_hub/`, … — and `img/`, `s2t/` when not opted in)
+`tmp/`, `hf_hub/`, … — and `img/`, `s2t/`, `t2s/` when not opted in)
 are not served — extend via profiles.yaml `dirs:` (skipped dirs are listed in
 the run log). A `.modelignore` at a models root excludes files/subtrees in
 place (one glob per line, `#` comments).
@@ -101,7 +102,7 @@ quantization: Q4_K_M         # exact suffix from snapshot filename: Q4_K_M, Q6_K
 hf_url: https://huggingface.co/org/model  # keep on one line
 description: "one-line summary."
 # --- serving (only what the model needs) ---
-role: chat                  # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server)
+role: chat                  # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server) | t2s (kokoro-podman)
 model: model.gguf           # snapshot filename when file lives in HF cache (with hf_repo:)
 hf_repo: org/model          # HF cache repo id — required with model: for cache files
 # mmproj: model-mmproj.gguf   # only if snapshot actually contains *mmproj*.gguf
@@ -141,17 +142,21 @@ set `dirs: {img: image}` and `backends: [llama-server, sd-server]` in
 `profiles.yaml`. Speech-to-text (whisper-server) is opt-in the same way:
 `s2t/` dir + `dirs: {s2t: s2t}` + `backends: [..., whisper-server]`, with an
 authored same-stem `.md` beside each GGML `.bin` (no stubs are generated).
+Text-to-speech (kokoro-podman) is opt-in via `t2s/` + `dirs: {t2s: t2s}` —
+weights and voices are baked into the container image, so the sidecar only
+needs `hf_repo: hexgrad/Kokoro-82M`.
 The `proxy` and
 `checkEndpoint: /` fields are emitted automatically for proxied entries —
-`sd-server` and `whisper-server`
+`sd-server`, `whisper-server`, and `kokoro-podman`
 (the default `/health` never returns 200 for sd-server — see `docs/plans/comfyui-sd.md`).
 
 ## Roles and directories
 
 `role:` selects how a model is served — `chat` (default), `embeddings`,
-`rerank`, `image` (sd-server), or `s2t` (whisper-server). Inferred from the top-level directory (`chat`/`t2t`/`vision`/`doc/` →
-chat, `embed/` → embeddings, `rerank/` → rerank, `img/` → image and `s2t/` → s2t
-when opted in; root defaults to chat) or from
+`rerank`, `image` (sd-server), `s2t` (whisper-server), or `t2s`
+(kokoro-podman). Inferred from the top-level directory (`chat`/`t2t`/`vision`/`doc/` →
+chat, `embed/` → embeddings, `rerank/` → rerank, `img/` → image and `s2t/` →
+s2t and `t2s/` → t2s when opted in; root defaults to chat) or from
 `type:` containing `embedding`/`rerank`/`image`; declare `role:` to override. Roots and
 role map are configured in profiles.yaml (`models_dirs:` + `dirs:`); the enable
 list `backends:` there also gates which backends are usable. See SPEC.md.
@@ -165,7 +170,7 @@ list `backends:` there also gates which backends are usable. See SPEC.md.
 | `concurrency: N` | Per-model concurrency limit |
 | `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
 | `reasoning-format` / `reasoning-preserve` | Chat + reasoning only (see above) |
-| `cache_type` / `parallel` | KV-cache precision / parallel slots + VRAM sizing (chat only; image/s2t fixed 512 MiB overhead) |
+| `cache_type` / `parallel` | KV-cache precision / parallel slots + VRAM sizing (chat only; image/s2t fixed 512 MiB, t2s fixed 3072 MiB overhead) |
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `ignore: true` | Skip this model entirely |

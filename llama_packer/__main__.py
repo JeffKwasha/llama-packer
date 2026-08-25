@@ -15,7 +15,7 @@ from pathlib import Path
 import yaml
 
 from llama_packer import Model, __version__, find_bin_dir
-from llama_packer.hardware import GpuProfile
+from llama_packer.hardware import GpuProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
@@ -27,7 +27,11 @@ from llama_packer.utils import (
     validate_dir_roles, NON_CHAT_ROLES,
 )
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
-from llama_packer.backends import SD_BACKENDS, VLLM_BACKENDS, validate_backend_names
+from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
+                                   validate_backend_names)
+from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES, KOKORO_CONTAINER_PORT
+
+
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -106,6 +110,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
     parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
                         "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
+    parser.add_argument("--kokoro-image", help="container image for `kokoro-podman` backend "
+                        "(overrides profiles.yaml t2s.image; default: vendor-detected upstream image)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -371,6 +377,19 @@ def main(argv: list[str] | None = None) -> None:
             cand = cand / "whisper-server"
         whisper_bin = str(cand)
 
+    # kokoro-podman resource configuration (CLI > profiles.yaml `t2s:` section >
+    # vendor-detected upstream image).  `vendor:` (auto|nvidia|amd|cpu) picks
+    # the default image tag AND device flags; `image:`/--kokoro-image overrides
+    # the tag only; `podman_args:` replaces the auto device flags entirely.
+    t2s_cfg = profiles_cfg.get("t2s") or {}
+    kokoro_vendor = str(t2s_cfg.get("vendor") or detect_gpu_vendor())
+    if kokoro_vendor not in KOKORO_DEFAULT_IMAGES:
+        logger.warning("profiles.yaml t2s.vendor: %r unknown (auto/nvidia/amd/cpu); "
+                       "using cpu defaults", kokoro_vendor)
+        kokoro_vendor = "cpu"
+    kokoro_image = str(args.kokoro_image or t2s_cfg.get("image")
+                       or KOKORO_DEFAULT_IMAGES[kokoro_vendor])
+
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
     # pushed/popped around its level.  Defaults, rules, companion resolution
@@ -382,6 +401,7 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
             "whisper_bin": whisper_bin or "",
+            "kokoro_image": kokoro_image,
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
@@ -447,6 +467,13 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["vllm_bin"] = vllm_bin
     template_vars.setdefault("sd_bin", "sd-server")
     template_vars.setdefault("whisper_bin", "whisper-server")
+    template_vars["kokoro_image"] = kokoro_image
+    template_vars["kokoro_vendor"] = kokoro_vendor
+    template_vars["podman_args"] = str(t2s_cfg.get("podman_args") or "")
+    template_vars["kokoro_container_port"] = str(
+        t2s_cfg.get("container_port") or KOKORO_CONTAINER_PORT)
+    if t2s_cfg.get("voices_dir"):
+        template_vars["voices_dir"] = str(t2s_cfg["voices_dir"])
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)

@@ -152,9 +152,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
            hf_home, out: list[Model]) -> None:
     """The single model pipeline: merge → construct → rules → companions → finalize."""
     merged = stack.merge_defaults(frontmatter)
-    # A model in embed//rerank/image/s2t inherits its role from the location
-    # when its own data (sidecar or defaults) does not declare one.
-    if role in ("embeddings", "rerank", "image", "s2t") and "role" not in merged:
+    # A model in embed//rerank/image/s2t/t2s inherits its role from the
+    # location when its own data (sidecar or defaults) does not declare one.
+    if role in ("embeddings", "rerank", "image", "s2t", "t2s") and "role" not in merged:
         merged["role"] = role
     try:
         model = Model(path, merged, hf_home=hf_home)
@@ -195,9 +195,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
 
 
 def _effective_role(fm: dict, role: str | None) -> str | None:
-    """Role for a sidecar: an embeddings/rerank/image/s2t *directory* wins, then
-    the explicit ``role:``, then a ``type:`` field containing embed/rerank/image."""
-    if role in ("embeddings", "rerank", "image", "s2t"):
+    """Role for a sidecar: an embeddings/rerank/image/s2t/t2s *directory* wins,
+    then the explicit ``role:``, then a ``type:`` field containing embed/rerank/image."""
+    if role in ("embeddings", "rerank", "image", "s2t", "t2s"):
         return role
     explicit = str(fm.get("role") or "")
     if explicit:
@@ -216,7 +216,7 @@ def _model_from_sidecar(md_path: Path, root: Path, role: str | None,
                         stack: ScopeStack, hf_home, out: list[Model]) -> None:
     fm = utils.parse_frontmatter(md_path)
     if not fm and not any(md_path.with_suffix(e).is_file()
-                          for e in (".gguf", ".safetensors", ".bin")):
+                          for e in (".gguf", ".safetensors", ".bin", ".onnx")):
         return  # no data and no model beside it: not a sidecar (README, ...)
     if fm.get("ignore"):
         logger.info("ignore: skipping %s", md_path.name)
