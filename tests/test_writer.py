@@ -192,3 +192,64 @@ def test_cache_type_and_parallel_not_in_metadata(make_model):
     assert "cache_type" not in entry["metadata"]
     assert "parallel" not in entry["metadata"]
 
+
+# ── Directional modalities ────────────────────────────────────────────────
+# llama-swap derives badges from capabilities.in/out: vision = image INPUT,
+# Image Gen = text→image OUT, Img→Img = image→image.  A VLM must therefore
+# never advertise image on the output side.
+
+
+def _entry_of(model):
+    return _build_entry(
+        model,
+        parallel=1,
+        cache_type="q8_0",
+        profiles_group=[("default", {})],
+        profiles_defaults={},
+        template_vars={"llama_bin": "/opt/llama-server"},
+        context_length=32768,
+        ctx_size=32768,
+    )[1]
+
+
+def test_vision_is_input_only(make_model, tmp_path):
+    # Regression: in/out used to share one modality list, so every VLM also
+    # showed llama-swap's "Image Gen" and "Img→Img" badges.
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
+    model = make_model("v", mmproj="v-mmproj.gguf")
+    caps = _entry_of(model)["capabilities"]
+    assert caps["in"] == ["text", "image"]
+    assert caps["out"] == ["text"]
+
+
+def test_audio_capability_is_input_only(make_model):
+    # audio → Transcription badge only; Speech requires an explicit output.
+    caps = _entry_of(make_model("a", capabilities=["audio"]))["capabilities"]
+    assert caps["in"] == ["text", "audio"]
+    assert caps["out"] == ["text"]
+
+
+def test_speech_capability_adds_audio_output(make_model):
+    caps = _entry_of(make_model("s", capabilities=["speech"]))["capabilities"]
+    assert caps["in"] == ["text"]
+    assert caps["out"] == ["text", "audio"]
+
+
+def test_dropped_mmproj_removes_image_input_not_output(make_model, tmp_path):
+    (tmp_path / "t-mmproj.gguf").write_bytes(b"x")
+    model = make_model("t", mmproj="t-mmproj.gguf")
+    _, entry = _build_entry(
+        model,
+        parallel=1,
+        cache_type="q8_0",
+        profiles_group=[("default", {})],
+        profiles_defaults={},
+        template_vars={"llama_bin": "/opt/llama-server"},
+        context_length=32768,
+        ctx_size=32768,
+        include_mmproj=False,
+    )
+    caps = entry["capabilities"]
+    assert caps["in"] == ["text"]
+    assert caps["out"] == ["text"]
+

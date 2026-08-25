@@ -508,7 +508,7 @@ _DEFAULT_DIR_ROLES = {
 
 # Roles a served directory may map to (companions are detected by filename,
 # never by directory).
-SERVED_ROLES = ("chat", "embeddings", "rerank")
+SERVED_ROLES = ("chat", "embeddings", "rerank", "image")
 
 
 def validate_dir_roles(dir_roles: dict) -> str | None:
@@ -527,6 +527,191 @@ def companion_kind(stem: str) -> str | None:
         return "mmproj"
     if _is_mtp_companion(stem):
         return "mtp"
+    return None
+
+
+# ── Model-kind classification ─────────────────────────────────────────
+#
+# Header-only classification of a weight file into "text" (LLM family),
+# "image" (diffusion/image/video generation weights) or "unknown".  Never
+# reads tensor data — GGUF metadata KV walk or the safetensors JSON header.
+# Classification drives the discovery guard that keeps diffusion weights
+# out of served text roles; the vocabulary below comes from converter
+# architecture strings and tensor names, never filenames.
+
+# Prefixes of stable-diffusion.cpp / ComfyUI ``general.architecture``
+# values (flux1, sdxl, sd3.5, wan2.1, …).  Architecture names are a
+# controlled vocabulary set by the gguf conversion scripts, so prefix
+# matching here is reliable — unlike filename matching (e.g. MiniMax H3).
+_DIFFUSION_ARCH_RES = tuple(re.compile(p, re.I) for p in (
+    r"^flux", r"^sd\d", r"^sdxl$", r"^ssd1", r"^stable-diffusion",
+    r"^chroma", r"^wan\d?", r"^hidream", r"^ltxv?$", r"^hunyuan",
+    r"^mochi", r"^cosmos", r"^auraflow", r"^pixart", r"^kandinsky",
+    r"^sana", r"^ace-?step", r"^omnigen", r"^qwen[-_]?image",
+    r"^z-?image", r"^ernie[-_]?image", r"^lumina", r"^sdx?-?l",
+))
+
+# Safetensors tensor-name fragments unique to diffusion weights (DiT/UNet/
+# VAE blocks).  Text-model transformers never use these block layouts.
+_ST_DIFFUSION_MARKERS = (
+    ".img_attn.", ".img_mlp.", ".img_mod.", ".txt_attn.", ".txt_mlp.",
+    "double_blocks.", "single_blocks.", "input_blocks.", "output_blocks.",
+    "middle_blocks.", "model.diffusion_model.", "first_stage_model.",
+    "cond_stage_model.", ".up_blocks.", ".down_blocks.", ".mid_block.",
+)
+
+# Safetensors tensor-name fragments of autoregressive / pooling text models.
+_ST_TEXT_MARKERS = (
+    ".layers.", "self_attn", ".attention.", "k_proj", "embed_tokens",
+    "lm_head", "encoder.layer", "transformer.h.", ".h.0.",
+)
+
+_GGUF_PROBE_CACHE: dict[tuple[str, int], tuple[str | None, bool]] = {}
+
+
+def gguf_header_probe(path: str | os.PathLike) -> tuple[str | None, bool]:
+    """Read ``(general.architecture, has_context_length)`` from a GGUF header.
+
+    Same dependency-free KV walk as :func:`read_gguf_context_length`; returns
+    ``(None, False)`` for non-GGUF or unparseable files.  Cached per mtime.
+    """
+    import struct
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None, False
+    key = (str(path), st.st_mtime_ns)
+    if key in _GGUF_PROBE_CACHE:
+        return _GGUF_PROBE_CACHE[key]
+    arch: str | None = None
+    has_ctx = False
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                raise ValueError
+            f.read(12)  # version + tensor_count
+            (n_kv,) = struct.unpack("<Q", f.read(8))
+            widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4,
+                      7: 1, 10: 8, 11: 8, 12: 8}
+            for _ in range(n_kv):
+                (klen,) = struct.unpack("<Q", f.read(8))
+                if klen > 4096:
+                    raise ValueError
+                key_s = f.read(klen).decode(errors="replace")
+                (vtype,) = struct.unpack("<I", f.read(4))
+                if vtype == 8:
+                    (slen,) = struct.unpack("<Q", f.read(8))
+                    raw = f.read(slen)
+                    if key_s == "general.architecture":
+                        arch = raw.decode(errors="replace")
+                        if has_ctx:
+                            break
+                elif vtype == 9:  # array
+                    (etype,) = struct.unpack("<I", f.read(4))
+                    (alen,) = struct.unpack("<Q", f.read(8))
+                    esize = widths.get(etype, 4)
+                    if etype == 8:
+                        for _ in range(alen):
+                            (elen,) = struct.unpack("<Q", f.read(8))
+                            f.seek(elen, 1)
+                    else:
+                        f.seek(esize * alen, 1)
+                elif vtype in widths:
+                    f.seek(widths[vtype], 1)
+                else:
+                    raise ValueError
+                if key_s.endswith(".context_length"):
+                    has_ctx = True
+                    if arch is not None:
+                        break
+    except (OSError, ValueError, struct.error):
+        pass
+    _GGUF_PROBE_CACHE[key] = (arch, has_ctx)
+    return arch, has_ctx
+
+
+def sniff_safetensors(path: str | os.PathLike, limit: int = 64) -> str:
+    """Classify a safetensors file by its header tensor names.
+
+    Returns ``"image"`` when diffusion DiT/UNet/VAE block names appear,
+    ``"text"`` when transformer/pooling names appear, else ``"unknown"``.
+    Reads only the JSON header, never tensor data.
+    """
+    import json
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(8)
+            if len(magic) < 8:
+                return "unknown"
+            n = int.from_bytes(magic, "little")
+            header = json.loads(fh.read(n).decode("utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return "unknown"
+    names = [k for k in header if k != "__metadata__"][:limit]
+    joined = "\n".join(names)
+    if any(m in joined.lower() for m in _ST_DIFFUSION_MARKERS):
+        return "image"
+    if any(m in joined.lower() for m in _ST_TEXT_MARKERS):
+        return "text"
+    return "unknown"
+
+
+def classify_file(path: str | os.PathLike) -> str:
+    """Header-only kind of a weight file: ``"text"``, ``"image"``, or ``"unknown"``."""
+    p = str(path)
+    if p.lower().endswith(".gguf"):
+        arch, has_ctx = gguf_header_probe(p)
+        if arch:
+            if any(rx.search(arch) for rx in _DIFFUSION_ARCH_RES):
+                return "image"
+            if has_ctx:
+                return "text"
+        return "unknown"
+    if p.lower().endswith(".safetensors"):
+        return sniff_safetensors(p)
+    return "unknown"
+
+
+def hf_readme_kind(repo_id: str, hf_home=None) -> str | None:
+    """Kind implied by the locally cached HF model card's ``pipeline_tag``.
+
+    Reads ``pipeline_tag`` (and falls back to ``tags``) from the snapshot
+    ``README.md`` frontmatter — offline, zero network.  Returns ``"image"``
+    for image/video generation tags, ``None`` when unresolved or anything
+    else.  Online cross-check: ``hf models info <repo>``.
+    """
+    tag_map = {
+        "text-to-image": "image", "image-to-image": "image",
+        "unconditional-image-generation": "image", "inpainting": "image",
+        "text-to-video": "image", "image-to-video": "image",
+    }
+    snap = hf_snapshot_dir(repo_id, hf_home)
+    if snap is None:
+        return None
+    rm = snap / "README.md"
+    if not rm.is_file():
+        return None
+    try:
+        content = rm.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not content.startswith("---"):
+        return None
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        fm = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return None
+    pt = str(fm.get("pipeline_tag") or "")
+    hit = tag_map.get(pt.lower())
+    if hit:
+        return hit
+    for t in (fm.get("tags") or []):
+        hit = tag_map.get(str(t).lower())
+        if hit:
+            return hit
     return None
 
 

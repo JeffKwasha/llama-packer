@@ -37,6 +37,7 @@ class Model:
         "ignore", "device", "concurrency", "fit-params", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel",
+
     })
 
     def __init__(self, md_path: Path, frontmatter: dict, hf_home=None):
@@ -416,10 +417,10 @@ class Model:
 
     @property
     def role(self) -> str:
-        """Role this model plays: ``chat``, ``embeddings``, or ``rerank``.
+        """Role this model plays: ``chat``, ``embeddings``, ``rerank``, or ``image``.
 
         Defaults to ``chat``. Discovery (``from_dir``) injects the role derived
-        from a model's directory (``embed/``/``rerank/``) or ``type:`` field
+        from a model's directory (``embed/``/``rerank/``/``img/``) or ``type:`` field
         when the sidecar does not declare one explicitly.
         """
         return str(self.frontmatter.get("role") or "chat")

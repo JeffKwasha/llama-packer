@@ -27,6 +27,7 @@ chat/
 # Large build artifacts / model weights (not source)
 .old/
 llama-b*/
+stable-diffusion*/
 llama-swap
 
 # uv / setuptools build artifacts

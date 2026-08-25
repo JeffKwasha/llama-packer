@@ -106,5 +106,6 @@ Serve a model with vLLM instead of llama-server via an override rule in `profile
 - Support multi-image/tensor-parallel vLLM provisioning
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
-- ComfyUI + stable-diffusion.cpp backends via llama-swap — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `sd-server` / `comfyui-boot` syntax findings (`checkEndpoint: /`, `/comfyui/` + `compat.ignoreWebsockets`, unified image)
+- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [SPEC.md](SPEC.md#image-backend-sd-server) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
 - Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)

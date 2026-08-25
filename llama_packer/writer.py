@@ -199,20 +199,35 @@ def _build_entry(
     # through automatically; only builder-consumed keys are excluded.
     metadata = model.pass_through_metadata()
 
-    caps = list(model.capabilities)
-    modalities = ["text"]
-    if "vision" in caps:
-        modalities.append("image")
-    if "audio" in caps:
-        modalities.append("audio")
+    # Directional modalities (llama-swap derives badges from these):
+    # vision → image INPUT; audio → audio INPUT (Transcription);
+    # speech → audio OUTPUT. Output stays text unless `speech` is declared,
+    # so a VLM never advertises text→image ("Image Gen") or image→image.
+    # role=image (sd-server) → diffusion outputs image; input is text+image
+    # (txt2img + img2img editing) so both Image Gen and Img→Img badges appear.
+    caps_l = [c.lower() for c in model.capabilities]
+    if model.role == "image":
+        in_mods = ["text", "image"]
+        out_mods = ["image"]
+    else:
+        in_mods = ["text"]
+        out_mods = ["text"]
+        if "vision" in caps_l:
+            in_mods.append("image")
+        if "audio" in caps_l:
+            in_mods.append("audio")
+        if "speech" in caps_l:
+            out_mods.append("audio")
 
-    # When mmproj is dropped, remove the (auto-added) vision capability so the
-    # main entry no longer advertises image input.
-    if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
-        caps = [c for c in caps if c.lower() != "vision"]
-        if "image" in modalities:
-            modalities.remove("image")
+    # When mmproj is dropped, remove the auto-added image input so the entry
+    # no longer advertises vision.  Image-role models keep image regardless.
+    if not include_mmproj and model.role != "image" and model.mmproj and model.mmproj.gguf_path:
+        caps = [c for c in model.capabilities if str(c).lower() != "vision"]
+        if "image" in in_mods:
+            in_mods.remove("image")
         metadata["mmproj_skipped"] = True
+    else:
+        caps = list(model.capabilities)
 
     tf = model.throughput_factor()
     if tf is not None:
@@ -260,10 +275,10 @@ def _build_entry(
     # > sidecar context_length > default); the VRAM-served -c limit is exposed
     # separately as metadata.ctx_size.
     entry["capabilities"] = {
-        "in": modalities,
-        "out": modalities,
-        "tools": "tools" in caps,
-        "reranker": "reranker" in caps or model.role == "rerank",
+        "in": in_mods,
+        "out": out_mods,
+        "tools": "tools" in [c.lower() for c in caps],
+        "reranker": "reranker" in caps_l or model.role == "rerank",
         "context": context_length,
     }
 
@@ -278,6 +293,14 @@ def _build_entry(
     conc = model.concurrency
     if conc is not None:
         entry["concurrencyLimit"] = conc
+
+    # Image backends (sd-server) are proxied HTTP services, not llama-swap
+    # managed inference — expose the standard proxy fields so llama-swap can
+    # health-check and route.  checkEndpoint "/" is required for sd-server
+    # (Discussion #866: /health never returns 200).
+    if model.backend == "sd-server":
+        entry["proxy"] = "http://127.0.0.1:${PORT}"
+        entry["checkEndpoint"] = "/"
 
     return entry_id, entry
 
@@ -395,7 +418,7 @@ class Planner:
         drop: dict[str, bool] = {}
         global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
         for model in self.models:
-            if model.role in ("embeddings", "rerank"):
+            if model.role in ("embeddings", "rerank", "image"):
                 continue
             if not (model.mmproj and model.mmproj.gguf_path):
                 continue
@@ -530,11 +553,10 @@ def _solve_matrix_context(
     # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     chat_params = []
     for m in chat_models:
-        # Embed/rerank models are handled via the separate overhead terms below
-        # (and CPU-resident models cost no VRAM), so they must not enter the
-        # shared chat budget — otherwise a small resident model can dictate the
-        # chat context for the whole fleet.
-        if m.role in ("embeddings", "rerank") or m.on_cpu:
+        # Embed/rerank/image models are handled outside the shared chat
+        # budget (fixed overhead / separate pool). Including a 40 GB
+        # diffusion model would collapse the chat budget, so exclude it.
+        if m.role in ("embeddings", "rerank", "image") or m.on_cpu:
             continue
         cache_type = m.cache_type_for(profiles.default_cache_type)
         parallel = m.parallel_for(profiles.default_parallel)

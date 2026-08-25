@@ -27,7 +27,7 @@ from llama_packer.utils import (
     validate_dir_roles,
 )
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
-from llama_packer.backends import VLLM_BACKENDS, validate_backend_names
+from llama_packer.backends import SD_BACKENDS, VLLM_BACKENDS, validate_backend_names
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -102,6 +102,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "(overrides profiles.yaml vllm.image)")
     parser.add_argument("--vllm-server", help="vLLM binary for `vllm` backend models "
                          "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
+    parser.add_argument("--sd-server", help="sd-server binary for `sd-server` backend "
+                         "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -187,7 +189,7 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
-        if m.role in ("embeddings", "rerank"):
+        if m.role in ("embeddings", "rerank", "image"):
             continue
         for eid in entry_ids_by_stem.get(m.stem, []):
             chat_idx += 1
@@ -227,6 +229,9 @@ def _health_check_timeout(models, args) -> int:
         drive_speed = _detect_drive_speed(model_paths)
     hct = max(120, int(1.2 * largest_mb / drive_speed))
     if any(m.backend in VLLM_BACKENDS for m in models):
+        hct = max(hct, 300)
+    # sd-server models also need generous timeout (diffusion weights load minutes)
+    if any(m.backend in SD_BACKENDS for m in models):
         hct = max(hct, 300)
     logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)",
                 hct, largest_mb, drive_speed)
@@ -333,6 +338,25 @@ def main(argv: list[str] | None = None) -> None:
     vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
     vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
 
+    # sd-server resource configuration (CLI > profiles.yaml `sd:` section >
+    # $SD_BIN_DIR > sd-server on PATH).  Single host binary for now (docker follow-up).
+    sd_cfg = profiles_cfg.get("sd") or {}
+    sd_bin_raw = args.sd_server or sd_cfg.get("bin") or os.environ.get("SD_BIN_DIR") or shutil.which("sd-server")
+    sd_bin = None
+    if sd_bin_raw:
+        raw = str(sd_bin_raw)
+        # SD_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR); expand to binary inside.
+        cand = Path(raw)
+        if cand.is_dir():
+            cand = cand / "sd-server"
+        sd_bin = str(cand) if cand else None
+        # When the explicit path doesn't exist, fall back to which() so a
+        # stale profile bin doesn't disable inference entirely.
+        if sd_bin and not Path(sd_bin).is_file() and not shutil.which(str(sd_bin)):
+            # Keep the raw value — is_available will be False, inference won't pick it,
+            # but an explicit `backend: sd-server` still reports a clear error.
+            pass
+
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
     # pushed/popped around its level.  Defaults, rules, companion resolution
@@ -342,6 +366,7 @@ def main(argv: list[str] | None = None) -> None:
             "llama_bin": llama_bin,
             "vllm_image": vllm_image,
             "vllm_bin": vllm_bin,
+            "sd_bin": sd_bin or "",
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
@@ -375,6 +400,8 @@ def main(argv: list[str] | None = None) -> None:
     # Compute optimal ${env.*} prefixes from the raw paths actually emitted,
     # then substitute them into the binary path and post-process the config.
     raw_paths = [llama_bin, fit_bin]
+    if sd_bin:
+        raw_paths.append(sd_bin)
     for _m in models:
         if getattr(_m, "_override_error", None):
             continue
@@ -392,11 +419,15 @@ def main(argv: list[str] | None = None) -> None:
     prefix_to_var, var_to_value = compute_env_prefixes(raw_paths, project_hint=llama_bin, hf_home=hf_home)
     sub = make_subst(prefix_to_var)
     template_vars["llama_bin"] = sub(llama_bin)
+    if sd_bin:
+        template_vars["sd_bin"] = sub(sd_bin)
 
     # vLLM backend defaults: already resolved above (CLI > profiles.yaml >
     # built-in constants) for backend inference.
     template_vars["vllm_image"] = vllm_image
     template_vars["vllm_bin"] = vllm_bin
+    template_vars.setdefault("sd_bin", "sd-server")
+
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
     # gpu_mem_util: explicit profiles.yaml value wins; otherwise derive the
