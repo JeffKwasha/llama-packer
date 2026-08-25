@@ -18,10 +18,11 @@ matches the model file next to it:
 | `doc/<name>.gguf` | OCR/extraction model (`ocr/` is legacy alias for `doc/`) |
 | `embed/<name>.gguf` | embeddings model (nested dirs like `embed/jina-v5/` keep the role) |
 | `rerank/<name>.gguf` | rerank model |
+| `img/<name>.gguf` | image model (sd-server; opt-in via `dirs: {img: image}` in `profiles.yaml`) |
 
 Orphan files under `embed/`/`rerank`/`doc/` get empty stub sidecars automatically
-(the role comes from the directory, not the stub). Other subdirs (`img/`,
-`misc/`, `tmp/`, `hf_hub/`, `s2t/`, …)
+(the role comes from the directory, not the stub). Other subdirs (`misc/`,
+`tmp/`, `hf_hub/`, `s2t/`, … — and `img/` when not opted in)
 are not served — extend via profiles.yaml `dirs:` (skipped dirs are listed in
 the run log). A `.modelignore` at a models root excludes files/subtrees in
 place (one glob per line, `#` comments).
@@ -61,6 +62,25 @@ referenced by filename from the parent sidecar — they are never main models:
 
 Set `mtp: true` when MTP heads are baked into the main GGUF (no companion).
 
+## Classifying model types
+
+Directory intent vs file truth: a served directory (`chat/`, `vision/`, …)
+means "text-output models live here"; an image tree (e.g. `img/` with
+`checkpoints/ diffusion_models/ text_encoders/`) means "generative-media
+pipeline assets". llama-packer classifies each *file* by its headers, never
+its filename — before writing a sidecar, verify what a file actually is:
+
+| Check | Command / method |
+|-------|------------------|
+| GGUF architecture | `gguf-dump --metadata <f>.gguf \| grep general.architecture` (or read the header: diffusion archs are `flux*`, `sdxl`, `sd3*`, `wan*`, `chroma`, …; LLM archs declare `<arch>.context_length`) |
+| Safetensors kind | Diffusion weights use DiT/UNet tensor blocks (`double_blocks.*`, `input_blocks.*`, VAE); LLMs use `layers.*.self_attn`/`k_proj`/`lm_head` |
+| HF model card | Locally cached snapshots carry `README.md` with a YAML frontmatter `pipeline_tag:` (`text-generation` vs `text-to-image`/`text-to-audio`) — offline and authoritative |
+| Not cached locally | `hf models info <org/repo>` or search hf.co (online) |
+
+Diffusion/image-generation weights placed under a served text role are excluded
+from the config with an error in the pack log — move them to the image tree
+(`img/` with `dirs: {img: image}` and `backends: [sd-server]`) or set `ignore: true`. Filenames prove nothing: classify by headers.
+
 ## Sidecar format
 
 Frontmatter must start with `---` on line 1 and end with `---`. `name:` is
@@ -79,19 +99,20 @@ quantization: Q4_K_M         # exact suffix from snapshot filename: Q4_K_M, Q6_K
 hf_url: https://huggingface.co/org/model  # keep on one line
 description: "one-line summary."
 # --- serving (only what the model needs) ---
-role: chat                  # chat (default) | embeddings | rerank
+role: chat                  # chat (default) | embeddings | rerank | image (sd-server)
 model: model.gguf           # snapshot filename when file lives in HF cache (with hf_repo:)
 hf_repo: org/model          # HF cache repo id — required with model: for cache files
 # mmproj: model-mmproj.gguf   # only if snapshot actually contains *mmproj*.gguf
 # speculative: model.mtp.gguf  # only if snapshot actually contains *mtp*.gguf
 # mtp: true                 # only when MTP heads are baked into the main GGUF
+# cli_args: "--vae ae.safetensors --lora my.safetensors"  # sd-server flags via cli_args (unstructured); also for any backend's extra flags
 # --- agent metadata (optional; passed through) ---
-capabilities: [vision, tools, reasoning, audio]
+capabilities: [vision, tools, reasoning, audio, speech]  # vision/audio = input, speech = output; image role → in:[text,image] out:[image]
 freethought: 0.7            # 0.0 = refuses; 1.0 = reasons about anything
 license: apache-2.0
 base_model: gemma-4          # family slug (gemma-4, qwen3, llama-3) — not a repo path
 finetune: instruct
-type: instruct              # descriptive label; type: embedding|rerank hints role
+type: instruct              # descriptive label; type: embedding|rerank|image hints role
 mtp_accuracy: 0.9           # MTP draft acceptance; feeds throughput estimate
 strengths: ["bash tool calling"]
 weaknesses: ["slow on 32GB"]
@@ -108,16 +129,22 @@ weaknesses: ["slow on 32GB"]
 
 Do not invent keys. `template:` is not valid — use `chat_template:` in
 `profiles.yaml`/`models.yaml` overrides (fleet-level). Backend (`backend:`) is
-also fleet-level and inferred from file type when absent (`.gguf` → llama-server,
-safetensors/`hf_repo` → vllm-docker); do not set it in sidecars. Any field not
+also fleet-level and inferred from file type when absent (`.gguf` → llama-server
+or sd-server when `role: image`, safetensors/`hf_repo` → vllm-docker); do not set it in sidecars unless pinning. Any field not
 listed above still flows through as `metadata`.
+
+Image sidecars (sd-server) are **opt-in**: put the diffusion GGUF under `img/`,
+set `dirs: {img: image}` and `backends: [llama-server, sd-server]` in
+`profiles.yaml`. The `proxy` and
+`checkEndpoint: /` fields are emitted automatically for `sd-server` entries
+(the default `/health` never returns 200 for sd-server — see `docs/plans/comfyui-sd.md`).
 
 ## Roles and directories
 
-`role:` selects how a model is served — `chat` (default), `embeddings`, or
-`rerank`. Inferred from the top-level directory (`chat`/`t2t`/`vision`/`doc/` →
-chat, `embed/` → embeddings, `rerank/` → rerank; root defaults to chat) or from
-`type:` containing `embedding`/`rerank`; declare `role:` to override. Roots and
+`role:` selects how a model is served — `chat` (default), `embeddings`,
+`rerank`, or `image` (sd-server). Inferred from the top-level directory (`chat`/`t2t`/`vision`/`doc/` →
+chat, `embed/` → embeddings, `rerank/` → rerank, `img/` → image when opted in; root defaults to chat) or from
+`type:` containing `embedding`/`rerank`/`image`; declare `role:` to override. Roots and
 role map are configured in profiles.yaml (`models_dirs:` + `dirs:`); the enable
 list `backends:` there also gates which backends are usable. See SPEC.md.
 
@@ -130,7 +157,7 @@ list `backends:` there also gates which backends are usable. See SPEC.md.
 | `concurrency: N` | Per-model concurrency limit |
 | `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
 | `reasoning-format` / `reasoning-preserve` | Chat + reasoning only (see above) |
-| `cache_type` / `parallel` | KV-cache precision / parallel slots + VRAM sizing |
+| `cache_type` / `parallel` | KV-cache precision / parallel slots + VRAM sizing (chat only; image fixed 512 MiB overhead) |
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `ignore: true` | Skip this model entirely |

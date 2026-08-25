@@ -18,9 +18,11 @@ models_dirs:
   # - /mnt/ai/models  # multiple roots allowed
 
 # Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank. CLI --extra-dirs merges similarly.
+# values must be chat | embeddings | rerank | image. CLI --extra-dirs merges similarly.
+# Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
 # dirs:
 #   it2t: chat
+#   img: image
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -29,10 +31,12 @@ models_dirs:
 
 # Backend enable/prefer list — ordered; a backend absent from the list is
 # disabled even when its resources are configured.  Omit the key to use all
-# registered backends in default order (llama-server, vllm-docker, vllm).
+# registered backends in default order (llama-server, vllm-docker, vllm, sd-server).
+# sd-server is opt-in for image generation; see the sd: section below.
 # backends:
 #   - llama-server
 #   - vllm-docker
+#   - sd-server
 
 # ── Profile definitions ────────────────────────────────
 # Each profile overlays `defaults` and emits llama-swap setParamsByID
@@ -94,6 +98,15 @@ profiles:
 #   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
 #   container_port: 8000
 #   # gpu_mem_util: 0.9  # derived from spare/reserve when omitted
+
+# ── sd-server backend (optional, image generation) ───────
+# Defaults for `backend: sd-server` (stable-diffusion.cpp).  CLI --sd-server
+# wins over this, then $SD_BIN_DIR, then `sd-server` on PATH.
+# Unlike chat models, image models are fixed VRAM (weights + 512 MiB
+# overhead) and excluded from the shared chat matrix — a 40 GB flux model won't
+# collapse the chat budget.
+# sd:
+#   bin: sd-server
 
 # ── Hardware (optional) ─────────────────────────────────
 # Override auto-detected VRAM pool. CLI --vram / --unified-system-mb win.

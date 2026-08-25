@@ -496,6 +496,58 @@ The binary (`vllm`) is resolved, highest to lowest:
 - Runs one vLLM server per model per image/binary; multi-image or cluster/tensor-parallel
   provisioning is future work.
 
+## Image Backend (sd-server)
+
+A model with `role: image` (selected via `dirs: {img: image}` and/or `type: image`) is served with
+`sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`backend: sd-server`).
+The emitted entry runs `sd-server --diffusion-model …` plus `cli_args` verbatim, proxied via llama-swap's `${PORT}`.
+
+All diffusion formats are supported: `.gguf` (flux, sdxl, sd3, wan, chroma, … — see `_DIFFUSION_ARCH_RES`) and
+`.safetensors` VAE / text-encoder companions. Classification is header-only, never filename-based.
+
+| Role | Model file | Endpoints (via llama-swap proxy) |
+|------|------------|-----------------------------------|
+| `image` | diffusion GGUF / safetensors | `/sdapi/v1/txt2img`, `/sdapi/v1/img2img`, compat `/v1/images/generations`, `/v1/images/edits` |
+
+Emission (see `docs/plans/comfyui-sd.md`):
+
+```yaml
+# sidecar: img/flux-ae.safetensors + img/flux-4b.gguf + img/flux-4b.md
+# flux-4b.md:
+# ---
+# name: flux-4b
+# # llm: qwen-4b.gguf
+# ---
+# With dirs: {img: image} and backends: [llama-server, sd-server] the entry emits:
+# cmd: sd-server --listen-port ${PORT} --listen-ip 0.0.0.0 --diffusion-model ${MODELS_DIR}/img/flux-4b.gguf  # add --vae etc. via cli_args:
+# proxy: http://127.0.0.1:${PORT}
+# checkEndpoint: /          # sd-server returns 200 on / only (not /health — Discussion #866)
+# capabilities: {in: [text, image], out: [image]}   # txt2img + img2img editing both advertised
+```
+
+### Image model resolution
+
+- `model:` (diffusion weights) resolved like all models: `model: file.gguf` relative to sidecar, then HF hub snapshot (`hf_repo` + `model:`).
+- A model with only diffusion GGUF is valid (some architectures bake the VAE).
+
+### Memory estimation
+
+`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, `ctx_factor = 0`, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM; the entry is excluded from the shared `chat + emb + rnk` matrix solve (a 40 GB diffusion model would otherwise collapse the chat budget).
+
+### Binary precedence
+
+`sd-server` is resolved: `--sd-server` CLI flag > `sd.bin` in `profiles.yaml` > `$SD_BIN_DIR` (file or directory containing `sd-server`) > `sd-server` on `PATH`. Absent binary disables format-based inference; an explicit `backend: sd-server` pin to a disabled setup is an error that skips the model. Docker variant is future work (tracked in `docs/plans/comfyui-sd.md`).
+
+### Capabilities
+
+`role: image` emits `capabilities: {in: [text, image], out: [image], context: design_context}` — image outputs, text+image inputs (so llama-swap shows both `Image Gen` and `Img→Img` badges). `vision/audio/speech` capabilities are ignored for `image` roles (those are chat-only). `proxy` / `checkEndpoint` are always emitted for `sd-server` entries.
+
+### Limitations
+
+- Single `sd-server` per diffusion model; no multi-UNet or distributed setup.
+- VRAM sizing is fixed and deliberately conservative — large flux/sdxl models should be sized via `spare` / `baseline` or explicit `hardware.vram` tuning, not matrix sharing.
+- `cli_args` pass-through works, but backend-specific flags (`--diffusion-fa`, `--offload-to-cpu`, `--lora-model-dir`) are operator-provided via sidecar `cli_args:` until first-class `sd_*` keys are added.
+- ComfyUI (`comfyui-boot`) remains future work via the same `image` role — see `docs/plans/comfyui-sd.md` for `compat.ignoreWebsockets` / `upstream.ignorePaths` shape.
 
 ## Override Rules
 
@@ -640,13 +692,14 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 
 profiles.yaml's ordered `backends:` list both **enables** and **prioritizes**
 backends; when absent, every registered backend is usable in registration
-order (`llama-server`, `vllm-docker`, `vllm`):
+order (`llama-server`, `vllm-docker`, `vllm`, `sd-server`):
 
 ```yaml
 # profiles.yaml
 backends:
   - llama-server    # tried first for everything it can serve
   - vllm-docker     # enabled, second preference
+  - sd-server       # image generation (opt-in; needs dirs: img: image)
   # vllm            # absent = disabled, even with resources configured
 ```
 
@@ -731,9 +784,10 @@ pushed, its models are built, then children are visited:
   | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
   | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
   | `rerank` | `rerank` | Reranker models |
+  | `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
 
   Files at the root itself default to `chat`; files under any other
-  subdirectory (`img/` for stable-diffusion-only models, `misc/`, `tmp/`,
+  subdirectory (`img/` when not opted in, `misc/`, `tmp/`,
   `hf_hub/`, `s2t/`, …) are **skipped** — one summary line per run names the
   skipped directories so nothing disappears silently. The whitelist is
   extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
@@ -887,7 +941,7 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `capabilities` | list | `[vision, tools, reasoning, audio]`; `vision` auto-added if a companion `mmproj` exists. Mapped to the native llama-swap `capabilities` block |
+| `capabilities` | list | `[vision, tools, reasoning, audio, speech]`; `vision` auto-added if a companion `mmproj` exists. Mapped to the native llama-swap `capabilities` block (directional, see below) |
 | `freethought` | float 0–1 | `1.0` reasons about anything; `0.0` readily refuses "distasteful" topics. Carried in `metadata` |
 | `strengths` / `weaknesses` | list | Concise task phrases agents match on |
 | `license` / `base_model` / `finetune` / `type` | str | Identity; carried in `metadata` |
@@ -899,7 +953,8 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 ### Derived fields (computed, not authored)
 
-- **`capabilities`** (native block): `in`/`out` = `["text"]` + `"image"` if `vision` in capabilities + `"audio"` if `audio`; `tools`/`reranker` boolean flags; `context` = design context (the model's maximum trained context: GGUF architectural max > sidecar `context_length` > default).
+- **`capabilities`** (native block): directional modalities, matching llama-swap's badge derivation — `in` = `["text"]` + `"image"` if `vision` + `"audio"` if `audio`; `out` = `["text"]` + `"audio"` if `speech`. Output stays text unless `speech` is declared, so a vision model never advertises text→image (`Image Gen`) or image→image (`Img→Img`). `tools`/`reranker` boolean flags; `context` = design context (the model's maximum trained context: GGUF architectural max > sidecar `context_length` > default).
+- **Model-kind guard**: every candidate in a served role is classified header-only (`general.architecture` + `<arch>.context_length` for GGUF; tensor-name blocks for safetensors; cached HF card `pipeline_tag` as offline fallback). Weights classified as diffusion/image-generation are excluded with an error log instead of being served.
 - **`throughput_factor`**: Heuristic relative speed index = `54 / (active_B × quant_bits)` × `(1 + draft_n × mtp_accuracy)` when MTP is on. Relative only — not real tok/s.
 - **`ctx_size`**: The VRAM-served context limit (`-c` / `--max-model-len`), exposed via `metadata.ctx_size`. Distinct from `capabilities.context`, which advertises the model's max trained context rather than what the deployment can currently fit.
 

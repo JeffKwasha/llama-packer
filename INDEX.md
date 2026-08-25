@@ -20,7 +20,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
 - [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)
 - [`llama_packer/discover.py`](llama_packer/discover.py) — depth-first model discovery, empty stub sidecars, HF-blobs guard
-- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, dir-role map (`_DEFAULT_DIR_ROLES`, `dir_role_map`), HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`)
+- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, dir-role map (`_DEFAULT_DIR_ROLES`, `dir_role_map`), HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`), header-only model-kind classification (`classify_file`, `gguf_header_probe`, `sniff_safetensors`, `hf_readme_kind`)
 
 ## Backends
 

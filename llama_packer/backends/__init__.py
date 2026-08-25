@@ -18,6 +18,7 @@ from llama_packer.backends.base import (
     BaseBackend,
 )
 from llama_packer.backends.llama_server import LlamaServerBackend
+from llama_packer.backends.sd_server import SdServerBackend
 from llama_packer.backends.vllm import VllmDockerBackend, VllmHostBackend
 
 if TYPE_CHECKING:
@@ -30,11 +31,12 @@ if TYPE_CHECKING:
 # host binary when both are available.
 BACKENDS: dict[str, BaseBackend] = {
     b.name: b
-    for b in (LlamaServerBackend(), VllmDockerBackend(), VllmHostBackend())
+    for b in (LlamaServerBackend(), VllmDockerBackend(), VllmHostBackend(), SdServerBackend())
 }
 
 # Backends that serve from an HF repo / safetensors rather than a local GGUF.
 VLLM_BACKENDS = frozenset({"vllm", "vllm-docker"})
+SD_BACKENDS = frozenset({"sd-server"})
 
 # Fallback backend when nothing is declared and inference cannot run
 # (e.g. a bare Model constructed outside the normal pipeline).
@@ -80,6 +82,11 @@ def infer_backend(model: "Model", avail: dict | None = None,
         candidates = [BACKENDS[n] for n in allowed if n in BACKENDS]
     for backend in candidates:
         if fmt in backend.formats and backend.is_available(avail):
+            # Role must be supported — otherwise a .gguf diffusion model under
+            # role=image would incorrectly infer llama-server and then be skipped
+            # as unsupported.  Infer the only backend that can actually serve it.
+            if model.role not in backend.roles:
+                continue
             return backend.name
     return None
 
@@ -96,6 +103,7 @@ def validate_backend_names(names) -> str | None:
 __all__ = [
     "BACKENDS",
     "VLLM_BACKENDS",
+    "SD_BACKENDS",
     "DEFAULT_BACKEND",
     "SETTING_KEYS",
     "FRAMEWORK_CONSUMED",

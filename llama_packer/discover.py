@@ -119,6 +119,11 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
                     continue  # companions join via fuzzy resolution, never walked
                 if p.with_suffix(".md").is_file():
                     continue  # authored sidecar owns this file
+                # Image role: safetensors orphans are typically companions, not
+                # standalone diffusion models. Require a sidecar to serve a safetensors
+                # image model (gguf diffusion orphans still auto-stub).
+                if role == "image" and suffix == ".safetensors":
+                    continue
                 _model_from_orphan(p, root, role, stack, generate_stubs,
                                    hf_home, out)
         for child in sorted(d.iterdir()):
@@ -140,9 +145,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
            hf_home, out: list[Model]) -> None:
     """The single model pipeline: merge → construct → rules → companions → finalize."""
     merged = stack.merge_defaults(frontmatter)
-    # A model in embed//rerank/ inherits its role from the location when its
-    # own data (sidecar or defaults) does not declare one.
-    if role in ("embeddings", "rerank") and "role" not in merged:
+    # A model in embed//rerank/image inherits its role from the location when
+    # its own data (sidecar or defaults) does not declare one.
+    if role in ("embeddings", "rerank", "image") and "role" not in merged:
         merged["role"] = role
     try:
         model = Model(path, merged, hf_home=hf_home)
@@ -152,13 +157,40 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     stack.apply_rules(model)
     model.resolve_companions()
     stack.finalize(model)
+    # Guard: keep generative-media weights out of served text roles.  The
+    # classification is header-only (GGUF metadata / safetensors names /
+    # cached HF model card) and never blocks the run — one error log per
+    # offending file, then the model is excluded from the config.
+    # The `image` role is exempt — diffusion weights are expected there.
+    if model.role in utils.SERVED_ROLES and model.role != "image" and model.gguf_path:
+        kind = utils.classify_file(model.gguf_path)
+        if kind == "unknown" and model.hf_repo:
+            kind = utils.hf_readme_kind(model.hf_repo, hf_home) or "unknown"
+        if kind == "image":
+            logger.error(
+                "%s: diffusion/image weights classified in a served %s role "
+                "(header check); excluded. Move under an image dir, set "
+                "`ignore: true`, or extend dirs: in profiles.yaml",
+                path.name, model.role)
+            return
+    # Guard: image role should only serve diffusion/image weights — skip
+    # textual-inversion embeddings, loras, and other assets that live under
+    # img/ but are not diffusion models themselves (they are companions).
+    if model.role == "image" and model.gguf_path:
+        kind = utils.classify_file(model.gguf_path)
+        if kind == "unknown" and model.hf_repo:
+            kind = utils.hf_readme_kind(model.hf_repo, hf_home) or "unknown"
+        if kind != "image":
+            logger.info("skipping %s: not diffusion/image weights in image role (kind=%s)",
+                        path.name, kind)
+            return
     out.append(model)
 
 
 def _effective_role(fm: dict, role: str | None) -> str | None:
-    """Role for a sidecar: an embeddings/rerank *directory* wins, then the
-    explicit ``role:``, then a ``type:`` field containing embed/rerank."""
-    if role in ("embeddings", "rerank"):
+    """Role for a sidecar: an embeddings/rerank/image *directory* wins, then
+    the explicit ``role:``, then a ``type:`` field containing embed/rerank/image."""
+    if role in ("embeddings", "rerank", "image"):
         return role
     explicit = str(fm.get("role") or "")
     if explicit:
@@ -168,6 +200,8 @@ def _effective_role(fm: dict, role: str | None) -> str | None:
         return "rerank"
     if "embed" in typ:
         return "embeddings"
+    if "image" in typ:
+        return "image"
     return role
 
 
