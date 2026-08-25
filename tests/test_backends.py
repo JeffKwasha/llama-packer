@@ -440,3 +440,53 @@ def test_unsupported_reason_accepts_vllm_rerank(make_model):
     m.gguf_path = None
     m.frontmatter["hf_url"] = "https://huggingface.co/org/R3-rerank"
     assert infer_backend(m, {"vllm_image": "img"}) == "vllm-docker"
+
+
+# ── whisper-server backend ────────────────────────────────────────────────
+
+def test_whisper_server_registered():
+    b = get_backend("whisper-server")
+    assert b.formats == {".bin"}
+    assert b.roles == {"s2t"}
+    assert b.proxied is True
+
+
+def test_whisper_server_requires_binary(make_model):
+    b = get_backend("whisper-server")
+    assert not b.is_available({})
+    assert b.is_available({"whisper_bin": "/opt/whisper-server"})
+
+
+def test_whisper_server_cmd(make_model):
+    m = make_model("w", role="s2t")
+    m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
+    cmd, meta = get_backend("whisper-server").build_cmd(
+        m, 32768, 1, "q8_0", {"whisper_bin": "/opt/whisper-server"})
+    assert cmd.startswith("/opt/whisper-server --host 0.0.0.0 --port ${PORT}")
+    assert "--model /models/s2t/ggml-large-v3.bin" in cmd
+    assert "--parallel 1" in cmd
+    assert meta == {}
+
+
+def test_whisper_server_cli_args_pass_through(make_model):
+    m = make_model("w", role="s2t", cli_args="--language en")
+    m.gguf_path = Path("/models/s2t/ggml-base.bin")
+    cmd, _ = get_backend("whisper-server").build_cmd(
+        m, 32768, 1, "q8_0", {"whisper_bin": "whisper-server"})
+    assert "--language en" in cmd
+
+
+def test_infer_backend_whisper(make_model):
+    from llama_packer.backends import infer_backend
+    m = make_model("w", role="s2t")
+    m.gguf_path = Path("/models/s2t/ggml-base.bin")
+    # No whisper binary configured → no inference.
+    assert infer_backend(m, {"llama_bin": "/opt/llama"}) is None
+    # Configured → whisper-server wins for role s2t (.bin is not .gguf anyway).
+    assert infer_backend(m, {"llama_bin": "/opt/llama",
+                             "whisper_bin": "/opt/whisper-server"}) == "whisper-server"
+
+
+def test_fixed_overhead_backends_include_whisper():
+    from llama_packer.backends import FIXED_OVERHEAD_BACKENDS
+    assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server"}

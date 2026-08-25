@@ -41,6 +41,26 @@ Output goes to `config.yaml` (`--output` overrides the path) and a sibling `conf
 
 See [SPEC.md](SPEC.md) for the full schema and [docs/architecture.md](docs/architecture.md) for how it fits together.
 
+## Directional modalities
+
+Each entry advertises `capabilities.in` / `capabilities.out` (llama-swap derives
+UI badges from these), driven by `role:` plus declared capabilities:
+
+| Role | Directory | in → out | Backend | Endpoint |
+|------|-----------|----------|---------|----------|
+| `chat` | `chat/` `vision/` `doc/` | text (+image if vision, +audio if audio) → text (+audio if speech) | llama-server / vLLM | `/v1/chat/completions` |
+| `embeddings` | `embed/` | text → vectors | llama-server / vLLM | `/v1/embeddings` |
+| `rerank` | `rerank/` | query+docs → scores | llama-server / vLLM | `/v1/rerank` |
+| `s2t` | `s2t/` (opt-in) | audio → text | whisper-server | `/v1/audio/transcriptions` |
+| `image` | `img/` (opt-in) | text+image → image | sd-server | `/sdapi/v1/txt2img` |
+
+On a **chat** model, `capabilities: [vision]` adds image *input*,
+`[audio]` adds audio *input* (Transcription badge), `[speech]` adds audio
+*output* — so a VLM never advertises "Image Gen", and output stays text unless
+`speech` is declared. Dedicated `s2t`/`image` roles are for standalone STT /
+diffusion micro-services; their modalities are fixed regardless of declared
+capabilities (`proxy` + `checkEndpoint: /` are emitted for them too).
+
 ## Sidecar example
 
 ```yaml
@@ -107,5 +127,7 @@ Serve a model with vLLM instead of llama-server via an override rule in `profile
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
 - Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [SPEC.md](SPEC.md#image-backend-sd-server) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [SPEC.md → Audio Backend](SPEC.md#audio-backend-whisper-server)
+- Text-to-speech (`t2s`, e.g. kokoro via rootless podman with CUDA + ROCm device pass-through) — planned; see [docs/plans/audio.md](docs/plans/audio.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
 - Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)

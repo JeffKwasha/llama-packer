@@ -24,7 +24,7 @@ from llama_packer.utils import (
     _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
-    validate_dir_roles,
+    validate_dir_roles, NON_CHAT_ROLES,
 )
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
 from llama_packer.backends import SD_BACKENDS, VLLM_BACKENDS, validate_backend_names
@@ -104,6 +104,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
     parser.add_argument("--sd-server", help="sd-server binary for `sd-server` backend "
                          "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
+    parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
+                        "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -189,7 +191,7 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
-        if m.role in ("embeddings", "rerank", "image"):
+        if m.role in NON_CHAT_ROLES:
             continue
         for eid in entry_ids_by_stem.get(m.stem, []):
             chat_idx += 1
@@ -357,6 +359,18 @@ def main(argv: list[str] | None = None) -> None:
             # but an explicit `backend: sd-server` still reports a clear error.
             pass
 
+    # whisper-server resource configuration (CLI > profiles.yaml `whisper:` section >
+    # $WHISPER_BIN_DIR > whisper-server on PATH).  Single host binary.
+    whisper_cfg = profiles_cfg.get("whisper") or {}
+    whisper_bin_raw = (args.whisper_server or whisper_cfg.get("bin")
+                       or os.environ.get("WHISPER_BIN_DIR") or shutil.which("whisper-server"))
+    whisper_bin = None
+    if whisper_bin_raw:
+        cand = Path(str(whisper_bin_raw))
+        if cand.is_dir():  # WHISPER_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR)
+            cand = cand / "whisper-server"
+        whisper_bin = str(cand)
+
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
     # pushed/popped around its level.  Defaults, rules, companion resolution
@@ -367,6 +381,7 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_image": vllm_image,
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
+            "whisper_bin": whisper_bin or "",
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
@@ -402,6 +417,8 @@ def main(argv: list[str] | None = None) -> None:
     raw_paths = [llama_bin, fit_bin]
     if sd_bin:
         raw_paths.append(sd_bin)
+    if whisper_bin:
+        raw_paths.append(whisper_bin)
     for _m in models:
         if getattr(_m, "_override_error", None):
             continue
@@ -421,12 +438,15 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["llama_bin"] = sub(llama_bin)
     if sd_bin:
         template_vars["sd_bin"] = sub(sd_bin)
+    if whisper_bin:
+        template_vars["whisper_bin"] = sub(whisper_bin)
 
     # vLLM backend defaults: already resolved above (CLI > profiles.yaml >
     # built-in constants) for backend inference.
     template_vars["vllm_image"] = vllm_image
     template_vars["vllm_bin"] = vllm_bin
     template_vars.setdefault("sd_bin", "sd-server")
+    template_vars.setdefault("whisper_bin", "whisper-server")
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)

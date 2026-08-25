@@ -172,8 +172,9 @@ class Model:
             if hit is not None:
                 return utils.smart_resolve(hit)
 
-        # 2. Convention: same stem, either .gguf or .safetensors
-        for ext in (".gguf", ".safetensors"):
+        # 2. Convention: same stem, .gguf / .safetensors / whisper GGML .bin
+        # (.bin only resolves for s2t models — discovery requires the s2t dir)
+        for ext in (".gguf", ".safetensors", ".bin"):
             candidate = parent / f"{self.stem}{ext}"
             if candidate.is_file():
                 return utils.smart_resolve(candidate)

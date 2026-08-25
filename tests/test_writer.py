@@ -253,3 +253,27 @@ def test_dropped_mmproj_removes_image_input_not_output(make_model, tmp_path):
     assert caps["in"] == ["text"]
     assert caps["out"] == ["text"]
 
+
+
+# ── s2t (whisper-server) role ─────────────────────────────────────────────
+
+def test_s2t_role_is_audio_in_text_out(make_model):
+    model = make_model("w", role="s2t")
+    caps = _entry_of(model)["capabilities"]
+    assert caps["in"] == ["audio"]
+    assert caps["out"] == ["text"]
+
+
+def test_s2t_entry_gets_proxy_fields(make_model):
+    # Proxied backends (whisper-server) must emit proxy + checkEndpoint "/"
+    # — llama-swap's default /health never returns 200 for them.
+    model = make_model("w", role="s2t", backend="whisper-server")
+    entry = _entry_of(model)
+    assert entry["proxy"] == "http://127.0.0.1:${PORT}"
+    assert entry["checkEndpoint"] == "/"
+
+
+def test_chat_models_still_have_no_proxy_fields(make_model):
+    entry = _entry_of(make_model("m"))
+    assert "proxy" not in entry
+    assert "checkEndpoint" not in entry

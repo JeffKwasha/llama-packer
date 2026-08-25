@@ -19,10 +19,12 @@ matches the model file next to it:
 | `embed/<name>.gguf` | embeddings model (nested dirs like `embed/jina-v5/` keep the role) |
 | `rerank/<name>.gguf` | rerank model |
 | `img/<name>.gguf` | image model (sd-server; opt-in via `dirs: {img: image}` in `profiles.yaml`) |
+| `s2t/<name>.bin` | speech-to-text model (whisper-server; opt-in via `dirs: {s2t: s2t}`; requires an authored same-stem `.md`) |
 
 Orphan files under `embed/`/`rerank`/`doc/` get empty stub sidecars automatically
-(the role comes from the directory, not the stub). Other subdirs (`misc/`,
-`tmp/`, `hf_hub/`, `s2t/`, … — and `img/` when not opted in)
+(the role comes from the directory, not the stub). Whisper `.bin` models are
+never stubbed — write the sidecar yourself. Other subdirs (`misc/`,
+`tmp/`, `hf_hub/`, … — and `img/`, `s2t/` when not opted in)
 are not served — extend via profiles.yaml `dirs:` (skipped dirs are listed in
 the run log). A `.modelignore` at a models root excludes files/subtrees in
 place (one glob per line, `#` comments).
@@ -99,7 +101,7 @@ quantization: Q4_K_M         # exact suffix from snapshot filename: Q4_K_M, Q6_K
 hf_url: https://huggingface.co/org/model  # keep on one line
 description: "one-line summary."
 # --- serving (only what the model needs) ---
-role: chat                  # chat (default) | embeddings | rerank | image (sd-server)
+role: chat                  # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server)
 model: model.gguf           # snapshot filename when file lives in HF cache (with hf_repo:)
 hf_repo: org/model          # HF cache repo id — required with model: for cache files
 # mmproj: model-mmproj.gguf   # only if snapshot actually contains *mmproj*.gguf
@@ -130,20 +132,26 @@ weaknesses: ["slow on 32GB"]
 Do not invent keys. `template:` is not valid — use `chat_template:` in
 `profiles.yaml`/`models.yaml` overrides (fleet-level). Backend (`backend:`) is
 also fleet-level and inferred from file type when absent (`.gguf` → llama-server
-or sd-server when `role: image`, safetensors/`hf_repo` → vllm-docker); do not set it in sidecars unless pinning. Any field not
+or sd-server when `role: image`, `.bin` in `s2t/` → whisper-server,
+safetensors/`hf_repo` → vllm-docker); do not set it in sidecars unless pinning. Any field not
 listed above still flows through as `metadata`.
 
 Image sidecars (sd-server) are **opt-in**: put the diffusion GGUF under `img/`,
 set `dirs: {img: image}` and `backends: [llama-server, sd-server]` in
-`profiles.yaml`. The `proxy` and
-`checkEndpoint: /` fields are emitted automatically for `sd-server` entries
+`profiles.yaml`. Speech-to-text (whisper-server) is opt-in the same way:
+`s2t/` dir + `dirs: {s2t: s2t}` + `backends: [..., whisper-server]`, with an
+authored same-stem `.md` beside each GGML `.bin` (no stubs are generated).
+The `proxy` and
+`checkEndpoint: /` fields are emitted automatically for proxied entries —
+`sd-server` and `whisper-server`
 (the default `/health` never returns 200 for sd-server — see `docs/plans/comfyui-sd.md`).
 
 ## Roles and directories
 
 `role:` selects how a model is served — `chat` (default), `embeddings`,
-`rerank`, or `image` (sd-server). Inferred from the top-level directory (`chat`/`t2t`/`vision`/`doc/` →
-chat, `embed/` → embeddings, `rerank/` → rerank, `img/` → image when opted in; root defaults to chat) or from
+`rerank`, `image` (sd-server), or `s2t` (whisper-server). Inferred from the top-level directory (`chat`/`t2t`/`vision`/`doc/` →
+chat, `embed/` → embeddings, `rerank/` → rerank, `img/` → image and `s2t/` → s2t
+when opted in; root defaults to chat) or from
 `type:` containing `embedding`/`rerank`/`image`; declare `role:` to override. Roots and
 role map are configured in profiles.yaml (`models_dirs:` + `dirs:`); the enable
 list `backends:` there also gates which backends are usable. See SPEC.md.
@@ -157,7 +165,7 @@ list `backends:` there also gates which backends are usable. See SPEC.md.
 | `concurrency: N` | Per-model concurrency limit |
 | `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
 | `reasoning-format` / `reasoning-preserve` | Chat + reasoning only (see above) |
-| `cache_type` / `parallel` | KV-cache precision / parallel slots + VRAM sizing (chat only; image fixed 512 MiB overhead) |
+| `cache_type` / `parallel` | KV-cache precision / parallel slots + VRAM sizing (chat only; image/s2t fixed 512 MiB overhead) |
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `ignore: true` | Skip this model entirely |

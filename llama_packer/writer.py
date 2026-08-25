@@ -205,10 +205,14 @@ def _build_entry(
     # so a VLM never advertises text→image ("Image Gen") or image→image.
     # role=image (sd-server) → diffusion outputs image; input is text+image
     # (txt2img + img2img editing) so both Image Gen and Img→Img badges appear.
+    # role=s2t (whisper-server) → audio in, text out (Transcription badge).
     caps_l = [c.lower() for c in model.capabilities]
     if model.role == "image":
         in_mods = ["text", "image"]
         out_mods = ["image"]
+    elif model.role == "s2t":
+        in_mods = ["audio"]
+        out_mods = ["text"]
     else:
         in_mods = ["text"]
         out_mods = ["text"]
@@ -294,11 +298,11 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # Image backends (sd-server) are proxied HTTP services, not llama-swap
-    # managed inference — expose the standard proxy fields so llama-swap can
-    # health-check and route.  checkEndpoint "/" is required for sd-server
-    # (Discussion #866: /health never returns 200).
-    if model.backend == "sd-server":
+    # Proxied backends (sd-server, whisper-server) are proxied HTTP services,
+    # not llama-swap managed inference — expose the standard proxy fields so
+    # llama-swap can health-check and route.  checkEndpoint "/" avoids the
+    # /health pitfall (Discussion #866: sd-server returns 200 on / only).
+    if backend.proxied:
         entry["proxy"] = "http://127.0.0.1:${PORT}"
         entry["checkEndpoint"] = "/"
 
@@ -418,7 +422,7 @@ class Planner:
         drop: dict[str, bool] = {}
         global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
         for model in self.models:
-            if model.role in ("embeddings", "rerank", "image"):
+            if model.role in utils.NON_CHAT_ROLES:
                 continue
             if not (model.mmproj and model.mmproj.gguf_path):
                 continue
@@ -553,10 +557,10 @@ def _solve_matrix_context(
     # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     chat_params = []
     for m in chat_models:
-        # Embed/rerank/image models are handled outside the shared chat
+        # Embed/rerank/image/s2t models are handled outside the shared chat
         # budget (fixed overhead / separate pool). Including a 40 GB
         # diffusion model would collapse the chat budget, so exclude it.
-        if m.role in ("embeddings", "rerank", "image") or m.on_cpu:
+        if m.role in utils.NON_CHAT_ROLES or m.on_cpu:
             continue
         cache_type = m.cache_type_for(profiles.default_cache_type)
         parallel = m.parallel_for(profiles.default_parallel)

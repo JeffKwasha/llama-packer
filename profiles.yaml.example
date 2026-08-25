@@ -18,11 +18,15 @@ models_dirs:
   # - /mnt/ai/models  # multiple roots allowed
 
 # Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank | image. CLI --extra-dirs merges similarly.
+# values must be chat | embeddings | rerank | image | s2t. CLI --extra-dirs
+# merges similarly.
 # Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
+# Speech-to-text (whisper.cpp) is opt-in: add `s2t: s2t` to serve .bin weights
+# via whisper-server (requires an authored same-stem sidecar per model).
 # dirs:
 #   it2t: chat
 #   img: image
+#   s2t: s2t
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -31,12 +35,14 @@ models_dirs:
 
 # Backend enable/prefer list — ordered; a backend absent from the list is
 # disabled even when its resources are configured.  Omit the key to use all
-# registered backends in default order (llama-server, vllm-docker, vllm, sd-server).
-# sd-server is opt-in for image generation; see the sd: section below.
+# registered backends in default order (llama-server, vllm-docker, vllm,
+# sd-server, whisper-server).  sd-server is opt-in for image generation and
+# whisper-server for speech-to-text; see the sd:/whisper: sections below.
 # backends:
 #   - llama-server
 #   - vllm-docker
 #   - sd-server
+#   - whisper-server
 
 # ── Profile definitions ────────────────────────────────
 # Each profile overlays `defaults` and emits llama-swap setParamsByID
@@ -107,6 +113,16 @@ profiles:
 # collapse the chat budget.
 # sd:
 #   bin: sd-server
+
+# ── whisper-server backend (optional, speech-to-text) ─────
+# Defaults for `backend: whisper-server` (whisper.cpp examples/server).
+# CLI --whisper-server wins over this, then $WHISPER_BIN_DIR, then
+# `whisper-server` on PATH.  Opt-in: add `s2t: s2t` under `dirs:` above;
+# each model needs an authored same-stem sidecar next to its GGML .bin
+# (e.g. ggml-large-v3.md beside ggml-large-v3.bin).  Fixed VRAM overhead,
+# excluded from the shared chat matrix.
+# whisper:
+#   bin: whisper-server
 
 # ── Hardware (optional) ─────────────────────────────────
 # Override auto-detected VRAM pool. CLI --vram / --unified-system-mb win.

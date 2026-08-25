@@ -36,6 +36,12 @@ vllm:
   # gpu_mem_util: 0.9   # optional; when omitted it is derived from the same
                         # reserve/spare VRAM budget llama.cpp uses
 
+# ── whisper-server backend (optional, speech-to-text) ──
+# Opt-in via profiles.yaml `dirs: {s2t: s2t}`; each model needs an authored
+# same-stem sidecar beside its GGML .bin. CLI --whisper-server overrides.
+# whisper:
+#   bin: whisper-server
+
 # ── Hardware ───────────────────────────────────────────
 # VRAM detection lives in llama_packer/hardware.py. Optional overrides:
 #   hardware:

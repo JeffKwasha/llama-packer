@@ -20,6 +20,7 @@ class SdServerBackend(BaseBackend):
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
     roles = frozenset({"image"})
     handles = frozenset({"cli_args"})
+    proxied = True
 
     def is_available(self, avail: dict) -> bool:
         return bool(avail.get("sd_bin"))

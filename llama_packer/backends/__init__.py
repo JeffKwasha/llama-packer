@@ -20,6 +20,7 @@ from llama_packer.backends.base import (
 from llama_packer.backends.llama_server import LlamaServerBackend
 from llama_packer.backends.sd_server import SdServerBackend
 from llama_packer.backends.vllm import VllmDockerBackend, VllmHostBackend
+from llama_packer.backends.whisper_server import WhisperServerBackend
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -31,12 +32,18 @@ if TYPE_CHECKING:
 # host binary when both are available.
 BACKENDS: dict[str, BaseBackend] = {
     b.name: b
-    for b in (LlamaServerBackend(), VllmDockerBackend(), VllmHostBackend(), SdServerBackend())
+    for b in (LlamaServerBackend(), VllmDockerBackend(), VllmHostBackend(),
+              SdServerBackend(), WhisperServerBackend())
 }
 
 # Backends that serve from an HF repo / safetensors rather than a local GGUF.
 VLLM_BACKENDS = frozenset({"vllm", "vllm-docker"})
 SD_BACKENDS = frozenset({"sd-server"})
+WHISPER_BACKENDS = frozenset({"whisper-server"})
+
+# Backends with fixed VRAM overhead (weights + buffer, no per-token KV factor):
+# excluded from the shared chat matrix solve.
+FIXED_OVERHEAD_BACKENDS = SD_BACKENDS | WHISPER_BACKENDS
 
 # Fallback backend when nothing is declared and inference cannot run
 # (e.g. a bare Model constructed outside the normal pipeline).
@@ -104,6 +111,8 @@ __all__ = [
     "BACKENDS",
     "VLLM_BACKENDS",
     "SD_BACKENDS",
+    "WHISPER_BACKENDS",
+    "FIXED_OVERHEAD_BACKENDS",
     "DEFAULT_BACKEND",
     "SETTING_KEYS",
     "FRAMEWORK_CONSUMED",

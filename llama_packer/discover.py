@@ -114,6 +114,13 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
             suffix = p.suffix.lower()
             if suffix == ".md":
                 _model_from_sidecar(p, root, role, stack, hf_home, out)
+            elif suffix == ".bin":
+                # Whisper GGML weights: served only via an authored same-stem
+                # sidecar inside an s2t-mapped directory — never walked as
+                # orphans, never stubbed (few models, low churn).
+                if role == "s2t" and not p.with_suffix(".md").is_file():
+                    logger.info("skipping %s: .bin model without a same-stem "
+                                ".md sidecar (write one to serve it)", p.name)
             elif suffix in (".gguf", ".safetensors"):
                 if utils.companion_kind(p.stem):
                     continue  # companions join via fuzzy resolution, never walked
@@ -145,9 +152,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
            hf_home, out: list[Model]) -> None:
     """The single model pipeline: merge → construct → rules → companions → finalize."""
     merged = stack.merge_defaults(frontmatter)
-    # A model in embed//rerank/image inherits its role from the location when
-    # its own data (sidecar or defaults) does not declare one.
-    if role in ("embeddings", "rerank", "image") and "role" not in merged:
+    # A model in embed//rerank/image/s2t inherits its role from the location
+    # when its own data (sidecar or defaults) does not declare one.
+    if role in ("embeddings", "rerank", "image", "s2t") and "role" not in merged:
         merged["role"] = role
     try:
         model = Model(path, merged, hf_home=hf_home)
@@ -188,9 +195,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
 
 
 def _effective_role(fm: dict, role: str | None) -> str | None:
-    """Role for a sidecar: an embeddings/rerank/image *directory* wins, then
+    """Role for a sidecar: an embeddings/rerank/image/s2t *directory* wins, then
     the explicit ``role:``, then a ``type:`` field containing embed/rerank/image."""
-    if role in ("embeddings", "rerank", "image"):
+    if role in ("embeddings", "rerank", "image", "s2t"):
         return role
     explicit = str(fm.get("role") or "")
     if explicit:
@@ -209,7 +216,7 @@ def _model_from_sidecar(md_path: Path, root: Path, role: str | None,
                         stack: ScopeStack, hf_home, out: list[Model]) -> None:
     fm = utils.parse_frontmatter(md_path)
     if not fm and not any(md_path.with_suffix(e).is_file()
-                          for e in (".gguf", ".safetensors")):
+                          for e in (".gguf", ".safetensors", ".bin")):
         return  # no data and no model beside it: not a sidecar (README, ...)
     if fm.get("ignore"):
         logger.info("ignore: skipping %s", md_path.name)

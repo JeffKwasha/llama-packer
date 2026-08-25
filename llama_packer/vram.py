@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer import vllm_estimate
-from llama_packer.backends import SD_BACKENDS, VLLM_BACKENDS
+from llama_packer.backends import FIXED_OVERHEAD_BACKENDS, VLLM_BACKENDS
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -466,22 +466,25 @@ class VramBudget:
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
-        # sd-server diffusion models: fixed VRAM overhead (weights + buffer),
-        # no per-token KV factor.  Image models range from 3 GB to 40 GB and are
-        # excluded from the shared chat matrix, so precise ctx_factor is irrelevant;
-        # calc_ctx will return design_ctx when ctx_factor==0.
-        if self.model.backend in SD_BACKENDS:
+        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t):
+        # VRAM = weights (file size) + fixed buffer, no per-token KV factor.
+        # These models range from ~150 MB (whisper base) to 40 GB (flux) and
+        # are excluded from the shared chat matrix, so precise ctx_factor is
+        # irrelevant; calc_ctx will return design_ctx when ctx_factor==0.
+        if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             main_mb = 0
             try:
                 if self.model.gguf_path and self.model.gguf_path.is_file():
                     main_mb = utils.get_model_size_mb(str(self.model.gguf_path))
             except OSError:
                 main_mb = 0
-            # Try fit-params static size when available for a more accurate weight estimate,
-            # but fall back to file size.  ctx_factor stays 0 for fixed overhead.
-            fit = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-            if fit is not None and fit.model_mib > 0:
-                main_mb = fit.model_mib
+            # Try fit-params static size when available for a more accurate weight
+            # estimate — GGUF only; a whisper GGML .bin cannot be measured and a
+            # subprocess attempt would just fail noisily. ctx_factor stays 0.
+            if self.model.gguf_path and str(self.model.gguf_path).endswith(".gguf"):
+                fit = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+                if fit is not None and fit.model_mib > 0:
+                    main_mb = fit.model_mib
             params = (main_mb, 0.0, _SD_COMPUTE_MB)
             self._effective_cache[cache_key] = params
             return params

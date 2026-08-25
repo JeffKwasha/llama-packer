@@ -46,6 +46,9 @@ class BaseBackend(ABC):
     formats: ClassVar[frozenset[str]]
     roles: ClassVar[frozenset[str]]
     handles: ClassVar[frozenset[str]]
+    # True when the server is a proxied HTTP service (llama-swap needs the
+    # `proxy:` + `checkEndpoint:` fields instead of managing inference).
+    proxied: ClassVar[bool] = False
 
     def unsupported_reason(self, model: "Model") -> str | None:
         """Return why this backend cannot serve *model*, or None if it can."""

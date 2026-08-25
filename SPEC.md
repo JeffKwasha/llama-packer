@@ -549,6 +549,67 @@ Emission (see `docs/plans/comfyui-sd.md`):
 - `cli_args` pass-through works, but backend-specific flags (`--diffusion-fa`, `--offload-to-cpu`, `--lora-model-dir`) are operator-provided via sidecar `cli_args:` until first-class `sd_*` keys are added.
 - ComfyUI (`comfyui-boot`) remains future work via the same `image` role — see `docs/plans/comfyui-sd.md` for `compat.ignoreWebsockets` / `upstream.ignorePaths` shape.
 
+## Audio Backend (whisper-server)
+
+A model with `role: s2t` (opt-in: an `s2t/` directory plus `dirs: {s2t: s2t}` in
+`profiles.yaml`) is served with **whisper-server** from
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`backend: whisper-server`) —
+the long-lived HTTP server from `examples/server` (the analog of `llama-server`;
+`whisper-cli` is oneshot and cannot be proxied by llama-swap). Exposes
+OpenAI-compatible `POST /v1/audio/transcriptions`.
+
+```yaml
+# profiles.yaml
+dirs: {s2t: s2t}
+backends: [llama-server, whisper-server]
+
+# sidecar: s2t/ggml-large-v3.md (authored — .bin orphans are never stubbed)
+---
+name: whisper-large-v3
+parameters: 1.5B
+---
+```
+
+Emitted entry:
+
+```yaml
+whisper-large-v3:
+  cmd: whisper-server --host 0.0.0.0 --port ${PORT} --model ${MODELS_DIR}/s2t/ggml-large-v3.bin --parallel 1
+  proxy: http://127.0.0.1:${PORT}
+  checkEndpoint: /        # same /health pitfall as sd-server (Discussion #866)
+  capabilities: {in: [audio], out: [text]}
+```
+
+### s2t model resolution
+
+- GGML `.bin` has no header fingerprint, so the directory is authoritative:
+  `.bin` files resolve only inside an `s2t`-mapped directory, by same-stem
+  sidecar convention (or frontmatter `model:`).
+- `.bin` orphans are never stubbed and never auto-served — a bare `.bin` with
+  no same-stem `.md` logs one info line and is skipped (few whisper models,
+  low churn; authored sidecars only).
+- A `.bin` beside a sidecar in any non-s2t role resolves but fails backend
+  inference ("no available backend supports format '.bin'") and the model is skipped.
+
+### Binary precedence
+
+`--whisper-server` CLI flag > `whisper.bin` in `profiles.yaml` `whisper:` section >
+`$WHISPER_BIN_DIR` (file or directory containing `whisper-server`) >
+`whisper-server` on `PATH`. Absent binary disables format-based inference;
+an explicit `backend: whisper-server` pin to a disabled setup is an error that
+skips the model. Docker variant is future work.
+
+### Capabilities and VRAM
+
+`role: s2t` emits `capabilities: {in: [audio], out: [text]}` (Transcription
+badge); declared `vision/audio/speech` capabilities are chat-only and ignored
+for s2t roles. VRAM is fixed overhead like sd-server: `model_mib = file-size`,
+`ctx_factor = 0`, `compute_mib = 512`; `ctx_size` tracks `design_context`
+(sidecar `context_length` or default) without affecting VRAM, and the entry is
+excluded from the shared chat matrix solve. The emitted `--parallel` maps the
+sidecar/profile slot count to concurrent transcription workers.
+
+
 ## Override Rules
 
 Sidecars carry model-intrinsic data. Cross-cutting serving choices —
@@ -687,6 +748,8 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `llama-server` | `.gguf` | chat, embeddings, rerank |
 | `vllm` | safetensors, `hf_repo` | chat |
 | `vllm-docker` | safetensors, `hf_repo` | chat |
+| `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | image |
+| `whisper-server` | `.bin` (s2t dir only) | s2t |
 
 ## Backend Selection
 
@@ -707,7 +770,8 @@ Inference walks this list (availability still filters: an entry without its
 binary/image configured is skipped) and picks the first backend whose formats
 and roles cover the model. An explicit sidecar/override `backend:` pin to a
 disabled name is an error that skips that model — pinning bypasses *inference*,
-never policy.
+never policy. Registration order: `llama-server`, `vllm-docker`, `vllm`,
+`sd-server`, `whisper-server`.
 
 ## Cache precision (`cache_type`)
 
@@ -782,13 +846,14 @@ pushed, its models are built, then children are visited:
   | `t2t` | `chat` | Legacy name for the chat dir |
   | `vision` | `chat` | VLMs + mmproj (same role as chat, colocated) |
   | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
-  | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
-  | `rerank` | `rerank` | Reranker models |
-  | `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
+| `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
+| `rerank` | `rerank` | Reranker models |
+| `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
+| `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
 
   Files at the root itself default to `chat`; files under any other
   subdirectory (`img/` when not opted in, `misc/`, `tmp/`,
-  `hf_hub/`, `s2t/`, …) are **skipped** — one summary line per run names the
+  `hf_hub/`, … — and `s2t/`, `img/` when not opted in) are **skipped** — one summary line per run names the
   skipped directories so nothing disappears silently. The whitelist is
   extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
   via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).

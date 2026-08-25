@@ -27,6 +27,8 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - llama-server — GGUF chat/embeddings/rerank; role flags, MTP, mmproj, chat-template, LoRA
 - vLLM — safetensors / `hf_repo`; all roles (`--task embed`/`--task score` for pooling); `vllm serve` (host binary)
 - vLLM docker — same, wrapped in `docker run` with bind-mounts for chat-template/lora dirs; per-model `vllm_image:` override
+- sd-server — stable-diffusion.cpp image generation (`role: image`, opt-in via `dirs: {img: image}`)
+- whisper-server — whisper.cpp speech-to-text (`role: s2t`, opt-in via `dirs: {s2t: s2t}`; GGML `.bin` + authored sidecar)
 - Backend selection: sidecar/override `backend:` wins (validated against profiles.yaml `backends:` enable list); else inferred from file format + roles, gated by the enable list and configured resources (see SPEC.md "Backend Selection")
 - See SPEC.md "vLLM Backend" + "Override Rules" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
 

@@ -310,3 +310,62 @@ def test_text_gguf_media_like_name_still_served(tmp_path):
                      "minimaxh3.context_length": 1000000}))
     models = Model.from_dir(root, generate_stubs=False)
     assert [m.stem for m in models] == ["minimax-h3"]
+
+
+# ── s2t (whisper) discovery ───────────────────────────────────────────────
+
+def test_s2t_optin_serves_sidecar_bin_models(tmp_path):
+    # Opt-in via dirs: {s2t: s2t}; each whisper .bin needs an authored
+    # same-stem sidecar (no stubs are generated for .bin orphans).
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "ggml-large-v3.bin").write_bytes(b"x")
+    (root / "s2t" / "ggml-large-v3.md").write_text(_sidecar("Whisper Large V3"))
+
+    models = Model.from_dir(root, generate_stubs=False,
+                            dir_roles={"s2t": "s2t"})
+    assert len(models) == 1
+    m = models[0]
+    assert m.role == "s2t"
+    assert m.gguf_path is not None and m.gguf_path.name == "ggml-large-v3.bin"
+
+
+def test_s2t_orphan_bin_without_sidecar_skipped_no_stub(tmp_path, caplog):
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
+
+    with caplog.at_level(logging.INFO):
+        models = Model.from_dir(root, generate_stubs=True,
+                                dir_roles={"s2t": "s2t"})
+    assert models == []
+    assert not (root / "s2t" / "ggml-base.md").exists()  # no stub written
+    assert any("ggml-base.bin" in r.message and "sidecar" in r.message
+               for r in caplog.records)
+
+
+def test_s2t_not_opted_in_is_skipped(tmp_path):
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
+    (root / "s2t" / "ggml-base.md").write_text(_sidecar("W"))
+
+    models = Model.from_dir(root, generate_stubs=False)
+    assert models == []
+
+
+def test_bin_outside_s2t_never_served(tmp_path, caplog):
+    # A .bin next to a sidecar in a non-s2t role resolves by stem (ordered
+    # last), but no backend supports .bin outside whisper-server's s2t role —
+    # finalize flags it and _filter_supported drops it from the config.
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "mysterious.bin").write_bytes(b"x")
+    (root / "chat" / "mysterious.md").write_text(_sidecar("Mystery"))
+
+    with caplog.at_level(logging.ERROR):
+        models = Model.from_dir(root, generate_stubs=False)
+    assert len(models) == 1
+    assert getattr(models[0], "_override_error", None) is not None
+    assert any("no available backend supports format '.bin'" in r.message
+               for r in caplog.records)
