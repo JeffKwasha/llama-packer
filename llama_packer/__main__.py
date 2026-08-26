@@ -111,7 +111,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
                         "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
     parser.add_argument("--kokoro-image", help="container image for `kokoro-podman` backend "
-                        "(overrides profiles.yaml t2s.image; default: vendor-detected upstream image)")
+                         "(overrides profiles.yaml t2s.image; default: vendor-detected upstream image)")
+    parser.add_argument("--no-macros", action="store_true",
+                         help="Disable flag macros (emit fully expanded cmds)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -155,6 +157,14 @@ def _apply_env_subst(config: dict, sub, raw_paths: list[str]) -> dict:
             if raw in cmd:
                 cmd = cmd.replace(raw, subs[raw])
         entry["cmd"] = cmd
+    # Also rewrite flag-macro definitions (they may contain absolute paths).
+    for k, v in list(config.get("macros", {}).items()):
+        if isinstance(v, str):
+            nv = v
+            for raw in order:
+                if raw in nv:
+                    nv = nv.replace(raw, subs[raw])
+            config["macros"][k] = nv
     return config
 
 
@@ -523,7 +533,24 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as e:
         logger.error("%s", e)
         sys.exit(1)
+    # Prepare flag macros (placeholder domain) — auto on unless --no-macros
+    flag_macros: dict[str, str] = {}
+    if not args.no_macros:
+        from llama_packer.macros import Macro, Macros
+        Macro.clear()
+        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub)
+        # Apply env substitution to flag macro definitions as well (they were
+        # built with placeholder-aware sub, but ensure consistency)
+        flag_macros = Macro.definitions()
+        logger.info("flag macros: %d registered (%s)", len(flag_macros), ", ".join(sorted(flag_macros)) if flag_macros else "none")
     config = _apply_env_subst(config, sub, raw_paths)
+    # Apply flag macros to every cmd (post-env, placeholder domain)
+    if flag_macros:
+        from llama_packer.macros import Macro
+        for entry in config.get("models", {}).values():
+            cmd = entry.get("cmd")
+            if cmd:
+                entry["cmd"] = Macro.apply(cmd)
     if not config.get("models"):
         logger.error("no model entries generated")
         sys.exit(1)
@@ -531,8 +558,14 @@ def main(argv: list[str] | None = None) -> None:
 
     # Resolve ${VAR} macros to absolute paths in the config itself so that
     # -watch-config reloads pick up new paths (e.g. a new llama-server version)
-    # without requiring a llama-swap service restart.
-    config["macros"] = {name: value for name, value in sorted(var_to_value.items())}
+    # without requiring a llama-swap service restart. Merge path + flag macros.
+    merged_macros: dict[str, str] = {name: value for name, value in sorted(var_to_value.items())}
+    # Flag macros may collide with path macros — new replaces old with warning
+    for k, v in flag_macros.items():
+        if k in merged_macros:
+            logger.warning("macros: flag macro %r collides with path macro %r; flag wins", k, merged_macros[k])
+        merged_macros[k] = v
+    config["macros"] = dict(sorted(merged_macros.items()))
 
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:

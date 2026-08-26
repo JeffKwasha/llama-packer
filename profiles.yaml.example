@@ -189,3 +189,16 @@ profiles:
 #     rnk: 100
 #   sets:
 #     rag: "__CHAT_VARS__ & emb & rnk"
+
+# ── Flag macros (optional) ──────────────────────────────────
+# Named flag chunks for cmd readability (llama-swap macros). Auto-derived
+# macros are always on: PROFILE_DEFAULTS (from defaults), PROFILE_<NAME> per
+# profile cache/parallel, MODELS_<DIR> per models.yaml chat_template/loras,
+# and COMMON_GPU (--n-gpu-layers 999). Explicit entries here have highest
+# priority and are longest-first at replacement time; collision with an
+# auto macro logs a warning and the new value wins.
+# Use ${NAME} in cmd via the macro, and define values as plain shell strings.
+# Example:
+# macros:
+#   COMMON: "--parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --n-gpu-layers 999"
+#   QWEN: "--jinja --chat-template-file ${MODELS_DIR}/chat/qwen3/chat_template.jinja --reasoning-format deepseek"
