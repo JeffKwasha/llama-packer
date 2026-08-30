@@ -559,13 +559,16 @@ def main(argv: list[str] | None = None) -> None:
     # Resolve ${VAR} macros to absolute paths in the config itself so that
     # -watch-config reloads pick up new paths (e.g. a new llama-server version)
     # without requiring a llama-swap service restart. Merge path + flag macros.
-    merged_macros: dict[str, str] = {name: value for name, value in sorted(var_to_value.items())}
+    # Preserve creation order so a flag macro that references a path macro
+    # (e.g. MODELS_CHAT_QWEN3 → ${MODELS_DIR}/...) is defined after its
+    # dependency — alphabetical sorting breaks nested substitution in llama-swap.
+    merged_macros: dict[str, str] = dict(var_to_value)
     # Flag macros may collide with path macros — new replaces old with warning
     for k, v in flag_macros.items():
         if k in merged_macros:
             logger.warning("macros: flag macro %r collides with path macro %r; flag wins", k, merged_macros[k])
         merged_macros[k] = v
-    config["macros"] = dict(sorted(merged_macros.items()))
+    config["macros"] = merged_macros
 
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
