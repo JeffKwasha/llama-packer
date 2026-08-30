@@ -93,6 +93,7 @@ Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](p
 | `defaults` / `profiles` | `temperature`, `top_p`, `cache_type`, `parallel`, `spare` (+ `base * N` expressions, `description` docs-only) |
 | `models_dirs` / `dirs` / `hf_home` | discovery roots & dir→role map (`it2t: chat`) |
 | `backends` / `vllm` | enable list (`llama-server`, `vllm-docker`), `image`/`bin`/`docker_args` |
+| `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
 | `matrix` | shared `emb`/`rnk` co-loading sets via `__CHAT_VARS__` |

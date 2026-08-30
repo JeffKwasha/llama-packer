@@ -70,6 +70,21 @@ def test_apply_env_subst_leaves_unmatched_paths_alone():
     assert out["models"]["m"]["cmd"] == "run /elsewhere/m.gguf"
 
 
+def test_backend_args_validation():
+    from llama_packer.__main__ import backend_args
+
+    # Missing/empty section or key -> empty string, never None.
+    assert backend_args(None, "llama_server") == ""
+    assert backend_args({}, "llama_server") == ""
+    assert backend_args({"args": None}, "llama_server") == ""
+    # Valid free-form flags pass through stripped.
+    assert backend_args({"args": " --flash-attn on -b 512 "},
+                        "llama_server") == "--flash-attn on -b 512"
+    # Bad quoting aborts the run (fail fast, not per-command).
+    with pytest.raises(SystemExit):
+        backend_args({"args": "--foo 'unclosed"}, "llama_server")
+
+
 def test_build_matrix_vars_includes_text_variants():
     import logging
     from llama_packer.__main__ import _build_matrix_vars

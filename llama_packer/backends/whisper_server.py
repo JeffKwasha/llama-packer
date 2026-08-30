@@ -12,6 +12,7 @@ directory is authoritative).  Exposes OpenAI-compatible
 from __future__ import annotations
 
 import logging
+import shlex
 from typing import TYPE_CHECKING
 
 from llama_packer.backends.base import BaseBackend
@@ -50,6 +51,10 @@ class WhisperServerBackend(BaseBackend):
             # Convert (parallel slots) → concurrent transcription workers.
             "--parallel", str(parallel),
         ]
+        # Global fleet-wide args (profiles.yaml `whisper.args`) precede the
+        # per-model cli_args; render_command dedups conflicting flags so
+        # per-model values win.
+        flags += shlex.split(tvars.get("whisper_args") or "")
         cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command(
             [tvars.get("whisper_bin", "whisper-server")], flags, cli_args,

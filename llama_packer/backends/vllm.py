@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar
 
@@ -198,6 +199,10 @@ class VllmHostBackend(BaseBackend):
         vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
         flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util),
                                   cache_type=cache_type, parallel=parallel)
+        # Global fleet-wide args (profiles.yaml `vllm.args`) precede the
+        # per-model cli_args; render_command dedups conflicting flags so
+        # per-model values win.
+        flags += shlex.split(tvars.get("vllm_args") or "")
         cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command([vllm_bin, "serve"], flags, cli_args)
         return cmd, _spec_meta(model)
@@ -242,6 +247,10 @@ class VllmDockerBackend(VllmHostBackend):
             model, ctx_size, str(container_port), gpu_mem_util,
             cache_type=cache_type, parallel=parallel, map_path=_map
         )
+        # Global fleet-wide args (profiles.yaml `vllm.args`) precede the
+        # per-model cli_args; render_command dedups conflicting flags so
+        # per-model values win.
+        serve_flags += shlex.split(tvars.get("vllm_args") or "")
         serve = utils.render_command(
             [vllm_bin, "serve"], serve_flags,
             (model.frontmatter.get("cli_args") or "").strip(),

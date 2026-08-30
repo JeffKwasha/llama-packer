@@ -360,6 +360,76 @@ def test_cli_args_duplicate_flag_collapses(make_model):
     assert "deepseek" not in cmd
 
 
+# ── global backend args (profiles.yaml `<section>.args`) ─────────────────
+
+def test_llama_server_global_args_chat(make_model):
+    # Chat models get the fleet-wide performance flags as-is.
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
+    cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", tv)
+    assert "--flash-attn on -b 512 -ub 512" in cmd
+
+
+def test_llama_server_global_args_role_flags_win(make_model):
+    # Global args render BEFORE the per-role flags, so embed/rerank keep
+    # their tuned -b/-ub 4096; non-conflicting flags still apply.
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
+    cmd, _ = LlamaServerBackend().build_cmd(
+        make_model("e", role="embeddings"), 32768, 1, "q8_0", tv)
+    assert cmd.count("-b ") == 1 and cmd.count("-ub ") == 1
+    assert "-b 4096 -ub 4096" in cmd
+    assert "-b 512" not in cmd
+    assert "--flash-attn on" in cmd
+
+
+def test_llama_server_global_args_per_model_cli_args_win(make_model):
+    # Per-model cli_args beat the global args per flag, emitted once.
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512"}
+    m = make_model("m", cli_args="-b 2048")
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", tv)
+    assert cmd.count("-b ") == 1
+    assert "-b 2048" in cmd
+    assert "--flash-attn on" in cmd
+
+
+def test_llama_server_global_args_absent_no_leak(make_model):
+    # No llama_args configured -> nothing changes.
+    cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", _tvars())
+    assert "--flash-attn" not in cmd
+
+
+def test_vllm_global_args_host_and_docker(make_model):
+    tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
+    m = make_model("v", hf_repo="org/model")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert "--max-num-batched-tokens 512" in cmd
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert "--max-num-batched-tokens 512" in cmd
+
+
+def test_vllm_global_args_per_model_cli_args_win(make_model):
+    tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
+    m = make_model("v", hf_repo="org/model", cli_args="--max-num-batched-tokens 1024")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert cmd.count("--max-num-batched-tokens") == 1
+    assert "--max-num-batched-tokens 1024" in cmd
+
+
+def test_whisper_server_global_args(make_model):
+    tv = {"whisper_bin": "/opt/whisper-server", "whisper_args": "--flash-attn on"}
+    m = make_model("w", role="s2t")
+    m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
+    cmd, _ = get_backend("whisper-server").build_cmd(m, 32768, 1, "q8_0", tv)
+    assert "--flash-attn on" in cmd
+
+
+def test_sd_server_global_args(make_model):
+    tv = {"sd_bin": "/opt/sd-server", "sd_args": "--diffusion-fa"}
+    m = make_model("i", role="image")
+    m.gguf_path = Path("/models/img/flux-4b.gguf")
+    cmd, _ = get_backend("sd-server").build_cmd(m, 4096, 1, "q8_0", tv)
+    assert "--diffusion-fa" in cmd
+
+
 def test_llama_server_multiple_loras_comma_joined(make_model):
     m = make_model("m")
     m._resolved_loras = [Path("/a/x.gguf"), Path("/a/y.gguf")]

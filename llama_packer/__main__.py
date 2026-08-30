@@ -7,6 +7,7 @@ import argparse
 import importlib.resources
 import logging
 import os
+import shlex
 import shutil
 import sys
 import textwrap
@@ -46,6 +47,23 @@ def setup_logging(verbosity: int = 0) -> None:
         format="%(levelname).1s | %(message)s",
         stream=sys.stderr,
     )
+
+
+def backend_args(cfg: dict | None, section: str) -> str:
+    """Validate and return a backend section's free-form ``args`` string.
+
+    Performance/tuning flags shared by every command that backend renders
+    (e.g. ``llama_server: {args: "--flash-attn on -b 512"}``).  Parsed with
+    shlex here so quoting errors fail fast at build time, not per command.
+    """
+    raw = str((cfg or {}).get("args") or "").strip()
+    if raw:
+        try:
+            shlex.split(raw)
+        except ValueError as e:
+            logger.error("profiles.yaml %s.args: bad quoting: %s", section, e)
+            sys.exit(1)
+    return raw
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -337,6 +355,12 @@ def main(argv: list[str] | None = None) -> None:
         "llama_bin": llama_bin,
         "models_dir": str(models_dirs[0]),
         "models_dirs": [str(d) for d in models_dirs],
+        # Global backend args (profiles.yaml `<section>.args`); rendered by
+        # each backend between its built-in flags and per-model cli_args.
+        "llama_args": "",
+        "vllm_args": "",
+        "sd_args": "",
+        "whisper_args": "",
     }
 
     max_ctx = None
@@ -487,6 +511,10 @@ def main(argv: list[str] | None = None) -> None:
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
+    template_vars["vllm_args"] = backend_args(vllm_cfg, "vllm")
+    template_vars["sd_args"] = backend_args(sd_cfg, "sd")
+    template_vars["whisper_args"] = backend_args(whisper_cfg, "whisper")
+    template_vars["llama_args"] = backend_args(profiles_cfg.get("llama_server"), "llama_server")
     # gpu_mem_util: explicit profiles.yaml value wins; otherwise derive the
     # fraction from the same reserve/spare budget llama.cpp uses, so vLLM's
     # --max-model-len and --gpu-memory-utilization describe one consistent pool.

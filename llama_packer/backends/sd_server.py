@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
@@ -43,6 +44,11 @@ class SdServerBackend(BaseBackend):
             "--listen-ip", "0.0.0.0",
             "--diffusion-model", diffusion,
         ]
+
+        # Global fleet-wide args (profiles.yaml `sd.args`) precede the
+        # per-model cli_args; render_command dedups conflicting flags so
+        # per-model values win.
+        flags += shlex.split(tvars.get("sd_args") or "")
 
         cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command(

@@ -68,6 +68,11 @@ class LlamaServerBackend(BaseBackend):
             "--n-gpu-layers", ("0" if model.on_cpu else "999"),
         ]
 
+        # Global fleet-wide args (profiles.yaml `llama_server.args`) come
+        # before the per-role flags, so role-specific values (embed/rerank
+        # -b/-ub 4096) win over them; per-model cli_args win over both.
+        flags += shlex.split(tvars.get("llama_args") or "")
+
         role_flags = self._ROLE_FLAGS.get(model.role)
         if role_flags:
             flags += shlex.split(role_flags)

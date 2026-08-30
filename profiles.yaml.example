@@ -100,6 +100,16 @@ profiles:
   #   cache_type: q4_0
   #   spare: 1G
 
+# ── llama-server backend args (optional) ────────────────
+# Free-form flags appended to every llama-server command — fleet-wide
+# performance/tuning knobs (per-model sidecar `cli_args:` still wins per
+# flag).  Rendered BEFORE the built-in per-role flags, so embed/rerank role
+# flags (-b 4096 -ub 4096) win over conflicting values here: `-b 512`
+# therefore tunes chat models only, while non-conflicting flags (e.g.
+# --flash-attn) apply to all roles.  Flags don't feed the VRAM estimator.
+# llama_server:
+#   args: "--flash-attn on -b 512 -ub 512"
+
 # ── vLLM backend (optional) ────────────────────────────
 # Defaults for `backend: vllm` / `vllm-docker` via overrides.
 # CLI --vllm-image / --vllm-server win over this.
@@ -109,6 +119,9 @@ profiles:
 #   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
 #   container_port: 8000
 #   # gpu_mem_util: 0.9  # derived from spare/reserve when omitted
+#   # Fleet-wide serve flags (vLLM spellings — e.g. -ub 512 ≈
+#   # --max-num-batched-tokens 512); per-model cli_args wins per flag.
+#   # args: "--max-num-batched-tokens 512"
 
 # ── sd-server backend (optional, image generation) ───────
 # Defaults for `backend: sd-server` (stable-diffusion.cpp).  CLI --sd-server
@@ -118,6 +131,8 @@ profiles:
 # collapse the chat budget.
 # sd:
 #   bin: sd-server
+#   # Fleet-wide sd-server flags (--diffusion-fa etc.); per-model cli_args wins.
+#   # args: "--diffusion-fa"
 
 # ── whisper-server backend (optional, speech-to-text) ─────
 # Defaults for `backend: whisper-server` (whisper.cpp examples/server).
@@ -128,6 +143,9 @@ profiles:
 # excluded from the shared chat matrix.
 # whisper:
 #   bin: whisper-server
+#   # Fleet-wide whisper-server flags (whisper.cpp shares --flash-attn);
+#   # per-model cli_args wins.
+#   # args: "--flash-attn on"
 
 # ── kokoro-podman backend (optional, text-to-speech) ──────
 # Kokoro-82M TTS via remsky/Kokoro-FastAPI in rootless podman

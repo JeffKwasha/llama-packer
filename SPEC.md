@@ -73,6 +73,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
+| `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
@@ -843,6 +844,44 @@ and roles cover the model. An explicit sidecar/override `backend:` pin to a
 disabled name is an error that skips that model — pinning bypasses *inference*,
 never policy. Registration order: `llama-server`, `vllm-docker`, `vllm`,
 `sd-server`, `whisper-server`, `kokoro-podman`.
+
+## Global backend args
+
+Each llama.cpp-family backend section in profiles.yaml accepts a free-form
+`args:` string of flags appended to **every** command that backend renders —
+the place for fleet-wide performance tuning:
+
+```yaml
+# profiles.yaml
+llama_server:
+  args: "--flash-attn on -b 512 -ub 512"
+vllm:
+  args: "--max-num-batched-tokens 512"   # vLLM spelling of -ub (FA is always on)
+whisper:
+  args: "--flash-attn on"                # whisper.cpp shares the option
+sd:
+  args: "--diffusion-fa"                 # stable-diffusion.cpp variant
+```
+
+The same *intent* maps to different flags per engine, so each backend owns its
+own `args` (kokoro is a containerized service — `t2s.podman_args` plays that
+role). Values are validated with shlex at build time (bad quoting aborts the
+run) and don't feed the VRAM estimator — they're operator responsibility,
+like sidecar `cli_args`.
+
+Precedence per flag is most-specific-wins, implemented via the ordered
+flag→value map in `render_command` (a flag can only appear once; later
+sources overwrite earlier values):
+
+1. backend built-in flags (`-c`, `--parallel`, …)
+2. llama-server per-role flags (`embeddings`/`rerank` `-b 4096 -ub 4096`)
+3. global `<section>.args` — **except** on llama-server, where `args` is
+   rendered *before* the role flags, so role-specific `-b`/`-ub` win and e.g.
+   `-b 512` tunes chat models only (non-conflicting flags apply to all roles)
+4. per-model sidecar `cli_args:`
+
+Note that the map keys on exact flag spelling: `-fa` and `--flash-attn` are
+distinct keys — use the spelling you want in the final command.
 
 ## Cache precision (`cache_type`)
 
