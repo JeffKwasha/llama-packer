@@ -24,6 +24,29 @@ KEEP_VERSIONS=3  # Keep current + N-1 previous versions
 NEWLY_INSTALLED=false
 OVERRIDE_ARCH=""  # --arch override (low priority, e.g., linux_amd64, linux_arm64)
 
+# Optional GitHub token for higher API rate limits (60/hr unauth → 5000/hr auth)
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+
+gh_curl() {
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
+    else
+        curl -s "$@"
+    fi
+}
+
+# GitHub API call with rate-limit detection
+gh_api() {
+    local response
+    response=$(gh_curl "$1") || true
+    if echo "$response" | grep -q "API rate limit exceeded"; then
+        echo "Error: GitHub API rate limit exceeded (60 req/hr unauthenticated)." >&2
+        echo "Set GITHUB_TOKEN for 5000 req/hr: export GITHUB_TOKEN=ghp_xxxx" >&2
+        exit 1
+    fi
+    echo "$response"
+}
+
 # Get highest installed version number
 get_highest_installed() {
     local highest=0
@@ -70,19 +93,24 @@ Examples:
   $(basename "$0") --swap-only v252  # Specific llama-swap version
   $(basename "$0") --arch linux_arm64  # Force ARM64 binary
 
+Environment:
+  GITHUB_TOKEN    Optional. GitHub personal access token for higher API
+                  rate limits (5000 req/hr vs 60). Set if you hit
+                  "rate limit exceeded" errors: export GITHUB_TOKEN=ghp_xxxx
+
 EOF
     exit 1
 }
 
 # Get latest release tag
 get_latest_tag() {
-    curl -s "$RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4 || true
+    gh_api "$RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4 || true
 }
 
 # Get release assets for a tag
 get_assets() {
     local tag="$1"
-    curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$tag" || true
+    gh_api "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$tag"
 }
 
 # Find asset URL by pattern
@@ -235,12 +263,12 @@ get_installed_llama_swap_version() {
 }
 
 get_latest_llama_swap_tag() {
-    curl -s "$LLAMA_SWAP_RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4 || true
+    gh_api "$LLAMA_SWAP_RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4 || true
 }
 
 get_llama_swap_assets() {
     local tag="$1"
-    curl -s "https://api.github.com/repos/mostlygeek/llama-swap/releases/tags/$tag" || true
+    gh_api "https://api.github.com/repos/mostlygeek/llama-swap/releases/tags/$tag"
 }
 
 # Update llama-swap: checks latest (or requested) release, verifies sha256 via checksums.txt, atomically replaces binary.
