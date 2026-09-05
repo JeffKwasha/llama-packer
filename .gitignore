@@ -35,4 +35,4 @@ llama-swap-v*
 build/
 
 # Local node_modules (e.g. extras/node_modules symlink for opencode plugin deps)
-node_modules/
+node_modules
