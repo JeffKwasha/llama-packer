@@ -47,6 +47,7 @@ usage() {
 Usage: $(basename "$0") [version|vulkan|rocm] [options]
 
 Download and install llama.cpp and llama-swap prebuilt binaries.
+Run this from the repo root; it installs into the repo root.
 
 Arguments:
   version       Specific llama.cpp version tag (e.g., b8913, b8902)
@@ -75,20 +76,20 @@ EOF
 
 # Get latest release tag
 get_latest_tag() {
-    curl -s "$RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4
+    curl -s "$RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4 || true
 }
 
 # Get release assets for a tag
 get_assets() {
     local tag="$1"
-    curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$tag"
+    curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$tag" || true
 }
 
 # Find asset URL by pattern
 find_asset() {
     local assets="$1"
     local pattern="$2"
-    echo "$assets" | grep -o "\"browser_download_url\": \"[^\"]*${pattern}[^\"]*\"" | head -1 | cut -d'"' -f4
+    echo "$assets" | grep -o "\"browser_download_url\": \"[^\"]*${pattern}[^\"]*\"" | head -1 | cut -d'"' -f4 || true
 }
 
 download_and_extract() {
@@ -234,12 +235,12 @@ get_installed_llama_swap_version() {
 }
 
 get_latest_llama_swap_tag() {
-    curl -s "$LLAMA_SWAP_RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4
+    curl -s "$LLAMA_SWAP_RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4 || true
 }
 
 get_llama_swap_assets() {
     local tag="$1"
-    curl -s "https://api.github.com/repos/mostlygeek/llama-swap/releases/tags/$tag"
+    curl -s "https://api.github.com/repos/mostlygeek/llama-swap/releases/tags/$tag" || true
 }
 
 # Update llama-swap: checks latest (or requested) release, verifies sha256 via checksums.txt, atomically replaces binary.
@@ -397,8 +398,8 @@ update_llama_swap() {
 
     # Ownership check before touching symlink/file
     if [ -e "$target" ] || [ -L "$target" ]; then
-        if [ "$(stat -c '%u' "$target" 2>/dev/null || stat -c '%u' "$INSTALL_DIR" 2>/dev/null || echo 0)" != "$(id -u)" ] && [ "$(stat -c '%u' "$INSTALL_DIR")" != "$(id -u)" ]; then
-            echo "Warning: not owner of $target, skipping replace" >&2
+        if [ ! -w "$INSTALL_DIR" ]; then
+            echo "Warning: not owner/writable of $target, skipping replace" >&2
             trap - RETURN; rm -rf "$tmpdir"
             return 1
         fi
