@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer import vllm_estimate
-from llama_packer.backends import SD_BACKENDS, VLLM_BACKENDS
+from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
+                                   SD_BACKENDS, VLLM_BACKENDS,
+                                   WHISPER_BACKENDS)
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -34,9 +36,20 @@ _MMPROJ_COMPUTE_MB = 150
 # MTP draft: fixed compute overhead + per-token KV factor estimate safety margin.
 _DRAFT_COMPUTE_MB = 64
 _DRAFT_CTX_SAFETY = 1.6
-# sd-server: fixed VRAM overhead for diffusion models (file sizes + this buffer).
+# sd-server/whisper: fixed VRAM overhead (file sizes + this buffer).
 # No per-token KV factor (ctx_factor=0) — calc_ctx returns design_ctx.
 _SD_COMPUTE_MB = 512
+# whisper-server s2t: measured on Vulkan (nemo-speech) the whole process
+# footprint ≈ Σ model files — activation memory is small and ggml compute
+# buffers are shared, so only a small buffer is charged per model.
+_WHISPER_COMPUTE_MB = 100
+# kokoro-podman: weights are baked into the container image (~330 MB), but the
+# PyTorch/CUDA runtime floors around 2.4 GiB and peaks near 4 GiB under load
+# (upstream /dev/unload benchmarks) — charge a conservative fixed buffer.
+_KOKORO_COMPUTE_MB = 3072
+_FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
+                     **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
+                     **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
 
 
 @dataclass
@@ -466,23 +479,40 @@ class VramBudget:
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
-        # sd-server diffusion models: fixed VRAM overhead (weights + buffer),
-        # no per-token KV factor.  Image models range from 3 GB to 40 GB and are
-        # excluded from the shared chat matrix, so precise ctx_factor is irrelevant;
-        # calc_ctx will return design_ctx when ctx_factor==0.
-        if self.model.backend in SD_BACKENDS:
+        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t,
+        # kokoro-podman t2s): VRAM = weights (file size, 0 when baked into the
+        # image) + a fixed runtime buffer, no per-token KV factor.  These are
+        # excluded from the shared chat matrix, so precise ctx_factor is
+        # irrelevant; calc_ctx will return design_ctx when ctx_factor==0.
+        if self.model.backend in FIXED_OVERHEAD_BACKENDS:
+            # Operator-pinned total VRAM (`vram_mb` in the sidecar) is the
+            # sizing: it *is* the fixed overhead, no measurement or estimate.
+            pin = self.model.frontmatter.get("vram_mb")
+            if pin is not None:
+                try:
+                    pinned = int(pin)
+                except (TypeError, ValueError):
+                    pinned = 0
+                    self._warn_once(
+                        "vram_mb: %s: %r is not an integer; ignoring",
+                        self.model.stem, pin)
+                if pinned > 0:
+                    return (pinned, 0.0, 0)
             main_mb = 0
             try:
                 if self.model.gguf_path and self.model.gguf_path.is_file():
                     main_mb = utils.get_model_size_mb(str(self.model.gguf_path))
             except OSError:
                 main_mb = 0
-            # Try fit-params static size when available for a more accurate weight estimate,
-            # but fall back to file size.  ctx_factor stays 0 for fixed overhead.
-            fit = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-            if fit is not None and fit.model_mib > 0:
-                main_mb = fit.model_mib
-            params = (main_mb, 0.0, _SD_COMPUTE_MB)
+            # Try fit-params static size when available for a more accurate weight
+            # estimate — GGUF only; GGML .bin / ONNX cannot be measured and a
+            # subprocess attempt would just fail noisily. ctx_factor stays 0.
+            if self.model.gguf_path and str(self.model.gguf_path).endswith(".gguf"):
+                fit = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+                if fit is not None and fit.model_mib > 0:
+                    main_mb = fit.model_mib
+            params = (main_mb, 0.0,
+                      _FIXED_COMPUTE_MB.get(self.model.backend, _SD_COMPUTE_MB))
             self._effective_cache[cache_key] = params
             return params
 
@@ -589,22 +619,84 @@ class VramBudget:
             logger.warning("model + compute exceeds available VRAM for %s", self.model.stem)
             return utils._MIN_CTX_SIZE
 
+        # Image token budget: image tokens are ordinary tokens inside -c (no
+        # VRAM beyond the context itself), but a max-size image must *fit* —
+        # every parallel slot needs image_max_tokens of its share of the
+        # context. The solved context is therefore never allowed to drop
+        # below parallel × image_max_tokens when the budget affords it.
+        img_floor = self._image_floor_tokens(parallel, include_mmproj)
+
         # If design context fits, use it (capped by sidecar context_length)
         ctx_at_design_mib = int(ctx_factor * design)
         if ctx_at_design_mib <= remaining:
             sidecar_ctx = self.model.frontmatter.get("context_length")
             if sidecar_ctx is not None:
-                return min(design, sidecar_ctx)
-            return design
+                ctx = min(design, sidecar_ctx)
+            else:
+                ctx = design
+            return self._raise_to_image_floor(ctx, img_floor, cap=ctx,
+                                              affordable=ctx)
 
         # Scale down linearly
         if ctx_factor <= 0:
             return utils._MIN_CTX_SIZE
         max_ctx = int(remaining / ctx_factor)
-        max_ctx = (max_ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
-        return max(max_ctx, utils._MIN_CTX_SIZE)
+        ctx = (max_ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
+        ctx = max(ctx, utils._MIN_CTX_SIZE)
+        return self._raise_to_image_floor(ctx, img_floor,
+                                          cap=max_ctx, affordable=max_ctx)
+
+    def _image_floor_tokens(self, parallel: int, include_mmproj: bool) -> int:
+        """KV slots per process that must stay reservable for image tokens.
+
+        ``parallel × image_max_tokens`` when the vision projection is served
+        and the sidecar declares a cap; 0 otherwise.
+        """
+        if not include_mmproj:
+            return 0
+        if not (self.model.mmproj and self.model.mmproj.gguf_path):
+            return 0
+        imax = self.model.image_max_tokens
+        if not imax:
+            return 0
+        return parallel * imax
+
+    def _raise_to_image_floor(
+        self, ctx: int, floor: int, cap: int, affordable: int,
+    ) -> int:
+        """Raise ``ctx`` to the image token floor within cap/affordability.
+
+        ``cap`` bounds the raise by the declared/architectural context;
+        ``affordable`` by what the VRAM budget supports. When the floor
+        exceeds what is available the request is logged (once) and the
+        context is left unchanged — an oversized image then overflows and
+        fails at request time instead of the server failing at load time.
+        """
+        if floor <= 0 or ctx >= floor:
+            return ctx
+        target = min(floor, cap, affordable)
+        if target > ctx:
+            if target < floor:
+                self._warn_once(
+                    "image tokens: %s: image_max_tokens budget %d per slot "
+                    "exceeds the affordable context %d; raised ctx to %d, "
+                    "large images may still not fit",
+                    self.model.stem, floor, affordable, target)
+            return target
+        self._warn_once(
+            "image tokens: %s: image_max_tokens budget %d per slot exceeds "
+            "the solved context %d (affordable %d); large images may not fit",
+            self.model.stem, floor, ctx, affordable)
+        return ctx
 
     # ── helpers ──
+
+    def _warn_once(self, msg: str, *args: object) -> None:
+        """Log a warning once per process (deduplicated by formatted message)."""
+        text = msg % args if args else msg
+        if text not in self._logged:
+            self._logged.add(text)
+            logger.warning(text)
 
     def _design_ctx(self) -> int:
         """Design context: GGUF architectural max > sidecar > default."""
@@ -668,12 +760,13 @@ class VramBudget:
 def solve_matrix_ctx(
     vram_total_mb: int,
     spare_mb: int,
-    chat_models: list[tuple[Model, int, float, int]],
+    chat_models: list[tuple[Model, int, float, int, int]],
     embed_params: tuple[int, float, int] | None,
     rerank_params: tuple[int, float, int] | None,
     embed_ctx: int = 0,
     rerank_ctx: int = 0,
     baseline_mb: int = 0,
+    fixed_overhead_mb: int = 0,
 ) -> int:
     """Solve the VRAM budget equation for chat context.
 
@@ -689,12 +782,16 @@ def solve_matrix_ctx(
     Args:
         vram_total_mb: Total VRAM in MB
         spare_mb: Reserved VRAM in MB
-        chat_models: List of (model, model_mib, context_factor, compute_mib)
+        chat_models: List of (model, model_mib, context_factor, compute_mib,
+            image_floor_tokens) — the floor being ``parallel ×
+            image_max_tokens`` for served vision, 0 otherwise
         embed_params: (model_mib, context_factor, compute_mib) for embedder
         rerank_params: (model_mib, context_factor, compute_mib) for reranker
         embed_ctx: Requested context for embedding model
         rerank_ctx: Requested context for reranking model
         baseline_mb: Driver/compositor VRAM already in use (added to the reserve)
+        fixed_overhead_mb: Extra fixed VRAM held by opportunistic co-loads
+            (subtracted from the chat budget before solving)
 
     Returns:
         Maximum chat context in tokens (rounded to _CTX_ROUND_TO)
@@ -712,19 +809,32 @@ def solve_matrix_ctx(
         r_mib, r_factor, r_compute = rerank_params
         rerank_overhead = r_mib + r_compute + int(r_factor * rerank_ctx)
 
-    remaining_for_chat = available - embed_overhead - rerank_overhead
+    remaining_for_chat = available - embed_overhead - rerank_overhead \
+        - fixed_overhead_mb
     if remaining_for_chat <= 0:
         return utils._MIN_CTX_SIZE
 
     best_ctx = 0
-    for model, model_mib, context_factor, compute_mib in chat_models:
+    for model, model_mib, context_factor, compute_mib, img_floor in chat_models:
         chat_budget = remaining_for_chat - model_mib - compute_mib
         if chat_budget <= 0:
             continue
         if context_factor > 0:
             ctx = int(chat_budget / context_factor)
+            # The image token floor is raise-to-fit only when it was already
+            # affordable; a larger floor cannot buy VRAM it doesn't have.
+            if img_floor > ctx:
+                logger.warning(
+                    "matrix: %s image_max_tokens budget %d per slot exceeds "
+                    "the solved chat ctx %d; large images may not fit",
+                    model.stem, img_floor, ctx)
         else:
             ctx = model.gguf_context_length or utils._DEFAULT_CONTEXT_LENGTH
+            if img_floor > ctx:
+                logger.warning(
+                    "matrix: %s image_max_tokens budget %d per slot exceeds "
+                    "its context %d; large images may not fit",
+                    model.stem, img_floor, ctx)
         ctx = (ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
         ctx = max(ctx, utils._MIN_CTX_SIZE)
         arch_max = model.design_context

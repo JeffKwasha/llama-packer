@@ -36,6 +36,20 @@ vllm:
   # gpu_mem_util: 0.9   # optional; when omitted it is derived from the same
                         # reserve/spare VRAM budget llama.cpp uses
 
+# ── whisper-server backend (optional, speech-to-text) ──
+# Opt-in via profiles.yaml `dirs: {s2t: s2t}`; each model needs an authored
+# same-stem sidecar beside its GGML .bin. CLI --whisper-server overrides.
+# whisper:
+#   bin: whisper-server
+
+# ── kokoro-podman backend (optional, text-to-speech) ───
+# Opt-in via profiles.yaml `dirs: {t2s: t2s}`; weights/voices are baked into
+# the image (sidecar only needs `hf_repo: hexgrad/Kokoro-82M`).  Vendor is
+# auto-detected; `vendor:` / `image:` / `podman_args:` / `voices_dir:` override
+# (see profiles.yaml.example for all options).
+# t2s:
+#   image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+
 # ── Hardware ───────────────────────────────────────────
 # VRAM detection lives in llama_packer/hardware.py. Optional overrides:
 #   hardware:

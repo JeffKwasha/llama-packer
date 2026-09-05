@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import shlex
 from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
@@ -14,6 +13,12 @@ if TYPE_CHECKING:
     from llama_packer.model import Model
 
 logger = logging.getLogger(__name__)
+
+# Architectures with a static-resolution vision encoder (fixed resize to a
+# single tile). llama-server ignores --image-min/max-tokens for these, so
+# declaring them in a sidecar is flagged instead of silently doing nothing.
+_STATIC_IMAGE_ARCHES = frozenset({"gemma3", "gemma4"})
+_warned_static_arch: set[str] = set()
 
 
 class LlamaServerBackend(BaseBackend):
@@ -49,6 +54,42 @@ class LlamaServerBackend(BaseBackend):
             return [], {"mtp_enabled": False}
         return args, {"mtp_enabled": True, "mtp_draft_max": n_max}
 
+    def _image_token_args(self, model: "Model", include_mmproj: bool) -> list[str]:
+        """--image-min/max-tokens flags from sidecar declarations.
+
+        Only emitted when the vision projection is actually served: the flags
+        are meaningless for a text-only variant. Declared on a model without
+        an mmproj — or on a static-resolution arch (Gemma/SigLIP, fixed ~256
+        tokens/image) — is warned about and skipped.
+        """
+        imin, imax = model.image_min_tokens, model.image_max_tokens
+        if imin is None and imax is None:
+            return []
+        if not (model.mmproj and model.mmproj.gguf_path):
+            logger.warning(
+                "image tokens: %s declares image_min/max_tokens but has no "
+                "mmproj companion; flags skipped", model.stem)
+            return []
+        if not include_mmproj:
+            return []  # text-only variant: vision not served, silently skip
+        arch = None
+        if model.gguf_path:
+            arch, _ = utils.gguf_header_probe(model.gguf_path)
+        if arch in _STATIC_IMAGE_ARCHES:
+            msg = (f"image tokens: {model.stem}: arch {arch!r} has a "
+                   f"static-resolution vision encoder (fixed ~256 tokens per "
+                   f"image); --image-min/max-tokens are no-ops and skipped")
+            if msg not in _warned_static_arch:
+                _warned_static_arch.add(msg)
+                logger.warning(msg)
+            return []
+        args: list[str] = []
+        if imin is not None:
+            args += ["--image-min-tokens", str(imin)]
+        if imax is not None:
+            args += ["--image-max-tokens", str(imax)]
+        return args
+
     def build_cmd(
         self,
         model: "Model",
@@ -68,15 +109,12 @@ class LlamaServerBackend(BaseBackend):
             "--n-gpu-layers", ("0" if model.on_cpu else "999"),
         ]
 
-        role_flags = self._ROLE_FLAGS.get(model.role)
-        if role_flags:
-            flags += shlex.split(role_flags)
-
         mtp_args, meta = self._mtp_args(model)
         flags += mtp_args
 
         if include_mmproj and model.mmproj and model.mmproj.gguf_path:
             flags += ["--mmproj", str(model.mmproj.gguf_path)]
+        flags += self._image_token_args(model, include_mmproj)
 
         ct = model.resolved_chat_template
         if ct is not None:
@@ -95,8 +133,10 @@ class LlamaServerBackend(BaseBackend):
             if model.reasoning_preserve:
                 flags += ["--reasoning-preserve"]
 
-        cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command(
-            [tvars.get("llama_bin", "")], flags, cli_args,
+            [tvars.get("llama_bin", "")], flags,
+            global_args=tvars.get("llama_args") or "",
+            role_flags=self._ROLE_FLAGS.get(model.role, ""),
+            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
         )
         return cmd, meta

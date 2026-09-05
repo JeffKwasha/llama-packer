@@ -29,6 +29,10 @@ chat/
 llama-b*/
 stable-diffusion*/
 llama-swap
+llama-swap-v*
 
 # uv / setuptools build artifacts
 build/
+
+# Local node_modules (e.g. extras/node_modules symlink for opencode plugin deps)
+node_modules/

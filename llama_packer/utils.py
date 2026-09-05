@@ -58,14 +58,26 @@ def _pair_flags(tokens: list[str]) -> dict[str, str]:
     return flags
 
 
-def render_command(head: list[str], flag_tokens: list[str], cli_args: str = "") -> str:
-    """Compose ``<head> <flags> <cli_args>`` with no duplicate flags.
+def render_command(head: list[str], builtin_flags: list[str], global_args: str = "",
+                   role_flags: str = "", cli_args: str = "") -> str:
+    """Compose ``<head> <flags>`` from precedence-ordered sources.
 
-    Structured ``flag_tokens`` and free-form ``cli_args`` are both reduced to
-    an ordered flag→value map; ``cli_args`` merges last (last-write-wins per
-    flag), so a flag set both structurally and in ``cli_args`` is emitted once.
+    Every source is reduced to one ordered flag→value map (a flag can only
+    appear once; a later source overwrites an earlier one — per-flag,
+    most-specific-wins).  Precedence, least to most specific:
+
+    1. ``builtin_flags`` — backend built-ins (``-c``, ``--parallel``, …)
+    2. ``global_args``  — fleet-wide tuning flags (profiles.yaml ``<section>.args``)
+    3. ``role_flags``   — per-role flags (embed/rerank ``-b/-ub 4096``)
+    4. ``cli_args``     — per-model sidecar ``cli_args:``
+
+    The free-form sources are shlex-parsed here, so quoting errors surface at
+    command-render time.  If a new use case needs a different ordering, open
+    an issue for a refactor instead of breaching these argument categories.
     """
-    flags = _pair_flags(flag_tokens)
+    flags = _pair_flags(builtin_flags)
+    flags.update(_pair_flags(shlex.split(global_args)))
+    flags.update(_pair_flags(shlex.split(role_flags)))
     flags.update(_pair_flags(shlex.split(cli_args)))
     out = list(head)
     for flag, value in flags.items():
@@ -507,8 +519,14 @@ _DEFAULT_DIR_ROLES = {
 }
 
 # Roles a served directory may map to (companions are detected by filename,
-# never by directory).
-SERVED_ROLES = ("chat", "embeddings", "rerank", "image")
+# never by directory).  ``s2t`` (whisper.cpp speech-to-text) and ``t2s``
+# (kokoro text-to-speech) are opt-in via profiles.yaml ``dirs:``, mirroring
+# ``img: image``.
+SERVED_ROLES = ("chat", "embeddings", "rerank", "image", "s2t", "t2s")
+
+# Roles excluded from chat-specific passes: mmproj keep/drop, the shared
+# chat+emb+rnk matrix solve, and matrix var collection.
+NON_CHAT_ROLES = ("embeddings", "rerank", "image", "s2t", "t2s")
 
 
 def validate_dir_roles(dir_roles: dict) -> str | None:

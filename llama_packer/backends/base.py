@@ -7,7 +7,11 @@ form the support matrix consulted by ``build_config``:
 
     name      registry key — the sidecar / override ``backend:`` value
     formats   model file formats the engine can load: ``.gguf``,
-              ``.safetensors`` and/or ``hf_repo`` (serving from an HF repo id)
+              ``.safetensors`` and/or ``hf_repo`` (legacy: serving directly
+              from an HF repo id when no local file is resolved; ``hf_repo``
+              itself is *not* a file – it is the *place* where a file lives,
+              resolved by ``Model._resolve_gguf_path`` to a concrete snapshot
+              file, ``gguf_path``)
     roles     model roles it can serve: chat / embeddings / rerank
     handles   SETTING_KEYS it renders into the command; anything a user
               declares that a backend does not handle is warned about instead
@@ -46,6 +50,9 @@ class BaseBackend(ABC):
     formats: ClassVar[frozenset[str]]
     roles: ClassVar[frozenset[str]]
     handles: ClassVar[frozenset[str]]
+    # True when the server is a proxied HTTP service (llama-swap needs the
+    # `proxy:` + `checkEndpoint:` fields instead of managing inference).
+    proxied: ClassVar[bool] = False
 
     def unsupported_reason(self, model: "Model") -> str | None:
         """Return why this backend cannot serve *model*, or None if it can."""
@@ -56,9 +63,11 @@ class BaseBackend(ABC):
             return None
         suffix = model.gguf_path.suffix.lower() if model.gguf_path else None
         if suffix not in self.formats:
-            got = (suffix
-                   or ("no local model file" if not model.hf_repo
-                       else model.hf_repo))
+            got = suffix or "no file"
+            if model.gguf_path:
+                got = model.gguf_path.name
+            elif model.hf_repo:
+                got = f"hf_repo {model.hf_repo!r} (no local file resolved)"
             return (f"format {got!r} not supported "
                     f"(supports: {', '.join(sorted(self.formats))})")
         return None

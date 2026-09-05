@@ -125,10 +125,15 @@ def test_infer_backend_no_available_backend_skips(make_model, tmp_path, caplog):
     import logging
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".onnx")
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.INFO):
         _run([m])
     assert getattr(m, "_override_error", None) is not None
-    assert any("no available backend" in r.message for r in caplog.records)
+    # Expected as info when engine unconfigured: ordinary fleets without a
+    # backend should not warn/error. Wording: “No backend supports … in …”
+    assert any("No backend supports" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING
+                   and "No backend supports" in r.message
+                   for r in caplog.records)
 
 
 def test_declared_backend_beats_inference(make_model, tmp_path):

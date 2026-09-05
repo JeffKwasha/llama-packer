@@ -210,14 +210,19 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
         m.vram.effective_static = fake_effective_static
         m.vram.fit_params_static = fake_fp
 
-    captured = {}
+    calls: list[dict] = []
     monkeypatch.setattr(writer, "solve_matrix_ctx",
-                        lambda **kw: captured.update(kw) or 8192)
+                        lambda **kw: calls.append(dict(kw)) or 8192)
     profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    writer._solve_matrix_context([chat], embed, rerank, "unused", 48000,
-                                 None, profiles)
-    assert captured["embed_ctx"] == 32768   # declared, not hardcoded 8192
-    assert captured["rerank_ctx"] == 16384
+    result = writer._solve_matrix_context([chat], embed, rerank, "unused",
+                                          48000, None, profiles)
+    assert result is not None
+    assert calls[0]["embed_ctx"] == 32768   # declared, not hardcoded 8192
+    assert calls[0]["rerank_ctx"] == 16384
+    # The fake solver returns 8192 (< tools_min_ctx) so the squeeze fires,
+    # but its gain is 0 (< ctx_gain_min) — declared contexts must survive.
+    assert (result.embed_ctx, result.rerank_ctx) == (32768, 16384)
+    assert result.squeeze is False
 
 
 def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
@@ -360,12 +365,182 @@ def test_cli_args_duplicate_flag_collapses(make_model):
     assert "deepseek" not in cmd
 
 
+# ── global backend args (profiles.yaml `<section>.args`) ─────────────────
+
+def test_llama_server_global_args_chat(make_model):
+    # Chat models get the fleet-wide performance flags as-is.
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
+    cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", tv)
+    assert "--flash-attn on -b 512 -ub 512" in cmd
+
+
+def test_llama_server_global_args_role_flags_win(make_model):
+    # Global args render BEFORE the per-role flags, so embed/rerank keep
+    # their tuned -b/-ub 4096; non-conflicting flags still apply.
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
+    cmd, _ = LlamaServerBackend().build_cmd(
+        make_model("e", role="embeddings"), 32768, 1, "q8_0", tv)
+    assert cmd.count("-b ") == 1 and cmd.count("-ub ") == 1
+    assert "-b 4096 -ub 4096" in cmd
+    assert "-b 512" not in cmd
+    assert "--flash-attn on" in cmd
+
+
+def test_llama_server_global_args_per_model_cli_args_win(make_model):
+    # Per-model cli_args beat the global args per flag, emitted once.
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512"}
+    m = make_model("m", cli_args="-b 2048")
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", tv)
+    assert cmd.count("-b ") == 1
+    assert "-b 2048" in cmd
+    assert "--flash-attn on" in cmd
+
+
+def test_llama_server_global_args_absent_no_leak(make_model):
+    # No llama_args configured -> nothing changes.
+    cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", _tvars())
+    assert "--flash-attn" not in cmd
+
+
+def test_vllm_global_args_host_and_docker(make_model):
+    tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
+    m = make_model("v", hf_repo="org/model")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert "--max-num-batched-tokens 512" in cmd
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert "--max-num-batched-tokens 512" in cmd
+
+
+def test_vllm_global_args_per_model_cli_args_win(make_model):
+    tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
+    m = make_model("v", hf_repo="org/model", cli_args="--max-num-batched-tokens 1024")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert cmd.count("--max-num-batched-tokens") == 1
+    assert "--max-num-batched-tokens 1024" in cmd
+
+
+def test_whisper_server_global_args(make_model):
+    tv = {"whisper_bin": "/opt/whisper-server", "whisper_args": "--flash-attn on"}
+    m = make_model("w", role="s2t")
+    m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
+    cmd, _ = get_backend("whisper-server").build_cmd(m, 32768, 1, "q8_0", tv)
+    assert "--flash-attn on" in cmd
+
+
+def test_sd_server_global_args(make_model):
+    tv = {"sd_bin": "/opt/sd-server", "sd_args": "--diffusion-fa"}
+    m = make_model("i", role="image")
+    m.gguf_path = Path("/models/img/flux-4b.gguf")
+    cmd, _ = get_backend("sd-server").build_cmd(m, 4096, 1, "q8_0", tv)
+    assert "--diffusion-fa" in cmd
+
+
+def test_whisper_global_args_per_model_cli_args_win(make_model):
+    # Parity with llama/vllm: per-model cli_args beat the global args per flag.
+    tv = {"whisper_bin": "/opt/whisper-server", "whisper_args": "--flash-attn on"}
+    m = make_model("w", role="s2t", cli_args="--flash-attn off")
+    m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
+    cmd, _ = get_backend("whisper-server").build_cmd(m, 32768, 1, "q8_0", tv)
+    assert cmd.count("--flash-attn") == 1
+    assert "--flash-attn off" in cmd
+
+
+def test_sd_global_args_per_model_cli_args_win(make_model):
+    tv = {"sd_bin": "/opt/sd-server", "sd_args": "--diffusion-fa --steps 20"}
+    m = make_model("i", role="image", cli_args="--steps 30")
+    m.gguf_path = Path("/models/img/flux-4b.gguf")
+    cmd, _ = get_backend("sd-server").build_cmd(m, 4096, 1, "q8_0", tv)
+    assert cmd.count("--steps") == 1
+    assert "--steps 30" in cmd
+    assert "--diffusion-fa" in cmd
+
+
+# ── render_command precedence (builtin < global < role < cli) ─────────────
+
+def test_render_command_precedence_order():
+    # Later sources overwrite earlier ones per flag; each flag emitted once.
+    from llama_packer.utils import render_command
+    # Later sources overwrite earlier values per flag; each flag emitted once
+    # (at its first-seen position).
+    cmd = render_command(
+        ["srv"], ["-c", "4096", "--parallel", "1"],
+        global_args="-b 512 --flash-attn on",
+        role_flags="-b 4096 -ub 4096",
+        cli_args="-c 8192",
+    )
+    assert cmd == "srv -c 8192 --parallel 1 -b 4096 --flash-attn on -ub 4096"
+
+
+def test_render_command_empty_sources():
+    from llama_packer.utils import render_command
+    assert render_command(["srv"], []) == "srv"
+    assert render_command(["srv"], ["-x"], global_args="", role_flags="") == "srv -x"
+
+
+def test_render_command_flag_order_preserved_within_source():
+    from llama_packer.utils import render_command
+    cmd = render_command(["srv"], ["--z-last", "1", "--a-first", "2"])
+    assert cmd == "srv --z-last 1 --a-first 2"
+
+
 def test_llama_server_multiple_loras_comma_joined(make_model):
     m = make_model("m")
     m._resolved_loras = [Path("/a/x.gguf"), Path("/a/y.gguf")]
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
     assert cmd.count("--lora") == 1
     assert "--lora /a/x.gguf,/a/y.gguf" in cmd
+
+
+# ── image token flags (vision sidecar declarations) ───────────────────────
+
+def test_llama_server_image_token_flags(make_model, tmp_path):
+    # Declared image token bounds on a vision model are emitted as CLI flags.
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
+    m = make_model("v", mmproj="v-mmproj.gguf",
+                   **{"image_min_tokens": 1024, "image_max_tokens": 4096})
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--mmproj" in cmd
+    assert "--image-min-tokens 1024" in cmd
+    assert "--image-max-tokens 4096" in cmd
+
+
+def test_llama_server_no_image_flags_without_declaration(make_model):
+    # No sidecar declaration -> no flags (defaults come from the model).
+    cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", _tvars())
+    assert "--image-min-tokens" not in cmd
+    assert "--image-max-tokens" not in cmd
+
+
+def test_llama_server_image_tokens_without_mmproj_warned(make_model, caplog):
+    m = make_model("m", **{"image_min_tokens": 1024})
+    with caplog.at_level(logging.WARNING):
+        cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--image-min-tokens" not in cmd
+    assert any("no mmproj companion" in r.message for r in caplog.records)
+
+
+def test_llama_server_image_tokens_static_arch_skipped(make_model, tmp_path,
+                                                       monkeypatch, caplog):
+    # Static-resolution vision archs (Gemma/SigLIP, ~256 tokens/image fixed)
+    # ignore the flags — declared bounds are warned about and skipped.
+    (tmp_path / "g-mmproj.gguf").write_bytes(b"mm")
+    m = make_model("g", mmproj="g-mmproj.gguf", **{"image_min_tokens": 1024})
+    monkeypatch.setattr("llama_packer.utils.gguf_header_probe",
+                        lambda p: ("gemma4", True))
+    with caplog.at_level(logging.WARNING):
+        cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--image-min-tokens" not in cmd
+    assert any("static-resolution" in r.message for r in caplog.records)
+
+
+def test_llama_server_image_tokens_text_variant_skipped(make_model, tmp_path):
+    # The -text variant serves no vision: flags dropped without a warning.
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
+    m = make_model("v", mmproj="v-mmproj.gguf", **{"image_min_tokens": 1024})
+    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars(),
+                                            include_mmproj=False)
+    assert "--image-min-tokens" not in cmd
+    assert "--mmproj" not in cmd
 
 
 def test_vllm_warns_on_reasoning_format(make_model, caplog):
@@ -440,3 +615,136 @@ def test_unsupported_reason_accepts_vllm_rerank(make_model):
     m.gguf_path = None
     m.frontmatter["hf_url"] = "https://huggingface.co/org/R3-rerank"
     assert infer_backend(m, {"vllm_image": "img"}) == "vllm-docker"
+
+
+# ── whisper-server backend ────────────────────────────────────────────────
+
+def test_whisper_server_registered():
+    b = get_backend("whisper-server")
+    assert b.formats == {".bin"}
+    assert b.roles == {"s2t"}
+    assert b.proxied is True
+
+
+def test_whisper_server_requires_binary(make_model):
+    b = get_backend("whisper-server")
+    assert not b.is_available({})
+    assert b.is_available({"whisper_bin": "/opt/whisper-server"})
+
+
+def test_whisper_server_cmd(make_model):
+    m = make_model("w", role="s2t")
+    m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
+    cmd, meta = get_backend("whisper-server").build_cmd(
+        m, 32768, 1, "q8_0", {"whisper_bin": "/opt/whisper-server"})
+    assert cmd.startswith("/opt/whisper-server --host 0.0.0.0 --port ${PORT}")
+    assert "--model /models/s2t/ggml-large-v3.bin" in cmd
+    assert "--parallel 1" in cmd
+    assert meta == {}
+
+
+def test_whisper_server_cli_args_pass_through(make_model):
+    m = make_model("w", role="s2t", cli_args="--language en")
+    m.gguf_path = Path("/models/s2t/ggml-base.bin")
+    cmd, _ = get_backend("whisper-server").build_cmd(
+        m, 32768, 1, "q8_0", {"whisper_bin": "whisper-server"})
+    assert "--language en" in cmd
+
+
+def test_infer_backend_whisper(make_model):
+    from llama_packer.backends import infer_backend
+    m = make_model("w", role="s2t")
+    m.gguf_path = Path("/models/s2t/ggml-base.bin")
+    # No whisper binary configured → no inference.
+    assert infer_backend(m, {"llama_bin": "/opt/llama"}) is None
+    # Configured → whisper-server wins for role s2t (.bin is not .gguf anyway).
+    assert infer_backend(m, {"llama_bin": "/opt/llama",
+                             "whisper_bin": "/opt/whisper-server"}) == "whisper-server"
+
+
+def test_fixed_overhead_backends_include_whisper():
+    from llama_packer.backends import FIXED_OVERHEAD_BACKENDS
+    assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server", "kokoro-podman"}
+
+
+# ── kokoro-podman backend ─────────────────────────────────────────────────
+
+def test_kokoro_registered():
+    b = get_backend("kokoro-podman")
+    assert b.formats == {".onnx", "hf_repo"}
+    assert b.roles == {"t2s"}
+    assert b.proxied is True
+
+
+def test_kokoro_requires_image():
+    from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES
+    b = get_backend("kokoro-podman")
+    assert not b.is_available({})
+    assert b.is_available({"kokoro_image": KOKORO_DEFAULT_IMAGES["nvidia"]})
+
+
+def _kokoro_model(tmp_path, **fm):
+    """hf_repo-only t2s Model (weights baked into the container image)."""
+    from llama_packer.model import Model
+    md = tmp_path / "k.md"
+    md.write_text("---\nname: k\n---\n")
+    fm.setdefault("role", "t2s")
+    fm.setdefault("hf_repo", "hexgrad/Kokoro-82M")
+    return Model(md, fm)
+
+
+def test_kokoro_cmd_nvidia(tmp_path):
+    m = _kokoro_model(tmp_path)
+    assert m.gguf_path is None and m.hf_repo  # image-baked: no local file
+    cmd, meta = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "ghcr.io/remsky/kokoro-fastapi-gpu:latest",
+        "kokoro_vendor": "nvidia",
+        "kokoro_container_port": 8880,
+    })
+    assert cmd.startswith("podman run --init --rm --name ${MODEL_ID}")
+    assert "-p ${PORT}:8880" in cmd
+    assert "--device nvidia.com/gpu=all" in cmd
+    assert cmd.endswith("ghcr.io/remsky/kokoro-fastapi-gpu:latest")
+    assert meta == {}
+
+
+def test_kokoro_cmd_amd_uses_native_rocm_devices(tmp_path):
+    m = _kokoro_model(tmp_path)
+    cmd, _ = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "ghcr.io/remsky/kokoro-fastapi-rocm:latest",
+        "kokoro_vendor": "amd",
+    })
+    assert "--device /dev/kfd --device /dev/dri" in cmd
+    assert "--group-add video" in cmd and "--group-add render" in cmd
+    assert "kokoro-fastapi-rocm:latest" in cmd
+
+
+def test_kokoro_cmd_cpu_has_no_device_flags(tmp_path):
+    m = _kokoro_model(tmp_path)
+    cmd, _ = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "ghcr.io/remsky/kokoro-fastapi-cpu:latest",
+        "kokoro_vendor": "cpu",
+    })
+    assert "--device" not in cmd
+
+
+def test_kokoro_podman_args_and_voices_override(tmp_path):
+    m = _kokoro_model(tmp_path)
+    cmd, _ = get_backend("kokoro-podman").build_cmd(m, 0, 1, "q8_0", {
+        "kokoro_image": "img",
+        "kokoro_vendor": "nvidia",
+        "podman_args": "--device /dev/mygpu",
+        "voices_dir": "/mnt/ai/models/t2s/voices",
+    })
+    # podman_args replaces the auto device flags entirely.
+    assert "--device /dev/mygpu" in cmd
+    assert "nvidia.com/gpu" not in cmd
+    # Voices mount is read-write so combined voicepacks persist.
+    assert "-v /mnt/ai/models/t2s/voices:/app/api/src/voices/v1_0" in cmd
+
+
+def test_infer_backend_kokoro(tmp_path):
+    from llama_packer.backends import infer_backend
+    # Weights are baked into the image — hf_repo-only sidecars are typical.
+    m = _kokoro_model(tmp_path)
+    assert infer_backend(m, {"kokoro_image": "img"}) == "kokoro-podman"

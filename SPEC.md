@@ -69,10 +69,11 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Shared embed/rerank/chat VRAM budget solving (`embed`/`rerank` model refs) | [Matrix Context Solving](#matrix-context-solving) |
+| `matrix` | Shared embed/rerank/chat VRAM budget solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
+| `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
@@ -184,6 +185,18 @@ Companion GGUFs cannot be measured by `llama-fit-params` — mmproj files fail t
 
 An attempt is made to run `llama-fit-params` on each companion first (cached per companion); on failure it falls back to the file-size estimate with a warning. This fixes companion VRAM being under-budgeted by raw file size alone (a Gemma4-31B + MTP + mmproj combination was measured to need ~1.8 GiB more than the sum of companion file sizes).
 
+### Image token budget (vision sidecars)
+
+Dynamic-resolution vision models (Qwen-VL family) convert each image to a resolution-dependent number of LLM tokens: 1 token ≈ 28×28 px for Qwen2.5-VL (14×14 patches, 2×2 merge) and ≈ 32×32 px for Qwen3-VL (16×16 patches). A sidecar can declare `image_min_tokens` / `image_max_tokens` (positive ints) on a vision model; both are pass-through to `llama-server --image-min-tokens/--image-max-tokens`, emitted only on variants that serve the `--mmproj` (text variants drop them silently). There are no packer-side defaults — unset keys mean llama-server reads the model's own metadata (which for e.g. Qwen2.5-VL tops out at 16384 tokens/image).
+
+Semantics:
+
+- **min**: low-resolution images are upscaled so they occupy at least this many tokens — the control for analysis quality. 1024 tokens ≈ 1 MP of effective detail, an adequate floor for art/artifact critique (dense images under-sampled below ~1k tokens tend to get answered from the model's prior instead of the pixels).
+- **max**: large images are downscaled to this token ceiling — the control for bounding KV cost and prompt size. Diminishing quality returns beyond ~4k tokens.
+- **Static-resolution archs** (Gemma 3/4, SigLIP: fixed resize, ~256 tokens/image) ignore both flags; declaring them there logs a one-time warning and skips emission, as does declaring them on a model with no mmproj companion.
+
+VRAM accounting: image tokens are ordinary tokens inside `-c` — they consume KV slots already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved context is never allowed to drop below `parallel × image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the matrix solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
+
 ### Context calculation formula
 
 ```
@@ -208,7 +221,7 @@ max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-co
 
 Chat models target a minimum useful context (`_MIN_USEFUL_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without vision (at the global `--spare`):
 
-- `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `vision` capability. An on-demand **text-only variant** `<id>-text` (no `--mmproj`, `vision` removed, `metadata.mmproj_skipped: true`, display name `[text]`) is emitted alongside so clients can pick the lower-memory serving.
+- `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `image` capability. An on-demand **text-only variant** `<id>-text` (no `--mmproj`, `image` removed, `metadata.mmproj_skipped: true`, display name `[text]`) is emitted alongside so clients can pick the lower-memory serving.
 - `ctx_with < min_context` → the main entry **drops** mmproj and is renamed `<id>-text` — the invariant is that the bare `<id>` always serves vision when the model has one; every no-mmproj entry carries the `-text` suffix and `[text]` label so a client that knows nothing of server config can tell it is text-only from `/v1/models`. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
 - `ctx_without < min_context` too → **vision is kept**: dropping the projection cannot reach the minimum either way, so sacrificing it buys nothing (a small VLM stays a full VLM). Informational log only — no warning, since no configuration can fix a design-context limit.
 
@@ -221,12 +234,55 @@ When `profiles.yaml` defines a `matrix` section with `embed` and `rerank` models
 ```
 reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
 available = vram_total - reserve - spare
-chat_ctx solves Σ(chat_weight + chat_factor × chat_ctx) = available - embed - rerank
+chat_ctx solves Σ(chat_weight + chat_factor × chat_ctx) = available - embed - rerank - coloads
 ```
 
-The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (default 8192 each). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models.
+The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (at their declared contexts). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models. Smaller chat models are never raised above their own design context — they are only clamped down to it.
 
 Embed/rerank models are auto-selected as the smallest model of each type, or matched by `--embed`/`--rerank` CLI selectors.
+
+### Knobs (matrix section keys)
+
+| key | default | meaning |
+| --- | --- | --- |
+| `min_chat_ctx` | 65536 | Co-load decision floor: a co-load is only included while chat stays at or above this |
+| `tools_min_ctx` | 131072 | Tools advertisement threshold; also the floor when a tools chat model can still keep it |
+| `coload_min_ctx` | 20480 | emb/rerank squeeze floor |
+| `ctx_gain_min` | 4096 | Minimum chat-context gain for a squeeze to be adopted |
+| `estimate_headroom` | 1.25 | Padding applied to *estimated* (not measured/pinned) co-load overheads |
+
+Invalid values warn and fall back to the default; the solve never fails on a bad knob.
+
+### emb/rerank squeeze
+
+When the baseline solve puts chat below `tools_min_ctx`, the solver re-solves with embed/rerank contexts clamped to `coload_min_ctx`. The squeeze is adopted only when it buys chat at least `ctx_gain_min`; otherwise design contexts are kept. An adopted squeeze is *realized*: the reduced context is emitted into the embed/rerank commands (that emit is what frees the VRAM), and `metadata.ctx_size` on those entries reflects it.
+
+### Opportunistic co-loads
+
+After the squeeze pass, enabled `s2t` and `image` models (not `t2s` — containerized, separate pool; not `embeddings`/`rerank` — unconditional residents) are included smallest-fixed-overhead-first while the chat solve stays at or above the floor:
+
+- floor = `tools_min_ctx` when a chat model declares `tools` and the baseline still keeps it; otherwise `min_chat_ctx`.
+- A candidate that would drop chat below the floor is skipped with a warning naming model and MB; it does not block smaller candidates later in the list.
+- Fixed overhead = weights + fixed compute (`ctx_factor = 0` for these backends). An operator-pinned `vram_mb` sidecar field is authoritative (`source: config`); otherwise the file-size + per-backend-buffer estimate applies, padded by `estimate_headroom` when no measurement exists. CPU-resident candidates cost 0.
+- Shared process overhead is counted once per process, not per model — a multi-model entry (e.g. a speech server hosting ASR + VAD + diarization) is budgeted as Σ(weights + per-model activations) + one shared constant; pin the entry with `vram_mb` to encode the sum directly.
+
+Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision), and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
+
+### tools demotion
+
+A chat model declaring `capabilities: [tools]` that the matrix solve serves below `tools_min_ctx` gets the capability demoted in its emitted entries: `capabilities.tools: false` and `metadata.tools_demoted: true` (per entry; the sidecar declaration is untouched, so re-packing at a higher served context restores it). This keeps `/v1/models` consumers (hermes, opencode, UIs) from sending tool calls to a window too small to serve them. Note `capabilities.context` reports the max *trained* context (`design_context`) regardless; the VRAM-served limit lives in `metadata.ctx_size`.
+
+## Main-Chat Context Determination
+
+The full context ladder, smallest to largest:
+
+1. `_MIN_CTX_SIZE` (4096) — hard emit floor for any served entry.
+2. `matrix.coload_min_ctx` (20K) — emb/rerank squeeze floor (above).
+3. `matrix.min_chat_ctx` (64K) — co-load decision floor: co-loads may not push chat below it. emb/rerank, being unconditional, may — at which point tools demotion is the signal.
+4. `matrix.tools_min_ctx` (128K) — tools advertisement threshold (above).
+5. `design_context` / `--max-context` — never raised, only clamped down.
+
+Without a matrix section, each model's context is solved independently by `calc_ctx` against the shared budget minus fixed co-load overheads (none included) — unchanged historical behavior.
 
 ## MTP Speculative Decoding
 
@@ -532,7 +588,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Memory estimation
 
-`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, `ctx_factor = 0`, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM; the entry is excluded from the shared `chat + emb + rnk` matrix solve (a 40 GB diffusion model would otherwise collapse the chat budget).
+`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, `ctx_factor = 0`, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM; the entry is excluded from the shared chat budget solve itself, but (unlike before) is a candidate for the opportunistic co-load pass when a matrix section is configured — included only while chat keeps its floor (a 40 GB diffusion model simply won't fit after the RAG set).
 
 ### Binary precedence
 
@@ -540,7 +596,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Capabilities
 
-`role: image` emits `capabilities: {in: [text, image], out: [image], context: design_context}` — image outputs, text+image inputs (so llama-swap shows both `Image Gen` and `Img→Img` badges). `vision/audio/speech` capabilities are ignored for `image` roles (those are chat-only). `proxy` / `checkEndpoint` are always emitted for `sd-server` entries.
+`role: image` emits `capabilities: {in: [text, image], out: [image], context: design_context}` — image outputs, text+image inputs (so llama-swap shows both `Image Gen` and `Img→Img` badges) — or `out: [video]` when `capabilities` contains `video` or `architecture` is `wan`, `hunyuan-video`, `h3`, `mochi` etc (video diffusion). `image/audio/speech/video` capabilities are ignored for `image` roles except `video` for output selection (chat-only otherwise). `proxy` / `checkEndpoint` are always emitted for `sd-server` entries.
 
 ### Limitations
 
@@ -548,6 +604,142 @@ Emission (see `docs/plans/comfyui-sd.md`):
 - VRAM sizing is fixed and deliberately conservative — large flux/sdxl models should be sized via `spare` / `baseline` or explicit `hardware.vram` tuning, not matrix sharing.
 - `cli_args` pass-through works, but backend-specific flags (`--diffusion-fa`, `--offload-to-cpu`, `--lora-model-dir`) are operator-provided via sidecar `cli_args:` until first-class `sd_*` keys are added.
 - ComfyUI (`comfyui-boot`) remains future work via the same `image` role — see `docs/plans/comfyui-sd.md` for `compat.ignoreWebsockets` / `upstream.ignorePaths` shape.
+
+## Audio Backend (whisper-server)
+
+A model with `role: s2t` (opt-in: an `s2t/` directory plus `dirs: {s2t: s2t}` in
+`profiles.yaml`) is served with **whisper-server** from
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`backend: whisper-server`) —
+the long-lived HTTP server from `examples/server` (the analog of `llama-server`;
+`whisper-cli` is oneshot and cannot be proxied by llama-swap). Exposes
+OpenAI-compatible `POST /v1/audio/transcriptions`.
+
+```yaml
+# profiles.yaml
+dirs: {s2t: s2t}
+backends: [llama-server, whisper-server]
+
+# sidecar: s2t/ggml-large-v3.md (authored — .bin orphans are never stubbed)
+---
+name: whisper-large-v3
+parameters: 1.5B
+---
+```
+
+Emitted entry:
+
+```yaml
+whisper-large-v3:
+  cmd: whisper-server --host 0.0.0.0 --port ${PORT} --model ${MODELS_DIR}/s2t/ggml-large-v3.bin --parallel 1
+  proxy: http://127.0.0.1:${PORT}
+  checkEndpoint: /        # same /health pitfall as sd-server (Discussion #866)
+  capabilities: {in: [audio], out: [text]}
+```
+
+### s2t model resolution
+
+- GGML `.bin` has no header fingerprint, so the directory is authoritative:
+  `.bin` files resolve only inside an `s2t`-mapped directory, by same-stem
+  sidecar convention (or frontmatter `model:`).
+- `.bin` orphans are never stubbed and never auto-served — a bare `.bin` with
+  no same-stem `.md` logs one info line and is skipped (few whisper models,
+  low churn; authored sidecars only).
+- A `.bin` beside a sidecar in any non-s2t role resolves but fails backend
+  inference ("no available backend supports format '.bin'") and the model is skipped.
+
+### Binary precedence
+
+`--whisper-server` CLI flag > `whisper.bin` in `profiles.yaml` `whisper:` section >
+`$WHISPER_BIN_DIR` (file or directory containing `whisper-server`) >
+`whisper-server` on `PATH`. Absent binary disables format-based inference;
+an explicit `backend: whisper-server` pin to a disabled setup is an error that
+skips the model. Docker variant is future work.
+
+### Capabilities and VRAM
+
+`role: s2t` emits `capabilities: {in: [audio], out: [text]}` (Transcription
+badge); declared `image/audio/speech` capabilities are chat-only and ignored
+for s2t roles. VRAM is fixed overhead like sd-server: `model_mib = file-size`,
+`ctx_factor = 0`, `compute_mib = 100` (measured on Vulkan: process footprint
+≈ Σ model files — activation memory is small; sd-server keeps its 512 MiB
+diffusion buffer); a sidecar `vram_mb` pins the total outright.
+`ctx_size` tracks `design_context` (sidecar `context_length` or default)
+without affecting VRAM. s2t models are candidates for the *opportunistic
+co-load pass* (see Matrix Context Solving): with a matrix section configured,
+the smallest ones join the shared resident set while chat keeps its floor.
+The emitted `--parallel` maps the sidecar/profile slot count to concurrent
+transcription workers.
+
+## Audio Backend (kokoro-podman)
+
+A model with `role: t2s` (opt-in: a `t2s/` directory plus `dirs: {t2s: t2s}` in
+`profiles.yaml`) is served with **kokoro-podman** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+text-to-speech via [remsky/Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI)
+in **rootless podman** (OpenAI-compatible `POST /v1/audio/speech`,
+`GET /v1/audio/voices`, health on `/`, container port 8880).
+
+```yaml
+# profiles.yaml
+dirs: {t2s: t2s}
+backends: [llama-server, kokoro-podman]
+```
+
+```yaml
+# sidecar: t2s/kokoro-v1.md — weights and ~50 voicepacks are baked into the
+# image, so hf_repo alone identifies the model; no local file required.
+---
+name: kokoro-v1
+hf_repo: hexgrad/Kokoro-82M
+description: "Kokoro-82M text-to-speech"
+---
+```
+
+Emitted entry (NVIDIA example):
+
+```yaml
+kokoro-v1:
+  cmd: podman run --init --rm --name ${MODEL_ID} -p ${PORT}:8880 --device nvidia.com/gpu=all ghcr.io/remsky/kokoro-fastapi-gpu:latest
+  proxy: http://127.0.0.1:${PORT}
+  checkEndpoint: /
+  capabilities: {in: [text], out: [audio]}
+```
+
+### Vendor selection
+
+The GPU vendor picks both the default image tag and device pass-through flags:
+
+| vendor | default image | podman flags |
+|--------|--------------|--------------|
+| nvidia | `ghcr.io/remsky/kokoro-fastapi-gpu:latest` | `--device nvidia.com/gpu=all` |
+| amd | `ghcr.io/remsky/kokoro-fastapi-rocm:latest` | `--device /dev/kfd --device /dev/dri --group-add video --group-add render` |
+| cpu | `ghcr.io/remsky/kokoro-fastapi-cpu:latest` | *(none)* |
+
+Detection probes `amd-smi`/`rocminfo` then `nvidia-smi`. Precedence for the
+image: CLI `--kokoro-image` > profiles.yaml `t2s.image:` > vendor default.
+`t2s.vendor:` (`auto|nvidia|amd|cpu`) overrides detection for tag *and* flags;
+`t2s.podman_args:` replaces the auto flags entirely; `t2s.container_port`
+overrides 8880; `t2s.voices_dir:` bind-mounts a persistent voicepack directory
+(read-write — the server loads `.pt` packs per request and saves combined
+voices back). Pin to an upstream release tag rather than `:latest` for
+stability (`gpu:-cu128` for RTX 50-series / Blackwell).
+
+### Voices
+
+No per-model configuration: voices live server-side in the image (~50 packs),
+selected per request via the JSON body (`"voice": "af_heart"`, weighted mixes
+like `"af_bella(2)+af_sky(1)"`) and listed at `/v1/audio/voices`.
+
+### Capabilities and VRAM
+
+`role: t2s` emits `capabilities: {in: [text], out: [audio]}` (Speech badge).
+VRAM is fixed overhead: weights are baked into the image so `model_mib` is 0
+unless a local file resolves, plus a conservative 3072 MiB runtime buffer (the
+PyTorch/CUDA floor is ~2.4 GiB, peaks near 4 GiB under load — upstream
+`/dev/unload` benchmarks). The entry is excluded from the shared chat matrix
+solve. A local `.onnx` copy may resolve by same-stem sidecar convention inside
+the `t2s/` dir.
+
+
 
 ## Override Rules
 
@@ -590,7 +782,7 @@ a map of `field: regex`; a model matches only if *every* field regex matches
 - Fields come from the sidecar frontmatter plus the synthetic `stem` and
   `name`.
 - **List-valued fields are joined with spaces** before matching, so
-  `capabilities: 'reasoning'` matches `[vision, tools, reasoning]`.
+  `capabilities: 'reasoning'` matches `[image, tools, reasoning]`.
 - A field **absent from a model never matches** (there is nothing to search) —
   to target "has no X", match a different field or invert in rule order.
 - An **invalid regex** logs a warning and that rule matches nothing (the run
@@ -687,6 +879,9 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `llama-server` | `.gguf` | chat, embeddings, rerank |
 | `vllm` | safetensors, `hf_repo` | chat |
 | `vllm-docker` | safetensors, `hf_repo` | chat |
+| `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | image |
+| `whisper-server` | `.bin` (s2t dir only) | s2t |
+| `kokoro-podman` | `.onnx`, `hf_repo` | t2s |
 
 ## Backend Selection
 
@@ -707,7 +902,47 @@ Inference walks this list (availability still filters: an entry without its
 binary/image configured is skipped) and picks the first backend whose formats
 and roles cover the model. An explicit sidecar/override `backend:` pin to a
 disabled name is an error that skips that model — pinning bypasses *inference*,
-never policy.
+never policy. Registration order: `llama-server`, `vllm-docker`, `vllm`,
+`sd-server`, `whisper-server`, `kokoro-podman`.
+
+## Global backend args
+
+Each llama.cpp-family backend section in profiles.yaml accepts a free-form
+`args:` string of flags appended to **every** command that backend renders —
+the place for fleet-wide performance tuning:
+
+```yaml
+# profiles.yaml
+llama_server:
+  args: "--flash-attn on -b 512 -ub 512"
+vllm:
+  args: "--max-num-batched-tokens 512"   # vLLM spelling of -ub (FA is always on)
+whisper:
+  args: "--flash-attn on"                # whisper.cpp shares the option
+sd:
+  args: "--diffusion-fa"                 # stable-diffusion.cpp variant
+```
+
+The same *intent* maps to different flags per engine, so each backend owns its
+own `args` (kokoro is a containerized service — `t2s.podman_args` plays that
+role). Values must be a string of flags (a non-string value aborts the run)
+and are validated with shlex at build time (bad quoting aborts the run);
+they don't feed the VRAM estimator — they're operator responsibility, like
+sidecar `cli_args`.
+
+Precedence per flag is most-specific-wins, implemented via the ordered
+flag→value map in `render_command` (a flag can only appear once; later
+sources overwrite earlier values). The same order applies to every backend:
+
+1. backend built-in flags (`-c`, `--parallel`, …) — including per-model
+   feature flags (mmproj, loras, MTP, reasoning)
+2. global `<section>.args` — so e.g. `-b 512` tunes chat models only:
+   llama-server's per-role `-b`/`-ub` (next tier) win on embed/rerank
+3. per-role flags (`embeddings`/`rerank` `-b 4096 -ub 4096`)
+4. per-model sidecar `cli_args:`
+
+Note that the map keys on exact flag spelling: `-fa` and `--flash-attn` are
+distinct keys — use the spelling you want in the final command.
 
 ## Cache precision (`cache_type`)
 
@@ -782,13 +1017,15 @@ pushed, its models are built, then children are visited:
   | `t2t` | `chat` | Legacy name for the chat dir |
   | `vision` | `chat` | VLMs + mmproj (same role as chat, colocated) |
   | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
-  | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
-  | `rerank` | `rerank` | Reranker models |
-  | `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
+| `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
+| `rerank` | `rerank` | Reranker models |
+| `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
+| `t2s` | `t2s` | Text-to-speech (kokoro via podman; opt-in via `dirs: {t2s: t2s}`) |
+| `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
 
   Files at the root itself default to `chat`; files under any other
   subdirectory (`img/` when not opted in, `misc/`, `tmp/`,
-  `hf_hub/`, `s2t/`, …) are **skipped** — one summary line per run names the
+  `hf_hub/`, … — and `s2t/`, `t2s/`, `img/` when not opted in) are **skipped** — one summary line per run names the
   skipped directories so nothing disappears silently. The whitelist is
   extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
   via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).
@@ -908,7 +1145,8 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 - **`metadata`** — the agent-choice descriptor: `freethought`, `strengths`, `weaknesses`,
   `license`, `base_model`, `finetune`, `type`, `parameters`, `quantization`, `hf_url`,
-  `ctx_size`, `mtp_enabled`, `mtp_draft_max`, `mtp_accuracy`, `throughput_factor`.
+  `ctx_size`, `mtp_enabled`, `mtp_draft_max`, `mtp_accuracy`, `throughput_factor`,
+  `image_min_tokens`, `image_max_tokens` (vision variants only).
 - **Native `capabilities`** — `in`/`out` modalities, `tools`, `reranker`, `context` (derived, see below).
 - **Native `name` / `description`** — display fields in `/v1/models`.
 
@@ -919,7 +1157,8 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 `speculative`, `speculative_config`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
 `mtp_draft_p_min`, `role`, `targets`, `allow_profiles`, `spare`, `capabilities`,
 `ignore`, `device`, `concurrency`, `fit-params`, `vllm_image`, `modes`, `default_mode`,
-`reasoning-format`, `reasoning-preserve`, `cache_type`, `parallel`.
+`reasoning-format`, `reasoning-preserve`, `cache_type`, `parallel`,
+`image_min_tokens`, `image_max_tokens`.
 
 ### Per-model config options
 
@@ -935,16 +1174,17 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `reasoning-preserve` | bool | Emit `--reasoning-preserve`. Chat + reasoning-capable models only |
 | `cache_type` | str | KV-cache precision for `--cache-type-k/v` and VRAM sizing (sidecar > profile > `q8_0`); see [Cache precision](#cache-precision-cache_type) |
 | `parallel` | int | Parallel slots for `--parallel` and VRAM sizing (sidecar > profile > 1) |
+| `image_min_tokens` / `image_max_tokens` | int | Vision (mmproj) only: floor/cap on image tokens per image → `--image-min-tokens`/`--image-max-tokens`. Dynamic-resolution archs only (Qwen-VL family; Gemma/SigLIP is fixed ~256 and warned+skipped). The cap also floors the solved context (`parallel × max` must fit); see [Image token budget](#image-token-budget-vision-sidecars) |
 | `ignore` | bool | Skip this model entirely |
 
 ### Agent-selection fields (optional, recommended)
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `capabilities` | list | `[vision, tools, reasoning, audio, speech]`; `vision` auto-added if a companion `mmproj` exists. Mapped to the native llama-swap `capabilities` block (directional, see below) |
+| `capabilities` | list | `[image, video, tools, reasoning, audio, speech]`; explicit (mmproj does NOT imply image/video). Mapped to the native llama-swap `capabilities` block (directional, see below). `vision` was removed — use `image` |
 | `freethought` | float 0–1 | `1.0` reasons about anything; `0.0` readily refuses "distasteful" topics. Carried in `metadata` |
 | `strengths` / `weaknesses` | list | Concise task phrases agents match on |
-| `license` / `base_model` / `finetune` / `type` | str | Identity; carried in `metadata` |
+| `license` / `base_model` / `architecture` / `finetune` / `type` | str | Identity; `architecture` is one step more generic than `base_model` and informs backends (e.g. `qwen3`, `qwen3-vl`, `flux`, `sdxl`, `wan`, `hunyuan-video`, `h3`, `mochi`, `omni`); carried in `metadata` |
 | `mtp_accuracy` | float | MTP draft acceptance rate; feeds `throughput_factor` |
 | `parameters` | str | `"12B"` or MoE `"26B-A4B"` (total-active) for accurate throughput |
 | `hf_url` | str | HuggingFace model URL |
@@ -953,7 +1193,7 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 ### Derived fields (computed, not authored)
 
-- **`capabilities`** (native block): directional modalities, matching llama-swap's badge derivation — `in` = `["text"]` + `"image"` if `vision` + `"audio"` if `audio`; `out` = `["text"]` + `"audio"` if `speech`. Output stays text unless `speech` is declared, so a vision model never advertises text→image (`Image Gen`) or image→image (`Img→Img`). `tools`/`reranker` boolean flags; `context` = design context (the model's maximum trained context: GGUF architectural max > sidecar `context_length` > default).
+- **`capabilities`** (native block): directional modalities, matching llama-swap's badge derivation — `in` = `["text"]` + `"image"` if `image` + `"video"` if `video` + `"audio"` if `audio`; `out` = `["text"]` + `"audio"` if `speech` + `"video"` if `video` + omni/video-arch (architecture `omni`/`video`/`wan`/`h3` etc). Output stays text unless `speech`/`video` output is declared, so a vision model never advertises text→image (`Image Gen`) unless `role:image`. `tools`/`reranker` boolean flags; `context` = design context (the model's maximum trained context: GGUF architectural max > sidecar `context_length` > default). `architecture` guides image vs video output for `role:image` (`out:[video]` when `video` in capabilities or `architecture` contains `video`/`wan`/`hunyuan-video`/`h3`).
 - **Model-kind guard**: every candidate in a served role is classified header-only (`general.architecture` + `<arch>.context_length` for GGUF; tensor-name blocks for safetensors; cached HF card `pipeline_tag` as offline fallback). Weights classified as diffusion/image-generation are excluded with an error log instead of being served.
 - **`throughput_factor`**: Heuristic relative speed index = `54 / (active_B × quant_bits)` × `(1 + draft_n × mtp_accuracy)` when MTP is on. Relative only — not real tok/s.
 - **`ctx_size`**: The VRAM-served context limit (`-c` / `--max-model-len`), exposed via `metadata.ctx_size`. Distinct from `capabilities.context`, which advertises the model's max trained context rather than what the deployment can currently fit.
@@ -970,7 +1210,7 @@ name: Model-Name
 context_length: 131072
 mtp: true
 hf_url: https://huggingface.co/...
-capabilities: [vision, tools, reasoning]
+capabilities: [image, tools, reasoning]
 freethought: 0.7
 license: apache-2.0
 base_model: llama-3

@@ -133,9 +133,19 @@ class ScopeStack:
                              model.stem, inferred)
                 model.frontmatter["backend"] = inferred
             else:
+                # Expected when a model needs a backend that is disabled (e.g.
+                # safetensors / hf_repo-only embeddings with vLLM unconfigured)
+                # – report the concrete file that was resolved, not “hf_repo”.
+                model_file = str(model.gguf_path) if model.gguf_path else (
+                    model.hf_repo or "no file")
                 fmt = (model.gguf_path.suffix.lower() if model.gguf_path
                        else "hf_repo" if model.hf_repo else "none")
-                errors.append(f"no available backend supports format {fmt!r}")
+                # User-facing wording per spec: “No backend supports {MODEL} in {SIDECAR}”
+                # INFO not WARNING: expected when vLLM is unconfigured and a
+                # safetensors/hf_repo model is present (fleet without vLLM).
+                reason = f"No backend supports {model_file} in {model.md_path} (role {model.role}, format {fmt!r})"
+                logger.info("%s", reason)
+                model._override_error = reason
 
         errors += resolve_setting_paths(model)
 

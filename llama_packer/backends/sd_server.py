@@ -20,6 +20,7 @@ class SdServerBackend(BaseBackend):
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
     roles = frozenset({"image"})
     handles = frozenset({"cli_args"})
+    proxied = True
 
     def is_available(self, avail: dict) -> bool:
         return bool(avail.get("sd_bin"))
@@ -43,8 +44,9 @@ class SdServerBackend(BaseBackend):
             "--diffusion-model", diffusion,
         ]
 
-        cli_args = (model.frontmatter.get("cli_args") or "").strip()
         cmd = utils.render_command(
-            [tvars.get("sd_bin", "sd-server")], flags, cli_args,
+            [tvars.get("sd_bin", "sd-server")], flags,
+            global_args=tvars.get("sd_args") or "",
+            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
         )
         return cmd, {}

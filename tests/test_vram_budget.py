@@ -59,6 +59,59 @@ def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
     assert ctx == 65536
 
 
+# ── image token floor ─────────────────────────────────────────────────────
+
+def _vision(make_model, tmp_path, stem, fit, **extra):
+    """Vision model (mmproj companion) with a fit-params block."""
+    (tmp_path / f"{stem}-mmproj.gguf").write_bytes(b"mm")
+    return make_model(stem, mmproj=f"{stem}-mmproj.gguf",
+                      **{"fit-params": fit, **extra})
+
+
+def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
+    # A declared image_max_tokens must fit the solved context: the ctx is
+    # raised from the rounded-down value to the floor when affordable.
+    fit = {"model_mib": 25000, "ctx_factor": 0.5, "compute_mib": 1000,
+           "cache_type": "q8_0", "parallel": 1}
+    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9000)
+    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+    # remaining = 30720 - 26000 - mmproj(0 + 150) = 4570; affordable 9140
+    # tokens; rounded ctx 8192 -> raised to the 9000 floor (affordable)
+    assert ctx == 9000
+
+
+def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
+    import logging
+
+    fit = {"model_mib": 25000, "ctx_factor": 0.5, "compute_mib": 1000,
+           "cache_type": "q8_0", "parallel": 1}
+    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=16384)
+    with caplog.at_level(logging.WARNING):
+        ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+    # floor 16384 > affordable 9140: ctx raised to what fits (9140), warning
+    assert ctx == 9140
+    assert any("large images may still not fit" in r.message
+               for r in caplog.records)
+
+
+def test_calc_ctx_image_floor_no_mmproj_no_floor(make_model, tmp_path):
+    # image_max_tokens without an attached mmproj: no flags, no floor.
+    fit = {"model_mib": 25000, "ctx_factor": 0.5, "compute_mib": 1000,
+           "cache_type": "q8_0", "parallel": 1}
+    model = make_model("i", **{"fit-params": fit, "image_max_tokens": 9440})
+    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+    assert ctx == 8192
+
+
+def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
+    # The -text variant serves no vision, so the floor must not apply.
+    fit = {"model_mib": 25000, "ctx_factor": 0.5, "compute_mib": 1000,
+           "cache_type": "q8_0", "parallel": 1}
+    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9440)
+    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=False)
+    assert ctx == 8192
+
+
 # ── cache-type scaling ────────────────────────────────────────────────────
 
 
@@ -90,7 +143,7 @@ def test_solve_matrix_ctx_basic(make_model):
     ctx = solve_matrix_ctx(
         vram_total_mb=32768,
         spare_mb=0,
-        chat_models=[(chat, 8000, 0.4, 500)],
+        chat_models=[(chat, 8000, 0.4, 500, 0)],
         embed_params=(500, 0.1, 100),
         rerank_params=None,
         embed_ctx=8192,
@@ -114,8 +167,47 @@ def test_solve_matrix_ctx_exhausted_budget(make_model):
     chat = make_model("chat", context_length=32768)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0,
-        chat_models=[(chat, 40000, 0.4, 0)],
+        chat_models=[(chat, 40000, 0.4, 0, 0)],
         embed_params=None, rerank_params=None,
     )
     # chat_budget = 30720 - 40000 < 0 -> skipped -> best_ctx 0 -> MIN_CTX
     assert ctx == utils._MIN_CTX_SIZE
+
+
+def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
+    chat = make_model("chat", context_length=32768)
+    chat_models = [(chat, 8000, 0.2, 500, 0)]
+    # available = 14336; budget = 5836 -> 29180 -> round 24576
+    assert solve_matrix_ctx(
+        vram_total_mb=16384, spare_mb=0, chat_models=chat_models,
+        embed_params=None, rerank_params=None,
+    ) == 24576
+    # 2000 MB of co-loads: budget = 3836 -> 19180 -> round 16384
+    assert solve_matrix_ctx(
+        vram_total_mb=16384, spare_mb=0, chat_models=chat_models,
+        embed_params=None, rerank_params=None, fixed_overhead_mb=2000,
+    ) == 16384
+
+
+def test_vram_mb_pin_is_authoritative(make_model):
+    model = make_model("s", backend="whisper-server", vram_mb=1280,
+                       context_length=8192)
+    # Pinned: the pin IS the sizing — weights, zero KV factor, zero compute.
+    assert model.vram.effective_static("unused") == (1280, 0.0, 0)
+
+
+def test_vram_mb_pin_invalid_ignored(make_model):
+    model = make_model("s", backend="whisper-server", vram_mb="big",
+                       context_length=8192)
+    triple = model.vram.effective_static("unused")
+    # Falls back to file size (dummy bytes -> 0 MB) + whisper compute buffer.
+    assert triple[0] == 0 and triple[1] == 0.0
+    assert triple[2] == 100  # _WHISPER_COMPUTE_MB
+
+
+def test_whisper_fixed_compute_is_small(make_model):
+    model = make_model("s", backend="whisper-server", context_length=8192)
+    # Measured on Vulkan (nemo-speech): footprint ~= sum of files, so the
+    # per-model buffer is small — not the 512 MB sd-server constant.
+    triple = model.vram.effective_static("unused")
+    assert triple[2] == 100

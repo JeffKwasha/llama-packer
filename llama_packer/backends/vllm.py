@@ -198,8 +198,11 @@ class VllmHostBackend(BaseBackend):
         vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
         flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util),
                                   cache_type=cache_type, parallel=parallel)
-        cli_args = (model.frontmatter.get("cli_args") or "").strip()
-        cmd = utils.render_command([vllm_bin, "serve"], flags, cli_args)
+        cmd = utils.render_command(
+            [vllm_bin, "serve"], flags,
+            global_args=tvars.get("vllm_args") or "",
+            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
+        )
         return cmd, _spec_meta(model)
 
 
@@ -244,7 +247,8 @@ class VllmDockerBackend(VllmHostBackend):
         )
         serve = utils.render_command(
             [vllm_bin, "serve"], serve_flags,
-            (model.frontmatter.get("cli_args") or "").strip(),
+            global_args=tvars.get("vllm_args") or "",
+            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
         )
         bind = [
             f"-v {d}:{'/models' if i == 0 else f'/models{i + 1}'}"

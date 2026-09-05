@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# update script for llama.cpp + llama-swap (Linux)
+# Usage: ./extras/update [version|vulkan|rocm] [options]
+# Examples:
+#   ./extras/update             # Latest llama.cpp Vulkan + latest llama-swap
+#   ./extras/update b8913       # Specific llama.cpp version + latest llama-swap
+#   ./extras/update vulkan      # Latest Vulkan build + latest llama-swap
+#   ./extras/update rocm        # Latest ROCm build + latest llama-swap
+#   ./extras/update --swap-only # Only update llama-swap
+#   ./extras/update --cpp-only  # Only update llama.cpp
+#   ./extras/update --swap-only v252  # Specific llama-swap version
+#   ./extras/update --skip-swap # Skip llama-swap update
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Binaries install into the repo root; when this script runs from extras/,
+# target the parent directory.
+INSTALL_DIR="$SCRIPT_DIR"
+[[ "$(basename "$SCRIPT_DIR")" == "extras" ]] && INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RELEASES_URL="https://api.github.com/repos/ggml-org/llama.cpp/releases"
+LLAMA_SWAP_RELEASES_URL="https://api.github.com/repos/mostlygeek/llama-swap/releases"
+KEEP_VERSIONS=3  # Keep current + N-1 previous versions
+NEWLY_INSTALLED=false
+OVERRIDE_ARCH=""  # --arch override (low priority, e.g., linux_amd64, linux_arm64)
+
+# Get highest installed version number
+get_highest_installed() {
+    local highest=0
+    for d in "$INSTALL_DIR"/llama-b[0-9]*; do
+        [ -d "$d" ] || continue
+        ver="${d##*b}"
+        [ "$ver" -gt "$highest" ] 2>/dev/null && highest="$ver"
+    done
+    echo "$highest"
+}
+
+# Compare versions: returns 0 if new_ver > old_ver
+is_newer() {
+    local new_ver="$1"
+    local old_ver="$2"
+    [ "$new_ver" -gt "$old_ver" ] 2>/dev/null
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [version|vulkan|rocm] [options]
+
+Download and install llama.cpp and llama-swap prebuilt binaries.
+
+Arguments:
+  version       Specific llama.cpp version tag (e.g., b8913, b8902)
+  vulkan Latest Vulkan build (default)
+  rocm   Latest ROCm build
+
+Options:
+  --swap-only        Only update llama-swap (skip llama.cpp)
+  --cpp-only         Only update llama.cpp (skip llama-swap)
+  --skip-swap        Skip llama-swap update
+  --swap-version TAG Specific llama-swap version (e.g., v252)
+  --arch ARCH        Override arch for llama-swap (linux_amd64, linux_arm64, x86_64, aarch64)
+  -h, --help         Show this help
+
+Examples:
+  $(basename "$0")              # Latest Vulkan + latest llama-swap
+  $(basename "$0") b8913        # Specific llama.cpp version + latest llama-swap
+  $(basename "$0") rocm  	# Latest ROCm + latest llama-swap
+  $(basename "$0") --swap-only  # Only llama-swap
+  $(basename "$0") --swap-only v252  # Specific llama-swap version
+  $(basename "$0") --arch linux_arm64  # Force ARM64 binary
+
+EOF
+    exit 1
+}
+
+# Get latest release tag
+get_latest_tag() {
+    curl -s "$RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4
+}
+
+# Get release assets for a tag
+get_assets() {
+    local tag="$1"
+    curl -s "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$tag"
+}
+
+# Find asset URL by pattern
+find_asset() {
+    local assets="$1"
+    local pattern="$2"
+    echo "$assets" | grep -o "\"browser_download_url\": \"[^\"]*${pattern}[^\"]*\"" | head -1 | cut -d'"' -f4
+}
+
+download_and_extract() {
+    local url="$1"
+    local version="$2"
+    local target_dir="${INSTALL_DIR}/llama-${version}"
+
+    # Check if already installed
+    if [ -d "$target_dir" ]; then
+        echo "llama.cpp $version already installed at $target_dir"
+        return 1
+    fi
+
+    echo "Downloading llama.cpp $version..."
+    local archive=$(basename "$url")
+    # Use tmp file to avoid partial download leaking as final file; cleanup on exit
+    local tmp_archive
+    tmp_archive=$(mktemp -p "$INSTALL_DIR" ".tmp-${archive}.XXXXXX")
+    trap 'rm -f "$tmp_archive"' RETURN
+    if ! curl -L -o "$tmp_archive" "$url"; then
+        rm -f "$tmp_archive"
+        trap - RETURN
+        echo "Error: download failed for $url" >&2
+        return 1
+    fi
+    mv "$tmp_archive" "$archive"
+    trap - RETURN
+
+    echo "Extracting..."
+    tar -xzf "$archive"
+
+    # Move contents to versioned directory
+    #local extracted_dir="${archive%.tar.gz}"
+    #mv "$extracted_dir" "$target_dir"
+
+    # Cleanup
+    rm -f "$archive"
+
+    echo "Installed to: $target_dir"
+    echo "Run: $target_dir/llama-server --help"
+}
+
+# Remove old versions, keeping only the newest KEEP_VERSIONS
+cleanup_old_versions() {
+    # Safety: INSTALL_DIR must be owned by current user
+    [[ "$(stat -c '%u' "$INSTALL_DIR")" != "$(id -u)" ]] && return 0
+
+    # Only match directories with 4+ digit version numbers (e.g. llama-b8913)
+    local dirs=()
+    for d in "$INSTALL_DIR"/llama-b[0-9][0-9][0-9][0-9]*; do
+        [ -d "$d" ] && dirs+=("$d")
+    done
+
+    # Nothing to clean
+    [ "${#dirs[@]}" -le "$KEEP_VERSIONS" ] && return 0
+
+    # Sort by version number descending
+    local sorted
+    sorted=$(printf '%s\n' "${dirs[@]}" | sort -t'b' -k2 -n -r)
+
+    local keep=$KEEP_VERSIONS
+    while IFS= read -r dir; do
+        keep=$((keep - 1))
+        [ "$keep" -lt 0 ] && echo "Removing old version: $dir" && rm -rf "$dir"
+    done <<< "$sorted"
+}
+
+# --- llama-swap helpers ---
+
+get_llama_swap_arch() {
+    if [ -n "$OVERRIDE_ARCH" ]; then
+        case "$OVERRIDE_ARCH" in
+            linux_amd64|x86_64|amd64) echo "linux_amd64" ;;
+            linux_arm64|aarch64|arm64) echo "linux_arm64" ;;
+            *) echo "$OVERRIDE_ARCH" ;;
+        esac
+        return
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64) echo "linux_amd64" ;;
+        aarch64|arm64) echo "linux_arm64" ;;
+        *) echo "linux_amd64" ;;
+    esac
+}
+
+# Update symlinks in INSTALL_DIR that point to old llama-b* dirs to new version.
+# Called after successful llama.cpp install.
+update_llama_cpp_symlinks() {
+    local new_target="$1"  # e.g., b10786 or llama-b10786
+    # Normalize to llama-bXXXX form
+    if [[ "$new_target" != llama-* ]]; then
+        new_target="llama-$new_target"
+    fi
+    local new_path="$INSTALL_DIR/$new_target"
+    [ -d "$new_path" ] || return 0
+    for link in "$INSTALL_DIR"/*; do
+        [ -L "$link" ] || continue
+        local tgt
+        tgt=$(readlink "$link" 2>/dev/null || true)
+        [ -n "$tgt" ] || continue
+        # Only consider symlinks whose target looks like llama-b*
+        if [[ "$tgt" == *llama-b[0-9]* ]]; then
+            # Don't update internal lib symlinks inside llama-b dirs (top-level only)
+            echo "Updating symlink $(basename "$link") -> $new_target (was $tgt)"
+            ln -snf "$new_target" "$link"
+        fi
+    done
+}
+
+# Update symlinks in INSTALL_DIR that point to old llama-swap-* versioned binaries
+update_llama_swap_symlinks() {
+    local new_target="$1"  # e.g., llama-swap-v252
+    local new_path="$INSTALL_DIR/$new_target"
+    [ -f "$new_path" ] || return 0
+    for link in "$INSTALL_DIR"/*; do
+        [ -L "$link" ] || continue
+        # Skip the primary llama-swap symlink itself (handled separately)
+        if [ "$(basename "$link")" = "llama-swap" ]; then
+            continue
+        fi
+        local tgt
+        tgt=$(readlink "$link" 2>/dev/null || true)
+        if [[ "$tgt" == *llama-swap* ]]; then
+            echo "Updating symlink $(basename "$link") -> $new_target (was $tgt)"
+            ln -snf "$new_target" "$link"
+        fi
+    done
+}
+
+get_installed_llama_swap_version() {
+    local bin="$INSTALL_DIR/llama-swap"
+    if [ -x "$bin" ]; then
+        local v
+        v=$("$bin" --version 2>&1 | grep -o 'v[0-9]\+' | head -1 | tr -d 'v' || true)
+        if [ -n "$v" ]; then
+            echo "$v"
+        else
+            echo "0"
+        fi
+    else
+        echo "0"
+    fi
+}
+
+get_latest_llama_swap_tag() {
+    curl -s "$LLAMA_SWAP_RELEASES_URL" | grep -o '"tag_name": ".*"' | head -1 | cut -d'"' -f4
+}
+
+get_llama_swap_assets() {
+    local tag="$1"
+    curl -s "https://api.github.com/repos/mostlygeek/llama-swap/releases/tags/$tag"
+}
+
+# Update llama-swap: checks latest (or requested) release, verifies sha256 via checksums.txt, atomically replaces binary.
+# Returns 0 on success or already up-to-date, 1 on error.
+update_llama_swap() {
+    local requested_tag="${1:-}"
+    local tag
+    if [ -n "$requested_tag" ] && [ "$requested_tag" != "latest" ]; then
+        tag="$requested_tag"
+        # normalize: allow 252 -> v252
+        if [[ ! "$tag" =~ ^v ]]; then
+            tag="v$tag"
+        fi
+    else
+        tag=$(get_latest_llama_swap_tag)
+    fi
+
+    if [ -z "$tag" ]; then
+        echo "Error: Could not fetch latest llama-swap tag" >&2
+        return 1
+    fi
+
+    local tag_num="${tag#v}"
+    local installed
+    installed=$(get_installed_llama_swap_version)
+
+    # If no specific version requested and installed is newer or equal, skip
+    if [ -z "$requested_tag" ] || [ "$requested_tag" = "latest" ]; then
+        if [ "$installed" -gt 0 ] && ! is_newer "$tag_num" "$installed"; then
+            echo "llama-swap v$installed already up-to-date (latest $tag)"
+            return 0
+        fi
+        # also handle case where installed > tag_num (local build ahead)
+        if is_newer "$installed" "$tag_num"; then
+            echo "Already have llama-swap v$installed, which is newer than $tag"
+            return 0
+        fi
+    else
+        # specific version requested: skip if already installed
+        if [ "$installed" = "$tag_num" ]; then
+            echo "llama-swap $tag already installed"
+            return 0
+        fi
+    fi
+
+    local arch
+    arch=$(get_llama_swap_arch)
+    local assets
+    assets=$(get_llama_swap_assets "$tag")
+    if [ -z "$assets" ] || echo "$assets" | grep -q '"message": "Not Found"'; then
+        echo "Error: llama-swap version $tag not found" >&2
+        return 1
+    fi
+
+    local url checksums_url
+    url=$(find_asset "$assets" "${arch}.tar.gz")
+    checksums_url=$(find_asset "$assets" "checksums.txt")
+
+    if [ -z "$url" ]; then
+        echo "Error: Could not find llama-swap asset for $tag ($arch)" >&2
+        return 1
+    fi
+    if [ -z "$checksums_url" ]; then
+        echo "Error: Could not find checksums.txt for $tag" >&2
+        return 1
+    fi
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # Ensure cleanup on any exit from this function (no leak)
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    echo "Downloading llama-swap $tag ($arch)..."
+    local archive_name
+    archive_name=$(basename "$url")
+    local archive_path="$tmpdir/$archive_name"
+    local checksums_path="$tmpdir/checksums.txt"
+
+    if ! curl -sL -o "$archive_path" "$url"; then
+        echo "Error: Failed to download $url" >&2
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! curl -sL -o "$checksums_path" "$checksums_url"; then
+        echo "Error: Failed to download checksums $checksums_url" >&2
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Verify sha256 before extraction (hash verification)
+    local expected_hash
+    expected_hash=$(grep -F "  $archive_name" "$checksums_path" | awk '{print $1}' || true)
+    if [ -z "$expected_hash" ]; then
+        # fallback: try first field match without double-space (some versions use single)
+        expected_hash=$(grep -F "$archive_name" "$checksums_path" | awk '{print $1}' | head -1 || true)
+    fi
+    if [ -z "$expected_hash" ]; then
+        echo "Error: Could not find hash for $archive_name in checksums.txt" >&2
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    echo "Verifying sha256..."
+    local actual_hash
+    actual_hash=$(sha256sum "$archive_path" | awk '{print $1}')
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        echo "Error: sha256 mismatch for $archive_name" >&2
+        echo "  expected: $expected_hash" >&2
+        echo "  actual:   $actual_hash" >&2
+        local fail_path="$INSTALL_DIR/_HASH_FAIL_$archive_name"
+        echo "Hash verification failed — saving downloaded file as $fail_path (no execute bit, symlink not updated)" >&2
+        cp -a "$archive_path" "$fail_path" || true
+        chmod -x "$fail_path" 2>/dev/null || true
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+    echo "Checksum verified: $actual_hash"
+
+    # PGP signature check: not implemented — upstream (mostlygeek/llama-swap)
+    # publishes no .asc/.sig files and goreleaser config has no signing;
+    # gpg/minisign are available but there is no secure signature to verify.
+    # If signatures become available at a stable URL and verification is
+    # <10 lines, add: curl -sL -o "$tmpdir/sig" "$sig_url" && gpgv/gpg --verify
+    # before the hash check.
+
+    echo "Extracting..."
+    if ! tar -xzf "$archive_path" -C "$tmpdir"; then
+        echo "Error: Failed to extract $archive_path" >&2
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if [ ! -f "$tmpdir/llama-swap" ]; then
+        echo "Error: Extracted archive does not contain llama-swap binary" >&2
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Extracted binary is already executable but ensure no exec on hash-fail path
+    # (hash verified above; only set exec after successful verification)
+    chmod +x "$tmpdir/llama-swap"
+
+    # Prepare versioned file + single .bak + symlink handling
+    local target="$INSTALL_DIR/llama-swap"
+    local versioned="$INSTALL_DIR/llama-swap-$tag"  # e.g., llama-swap-v252
+    local backup="$INSTALL_DIR/llama-swap.bak"  # single backup file (overwrite)
+
+    # Move verified binary to versioned location
+    if ! mv "$tmpdir/llama-swap" "$versioned"; then
+        echo "Error: Failed to move verified binary to $versioned" >&2
+        trap - RETURN; rm -rf "$tmpdir"
+        return 1
+    fi
+    chmod +x "$versioned"
+
+    # Ownership check before touching symlink/file
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ "$(stat -c '%u' "$target" 2>/dev/null || stat -c '%u' "$INSTALL_DIR" 2>/dev/null || echo 0)" != "$(id -u)" ] && [ "$(stat -c '%u' "$INSTALL_DIR")" != "$(id -u)" ]; then
+            echo "Warning: not owner of $target, skipping replace" >&2
+            trap - RETURN; rm -rf "$tmpdir"
+            return 1
+        fi
+    fi
+
+    # Backup: single .bak file (overwrite)
+    if [ -L "$target" ]; then
+        local current_target
+        current_target=$(readlink "$target" 2>/dev/null || true)
+        local real_path
+        # Resolve symlink target to absolute path (handles relative links)
+        real_path=$(readlink -f "$target" 2>/dev/null || echo "$INSTALL_DIR/$current_target")
+        if [ -f "$real_path" ]; then
+            echo "Backing up old symlink target $current_target to $backup"
+            cp -a "$real_path" "$backup" || cp -a "$target" "$backup" || true
+        else
+            echo "Backing up old symlink $target -> $current_target to $backup"
+            cp -a "$target" "$backup" 2>/dev/null || true
+        fi
+        # Update primary symlink to new versioned file
+        ln -snf "$(basename "$versioned")" "$target"
+        echo "Updated symlink $target -> $(basename "$versioned")"
+    elif [ -f "$target" ]; then
+        echo "Backing up old binary to $backup (single file, overwriting)"
+        cp -a "$target" "$backup" || true
+        rm -f "$target"
+        ln -snf "$(basename "$versioned")" "$target"
+        echo "Migrated $target to symlink -> $(basename "$versioned") (was regular file)"
+    else
+        ln -snf "$(basename "$versioned")" "$target"
+        echo "Created symlink $target -> $(basename "$versioned")"
+    fi
+
+    # Update any other symlinks in INSTALL_DIR that point to old llama-swap-* binaries
+    update_llama_swap_symlinks "$(basename "$versioned")"
+
+    trap - RETURN
+    rm -rf "$tmpdir"
+
+    local new_ver
+    new_ver=$("$target" --version 2>/dev/null | head -1 || echo "v$tag_num")
+    # Fallback if binary is wrong arch or fails to execute
+    if [ -z "$new_ver" ]; then
+        new_ver="v$tag_num"
+    fi
+    echo "Installed llama-swap $tag to $versioned (symlink $target) ($new_ver)"
+    return 0
+}
+
+# --- argument parsing ---
+VERSION="latest-vulkan"
+SWAP_VERSION=""
+SKIP_SWAP=false
+SWAP_ONLY=false
+CPP_ONLY=false
+
+# Parse flags (allow mixing); remaining positional used for llama.cpp version
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage ;;
+        --swap-only) SWAP_ONLY=true; shift ;;
+        --cpp-only) CPP_ONLY=true; shift ;;
+        --skip-swap) SKIP_SWAP=true; shift ;;
+        --arch)
+            if [ -z "${2:-}" ]; then echo "Error: --arch requires argument" >&2; exit 1; fi
+            OVERRIDE_ARCH="$2"; shift 2
+            ;;
+        --swap-version)
+            if [ -z "${2:-}" ]; then echo "Error: --swap-version requires argument" >&2; exit 1; fi
+            SWAP_VERSION="$2"; shift 2
+            ;;
+        --) shift; break ;;
+        -*) echo "Unknown option: $1" >&2; usage ;;
+        *)
+            # Positional: allow v252 as swap version shorthand
+            if [[ "$1" =~ ^v[0-9]+$ ]] && [ -z "$SWAP_VERSION" ] && ! $CPP_ONLY; then
+                # Heuristic: v-prefixed numeric without b -> likely llama-swap if not already set
+                # If user also wants cpp, they should use --swap-version explicitly.
+                # For backward compat, treat bare v* as swap version only when --swap-only is set
+                if $SWAP_ONLY; then
+                    SWAP_VERSION="$1"
+                else
+                    # Without --swap-only, ambiguous — treat as cpp version if starts with b, else swap
+                    # To avoid breakage, default to swap version and keep cpp at default
+                    SWAP_VERSION="$1"
+                    echo "Note: Interpreting $1 as llama-swap version (use --swap-version to be explicit)" >&2
+                fi
+            elif [[ "$1" == "vulkan" || "$1" == "rocm" || "$1" == "latest" || "$1" =~ ^b[0-9]+$ ]]; then
+                VERSION="$1"
+            else
+                # Generic fallback: treat as llama.cpp version tag
+                VERSION="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Mutual exclusivity
+if $SWAP_ONLY && $CPP_ONLY; then
+    echo "Error: --swap-only and --cpp-only are mutually exclusive" >&2
+    exit 1
+fi
+if $SWAP_ONLY; then
+    SKIP_SWAP=false
+fi
+if $CPP_ONLY; then
+    SKIP_SWAP=true
+fi
+
+# Main: llama.cpp
+if ! $SWAP_ONLY; then
+    HIGHEST_INSTALLED=$(get_highest_installed)
+
+    case "$VERSION" in
+        *vulkan)
+            TAG=$(get_latest_tag)
+            if is_newer "$HIGHEST_INSTALLED" "${TAG#b}"; then
+                echo "Already have version b$HIGHEST_INSTALLED, which is newer than $TAG"
+            else
+                ASSETS=$(get_assets "$TAG")
+                URL=$(find_asset "$ASSETS" "ubuntu-vulkan-x64")
+                if [ -z "$URL" ]; then
+                    echo "Error: Could not find Vulkan asset for $TAG" >&2
+                    exit 1
+                fi
+                if download_and_extract "$URL" "$TAG"; then
+                    NEWLY_INSTALLED=true
+                fi
+            fi
+            ;;
+        *rocm)
+            TAG=$(get_latest_tag)
+            if is_newer "$HIGHEST_INSTALLED" "${TAG#b}"; then
+                echo "Already have version b$HIGHEST_INSTALLED, which is newer than $TAG"
+            else
+                ASSETS=$(get_assets "$TAG")
+                URL=$(find_asset "$ASSETS" "ubuntu-rocm-[^-]*-x64")
+                if [ -z "$URL" ]; then
+                    echo "Error: Could not find ROCm asset for $TAG" >&2
+                    exit 1
+                fi
+                if download_and_extract "$URL" "$TAG"; then
+                    NEWLY_INSTALLED=true
+                fi
+            fi
+            ;;
+        latest)
+            TAG=$(get_latest_tag)
+            if is_newer "$HIGHEST_INSTALLED" "${TAG#b}"; then
+                echo "Already have version b$HIGHEST_INSTALLED, which is newer than $TAG"
+            else
+                ASSETS=$(get_assets "$TAG")
+                URL=$(find_asset "$ASSETS" "ubuntu-vulkan-x64")
+                if [ -z "$URL" ]; then
+                    echo "Error: Could not find Vulkan asset for $TAG" >&2
+                    exit 1
+                fi
+                if download_and_extract "$URL" "$TAG"; then
+                    NEWLY_INSTALLED=true
+                fi
+            fi
+            ;;
+        *)
+            # Treat as specific version tag
+            ASSETS=$(get_assets "$VERSION")
+            if [ -z "$ASSETS" ] || [ "$ASSETS" = "[]" ]; then
+                echo "Error: Version $VERSION not found" >&2
+                exit 1
+            fi
+            URL=$(find_asset "$ASSETS" "ubuntu-vulkan-x64")
+            if [ -z "$URL" ]; then
+                # Try ROCm
+                URL=$(find_asset "$ASSETS" "ubuntu-rocm-[^-]*-x64")
+                if [ -z "$URL" ]; then
+                    echo "Error: Could not find Linux asset for $VERSION" >&2
+                    exit 1
+                fi
+            fi
+            if download_and_extract "$URL" "$VERSION"; then
+                NEWLY_INSTALLED=true
+            fi
+            ;;
+    esac
+
+    # Cleanup old versions after successful install and update symlinks
+    if [ "$NEWLY_INSTALLED" = true ]; then
+        cleanup_old_versions
+        # Update any symlinks pointing to old llama-b* to new version
+        # Determine which tag was installed (TAG or VERSION)
+        _installed_cpp_tag="${TAG:-$VERSION}"
+        update_llama_cpp_symlinks "$_installed_cpp_tag"
+    fi
+fi
+
+# Main: llama-swap (unless skipped)
+if ! $SKIP_SWAP; then
+    if [ -n "$SWAP_VERSION" ]; then
+        update_llama_swap "$SWAP_VERSION" || exit 1
+    else
+        update_llama_swap || echo "Warning: llama-swap update failed" >&2
+    fi
+fi
