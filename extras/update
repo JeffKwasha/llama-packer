@@ -25,7 +25,7 @@ NEWLY_INSTALLED=false
 OVERRIDE_ARCH=""  # --arch override (low priority, e.g., linux_amd64, linux_arm64)
 
 # Optional GitHub token for higher API rate limits (60/hr unauth → 5000/hr auth)
-GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+GITHUB_TOKEN="${GITHUB_TOKEN:-${GITHUB_PERSONAL_ACCESS_TOKEN:-}}"
 
 gh_curl() {
     if [ -n "$GITHUB_TOKEN" ]; then
@@ -94,9 +94,9 @@ Examples:
   $(basename "$0") --arch linux_arm64  # Force ARM64 binary
 
 Environment:
-  GITHUB_TOKEN    Optional. GitHub personal access token for higher API
-                  rate limits (5000 req/hr vs 60). Set if you hit
-                  "rate limit exceeded" errors: export GITHUB_TOKEN=ghp_xxxx
+  GITHUB_TOKEN            Optional. GitHub personal access token for higher
+                          API rate limits (5000 req/hr vs 60). Also reads
+                          GITHUB_PERSONAL_ACCESS_TOKEN as a fallback.
 
 EOF
     exit 1
