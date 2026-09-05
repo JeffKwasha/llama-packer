@@ -35,13 +35,18 @@ gh_curl() {
     fi
 }
 
-# GitHub API call with rate-limit detection
+# GitHub API call with error detection
 gh_api() {
     local response
     response=$(gh_curl "$1") || true
     if echo "$response" | grep -q "API rate limit exceeded"; then
         echo "Error: GitHub API rate limit exceeded (60 req/hr unauthenticated)." >&2
         echo "Set GITHUB_TOKEN for 5000 req/hr: export GITHUB_TOKEN=ghp_xxxx" >&2
+        exit 1
+    fi
+    if echo "$response" | grep -q '"status": "40[13]"'; then
+        echo "Error: GitHub API authentication failed (bad or expired token)." >&2
+        echo "Check GITHUB_TOKEN / GITHUB_PERSONAL_ACCESS_TOKEN." >&2
         exit 1
     fi
     echo "$response"
