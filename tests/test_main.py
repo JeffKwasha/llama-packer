@@ -70,6 +70,32 @@ def test_apply_env_subst_leaves_unmatched_paths_alone():
     assert out["models"]["m"]["cmd"] == "run /elsewhere/m.gguf"
 
 
+def test_backend_args_validation(caplog):
+    import logging
+    from llama_packer.__main__ import backend_args
+
+    # Missing/empty section or key -> empty string, never None.
+    assert backend_args(None, "llama_server") == ""
+    assert backend_args({}, "llama_server") == ""
+    assert backend_args({"args": None}, "llama_server") == ""
+    assert backend_args({"args": "   "}, "llama_server") == ""
+    # Valid free-form flags pass through stripped.
+    assert backend_args({"args": " --flash-attn on -b 512 "},
+                        "llama_server") == "--flash-attn on -b 512"
+    # Bad quoting aborts the run (fail fast, not per-command).
+    with pytest.raises(SystemExit):
+        backend_args({"args": "--foo 'unclosed"}, "llama_server")
+    # Non-string YAML values are rejected, not stringified into garbage flags.
+    with pytest.raises(SystemExit):
+        backend_args({"args": 4096}, "llama_server")
+    with pytest.raises(SystemExit):
+        backend_args({"args": ["--flash-attn", "on"]}, "llama_server")
+    # A stringified container still passes (verbatim) but warns.
+    with caplog.at_level(logging.WARNING):
+        assert backend_args({"args": "['--flash-attn']"}, "sd") == "['--flash-attn']"
+    assert "stringified container" in caplog.text
+
+
 def test_build_matrix_vars_includes_text_variants():
     import logging
     from llama_packer.__main__ import _build_matrix_vars
@@ -82,7 +108,56 @@ def test_build_matrix_vars_includes_text_variants():
     # Only emitted entries become vars: alpha kept vision (has -text), beta
     # was auto-dropped (its main entry IS beta-text), ghost never emitted.
     entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"], "beta": ["beta-text"]}
-    vars_ = _build_matrix_vars(models, m("embeddings", "emb-1"), m("rerank", "rnk-1"),
-                               entry_ids_by_stem, logging.getLogger("test"))
+    vars_, coload_vars = _build_matrix_vars(
+        models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), [],
+        entry_ids_by_stem, logging.getLogger("test"))
     assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
                      "emb": "emb-1", "rnk": "rnk-1"}
+    assert coload_vars == []
+
+
+def test_build_matrix_vars_includes_coloads():
+    import logging
+    from llama_packer.__main__ import _build_matrix_vars
+
+    def m(role, tid):
+        return SimpleNamespace(role=role, template_id=tid, stem=tid)
+
+    models = [m("chat", "alpha"), m("s2t", "parakeet"), m("image", "flux"),
+              m("image", "flux2")]
+    vars_, coload_vars = _build_matrix_vars(
+        models, None, None, ["parakeet", "flux", "flux2"],
+        {"alpha": ["alpha"]}, logging.getLogger("test"))
+    assert vars_["c1"] == "alpha"
+    assert vars_["s2t"] == "parakeet"
+    assert vars_["img"] == "flux"
+    assert vars_["img2"] == "flux2"
+    assert coload_vars == ["s2t", "img", "img2"]
+
+
+def test_expand_matrix_sets_placeholders():
+    import logging
+    from llama_packer.__main__ import _expand_matrix_sets
+
+    log = logging.getLogger("test")
+    out = _expand_matrix_sets(
+        {"rag": "__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__",
+         "chat_only": "__CHAT_VARS__"},
+        "(c1 | c2)", ["s2t", "img"], log)
+    assert out["rag"] == "(c1 | c2) & emb & rnk & (s2t | img)"
+    assert out["chat_only"] == "(c1 | c2)"
+
+
+def test_expand_matrix_sets_no_coloads_drops_placeholder(caplog):
+    import logging
+    from llama_packer.__main__ import _expand_matrix_sets
+
+    log = logging.getLogger("test")
+    with caplog.at_level(logging.WARNING):
+        out = _expand_matrix_sets(
+            {"rag": "__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__",
+             "leading": "__COLOAD_VARS__ & __CHAT_VARS__"},
+            "(c1)", [], log)
+    assert out["rag"] == "(c1) & emb & rnk"
+    assert out["leading"] == "(c1)"
+    assert "__COLOAD_VARS__" in caplog.text

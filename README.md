@@ -41,6 +41,31 @@ Output goes to `config.yaml` (`--output` overrides the path) and a sibling `conf
 
 See [SPEC.md](SPEC.md) for the full schema and [docs/architecture.md](docs/architecture.md) for how it fits together.
 
+## Directional modalities
+
+Each entry advertises `capabilities.in` / `capabilities.out` (llama-swap derives
+UI badges from these), driven by `role:` plus declared capabilities:
+
+| Role | Directory | in → out | Backend | Endpoint |
+|------|-----------|----------|---------|----------|
+| `chat` | `chat/` `vision/` `doc/` | text (+image if image, +video if video, +audio if audio) → text (+audio if speech, +video if omni/video-arch) | llama-server / vLLM | `/v1/chat/completions` |
+| `embeddings` | `embed/` | text → vectors | llama-server / vLLM | `/v1/embeddings` |
+| `rerank` | `rerank/` | query+docs → scores | llama-server / vLLM | `/v1/rerank` |
+| `s2t` | `s2t/` (opt-in) | audio → text | whisper-server | `/v1/audio/transcriptions` |
+| `t2s` | `t2s/` (opt-in) | text → audio | kokoro-podman | `/v1/audio/speech` |
+| `image` | `img/` (opt-in) | text+image → image (or video if video capability / video-arch) | sd-server | `/sdapi/v1/txt2img` |
+
+On a **chat** model, `capabilities: [image]` adds image *input* (`vision`
+was removed — llama-swap modalities are text/audio/image/video), `[video]`
+adds video *input* (and *output* for omni/video-arch), `[audio]` adds audio
+*input* (Transcription badge), `[speech]` adds audio *output* — so a VLM
+never advertises "Image Gen", and output stays text unless `speech`/`video`
+output is declared. `mmproj:` is a companion filename, not a capability:
+declare `capabilities: [image]` explicitly or the projection costs VRAM
+without being advertised (warned in the run log). Dedicated `s2t`/`image` roles are for standalone STT /
+diffusion micro-services; their modalities are fixed regardless of declared
+capabilities (`proxy` + `checkEndpoint: /` are emitted for them too).
+
 ## Sidecar example
 
 ```yaml
@@ -50,7 +75,7 @@ parameters: 12B
 context_length: 262144
 quantization: Q4_K_XL
 mmproj: gemma-4-12B-it-mmproj-F16.gguf
-capabilities: [vision, tools, reasoning]
+capabilities: [image, tools, reasoning]
 freethought: 0.55
 strengths: ["strong multimodal", "full 256K context"]
 weaknesses: ["MTP adds VRAM"]
@@ -72,6 +97,7 @@ Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](p
 | `defaults` / `profiles` | `temperature`, `top_p`, `cache_type`, `parallel`, `spare` (+ `base * N` expressions, `description` docs-only) |
 | `models_dirs` / `dirs` / `hf_home` | discovery roots & dir→role map (`it2t: chat`) |
 | `backends` / `vllm` | enable list (`llama-server`, `vllm-docker`), `image`/`bin`/`docker_args` |
+| `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
 | `matrix` | shared `emb`/`rnk` co-loading sets via `__CHAT_VARS__` |
@@ -107,5 +133,7 @@ Serve a model with vLLM instead of llama-server via an override rule in `profile
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
 - Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [SPEC.md](SPEC.md#image-backend-sd-server) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [SPEC.md → Audio Backend](SPEC.md#audio-backend-whisper-server)
+- Text-to-speech via `kokoro-podman` (Kokoro-82M in rootless podman, NVIDIA + AMD/ROCm) — **available** as `role: t2s` with `dirs: {t2s: t2s}` and `backends: [kokoro-podman]` (opt-in; weights baked into the image — an `hf_repo`-only sidecar suffices; fixed ~3 GiB VRAM); see [SPEC.md → Audio Backend (kokoro-podman)](SPEC.md#audio-backend-kokoro-podman)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
 - Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)

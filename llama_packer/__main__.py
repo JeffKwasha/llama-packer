@@ -7,6 +7,8 @@ import argparse
 import importlib.resources
 import logging
 import os
+import re
+import shlex
 import shutil
 import sys
 import textwrap
@@ -15,7 +17,7 @@ from pathlib import Path
 import yaml
 
 from llama_packer import Model, __version__, find_bin_dir
-from llama_packer.hardware import GpuProfile
+from llama_packer.hardware import GpuProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
@@ -24,10 +26,14 @@ from llama_packer.utils import (
     _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
-    validate_dir_roles,
+    validate_dir_roles, NON_CHAT_ROLES,
 )
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
-from llama_packer.backends import SD_BACKENDS, VLLM_BACKENDS, validate_backend_names
+from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
+                                   validate_backend_names)
+from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES, KOKORO_CONTAINER_PORT
+
+
 
 
 _LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -42,6 +48,39 @@ def setup_logging(verbosity: int = 0) -> None:
         format="%(levelname).1s | %(message)s",
         stream=sys.stderr,
     )
+
+
+def fatal(msg: str, *args) -> None:
+    """Log a CRITICAL complaint, then abort — for unrecoverable config errors."""
+    logger.critical(msg, *args)
+    sys.exit(1)
+
+
+def backend_args(cfg: dict | None, section: str) -> str:
+    """Validate and return a backend section's free-form ``args`` string.
+
+    Performance/tuning flags shared by every command that backend renders
+    (e.g. ``llama_server: {args: "--flash-attn on -b 512"}``).  Parsed with
+    shlex here so quoting errors fail fast at build time, not per command.
+    """
+    value = (cfg or {}).get("args")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    if not isinstance(value, str):
+        fatal("profiles.yaml %s.args: must be a string of flags, got %s",
+              section, type(value).__name__)
+    raw = value.strip()
+    if raw:
+        try:
+            shlex.split(raw)
+        except ValueError as e:
+            fatal("profiles.yaml %s.args: bad quoting: %s", section, e)
+        if raw.startswith("[") or raw.endswith("]"):
+            logger.warning(
+                "profiles.yaml %s.args: looks like a stringified container "
+                "(starts with '[' / ends with ']'); emitting tokens verbatim. "
+                "Did you mean a quoted flag string?", section)
+    return raw
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -104,6 +143,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
     parser.add_argument("--sd-server", help="sd-server binary for `sd-server` backend "
                          "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
+    parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
+                        "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
+    parser.add_argument("--kokoro-image", help="container image for `kokoro-podman` backend "
+                         "(overrides profiles.yaml t2s.image; default: vendor-detected upstream image)")
+    parser.add_argument("--no-macros", action="store_true",
+                         help="Disable flag macros (emit fully expanded cmds)")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -147,6 +192,14 @@ def _apply_env_subst(config: dict, sub, raw_paths: list[str]) -> dict:
             if raw in cmd:
                 cmd = cmd.replace(raw, subs[raw])
         entry["cmd"] = cmd
+    # Also rewrite flag-macro definitions (they may contain absolute paths).
+    for k, v in list(config.get("macros", {}).items()):
+        if isinstance(v, str):
+            nv = v
+            for raw in order:
+                if raw in nv:
+                    nv = nv.replace(raw, subs[raw])
+            config["macros"][k] = nv
     return config
 
 
@@ -168,28 +221,38 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
                 or selector in m.template_id)
         ]
         if len(hits) != 1:
-            logger.error("selector %r matched %d %s models (need exactly 1): %s",
-                         selector, len(hits), type_name,
-                         [h.stem for h in hits])
-            sys.exit(1)
+            fatal("selector %r matched %d %s models (need exactly 1): %s",
+                  selector, len(hits), type_name,
+                  [h.stem for h in hits])
         return hits[0]
     return min(cands, key=lambda m: m.vram_mb)
 
 
+# Var-name prefix per co-load role, used in set expressions
+# (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
+_COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
+
+
 def _build_matrix_vars(models: list, embed_model, rerank_model,
-                       entry_ids_by_stem: dict[str, list[str]], logger) -> dict:
-    """Auto-collect matrix vars: chat entries + selected embed/rerank.
+                       coload_stems: list[str],
+                       entry_ids_by_stem: dict[str, list[str]], logger) -> tuple[dict, list[str]]:
+    """Auto-collect matrix vars: chat entries + selected embed/rerank + co-loads.
 
     Each chat model contributes a var per emitted entry id (the bare id and,
     when present, its text-only variant — see writer.TEXT_SUFFIX), so text
     variants join the same co-loading sets as their parent entry.  The
     stem → ids mapping comes from the emitter (EmittedConfig) so naming is
-    owned in exactly one place.
+    owned in exactly one place.  Opportunistically included non-chat models
+    (``coload_stems``, from the matrix solve) contribute one role-prefixed
+    var each (``s2t``, ``img``; numbered on collision).
+
+    Returns (vars, coload_var_names) — the latter feeds the
+    ``__COLOAD_VARS__`` placeholder in set expressions.
     """
     vars_: dict[str, str] = {}
     chat_idx = 0
     for m in models:
-        if m.role in ("embeddings", "rerank", "image"):
+        if m.role in NON_CHAT_ROLES:
             continue
         for eid in entry_ids_by_stem.get(m.stem, []):
             chat_idx += 1
@@ -198,8 +261,22 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
         vars_["emb"] = embed_model.template_id
     if rerank_model is not None:
         vars_["rnk"] = rerank_model.template_id
-    logger.info("matrix vars: %d chat + emb + rnk", chat_idx)
-    return vars_
+    by_stem = {m.stem: m for m in models}
+    coload_vars: list[str] = []
+    for stem in coload_stems:
+        m = by_stem.get(stem)
+        if m is None:
+            continue
+        prefix = _COLOAD_VAR_PREFIX.get(m.role, "coload")
+        name, n = prefix, 1
+        while name in vars_:
+            n += 1
+            name = f"{prefix}{n}"
+        vars_[name] = m.template_id
+        coload_vars.append(name)
+    logger.info("matrix vars: %d chat + emb + rnk + %d coload",
+                chat_idx, len(coload_vars))
+    return vars_, coload_vars
 
 
 def _health_check_timeout(models, args) -> int:
@@ -238,6 +315,33 @@ def _health_check_timeout(models, args) -> int:
     return hct
 
 
+def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
+                        coload_vars: list[str], logger) -> dict:
+    """Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs.
+
+    Placeholders expand to parenthesized OR-lists of VAR NAMES (not model
+    IDs — the llama-swap sets DSL references var names, which map to model
+    IDs via ``vars``).  With no co-loads included, a ``__COLOAD_VARS__`` term
+    is dropped from the expression entirely.
+    """
+    coload_expr = "(" + " | ".join(coload_vars) + ")" if coload_vars else None
+    expanded: dict[str, str] = {}
+    for sname, sexpr in sets_cfg.items():
+        expr = sexpr.replace("__CHAT_VARS__", chat_expr)
+        if coload_expr:
+            expr = expr.replace("__COLOAD_VARS__", coload_expr)
+        else:
+            expr = (expr.replace("& __COLOAD_VARS__", "")
+                        .replace("__COLOAD_VARS__ &", "")
+                        .replace("__COLOAD_VARS__", ""))
+            if "__COLOAD_VARS__" in sexpr:
+                logger.warning(
+                    "matrix: set %r references __COLOAD_VARS__ but no "
+                    "co-loads were included; term dropped", sname)
+        expanded[sname] = expr.strip()
+    return expanded
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     setup_logging(args.verbose)
@@ -256,16 +360,14 @@ def main(argv: list[str] | None = None) -> None:
                 profiles_path, Path(str(bundled)).parent)
             profiles_path = Path(str(bundled))
         else:
-            logger.error("profiles file not found: %s (see profiles.yaml.example)",
-                         profiles_path)
-            sys.exit(1)
+            fatal("profiles file not found: %s (see profiles.yaml.example)",
+                  profiles_path)
 
     with open(profiles_path) as f:
         profiles_cfg = yaml.safe_load(f) or {}
 
     if not Profiles(profiles_cfg).profile_list:
-        logger.error("no profiles defined in profiles.yaml")
-        sys.exit(1)
+        fatal("no profiles defined in profiles.yaml")
 
     # Models dirs: CLI --models-dir > profiles.yaml models_dirs: > ./models.
     if args.models_dir:
@@ -275,8 +377,7 @@ def main(argv: list[str] | None = None) -> None:
     missing = [d for d in models_dirs if not d.is_dir()]
     if missing:
         for d in missing:
-            logger.error("models directory not found: %s", d)
-        sys.exit(1)
+            fatal("models directory not found: %s", d)
 
     if args.agents:
         for d in models_dirs:
@@ -289,22 +390,18 @@ def main(argv: list[str] | None = None) -> None:
     # Directory-name → role map extension from profiles.yaml `dirs:`.
     dir_roles = profiles_cfg.get("dirs") or {}
     if not isinstance(dir_roles, dict):
-        logger.error("profiles.yaml dirs: must be a mapping of directory name to role")
-        sys.exit(1)
+        fatal("profiles.yaml dirs: must be a mapping of directory name to role")
     err = validate_dir_roles(dir_roles)
     if err:
-        logger.error("profiles.yaml %s", err)
-        sys.exit(1)
+        fatal("profiles.yaml %s", err)
 
     # Backend enable/prefer list (ordered; absent = all registered).
     backends_cfg = profiles_cfg.get("backends") or []
     if not isinstance(backends_cfg, list):
-        logger.error("profiles.yaml backends: must be a list of backend names")
-        sys.exit(1)
+        fatal("profiles.yaml backends: must be a list of backend names")
     err = validate_backend_names(backends_cfg)
     if err:
-        logger.error("profiles.yaml %s", err)
-        sys.exit(1)
+        fatal("profiles.yaml %s", err)
 
     if args.llama_server:
         llama_bin = str(Path(args.llama_server).resolve())
@@ -319,6 +416,11 @@ def main(argv: list[str] | None = None) -> None:
         "llama_bin": llama_bin,
         "models_dir": str(models_dirs[0]),
         "models_dirs": [str(d) for d in models_dirs],
+        # Fleet-wide flag strings, assigned in main() below:
+        # llama_args  — profiles.yaml llama_server.args
+        # vllm_args   — profiles.yaml vllm.args
+        # sd_args     — profiles.yaml sd.args
+        # whisper_args — profiles.yaml whisper.args
     }
 
     max_ctx = None
@@ -357,6 +459,31 @@ def main(argv: list[str] | None = None) -> None:
             # but an explicit `backend: sd-server` still reports a clear error.
             pass
 
+    # whisper-server resource configuration (CLI > profiles.yaml `whisper:` section >
+    # $WHISPER_BIN_DIR > whisper-server on PATH).  Single host binary.
+    whisper_cfg = profiles_cfg.get("whisper") or {}
+    whisper_bin_raw = (args.whisper_server or whisper_cfg.get("bin")
+                       or os.environ.get("WHISPER_BIN_DIR") or shutil.which("whisper-server"))
+    whisper_bin = None
+    if whisper_bin_raw:
+        cand = Path(str(whisper_bin_raw))
+        if cand.is_dir():  # WHISPER_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR)
+            cand = cand / "whisper-server"
+        whisper_bin = str(cand)
+
+    # kokoro-podman resource configuration (CLI > profiles.yaml `t2s:` section >
+    # vendor-detected upstream image).  `vendor:` (auto|nvidia|amd|cpu) picks
+    # the default image tag AND device flags; `image:`/--kokoro-image overrides
+    # the tag only; `podman_args:` replaces the auto device flags entirely.
+    t2s_cfg = profiles_cfg.get("t2s") or {}
+    kokoro_vendor = str(t2s_cfg.get("vendor") or detect_gpu_vendor())
+    if kokoro_vendor not in KOKORO_DEFAULT_IMAGES:
+        logger.warning("profiles.yaml t2s.vendor: %r unknown (auto/nvidia/amd/cpu); "
+                       "using cpu defaults", kokoro_vendor)
+        kokoro_vendor = "cpu"
+    kokoro_image = str(args.kokoro_image or t2s_cfg.get("image")
+                       or KOKORO_DEFAULT_IMAGES[kokoro_vendor])
+
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
     # pushed/popped around its level.  Defaults, rules, companion resolution
@@ -367,6 +494,8 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_image": vllm_image,
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
+            "whisper_bin": whisper_bin or "",
+            "kokoro_image": kokoro_image,
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
@@ -377,8 +506,7 @@ def main(argv: list[str] | None = None) -> None:
                       extra_dirs=args.extra_dirs, dir_roles=dir_roles,
                       hf_home=hf_home)
     if not models:
-        logger.error("no models found (create a .md sidecar file)")
-        sys.exit(1)
+        fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
 
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
@@ -402,6 +530,8 @@ def main(argv: list[str] | None = None) -> None:
     raw_paths = [llama_bin, fit_bin]
     if sd_bin:
         raw_paths.append(sd_bin)
+    if whisper_bin:
+        raw_paths.append(whisper_bin)
     for _m in models:
         if getattr(_m, "_override_error", None):
             continue
@@ -421,15 +551,29 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["llama_bin"] = sub(llama_bin)
     if sd_bin:
         template_vars["sd_bin"] = sub(sd_bin)
+    if whisper_bin:
+        template_vars["whisper_bin"] = sub(whisper_bin)
 
     # vLLM backend defaults: already resolved above (CLI > profiles.yaml >
     # built-in constants) for backend inference.
     template_vars["vllm_image"] = vllm_image
     template_vars["vllm_bin"] = vllm_bin
     template_vars.setdefault("sd_bin", "sd-server")
+    template_vars.setdefault("whisper_bin", "whisper-server")
+    template_vars["kokoro_image"] = kokoro_image
+    template_vars["kokoro_vendor"] = kokoro_vendor
+    template_vars["podman_args"] = str(t2s_cfg.get("podman_args") or "")
+    template_vars["kokoro_container_port"] = str(
+        t2s_cfg.get("container_port") or KOKORO_CONTAINER_PORT)
+    if t2s_cfg.get("voices_dir"):
+        template_vars["voices_dir"] = str(t2s_cfg["voices_dir"])
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
+    template_vars["vllm_args"] = backend_args(vllm_cfg, "vllm")
+    template_vars["sd_args"] = backend_args(sd_cfg, "sd")
+    template_vars["whisper_args"] = backend_args(whisper_cfg, "whisper")
+    template_vars["llama_args"] = backend_args(profiles_cfg.get("llama_server"), "llama_server")
     # gpu_mem_util: explicit profiles.yaml value wins; otherwise derive the
     # fraction from the same reserve/spare budget llama.cpp uses, so vLLM's
     # --max-model-len and --gpu-memory-utilization describe one consistent pool.
@@ -474,32 +618,60 @@ def main(argv: list[str] | None = None) -> None:
             min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
         )
     except ValueError as e:
-        logger.error("%s", e)
-        sys.exit(1)
+        fatal("%s", e)
+    # Prepare flag macros (placeholder domain) — auto on unless --no-macros
+    flag_macros: dict[str, str] = {}
+    if not args.no_macros:
+        from llama_packer.macros import Macro, Macros
+        Macro.clear()
+        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub)
+        # Apply env substitution to flag macro definitions as well (they were
+        # built with placeholder-aware sub, but ensure consistency)
+        flag_macros = Macro.definitions()
+        logger.info("flag macros: %d registered (%s)", len(flag_macros), ", ".join(sorted(flag_macros)) if flag_macros else "none")
     config = _apply_env_subst(config, sub, raw_paths)
+    # Apply flag macros to every cmd (post-env, placeholder domain)
+    if flag_macros:
+        from llama_packer.macros import Macro
+        for entry in config.get("models", {}).values():
+            cmd = entry.get("cmd")
+            if cmd:
+                entry["cmd"] = Macro.apply(cmd)
     if not config.get("models"):
-        logger.error("no model entries generated")
-        sys.exit(1)
+        fatal("no model entries generated")
     logger.info("entries: %d generated", len(config["models"]))
 
     # Resolve ${VAR} macros to absolute paths in the config itself so that
     # -watch-config reloads pick up new paths (e.g. a new llama-server version)
-    # without requiring a llama-swap service restart.
-    config["macros"] = {name: value for name, value in sorted(var_to_value.items())}
+    # without requiring a llama-swap service restart. Merge path + flag macros.
+    # Preserve creation order so a flag macro that references a path macro
+    # (e.g. MODELS_CHAT_QWEN3 → ${MODELS_DIR}/...) is defined after its
+    # dependency — alphabetical sorting breaks nested substitution in llama-swap.
+    merged_macros: dict[str, str] = dict(var_to_value)
+    # Flag macros may collide with path macros — new replaces old with warning
+    for k, v in flag_macros.items():
+        if k in merged_macros:
+            logger.warning("macros: flag macro %r collides with path macro %r; flag wins", k, merged_macros[k])
+        merged_macros[k] = v
+    config["macros"] = merged_macros
 
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
-        vars_ = _build_matrix_vars(models, embed_model, rerank_model,
-                                   config.entry_ids_by_stem, logger)
-        # Expand the __CHAT_VARS__ placeholder in each set with the chat VAR
-        # NAMES (c1 | c2 | ...), not the model IDs — llama-swap sets DSL
-        # references var names, which map to model IDs via `vars`.
-        chat_var_names = [k for k in vars_ if k.startswith("c")]
-        # Parenthesize the OR-list: '&' binds tighter than '|' in the DSL.
+        vars_, coload_vars = _build_matrix_vars(
+            models, embed_model, rerank_model, config.coload_stems,
+            config.entry_ids_by_stem, logger)
+        chat_var_names = [k for k in vars_ if re.fullmatch(r"c\d+", k)]
+        # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
         chat_expr = "(" + " | ".join(chat_var_names) + ")"
-        sets = {}
-        for sname, sexpr in (matrix_cfg.get("sets") or {}).items():
-            sets[sname] = sexpr.replace("__CHAT_VARS__", chat_expr)
+        sets_cfg = matrix_cfg.get("sets") or {}
+        sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
+        if coload_vars:
+            joined = " ".join(str(s) for s in sets_cfg.values())
+            if "__COLOAD_VARS__" not in joined:
+                logger.info(
+                    "matrix: co-loads %s included but no set references "
+                    "__COLOAD_VARS__; they stay outside the co-loading sets",
+                    coload_vars)
         # llama-swap schema: matrix lives under routing.router.settings.matrix,
         # not at the top level.
         config["routing"] = {

@@ -18,11 +18,18 @@ models_dirs:
   # - /mnt/ai/models  # multiple roots allowed
 
 # Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank | image. CLI --extra-dirs merges similarly.
+# values must be chat | embeddings | rerank | image | s2t | t2s. CLI --extra-dirs
+# merges similarly.
 # Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
+# Speech-to-text (whisper.cpp) is opt-in: add `s2t: s2t` to serve .bin weights
+# via whisper-server (requires an authored same-stem sidecar per model).
+# Text-to-speech (kokoro) is opt-in: add `t2s: t2s` to serve via kokoro-podman
+# (weights are baked into the image — an hf_repo-only sidecar suffices).
 # dirs:
 #   it2t: chat
 #   img: image
+#   s2t: s2t
+#   t2s: t2s
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -31,12 +38,16 @@ models_dirs:
 
 # Backend enable/prefer list — ordered; a backend absent from the list is
 # disabled even when its resources are configured.  Omit the key to use all
-# registered backends in default order (llama-server, vllm-docker, vllm, sd-server).
-# sd-server is opt-in for image generation; see the sd: section below.
+# registered backends in default order (llama-server, vllm-docker, vllm,
+# sd-server, whisper-server, kokoro-podman).  sd-server is opt-in for image
+# generation, whisper-server for speech-to-text, and kokoro-podman for
+# text-to-speech; see the sd:/whisper:/t2s: sections below.
 # backends:
 #   - llama-server
 #   - vllm-docker
 #   - sd-server
+#   - whisper-server
+#   - kokoro-podman
 
 # ── Profile definitions ────────────────────────────────
 # Each profile overlays `defaults` and emits llama-swap setParamsByID
@@ -47,11 +58,11 @@ profiles:
   default:
 
   coder:
-    description: "Optimized for code generation and bash commands"
+    description: "coding and agentic work"
     temperature: "base * 0.7"
 
   # creative:
-  #   description: "Higher temperature for creative and writing tasks"
+  #   description: "creative writing"
   #   temperature: "base * 1.2"
 
   # ── Sampling params ──────────────────────────────────
@@ -82,12 +93,22 @@ profiles:
   #   description: "Concurrency-tuned"
   #   parallel: 2
   #   cache_type: q4_K_M
-  #   spare: 6G
+  #   spare: 2G
 
   # low-mem:
   #   description: "Smaller KV cache for tight VRAM budgets"
   #   cache_type: q4_0
   #   spare: 1G
+
+# ── llama-server backend args (optional) ────────────────
+# Free-form flags appended to every llama-server command — fleet-wide
+# performance/tuning knobs (per-model sidecar `cli_args:` still wins per
+# flag).  Rendered BEFORE the built-in per-role flags, so embed/rerank role
+# flags (-b 4096 -ub 4096) win over conflicting values here: `-b 512`
+# therefore tunes chat models only, while non-conflicting flags (e.g.
+# --flash-attn) apply to all roles.  Flags don't feed the VRAM estimator.
+# llama_server:
+#   args: "--flash-attn on -b 512 -ub 512"
 
 # ── vLLM backend (optional) ────────────────────────────
 # Defaults for `backend: vllm` / `vllm-docker` via overrides.
@@ -98,6 +119,9 @@ profiles:
 #   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
 #   container_port: 8000
 #   # gpu_mem_util: 0.9  # derived from spare/reserve when omitted
+#   # Fleet-wide serve flags (vLLM spellings — e.g. -ub 512 ≈
+#   # --max-num-batched-tokens 512); per-model cli_args wins per flag.
+#   # args: "--max-num-batched-tokens 512"
 
 # ── sd-server backend (optional, image generation) ───────
 # Defaults for `backend: sd-server` (stable-diffusion.cpp).  CLI --sd-server
@@ -107,6 +131,46 @@ profiles:
 # collapse the chat budget.
 # sd:
 #   bin: sd-server
+#   # Fleet-wide sd-server flags (--diffusion-fa etc.); per-model cli_args wins.
+#   # args: "--diffusion-fa"
+
+# ── whisper-server backend (optional, speech-to-text) ─────
+# Defaults for `backend: whisper-server` (whisper.cpp examples/server).
+# CLI --whisper-server wins over this, then $WHISPER_BIN_DIR, then
+# `whisper-server` on PATH.  Opt-in: add `s2t: s2t` under `dirs:` above;
+# each model needs an authored same-stem sidecar next to its GGML .bin
+# (e.g. ggml-large-v3.md beside ggml-large-v3.bin).  Fixed VRAM overhead,
+# excluded from the shared chat matrix.
+# whisper:
+#   bin: whisper-server
+#   # Fleet-wide whisper-server flags (whisper.cpp shares --flash-attn);
+#   # per-model cli_args wins.
+#   # args: "--flash-attn on"
+
+# ── kokoro-podman backend (optional, text-to-speech) ──────
+# Kokoro-82M TTS via remsky/Kokoro-FastAPI in rootless podman
+# (OpenAI-compatible /v1/audio/speech; container port 8880).  Opt-in: add
+# `t2s: t2s` under `dirs:`; weights + ~50 voices are baked into the image,
+# so a sidecar only needs `hf_repo: hexgrad/Kokoro-82M`.  Fixed ~3 GiB
+# VRAM (PyTorch runtime floor), excluded from the chat matrix.
+#
+# vendor: auto-detected (nvidia | amd | cpu) — picks the default image tag
+# AND device pass-through flags:
+#   nvidia → ghcr.io/remsky/kokoro-fastapi-gpu:latest   --device nvidia.com/gpu=all
+#            (-cu128 tag for RTX 50-series / Blackwell)
+#   amd    → ghcr.io/remsky/kokoro-fastapi-rocm:latest  --device /dev/kfd --device /dev/dri
+#            (native ROCm build — experimental upstream, amd64 only)
+#   cpu    → ghcr.io/remsky/kokoro-fastapi-cpu:latest   (no device flags)
+# Pin to a release tag instead of :latest for stability. CLI --kokoro-image
+# overrides the tag only; podman_args replaces the auto device flags entirely;
+# voices_dir bind-mounts a persistent voicepack directory (read-write: the
+# server saves combined voices there).
+# t2s:
+#   vendor: auto
+#   image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+#   podman_args: ""
+#   container_port: 8880
+#   voices_dir: /mnt/ai/models/t2s/voices
 
 # ── Hardware (optional) ─────────────────────────────────
 # Override auto-detected VRAM pool. CLI --vram / --unified-system-mb win.
@@ -143,3 +207,16 @@ profiles:
 #     rnk: 100
 #   sets:
 #     rag: "__CHAT_VARS__ & emb & rnk"
+
+# ── Flag macros (optional) ──────────────────────────────────
+# Named flag chunks for cmd readability (llama-swap macros). Auto-derived
+# macros are always on: PROFILE_DEFAULTS (from defaults), PROFILE_<NAME> per
+# profile cache/parallel, MODELS_<DIR> per models.yaml chat_template/loras,
+# and COMMON_GPU (--n-gpu-layers 999). Explicit entries here have highest
+# priority and are longest-first at replacement time; collision with an
+# auto macro logs a warning and the new value wins.
+# Use ${NAME} in cmd via the macro, and define values as plain shell strings.
+# Example:
+# macros:
+#   COMMON: "--parallel 1 --cache-type-k q8_0 --cache-type-v q8_0 --n-gpu-layers 999"
+#   QWEN: "--jinja --chat-template-file ${MODELS_DIR}/chat/qwen3/chat_template.jinja --reasoning-format deepseek"

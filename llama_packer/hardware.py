@@ -218,6 +218,40 @@ def detect_gpu_env_var() -> str:
     return "ROCR_VISIBLE_DEVICES"
 
 
+def detect_gpu_vendor() -> str:
+    """Detect the GPU vendor: ``"amd"``, ``"nvidia"``, or ``"cpu"``.
+
+    Same probes as :func:`detect_gpu_env_var` (amd-smi / rocminfo, then
+    nvidia-smi) but returning a vendor label — used to pick container
+    default images and device pass-through flags (kokoro-podman).
+    """
+    try:
+        out = subprocess.run(
+            ["amd-smi", "metric", "-m", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return "amd"
+    except Exception:
+        pass
+    try:
+        subprocess.run(["rocminfo"], capture_output=True, timeout=10,
+                       check=True)
+        return "amd"
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return "nvidia"
+    except Exception:
+        pass
+    return "cpu"
+
+
 # ── GpuProfile ────────────────────────────────────────────────────────────
 #
 # Per-library memory rules (cuda11/cuda12/rocm6/rocm7, flash-attention/FP8

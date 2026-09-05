@@ -10,12 +10,12 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Modules
 
-- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, ...), companion resolution
+- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, `image_min/max_tokens`, ...), companion resolution
 - [`llama_packer/profiles.py`](llama_packer/profiles.py) — `Profiles` value object: defaults, spare precedence, `allow_profiles` filtering, per-model variant grouping
-- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + always-on `-text` variant, renamed auto-dropped main, matrix solve, bounded ctx) → `emit_config` (llama-swap entries with bare `<id>` = vision / `<id>-text` = text-only), `_filter_supported`, `write_yaml`
+- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + always-on `-text` variant, renamed auto-dropped main, matrix solve: squeeze + opportunistic s2t/image co-loads + tools demotion, bounded ctx) → `emit_config` (llama-swap entries with bare `<id>` = image-capable / `<id>-text` = text-only; exposes `entry_ids_by_stem`, `coload_stems`), `_filter_supported` (validation boundary incl. capability/companion cross-check), `write_yaml`
 - [`llama_packer/backends/`](llama_packer/backends/) — backend package: `base` (ABC + support matrix + `is_available`), `llama_server`, `vllm` (host + docker); `BACKENDS` registry, `infer_backend`, `VLLM_BACKENDS`, `get_backend`
 - [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules (global profiles.yaml + directory-scoped `models.yaml`, inner scope wins) → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
-- [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` fit-params, `solve_matrix_ctx`
+- [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` fit-params (incl. `vram_mb` pin for fixed-overhead backends), `solve_matrix_ctx` (+`fixed_overhead_mb`)
 - [`llama_packer/vllm_estimate.py`](llama_packer/vllm_estimate.py) — vLLM memory estimation via `vllm-memory-estimator` (+ safetensors fallback)
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
 - [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)
@@ -27,16 +27,21 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - llama-server — GGUF chat/embeddings/rerank; role flags, MTP, mmproj, chat-template, LoRA
 - vLLM — safetensors / `hf_repo`; all roles (`--task embed`/`--task score` for pooling); `vllm serve` (host binary)
 - vLLM docker — same, wrapped in `docker run` with bind-mounts for chat-template/lora dirs; per-model `vllm_image:` override
+- sd-server — stable-diffusion.cpp image generation (`role: image`, opt-in via `dirs: {img: image}`)
+- whisper-server — whisper.cpp speech-to-text (`role: s2t`, opt-in via `dirs: {s2t: s2t}`; GGML `.bin` + authored sidecar)
+- kokoro-podman — Kokoro-82M text-to-speech in rootless podman (`role: t2s`, opt-in via `dirs: {t2s: t2s}`; vendor-detected NVIDIA/AMD/CPU image)
 - Backend selection: sidecar/override `backend:` wins (validated against profiles.yaml `backends:` enable list); else inferred from file format + roles, gated by the enable list and configured resources (see SPEC.md "Backend Selection")
+- Global backend args: profiles.yaml `<section>.args` (llama_server / vllm / sd / whisper) — fleet-wide flags, built-ins < args < role flags < per-model `cli_args` (see SPEC.md "Global backend args")
 - See SPEC.md "vLLM Backend" + "Override Rules" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
 
 ## Docs
 
-- [README.md](README.md) — usage, sidecar example
+- [README.md](README.md) — usage, sidecar example, directional modalities
+- [FAQ.md](FAQ.md) — why HF-hub models don't show up and how to serve them (sidecar `model:`+`hf_repo:` vs symlinks)
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
-- [docs/plans/](docs/plans/) — design proposals (vllm-gb10)
+- [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload)
 - [docs/reference.md](docs/reference.md) — external links
 
 ## Data dirs
@@ -45,3 +50,5 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - `/mnt/ai/models` — canonical model root (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); configured via profiles.yaml `models_dirs:` + `dirs:` / `hf_home:`
 - `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
+- [`extras/update`](extras/update) — llama.cpp + llama-swap updater (installs into repo root)
+- [`extras/llamaswap.ts`](extras/llamaswap.ts) — opencode llama-swap plugin (setup: [`extras/README.md`](extras/README.md))

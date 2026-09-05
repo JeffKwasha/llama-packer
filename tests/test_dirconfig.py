@@ -169,8 +169,10 @@ def test_validate_dir_roles():
 def test_emit_config_duplicate_id_raises(make_model):
     from llama_packer.writer import emit_config, Planner, TEXT_SUFFIX
 
-    a = make_model("dup", name="My Model")
-    b = make_model("dup2", name="my-model!")  # slugs to the same entry id
+    # template_id is slug of sidecar stem (not name). Two different stems that
+    # slug to the same id are "my model" and "my-model" -> both "my-model".
+    a = make_model("my model", name="My Model")
+    b = make_model("my-model", name="my-model!")  # same slug as "my model"
 
     class P:
         pass

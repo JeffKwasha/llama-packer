@@ -68,9 +68,48 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
         backend = get_backend(model.backend)
         reason = backend.unsupported_reason(model)
         if reason:
-            logger.error("skipping %s: %s backend cannot serve it: %s",
-                         model.stem, backend.name, reason)
+            model_file = str(model.gguf_path) if model.gguf_path else (model.hf_repo or "no file")
+            logger.error("No backend supports %s in %s (backend %s, role %s): %s",
+                         model_file, model.md_path, backend.name, model.role, reason)
             continue
+
+        # Diffusion/image-generation GGUF under a non-image role would
+        # incorrectly emit a llama-server entry. Classify by header, not filename.
+        if model.gguf_path and model.gguf_path.is_file():
+            arch, _ = utils.gguf_header_probe(model.gguf_path)
+            if arch and any(rx.search(arch) for rx in utils._DIFFUSION_ARCH_RES):
+                if model.role != "image":
+                    logger.error("skipping %s: diffusion arch %r requires role: image (sd-server); "
+                                 "move to img/ with dirs:{img:image} or set ignore:true (found role=%r)",
+                                 model.stem, arch, model.role)
+                    continue
+                # explicit architecture hint for video diffusion (H3 etc.)
+                fm_arch = str(model.frontmatter.get("architecture") or "").lower()
+                if not fm_arch:
+                    logger.warning("sidecar %s: diffusion arch %r but no architecture: set (e.g. architecture: wan/hunyuan-video/flux) for backend routing",
+                                   model.stem, arch)
+
+        # s2t/t2s/image must not be served as chat via llama-server
+        if model.role in ("s2t", "t2s", "image") and backend.name == "llama-server":
+            logger.error("skipping %s: role %r must not use backend %r (use %s)",
+                         model.stem, model.role, backend.name,
+                         {"s2t":"whisper-server","t2s":"kokoro-podman","image":"sd-server"}[model.role])
+            continue
+
+        # Capability / companion cross-check: mmproj is a file, not a
+        # capability — what it enables must be declared explicitly.
+        caps_l = [str(c).lower() for c in model.capabilities]
+        has_mmproj = bool(model.mmproj and model.mmproj.gguf_path)
+        if "vision" in caps_l:
+            logger.error("skipping capability 'vision' on %s: removed, use 'image' "
+                         "(llama-swap modalities are text/audio/image/video)",
+                         model.stem)
+        if has_mmproj and model.role not in ("s2t", "t2s", "image", "embeddings", "rerank") \
+                and "image" not in caps_l and "video" not in caps_l:
+            logger.warning("sidecar %s: mmproj companion present but neither 'image' nor 'video' "
+                           "declared — projection costs VRAM but is not advertised; "
+                           "declare capabilities: [image] (or [image, video])",
+                           model.stem)
 
         fm = model.frontmatter
 
@@ -152,20 +191,34 @@ def _build_entry(
     ctx_size: int,
     include_mmproj: bool = True,
     name_suffix: str = "",
+    tools_demoted: bool = False,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
     ``include_mmproj=False`` omits the vision projection from the command,
-    removes the ``vision`` capability, and flags ``metadata.mmproj_skipped``.
+    removes the ``image``/``video`` input capabilities, and flags
+    ``metadata.mmproj_skipped``.
     ``name_suffix`` is appended to the model display name (e.g. the vision
     variant's `` [vision 92k]``).
+    ``tools_demoted=True`` drops the ``tools`` capability: the matrix solve
+    served the model below ``tools_min_ctx``, so advertising tool calling
+    would mislead clients — ``metadata.tools_demoted`` records why.
     """
-    base_id = utils.slugify(model.name)
+    base_id = model.template_id
 
     # Build the launch command via the model's backend.  The backend is chosen
     # by override rules (model.backend), and validation/skip of unsupported
     # format/role combos happens in build_config's pre-pass.
     backend = get_backend(model.backend)
+    # Verbose trace: what backend was picked and why (visible with -V/-VV)
+    if logger.isEnabledFor(logging.INFO):
+        arch = str(model.frontmatter.get("architecture") or model.frontmatter.get("base_model") or "")
+        fmt = model.gguf_path.suffix if model.gguf_path else ("hf_repo" if model.hf_repo else "no-file")
+        logger.info("backend %s -> %s (role=%s fmt=%s arch=%s caps=%s%s)",
+                    model.stem, backend.name, model.role, fmt, arch or "-",
+                    ",".join(model.capabilities) or "-",
+                    " mmproj" if (model.mmproj and model.mmproj.gguf_path) else "")
+        logger.debug("backend %s handles=%s", backend.name, sorted(backend.handles))
     cmd_str, backend_meta = backend.build_cmd(
         model, ctx_size, parallel, cache_type, template_vars,
         include_mmproj=include_mmproj,
@@ -200,34 +253,65 @@ def _build_entry(
     metadata = model.pass_through_metadata()
 
     # Directional modalities (llama-swap derives badges from these):
-    # vision → image INPUT; audio → audio INPUT (Transcription);
-    # speech → audio OUTPUT. Output stays text unless `speech` is declared,
-    # so a VLM never advertises text→image ("Image Gen") or image→image.
-    # role=image (sd-server) → diffusion outputs image; input is text+image
-    # (txt2img + img2img editing) so both Image Gen and Img→Img badges appear.
+    # image → image INPUT; video → video INPUT (and OUTPUT for omni/video-arch);
+    # audio → audio INPUT (Transcription); speech → audio OUTPUT.
+    # Output stays text unless `speech`/`video` output is declared.
+    # role=image (sd-server) → diffusion outputs image or video by architecture;
+    #   in:[text,image] out:[image] vs out:[video] (see architecture/video token).
+    # role=s2t (whisper-server) → audio in, text out (Transcription badge).
     caps_l = [c.lower() for c in model.capabilities]
+    arch = str(model.frontmatter.get("architecture") or "").lower()
+    is_video_arch = "video" in arch or arch in {"wan", "hunyuan-video", "h3", "mochi", "cosmos"}
     if model.role == "image":
         in_mods = ["text", "image"]
-        out_mods = ["image"]
+        # architecture or explicit video token decides output modality
+        if "video" in caps_l or is_video_arch:
+            out_mods = ["video"]
+        else:
+            out_mods = ["image"]
+    elif model.role == "s2t":
+        in_mods = ["audio"]
+        out_mods = ["text"]
+    elif model.role == "t2s":
+        in_mods = ["text"]
+        out_mods = ["audio"]
     else:
         in_mods = ["text"]
         out_mods = ["text"]
-        if "vision" in caps_l:
+        if "image" in caps_l:
             in_mods.append("image")
+        if "video" in caps_l:
+            in_mods.append("video")
         if "audio" in caps_l:
             in_mods.append("audio")
         if "speech" in caps_l:
             out_mods.append("audio")
+        # omni models with video capability can also generate video
+        if "video" in caps_l and (is_video_arch or arch == "omni" or "omni" in arch):
+            if "video" not in out_mods:
+                out_mods.append("video")
 
-    # When mmproj is dropped, remove the auto-added image input so the entry
-    # no longer advertises vision.  Image-role models keep image regardless.
+    # When mmproj is dropped, remove its associated input modalities.
+    # mmproj does not imply image/video - only explicit tokens are removed,
+    # and only when a companion exists (baked-in video stays).
     if not include_mmproj and model.role != "image" and model.mmproj and model.mmproj.gguf_path:
-        caps = [c for c in model.capabilities if str(c).lower() != "vision"]
-        if "image" in in_mods:
+        caps = [c for c in model.capabilities if str(c).lower() not in ("image", "video")]
+        if "image" in caps_l and "image" in in_mods:
             in_mods.remove("image")
+        if "video" in caps_l and "video" in in_mods:
+            in_mods.remove("video")
         metadata["mmproj_skipped"] = True
     else:
         caps = list(model.capabilities)
+
+    # tools demotion: served context below the tools threshold → stop
+    # advertising tool calling (per-variant; the sidecar declaration is
+    # untouched, so a re-pack at a higher context restores it).
+    if tools_demoted and "tools" in [c.lower() for c in caps]:
+        caps = [c for c in caps if str(c).lower() != "tools"]
+        metadata["tools_demoted"] = True
+        logger.info("capabilities: %s: tools demoted (served ctx %d below "
+                    "tools_min_ctx)", model.stem, ctx_size)
 
     tf = model.throughput_factor()
     if tf is not None:
@@ -236,6 +320,14 @@ def _build_entry(
     metadata["mtp_enabled"] = backend_meta.get("mtp_enabled", False)
     if backend_meta.get("mtp_enabled"):
         metadata["mtp_draft_max"] = backend_meta["mtp_draft_max"]
+
+    # Image token budget (client-facing so callers can size requests): only
+    # advertised on variants that actually serve the vision projection.
+    if include_mmproj and model.mmproj and model.mmproj.gguf_path:
+        if model.image_min_tokens is not None:
+            metadata["image_min_tokens"] = model.image_min_tokens
+        if model.image_max_tokens is not None:
+            metadata["image_max_tokens"] = model.image_max_tokens
 
     # Expose the resolved chat template so clients know which Jinja template
     # drives the model, and which kwargs they may pass per-request
@@ -294,11 +386,11 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # Image backends (sd-server) are proxied HTTP services, not llama-swap
-    # managed inference — expose the standard proxy fields so llama-swap can
-    # health-check and route.  checkEndpoint "/" is required for sd-server
-    # (Discussion #866: /health never returns 200).
-    if model.backend == "sd-server":
+    # Proxied backends (sd-server, whisper-server) are proxied HTTP services,
+    # not llama-swap managed inference — expose the standard proxy fields so
+    # llama-swap can health-check and route.  checkEndpoint "/" avoids the
+    # /health pitfall (Discussion #866: sd-server returns 200 on / only).
+    if backend.proxied:
         entry["proxy"] = "http://127.0.0.1:${PORT}"
         entry["checkEndpoint"] = "/"
 
@@ -312,6 +404,70 @@ def _build_entry(
 # always serves vision when the model has an mmproj; the text-only serving is
 # always ``<id>-text`` (see :func:`emit_config`).
 TEXT_SUFFIX = "-text"
+
+
+@dataclass(frozen=True)
+class MatrixKnobs:
+    """Tunables of the matrix solve, from the ``matrix:`` config section.
+
+    Context tiers, smallest to largest: ``coload_min_ctx`` (emb/rnk squeeze
+    floor) → ``min_chat_ctx`` (co-load decision floor) → ``tools_min_ctx``
+    (tools advertisement threshold).  ``ctx_gain_min`` gates the squeeze
+    adoption; ``estimate_headroom`` pads estimated co-load overheads.
+    """
+    min_chat_ctx: int = 65536
+    tools_min_ctx: int = 131072
+    coload_min_ctx: int = 20480
+    ctx_gain_min: int = 4096
+    estimate_headroom: float = 1.25
+
+    @classmethod
+    def from_cfg(cls, matrix_cfg: dict | None) -> "MatrixKnobs":
+        """Parse knobs from the matrix section, warning and defaulting on
+        invalid values (a bad knob must not silently break the solve)."""
+        cfg = matrix_cfg or {}
+        knobs: dict = {}
+        for key in ("min_chat_ctx", "tools_min_ctx", "coload_min_ctx",
+                    "ctx_gain_min"):
+            v = cfg.get(key)
+            if v is None:
+                continue
+            try:
+                iv = int(v)
+                assert iv > 0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("matrix: %s=%r is not a positive integer; "
+                               "using default", key, v)
+                continue
+            knobs[key] = iv
+        v = cfg.get("estimate_headroom")
+        if v is not None:
+            try:
+                fv = float(v)
+                assert fv >= 1.0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("matrix: estimate_headroom=%r is not a float "
+                               ">= 1.0; using default", v)
+            else:
+                knobs["estimate_headroom"] = fv
+        return cls(**knobs)
+
+
+@dataclass(frozen=True)
+class MatrixSolve:
+    """Result of the shared matrix solve.
+
+    ``chat_ctx`` is the solved shared chat context.  ``embed_ctx`` /
+    ``rerank_ctx`` are the contexts the RAG models should be served at
+    (design context, or the squeezed value when the squeeze was adopted).
+    ``coloads`` lists opportunistically included non-chat models as
+    (stem, fixed overhead MB) pairs.
+    """
+    chat_ctx: int
+    embed_ctx: int
+    rerank_ctx: int
+    coloads: tuple[tuple[str, int], ...] = ()
+    squeeze: bool = False
 
 
 @dataclass(frozen=True)
@@ -331,6 +487,8 @@ class Variant:
     ctx_size: int
     include_mmproj: bool
     vision_ctx: int | None = None
+    coload: bool = False
+    tools_demoted: bool = False
 
 
 class Planner:
@@ -365,11 +523,13 @@ class Planner:
         self.spare = spare
         self.max_context = max_context
         self.matrix_cfg = matrix_cfg
+        self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
         self.embed_model = embed_model
         self.rerank_model = rerank_model
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.chat_ctx: int | None = None  # matrix-solved shared context, if any
+        self.matrix_result: MatrixSolve | None = None
 
     # ── bounded ctx: the single home of the clamp invariant ──
 
@@ -418,7 +578,7 @@ class Planner:
         drop: dict[str, bool] = {}
         global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
         for model in self.models:
-            if model.role in ("embeddings", "rerank", "image"):
+            if model.role in utils.NON_CHAT_ROLES:
                 continue
             if not (model.mmproj and model.mmproj.gguf_path):
                 continue
@@ -447,31 +607,59 @@ class Planner:
                         model.stem, ctx_with, self.min_context, ctx_without)
         return drop
 
-    def _solve_matrix(self, drop_stems: set[str]) -> int | None:
+    def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
         """Shared chat context when a matrix section is configured."""
         if not (self.matrix_cfg and self.embed_model and self.rerank_model):
             return None
-        chat_ctx = _solve_matrix_context(
+        result = _solve_matrix_context(
             self.models, self.embed_model, self.rerank_model,
             self.fit_bin, self.vram_total, self.spare, self.profiles,
             baseline_mb=self.baseline_mb, drop_stems=drop_stems,
+            knobs=self.knobs,
         )
-        if chat_ctx is not None:
-            logger.info("matrix: solved chat_ctx=%d", chat_ctx)
-        return chat_ctx
+        if result is not None:
+            logger.info("matrix: solved chat_ctx=%d (squeeze=%s, coloads=%s)",
+                        result.chat_ctx, result.squeeze,
+                        [s for s, _ in result.coloads])
+        return result
 
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
         Order matters: the mmproj drop decision runs first (its result feeds
         the matrix solve), then per-model variants are grouped by profile.
+        The matrix result threads through everywhere: the solved chat context
+        clamps chat entries, an adopted emb/rnk squeeze clamps the RAG
+        entries' contexts, tools are demoted on chat entries solved below
+        ``tools_min_ctx``, and included co-loads are flagged so the emitter
+        can expose them for matrix-var construction.
         """
         drop_mmproj = self._mmproj_drop_pass()
-        self.chat_ctx = self._solve_matrix({s for s, d in drop_mmproj.items() if d})
+        self.matrix_result = self._solve_matrix(
+            {s for s, d in drop_mmproj.items() if d})
+        if self.matrix_result is not None:
+            self.chat_ctx = self.matrix_result.chat_ctx
+        coload_stems = ({s for s, _ in self.matrix_result.coloads}
+                        if self.matrix_result else set())
 
         plan: dict[str, list[Variant]] = {}
         for model in self.models:
             context_length = model.design_context
+            # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
+            # RAG entry's served context (the emit is what frees the VRAM).
+            if model.role == "embeddings" and self.matrix_result:
+                context_length = min(context_length,
+                                     self.matrix_result.embed_ctx)
+            elif model.role == "rerank" and self.matrix_result:
+                context_length = min(context_length,
+                                     self.matrix_result.rerank_ctx)
+            tools_demoted = (
+                model.role == "chat"
+                and self.chat_ctx is not None
+                and self.chat_ctx < self.knobs.tools_min_ctx
+                and "tools" in [c.lower() for c in model.capabilities])
+            is_coload = model.stem in coload_stems
+
             include_mmproj = not drop_mmproj.get(model.stem, False)
 
             groups = self.profiles.groups_for(model, self.vram_total, self.spare)
@@ -492,7 +680,8 @@ class Planner:
                 variants.append(Variant(
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                     profiles_group=group, ctx_size=ctx_size,
-                    include_mmproj=include_mmproj, vision_ctx=vision_ctx))
+                    include_mmproj=include_mmproj, vision_ctx=vision_ctx,
+                    coload=is_coload, tools_demoted=tools_demoted))
 
                 # On-demand text-only variant: when the main entry keeps its
                 # mmproj, also plan a no-vision entry (``<id>-text``) so
@@ -508,7 +697,8 @@ class Planner:
                     variants.append(Variant(
                         parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                         profiles_group=group, ctx_size=text_ctx,
-                        include_mmproj=False))
+                        include_mmproj=False, coload=is_coload,
+                        tools_demoted=tools_demoted))
             plan[model.stem] = variants
         return plan
 
@@ -531,19 +721,31 @@ def _solve_matrix_context(
     profiles: Profiles,
     baseline_mb: int = 0,
     drop_stems: set[str] | None = None,
-) -> int | None:
-    """Solve VRAM budget equation for chat context given embed/rerank allocations.
+    knobs: MatrixKnobs | None = None,
+) -> MatrixSolve | None:
+    """Solve the shared VRAM budget for chat context plus co-loads.
 
     Runs fit-params once per model to get static parameters, then solves:
         available = Σ(chat_weight + chat_factor*chat_ctx)
                    + (embed_weight + embed_factor*embed_ctx)
                    + (rerank_weight + rerank_factor*rerank_ctx)
 
-    Returns the maximum chat context that fits, or None on failure.
+    Three passes, in order:
 
-    ``drop_stems`` is the set of chat-model stems whose mmproj is being skipped
-    to reach the minimum useful context (their combined budget omits mmproj).
+    1. *Baseline*: embed/rerank at their design context → ``chat_ctx₀``.
+    2. *Squeeze* (§2b): when ``chat_ctx₀`` is below ``tools_min_ctx``, re-solve
+       with embed/rerank contexts clamped to ``coload_min_ctx``; adopt only
+       when the gain reaches ``ctx_gain_min``.
+    3. *Opportunistic co-loads* (§2): enabled ``s2t``/``image`` models not on
+       the GPU pool's excluded list, smallest fixed overhead first, are
+       included while the chat solve stays at or above the floor
+       (``tools_min_ctx`` when a tools chat model can keep it, else
+       ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+
+    Returns the :class:`MatrixSolve` (chat context, adopted RAG contexts,
+    included co-loads) or None on failure.
     """
+    knobs = knobs or MatrixKnobs()
     spare_mb = parse_spare_mb(spare, vram_total)
 
     drop_stems = drop_stems or set()
@@ -553,10 +755,10 @@ def _solve_matrix_context(
     # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     chat_params = []
     for m in chat_models:
-        # Embed/rerank/image models are handled outside the shared chat
+        # Embed/rerank/image/s2t models are handled outside the shared chat
         # budget (fixed overhead / separate pool). Including a 40 GB
         # diffusion model would collapse the chat budget, so exclude it.
-        if m.role in ("embeddings", "rerank", "image") or m.on_cpu:
+        if m.role in utils.NON_CHAT_ROLES or m.on_cpu:
             continue
         cache_type = m.cache_type_for(profiles.default_cache_type)
         parallel = m.parallel_for(profiles.default_parallel)
@@ -565,7 +767,11 @@ def _solve_matrix_context(
         if fp is None:
             logger.warning("matrix: could not get fit params for %s", m.stem)
             continue
-        chat_params.append((m, fp[0], fp[1], fp[2]))
+        img_floor = 0
+        if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
+                and m.image_max_tokens):
+            img_floor = parallel * m.image_max_tokens
+        chat_params.append((m, fp[0], fp[1], fp[2], img_floor))
 
     if not chat_params:
         return None
@@ -589,23 +795,121 @@ def _solve_matrix_context(
     embed_ctx = embed_model.design_context
     rerank_ctx = rerank_model.design_context
 
-    return solve_matrix_ctx(
-        vram_total_mb=vram_total,
-        spare_mb=spare_mb,
-        chat_models=chat_params,
-        embed_params=embed_params,
-        rerank_params=rerank_params,
-        embed_ctx=embed_ctx,
-        rerank_ctx=rerank_ctx,
-        baseline_mb=baseline_mb,
+    def _solve(embed_ctx_: int, rerank_ctx_: int,
+               fixed_overhead_mb: int = 0) -> int:
+        return solve_matrix_ctx(
+            vram_total_mb=vram_total,
+            spare_mb=spare_mb,
+            chat_models=chat_params,
+            embed_params=embed_params,
+            rerank_params=rerank_params,
+            embed_ctx=embed_ctx_,
+            rerank_ctx=rerank_ctx_,
+            baseline_mb=baseline_mb,
+            fixed_overhead_mb=fixed_overhead_mb,
+        )
+
+    # 1. Baseline.
+    chat_ctx = _solve(embed_ctx, rerank_ctx)
+
+    # 2. emb/rerank squeeze: when chat falls below the tools threshold, the
+    #    RAG models yield context (down to coload_min_ctx) to buy it back.
+    squeeze = False
+    if chat_ctx < knobs.tools_min_ctx:
+        sq_embed = min(embed_ctx, knobs.coload_min_ctx)
+        sq_rerank = min(rerank_ctx, knobs.coload_min_ctx)
+        if (sq_embed, sq_rerank) != (embed_ctx, rerank_ctx):
+            sq_ctx = _solve(sq_embed, sq_rerank)
+            gain = sq_ctx - chat_ctx
+            if gain >= knobs.ctx_gain_min:
+                logger.info(
+                    "matrix: squeeze adopted (embed/rerank -> %d/%d, "
+                    "chat %d -> %d, gain %d)",
+                    sq_embed, sq_rerank, chat_ctx, sq_ctx, gain)
+                chat_ctx, embed_ctx, rerank_ctx = sq_ctx, sq_embed, sq_rerank
+                squeeze = True
+            else:
+                logger.info(
+                    "matrix: squeeze rejected (gain %d < ctx_gain_min %d)",
+                    gain, knobs.ctx_gain_min)
+
+    # 3. Opportunistic co-loads: enabled s2t/image models, smallest first.
+    #    Floor: keep tools_min_ctx for a tools chat model that still has it;
+    #    otherwise min_chat_ctx.  (When the baseline is already below the
+    #    tools threshold, tools are demoted downstream and the floor is the
+    #    co-load floor.)
+    any_tools = any(
+        "tools" in [c.lower() for c in m.capabilities]
+        for m, *_ in chat_params)
+    floor = knobs.tools_min_ctx if (any_tools and chat_ctx >= knobs.tools_min_ctx) \
+        else knobs.min_chat_ctx
+    coloads: list[tuple[str, int]] = []
+    if chat_ctx >= floor:
+        overheads: list[tuple[int, str, Model]] = []
+        for m in chat_models:
+            if m.role not in ("s2t", "image"):
+                continue
+            oh = _coload_overhead(m, fit_bin, profiles, knobs)
+            if oh is None:
+                logger.warning("matrix: co-load %s skipped: cannot size it",
+                               m.stem)
+                continue
+            overheads.append((oh, m.stem, m))
+        used = 0
+        for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
+            ctx = _solve(embed_ctx, rerank_ctx, fixed_overhead_mb=used + oh)
+            if ctx >= floor:
+                used += oh
+                coloads.append((stem, oh))
+                logger.info("matrix: co-load %s included (%d MB, chat_ctx=%d)",
+                            stem, oh, ctx)
+            else:
+                logger.warning(
+                    "matrix: co-load %s skipped: would drop chat ctx to %d "
+                    "(floor %d)", stem, ctx, floor)
+    return MatrixSolve(
+        chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
+        coloads=tuple(coloads), squeeze=squeeze,
     )
+
+
+def _coload_overhead(
+    m: Model, fit_bin: str, profiles: Profiles, knobs: MatrixKnobs,
+) -> int | None:
+    """Fixed VRAM overhead (MB) of an opportunistic co-load candidate.
+
+    Uses the backend's effective static params (weights + fixed compute;
+    ctx_factor is 0 for these backends).  Overheads that are *estimated*
+    rather than measured or pinned carry ``estimate_headroom`` so a bad
+    guess errs toward reserving more.
+    """
+    if m.on_cpu:
+        return 0
+    # An operator-pinned vram_mb is authoritative — no headroom.
+    pinned = m.frontmatter.get("vram_mb") is not None
+    cache_type = m.cache_type_for(profiles.default_cache_type)
+    parallel = m.parallel_for(profiles.default_parallel)
+    fp = m.vram.fit_params_static(fit_bin, cache_type=cache_type,
+                                  parallel=parallel)
+    measured = pinned or (fp is not None and fp.source == "fit-params")
+    triple = m.vram.effective_static(fit_bin, cache_type=cache_type,
+                                     parallel=parallel)
+    if triple is None:
+        return None
+    model_mib, ctx_factor, compute_mib = triple
+    # These backends have ctx_factor 0; a nonzero factor would mean a
+    # context-driven model wrongly landed in the pool — charge design ctx.
+    overhead = model_mib + compute_mib + int(ctx_factor * m.design_context)
+    if not measured:
+        overhead = int(overhead * knobs.estimate_headroom)
+    return overhead
 
 
 # ── Emission ──────────────────────────────────────────────────────────────
 
 
 def emit_config(models: list[Model], plan: dict[str, list[Variant]],
-                profiles: Profiles, template_vars: dict) -> dict:
+                profiles: Profiles, template_vars: dict) -> EmittedConfig:
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
@@ -625,15 +929,19 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}
+    coload_stems: set[str] = set()
     for model in models:
         context_length = model.design_context
         for v in plan.get(model.stem, []):
             text_only = not v.include_mmproj
+            if v.coload:
+                coload_stems.add(model.stem)
             entry_id, entry = _build_entry(
                 model, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
                 name_suffix=" [text]" if text_only else "",
+                tools_demoted=v.tools_demoted,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX
@@ -653,6 +961,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 profiles.defaults, template_vars, context_length, v.vision_ctx,
                 include_mmproj=True,
                 name_suffix=f" [vision {n_k}k]",
+                tools_demoted=v.tools_demoted,
             )
             vision_id += f"-vision-{n_k}k"
             if vision_id in entries:
@@ -662,7 +971,8 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
             entries[vision_id] = vision_entry
             owner[vision_id] = model.stem
 
-    config = EmittedConfig(entry_ids_by_stem=ids_by_stem)
+    config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
+                           coload_stems=sorted(coload_stems))
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -681,12 +991,16 @@ class EmittedConfig(dict):
     ``EmittedConfig.plain()`` before dumping — a dict subclass would otherwise
     emit a ``!!python/object`` tag); carries ``entry_ids_by_stem`` so callers
     (e.g. matrix-var construction) can map a model to the entry ids it
-    actually produced instead of re-deriving id naming conventions.
+    actually produced instead of re-deriving id naming conventions, and
+    ``coload_stems`` — the opportunistically included non-chat models (see
+    ``MatrixSolve``) — for the same purpose.
     """
 
-    def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None, **kwargs):
+    def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
+                 coload_stems: list[str] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
+        self.coload_stems: list[str] = coload_stems or []
 
     def plain(self) -> dict:
         return dict(self)
@@ -705,7 +1019,7 @@ def build_config(
     rerank_model: Model | None = None,
     baseline_mb: int = 0,
     min_context: int = utils._MIN_USEFUL_CTX,
-) -> dict:
+) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
 
     Composes the pipeline: validate/filter models, plan serving variants

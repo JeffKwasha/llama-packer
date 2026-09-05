@@ -26,9 +26,81 @@ _CL_RE = re.compile(r"^context_limit_\d+G$")
 class Model:
     """Represents a main model with optional mmproj and MTP companions."""
 
+    # Global registry: claimed weight files → owning Model. The key is the
+    # weight's realpath (and dev:ino for hardlinks) so a sidecar with an
+    # explicit `model:` that strips quant/version still claims the file.
+    # The registry is cleared at the start of each discover() call; all
+    # discovery-time Model construction registers automatically.
+    _by_gguf: ClassVar[dict[str, "Model"]] = {}
+    _by_gguf_stat: ClassVar[dict[str, "Model"]] = {}
+    _by_md: ClassVar[dict[str, "Model"]] = {}
+
+    @classmethod
+    def clear_registry(cls) -> None:
+        cls._by_gguf.clear()
+        cls._by_gguf_stat.clear()
+        cls._by_md.clear()
+
+    @classmethod
+    def _register(cls, m: "Model") -> None:
+        import os
+        if m.gguf_path is not None:
+            try:
+                real = os.path.realpath(str(m.gguf_path))
+                cls._by_gguf.setdefault(real, m)
+                try:
+                    st = os.stat(str(m.gguf_path))
+                    stat_key = f"{real}|{st.st_dev}:{st.st_ino}"
+                    cls._by_gguf_stat.setdefault(stat_key, m)
+                except OSError:
+                    pass
+            except OSError:
+                pass
+        try:
+            md_real = os.path.realpath(str(m.md_path))
+            cls._by_md.setdefault(md_real, m)
+        except OSError:
+            pass
+
+    @classmethod
+    def is_claimed(cls, weight_path: Path) -> bool:
+        """True if any registered Model already claims *weight_path*."""
+        import os
+        try:
+            real = os.path.realpath(str(weight_path))
+            if real in cls._by_gguf:
+                return True
+            try:
+                st = os.stat(str(weight_path))
+                stat_key = f"{real}|{st.st_dev}:{st.st_ino}"
+                if stat_key in cls._by_gguf_stat:
+                    return True
+            except OSError:
+                pass
+        except OSError:
+            return False
+        return False
+
+    @classmethod
+    def find_by_gguf(cls, weight_path: Path) -> "Model | None":
+        import os
+        try:
+            real = os.path.realpath(str(weight_path))
+            m = cls._by_gguf.get(real)
+            if m is not None:
+                return m
+            try:
+                st = os.stat(str(weight_path))
+                stat_key = f"{real}|{st.st_dev}:{st.st_ino}"
+                return cls._by_gguf_stat.get(stat_key)
+            except OSError:
+                return None
+        except OSError:
+            return None
+
     # Frontmatter keys this Model consumes (not passed through to metadata)
     FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "name", "context_length", "description", "cli_args", "model",
+        "name", "model_id", "id", "context_length", "description", "cli_args", "model",
         "backend", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
         "attention", "kv_cache", "tool_args", "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
@@ -37,7 +109,19 @@ class Model:
         "ignore", "device", "concurrency", "fit-params", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel",
+        "image_min_tokens", "image_max_tokens",
 
+    })
+
+    # Known pass-through metadata keys (documented in models_AGENTS.md)
+    # Any frontmatter key not in FIELDS and not in this set triggers a warning
+    # but still flows through as metadata (elegance over backwards compat).
+    KNOWN_METADATA: ClassVar[frozenset[str]] = frozenset({
+        "parameters", "quantization", "hf_url", "license", "base_model",
+        "architecture", "finetune", "type", "mtp_accuracy", "strengths",
+        "weaknesses", "freethought",
+        # per-model calibration / quality metrics (kept for now, low signal)
+        "quant_layout", "calibration_tokens", "top1_agreement_vs_bf16", "kld_vs_bf16",
     })
 
     def __init__(self, md_path: Path, frontmatter: dict, hf_home=None):
@@ -48,21 +132,57 @@ class Model:
         self._gguf_ctx_cache: int | None = None  # cached GGUF architectural context
         self._vram: VramBudget | None = None  # lazy VRAM budget calculator
 
-        # Resolve the model file path. vLLM backends may have no local file —
-        # they are served from an HF repo id (hf_repo / hf_url) instead.
+        # Resolve the model file path. hf_repo is a *place* (hub repo)
+        # where a file lives, not a file itself. Most sidecars resolve to a
+        # concrete file (same-stem, explicit model:, or single non-mmproj file
+        # in the snapshot). hf_repo-only (no local file) is allowed for
+        # backends that serve directly from a repo id (vLLM safetensors,
+        # kokoro-podman which is image-baked). Every other case needs a file.
         self.gguf_path = self._resolve_gguf_path()
         if not self.gguf_path and self.hf_repo is None:
-            raise ValueError(f"No GGUF/safetensors or hf_repo found for {md_path}")
-        if not self.gguf_path and self.frontmatter.get("model"):
+            tried_local = ", ".join(
+                f"{self.stem}{ext}" for ext in (".gguf", ".safetensors", ".bin", ".onnx")
+            )
             raise ValueError(
-                f"model file {self.frontmatter['model']!r} for {md_path} not found "
-                f"locally or in the HF hub cache (hf download {self.hf_repo})")
+                f"sidecar {md_path.name} (no hf_repo): no model file found. "
+                f"Tried same-stem {tried_local} beside sidecar ({self.md_path.parent}). "
+                f"Fix: add `model: <filename>` (local file or snapshot file) + `hf_repo: org/repo` if in hub, "
+                f"or place {self.stem}.gguf (etc.) beside the sidecar, or `ignore: true`."
+            )
+        if not self.gguf_path and self.frontmatter.get("model"):
+            tried_local = ", ".join(
+                f"{self.stem}{ext}" for ext in (".gguf", ".safetensors", ".bin", ".onnx")
+            )
+            snap = None
+            snap_listing = ""
+            if self.hf_repo:
+                try:
+                    snap = utils.hf_snapshot_dir(self.hf_repo, self._hf_home)
+                    if snap and snap.is_dir():
+                        files = sorted(p.name for p in snap.iterdir() if p.is_file())
+                        if files:
+                            snap_listing = f" – snapshot {snap} contains: {', '.join(files[:12])}"
+                            if len(files) > 12:
+                                snap_listing += f" (+{len(files)-12} more)"
+                    else:
+                        snap_listing = f" – snapshot for {self.hf_repo!r} not found (hf download {self.hf_repo})"
+                except Exception:
+                    pass
+            raise ValueError(
+                f"sidecar {md_path.name} (hf_repo {self.hf_repo!r}): explicit `model: {self.frontmatter['model']!r}` not found. "
+                f"Tried beside sidecar ({self.md_path.parent}) and in hub snapshot{snap_listing}. "
+                f"Fix: set `model: <exact filename in snapshot>` (run `ls {snap or '$HF_HOME/hub/models--…/snapshots/...'}`) "
+                f"or place same-stem file {tried_local} beside the sidecar."
+            )
 
         # Resolve companions later — resolve_companions() is called by
         # discovery after scope defaults and override rules have had their
         # say (frontmatter must be final before companion resolution).
         self.mmproj: Model | None = None
         self.mtp: Model | None = None
+        # Register this sidecar↔weight claim globally so orphan detection can
+        # ask Model.is_claimed(path) after the walk is complete.
+        self.__class__._register(self)
 
     def resolve_companions(self) -> None:
         """Resolve mmproj and MTP companions from final frontmatter.
@@ -80,14 +200,11 @@ class Model:
 
         assert self.gguf_path is not None
 
-        # Search for companions in both model-file parent and .md parent (models dir)
-        # This handles symlinks where .gguf points elsewhere but companions stay in models/
-        search_dirs = []
-        if self.gguf_path.parent not in search_dirs:
-            search_dirs.append(self.gguf_path.parent)
-        md_parent = self.md_path.parent
-        if md_parent not in search_dirs:
-            search_dirs.append(md_parent)
+        # Companion search is anchored to the *model file's* parent directory only
+        # (the snapshot or local dir). The sidecar's parent is not searched for
+        # fuzzy fallbacks - explicit mmproj:/speculative: may still resolve via
+        # _resolve_ref/_resolve_hub_ref (parent, parent.parent, hub).
+        search_dirs = [self.gguf_path.parent]
 
         # --- mmproj ---
         mmproj_val = self.frontmatter.get("mmproj")
@@ -111,25 +228,42 @@ class Model:
             else:
                 logger.warning("mmproj: configured %s missing for %s", mmproj_val, self.stem)
         else:
-            # Fuzzy match: look for *mmproj*.gguf with same family prefix —
-            # next to the model, then inside the hf_repo snapshot.
-            family = utils._gguf_family(self.gguf_path.stem).lower()
-            for d in search_dirs:
-                for f in sorted(d.glob("*mmproj*.gguf")):
-                    mmproj_family = utils._gguf_family(f.stem).lower()
-                    if mmproj_family.startswith(family) or family.startswith(mmproj_family):
-                        self.mmproj = Model._get_or_create_companion(f)
-                        break
-                if self.mmproj:
-                    break
-            if self.mmproj is None and self.hf_repo:
+            # No explicit mmproj — local models require explicit mmproj: (or
+            # mmproj: false to silence). Only HF snapshots auto-discover, and
+            # only when the gguf lives inside its own snapshot (every file in
+            # that snapshot belongs to the same release). Matching rule:
+            # mmproj_stripped (stem without 'mmproj.*' + quant/version) must be
+            # prefix of model stem.
+            # Rerank/embeddings (and image/s2t/t2s) never auto-attach vision.
+            if self.hf_repo and self.role not in utils.NON_CHAT_ROLES:
                 snap = utils.hf_snapshot_dir(self.hf_repo, self._hf_home)
-                if snap is not None:
+                # Auto only when model is inside its snapshot directory
+                if snap is not None and self.gguf_path.parent == snap:
+                    def _strip_mmproj(stem: str) -> str:
+                        base = re.split(r"[-_.]?mmproj.*", stem, flags=re.I)[0]
+                        base = base.rstrip("-_.")
+                        # Strip quant/version like _gguf_family but keep base
+                        return utils._gguf_family(base).lower() if base else ""
+
+                    def _is_preferred_mmproj(name: str) -> bool:
+                        return bool(re.search(r"mmproj-(?:bf|fp|f)16\.gguf$", name, re.I))
+
+                    model_stem_lc = self.gguf_path.stem.lower()
+                    candidates: list[Path] = []
                     for f in sorted(snap.glob("*mmproj*.gguf")):
-                        mmproj_family = utils._gguf_family(f.stem).lower()
-                        if mmproj_family.startswith(family) or family.startswith(mmproj_family):
-                            self.mmproj = Model._get_or_create_companion(f)
-                            break
+                        stripped = _strip_mmproj(f.stem)
+                        if not stripped:
+                            continue
+                        if not model_stem_lc.startswith(stripped):
+                            continue
+                        candidates.append(f)
+                    if candidates:
+                        preferred = [c for c in candidates if _is_preferred_mmproj(c.name)]
+                        chosen = sorted(preferred or candidates)[0]
+                        self.mmproj = Model._get_or_create_companion(chosen)
+                    else:
+                        logger.debug("mmproj: no snapshot mmproj prefix for %s in %s",
+                                     self.stem, snap)
 
         # --- MTP (speculative) ---
         # Check frontmatter flags
@@ -162,7 +296,15 @@ class Model:
     def _resolve_gguf_path(self) -> Path | None:
         """Resolve the main model file (.gguf or .safetensors): frontmatter
         ``model:`` field (local dir, then the HF hub cache via ``hf_repo``),
-        then the same-stem convention."""
+        then the same-stem convention, then (if ``hf_repo`` is set) a single
+        non-mmproj model inside the snapshot.
+
+        ``hf_repo``/``hf_url`` is a *place* (hub repo) that can hold many
+        files – it is not itself a model file. The actual model is the GGUF/
+        safetensors / .bin resolved here. If the repo holds exactly one
+        non-mmproj model file, it is used; if several, the sidecar must
+        disambiguate with ``model: <filename>``.
+        """
         parent = self.md_path.parent
 
         # 1. Check frontmatter `model` field
@@ -171,14 +313,58 @@ class Model:
             hit = self._resolve_ref(str(file_ref))
             if hit is not None:
                 return utils.smart_resolve(hit)
+            # Explicit model: field but file not found is an error – list how.
+            # Keep returning None so __init__ can raise with full guidance;
+            # the message there explains the tried locations.
+            return None
 
-        # 2. Convention: same stem, either .gguf or .safetensors
-        for ext in (".gguf", ".safetensors"):
+        # 2. Convention: same stem, .gguf / .safetensors / whisper GGML .bin /
+        # kokoro ONNX (.bin and .onnx resolve only for their audio roles —
+        # discovery requires the s2t/t2s directory)
+        for ext in (".gguf", ".safetensors", ".bin", ".onnx"):
             candidate = parent / f"{self.stem}{ext}"
             if candidate.is_file():
                 return utils.smart_resolve(candidate)
 
-        # 3. No model file found by stem -> give up
+        # 3. No local file – try hf_repo snapshot auto (exactly one non-mmproj
+        # model → use it, several → error, none → give up for __init__ error)
+        if self.hf_repo:
+            snap = utils.hf_snapshot_dir(self.hf_repo, self._hf_home)
+            if snap is not None and snap.is_dir():
+                # Collect non-mmproj candidates (mmproj/mtp are companions, not
+                # main models). Also skip .msgpack etc – only real weight files.
+                candidates: list[Path] = []
+                for p in snap.iterdir():
+                    if not p.is_file():
+                        continue
+                    suf = p.suffix.lower()
+                    if suf not in {".gguf", ".safetensors", ".bin", ".onnx"}:
+                        continue
+                    stem_lc = p.stem.lower()
+                    if "mmproj" in stem_lc:
+                        continue
+                    # mtp/draft companions also contain "mtp" – skip them
+                    if "mtp" in stem_lc and "mmproj" not in stem_lc:
+                        # Heuristic: draft/MTP files are companions, but a main
+                        # model could legitimately contain "mtp" (rare). Be
+                        # conservative – only skip if it also looks like a
+                        # companion (e.g. draft, speculative). Keep simple for now
+                        # and only skip mmproj; MTP main models are uncommon.
+                        pass
+                    candidates.append(p)
+                if len(candidates) == 1:
+                    return utils.smart_resolve(candidates[0])
+                if len(candidates) > 1:
+                    names = ", ".join(sorted(p.name for p in candidates))
+                    raise ValueError(
+                        f"sidecar {self.md_path.name} (hf_repo {self.hf_repo!r}): "
+                        f"several models in snapshot {snap}: {names} – "
+                        f"set `model: <filename>` in the sidecar to choose one "
+                        f"(exact file in the snapshot, e.g. `ls {snap}`)"
+                    )
+                # zero candidates – fall through to __init__ error (no file)
+
+        # 4. No model file found by any method
         return None
 
     def _resolve_ref(self, ref: str) -> Path | None:
@@ -498,15 +684,28 @@ class Model:
 
     @property
     def template_id(self) -> str:
-        """The id used as the llama-swap model key (slug of `name`)."""
-        return utils.slugify(self.name)
+        """The id used as the llama-swap model key.
+
+        Defaults to ``slugify(sidecar stem)``; an explicit ``model_id`` (or
+        ``id``) frontmatter field overrides it verbatim and is validated to
+        ``^[A-Za-z0-9._-]+$`` (error on invalid). ``name`` is display-only
+        and does not affect the id.
+        """
+        raw = self.frontmatter.get("model_id") or self.frontmatter.get("id")
+        if raw is not None:
+            raw_str = str(raw).strip()
+            if not re.match(r"^[A-Za-z0-9._-]+$", raw_str):
+                raise ValueError(
+                    f"model_id {raw_str!r} for {self.md_path.name} contains "
+                    f"invalid characters (allowed: A-Za-z0-9._-)"
+                )
+            return raw_str
+        return utils.slugify(str(self.stem))
 
     @property
     def capabilities(self) -> list[str]:
-        """Declared capabilities, with `vision` auto-added when a companion mmproj exists."""
+        """Declared capabilities (explicit; mmproj does not imply image/video)."""
         caps = [str(c) for c in (self.frontmatter.get("capabilities") or [])]
-        if self.mmproj and "vision" not in [c.lower() for c in caps]:
-            caps.append("vision")
         return caps
 
     @property
@@ -526,6 +725,43 @@ class Model:
             return utils.get_model_size_mb(str(self.mmproj.gguf_path))
         return 0
 
+    def _image_token_value(self, key: str) -> int | None:
+        """Validate a positive-integer image token frontmatter key."""
+        v = self.frontmatter.get(key)
+        if v is None or v == "":
+            return None
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            logger.warning("%s: %s: %r is not an integer; ignoring",
+                           self.stem, key, v)
+            return None
+        if n <= 0:
+            logger.warning("%s: %s: %d is not positive; ignoring",
+                           self.stem, key, n)
+            return None
+        return n
+
+    @property
+    def image_min_tokens(self) -> int | None:
+        """Sidecar ``image_min_tokens``: floor on image tokens per image.
+
+        Dynamic-resolution vision models (Qwen-VL family) upscale small
+        images to this token count; ``None`` (unset) means llama-server uses
+        the model's own default. Only meaningful with an attached mmproj.
+        """
+        return self._image_token_value("image_min_tokens")
+
+    @property
+    def image_max_tokens(self) -> int | None:
+        """Sidecar ``image_max_tokens``: cap on image tokens per image.
+
+        Bounds the KV cost of large images. ``None`` (unset) keeps the model
+        default — which can be very large (Qwen2.5-VL tops out at 16384
+        tokens/image), so an explicit cap is the normal way to bound VRAM.
+        """
+        return self._image_token_value("image_max_tokens")
+
     def pass_through_metadata(self) -> dict:
         """Frontmatter fields exposed to clients, minus builder-consumed keys.
 
@@ -540,6 +776,13 @@ class Model:
                 continue
             if v is None or v == "" or (isinstance(v, (list, dict)) and len(v) == 0):
                 continue
+            if k not in self.KNOWN_METADATA:
+                # difflib hint for likely typo
+                import difflib
+                close = difflib.get_close_matches(k, sorted(self.FIELDS | self.KNOWN_METADATA), n=1, cutoff=0.7)
+                hint = f" (did you mean {close[0]!r}?)" if close else ""
+                logger.warning("sidecar %s: unhandled frontmatter key %r%s -> passed through as metadata",
+                               self.md_path.name, k, hint)
             meta[k] = copy.deepcopy(v)
         return meta
 

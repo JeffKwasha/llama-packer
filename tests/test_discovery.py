@@ -157,15 +157,15 @@ def test_hf_snapshot_file_no_ref_single_snapshot(tmp_path):
 
 
 def test_model_resolves_gguf_from_hf_cache(tmp_path):
-    hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj.gguf"))
+    hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj-BF16.gguf"))
     md_path = tmp_path / "qwen.md"
     fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
     m = Model(md_path, fm, hf_home=hf_home)
     m.resolve_companions()
     assert m.gguf_path is not None
     assert m.gguf_path.name == "Qwen-x.Q4_K_M.gguf"
-    # Companion resolution searches the HF snapshot dir too.
-    assert m.mmproj is not None and m.mmproj.stem == "Qwen-x-mmproj"
+    # Companion resolution searches the model's parent (snapshot) for mmproj-BF16/FP16.
+    assert m.mmproj is not None and m.mmproj.stem == "Qwen-x-mmproj-BF16"
 
 
 def test_model_explicit_model_missing_everywhere_raises(tmp_path):
@@ -210,12 +210,12 @@ def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
 
 
 def test_model_companion_fuzzy_from_hub_when_local_absent(tmp_path):
-    hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj.gguf"))
+    hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj-BF16.gguf"))
     md_path = tmp_path / "qwen.md"
     fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
     m = Model(md_path, fm, hf_home=hf_home)
     m.resolve_companions()
-    assert m.mmproj is not None and m.mmproj.gguf_path.name == "Qwen-x-mmproj.gguf"
+    assert m.mmproj is not None and m.mmproj.gguf_path.name == "Qwen-x-mmproj-BF16.gguf"
 
 
 def test_model_companion_cross_repo_hub_ref(tmp_path):
@@ -310,3 +310,101 @@ def test_text_gguf_media_like_name_still_served(tmp_path):
                      "minimaxh3.context_length": 1000000}))
     models = Model.from_dir(root, generate_stubs=False)
     assert [m.stem for m in models] == ["minimax-h3"]
+
+
+# ── s2t (whisper) discovery ───────────────────────────────────────────────
+
+def test_s2t_optin_serves_sidecar_bin_models(tmp_path):
+    # Opt-in via dirs: {s2t: s2t}; each whisper .bin needs an authored
+    # same-stem sidecar (no stubs are generated for .bin orphans).
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "ggml-large-v3.bin").write_bytes(b"x")
+    (root / "s2t" / "ggml-large-v3.md").write_text(_sidecar("Whisper Large V3"))
+
+    models = Model.from_dir(root, generate_stubs=False,
+                            dir_roles={"s2t": "s2t"})
+    assert len(models) == 1
+    m = models[0]
+    assert m.role == "s2t"
+    assert m.gguf_path is not None and m.gguf_path.name == "ggml-large-v3.bin"
+
+
+def test_s2t_orphan_bin_without_sidecar_skipped_no_stub(tmp_path, caplog):
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
+
+    with caplog.at_level(logging.INFO):
+        models = Model.from_dir(root, generate_stubs=True,
+                                dir_roles={"s2t": "s2t"})
+    assert models == []
+    assert not (root / "s2t" / "ggml-base.md").exists()  # no stub written
+    assert any("ggml-base.bin" in r.message and "sidecar" in r.message
+               for r in caplog.records)
+
+
+def test_s2t_not_opted_in_is_skipped(tmp_path):
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
+    (root / "s2t" / "ggml-base.md").write_text(_sidecar("W"))
+
+    models = Model.from_dir(root, generate_stubs=False)
+    assert models == []
+
+
+def test_bin_outside_s2t_never_served(tmp_path, caplog):
+    # A .bin next to a sidecar in a non-s2t role resolves by stem (ordered
+    # last), but no backend supports .bin outside whisper-server's s2t role —
+    # finalize flags it (info: expected in ordinary fleets, not an
+    # operator error) and _filter_supported drops it from the config.
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "mysterious.bin").write_bytes(b"x")
+    (root / "chat" / "mysterious.md").write_text(_sidecar("Mystery"))
+
+    with caplog.at_level(logging.INFO):
+        models = Model.from_dir(root, generate_stubs=False)
+    assert len(models) == 1
+    assert getattr(models[0], "_override_error", None) is not None
+    assert any("No backend supports" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR
+                   and "No backend supports" in r.message
+                   for r in caplog.records)
+
+
+# ── t2s (kokoro) discovery ────────────────────────────────────────────────
+
+def test_t2s_optin_hf_repo_only_sidecar(tmp_path, caplog):
+    # Kokoro weights are baked into the container image: a t2s sidecar needs
+    # no local model file at all — hf_repo alone identifies it.
+    from llama_packer.backends import infer_backend
+    root = tmp_path / "models"
+    (root / "t2s").mkdir(parents=True)
+    (root / "t2s" / "kokoro-v1.md").write_text(
+        "---\nname: kokoro-v1\nhf_repo: hexgrad/Kokoro-82M\n---\n")
+
+    with caplog.at_level(logging.ERROR):
+        models = Model.from_dir(root, generate_stubs=False,
+                                dir_roles={"t2s": "t2s"})
+    assert len(models) == 1
+    m = models[0]
+    assert m.role == "t2s"
+    # Backend inference needs the configured image (from_dir passes no avail,
+    # so availability gating happens at pack time, not discovery time).
+    assert infer_backend(m, {"kokoro_image": "img"}) == "kokoro-podman"
+
+
+def test_t2s_onnx_sidecar_stem_resolves(tmp_path):
+    # A locally downloaded .onnx copy resolves by same-stem convention.
+    root = tmp_path / "models"
+    (root / "t2s").mkdir(parents=True)
+    (root / "t2s" / "kokoro-v1.onnx").write_bytes(b"x")
+    (root / "t2s" / "kokoro-v1.md").write_text(_sidecar("Kokoro v1"))
+
+    models = Model.from_dir(root, generate_stubs=False,
+                            dir_roles={"t2s": "t2s"})
+    assert len(models) == 1
+    assert models[0].gguf_path is not None
+    assert models[0].gguf_path.name == "kokoro-v1.onnx"
