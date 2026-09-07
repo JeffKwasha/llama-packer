@@ -117,4 +117,6 @@ def test_run_probe_end_to_end(tmp_path):
         m.vram = FakeVram()
     text = run_probe([a, b], "/bin/fit", "q8_0")
     assert "qb" in text and "qa" not in text  # largest represents qwen3
-    assert text.count("1.000") == 4  # p=1/2/4/8 all linear
+    # 4 rows, each with ctx_ratio and compute_ratio of 1.000
+    assert text.count("1.000") == 8
+    assert "FAIL" not in text
