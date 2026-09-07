@@ -215,7 +215,10 @@ profiles:
 #     rnk: 100
 #   sets:
 #     rag: "__CHAT_VARS__ & emb & rnk"
-#   auto_parallel: false        # value-function (ctx, slots) solve for unpinned chat
+#   auto_parallel: false        # on by default: value-function (ctx, slots)
+#                               # solve for unpinned chat; false disables it
+#                               # fleet-wide (a sidecar parallel: pin opts one
+#                               # model out)
 #   auto_parallel_max: 8        # hard cap on auto slots
 #   parallel_power: 0.75        # slot exponent: what each extra chat is worth
 #

@@ -250,7 +250,7 @@ Embed/rerank models are auto-selected as the smallest model of each type, or mat
 | `coload_min_ctx` | 20480 | emb/rerank squeeze floor |
 | `ctx_gain_min` | 4096 | Minimum chat-context gain for a squeeze to be adopted |
 | `estimate_headroom` | 1.25 | Padding applied to *estimated* (not measured/pinned) co-load overheads |
-| `auto_parallel` | false | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins |
+| `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins. Set `false` to disable fleet-wide; a sidecar `parallel:` pin opts a single model out |
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
 | `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth |
 

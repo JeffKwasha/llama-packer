@@ -195,7 +195,7 @@ unchanged), so no change there beyond using the solved `p`.
 
 | key | default | meaning |
 |---|---|---|
-| `auto_parallel` | `false` (opt-in until proven) | enable the solve step |
+| `auto_parallel` | `true` | enable the solve step (`false` disables fleet-wide; a sidecar `parallel:` pin opts one model out) |
 | `auto_parallel_max` | `8` | hard cap on slots |
 | `parallel_power` | `0.75` | B in the score: what each extra simultaneous chat is worth |
 
