@@ -22,13 +22,16 @@ from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
 from llama_packer.utils import (
-    _MIN_AGENTIC_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
-    _RESERVE_SYSTEM, _RESERVE_VIDEO,
-    VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
-    VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
+    compute_env_prefixes, make_subst, _detect_drive_speed,
     validate_dir_roles, NON_CHAT_ROLES,
 )
+from llama_packer.consts import (
+    _MIN_AGENTIC_CTX, _RESERVE_SYSTEM, _RESERVE_VIDEO,
+    VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
+    VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
+)
 from llama_packer.writer import build_config, write_yaml, EmittedConfig
+from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
 from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES, KOKORO_CONTAINER_PORT
@@ -36,17 +39,18 @@ from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES, KOKORO_CONTAINER
 
 
 
-_LOG_LEVELS = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
-
 logger = logging.getLogger(__name__)
 
 
 def setup_logging(verbosity: int = 0) -> None:
-    level = _LOG_LEVELS.get(verbosity, logging.DEBUG)
+    # Each -v drops LOGLEVEL by 10 from the WARNING default (-v: INFO,
+    # -vv: DEBUG, -vvv: 0/NOTSET); never negative.
+    level = max(0, logging.WARNING - 10 * max(0, verbosity))
     logging.basicConfig(
         level=level,
         format="%(levelname).1s | %(message)s",
         stream=sys.stderr,
+        force=True,
     )
 
 
@@ -91,14 +95,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             Examples:
               llama-packer                              # defaults
               llama-packer --dry-run                    # preview
-              llama-packer -v 8929                      # specific llama-server version
+              llama-packer --llama-version 8929         # specific llama-server version
               llama-packer --llama-server /opt/lsrv     # explicit binary path
               llama-packer --output /etc/ls/config.yaml
         """),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print config to stdout instead of writing")
+    parser.add_argument("--probe-parallel-scaling", action="store_true",
+                        help="Measure llama-fit-params VRAM at parallel 1/2/4/8 for one "
+                             "model per GGUF arch family and print the linearity table; "
+                             "writes nothing, then exits")
     parser.add_argument("--output", default="config.yaml", help="Output path (default: config.yaml)")
-    parser.add_argument("-v", "--llama-version", default="latest", dest="version",
+    parser.add_argument("--llama-version", default="latest", dest="version",
                         help="llama-server version (default: latest)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
                         help="Show llama-packer version and exit")
@@ -134,7 +142,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Health check timeout in seconds (default: auto-calculated from model sizes)")
     parser.add_argument("--drive-speed", type=int, default=None,
                         help="Slowest drive speed in MB/s for timeout calc (default: auto-detect, else 100)")
-    parser.add_argument("--verbose", "-V", action="count", default=0, help="Increase verbosity (-V: info, -VV: debug)")
+    parser.add_argument("--verbose", "-v", "-V", action="count", default=0,
+                        help="Increase verbosity, repeatable (-v: INFO, -vv: DEBUG, -vvv: all)")
     parser.add_argument("--embed", help="Substring selector for the embedder; else smallest embed-type model")
     parser.add_argument("--rerank", help="Substring selector for the reranker; else smallest rerank-type model")
     parser.add_argument("--vllm-image", help="vLLM docker image for `vllm-docker` backend models "
@@ -509,6 +518,13 @@ def main(argv: list[str] | None = None) -> None:
         fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
 
+    if args.probe_parallel_scaling:
+        from llama_packer.parallel_probe import run_probe
+        print(run_probe(
+            models, fit_bin,
+            Profiles(profiles_cfg).default_cache_type))
+        return
+
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
     if args.health_check_timeout is None:
         hct = _health_check_timeout(models, args)
@@ -608,7 +624,10 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("matrix embed: %s", embed_model.stem)
             logger.info("matrix rerank: %s", rerank_model.stem)
 
-    # Build config
+    # Build config (progress bar appears only once the denominator is
+    # known — total=len(models); without rich / non-TTY it is a no-op).
+    progress = PackerProgress(enabled=sys.stderr.isatty())
+    progress.start(len(models), "budgeting")
     try:
         config = build_config(
             models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
@@ -617,9 +636,12 @@ def main(argv: list[str] | None = None) -> None:
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
+            progress_cb=lambda stem: progress.advance(stem),
         )
     except ValueError as e:
         fatal("%s", e)
+    finally:
+        progress.stop()
     # Prepare flag macros (placeholder domain) — auto on unless --no-macros
     flag_macros: dict[str, str] = {}
     if not args.no_macros:

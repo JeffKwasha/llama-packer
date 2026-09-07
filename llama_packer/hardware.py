@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llama_packer import utils
+from llama_packer.consts import _RESERVE_SYSTEM
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +284,7 @@ class GpuProfile:
         if is_unified:
             reserve = _UNIFIED_SYSTEM_RESERVE_DEFAULT
             logger.info("unified memory: reserving %d MiB for the system", reserve)
-            baseline_mb = max(baseline_mb, reserve - utils._RESERVE_SYSTEM)
+            baseline_mb = max(baseline_mb, reserve - _RESERVE_SYSTEM)
         return cls(vram_mb=pool_mb, family="default", baseline_mb=baseline_mb)
 
     @classmethod
@@ -348,7 +349,7 @@ class GpuProfile:
         # _RESERVE_SYSTEM makes the reserve exactly the knob.  Explicit
         # --baseline/hardware.baseline_mb (live spike detection) wins instead.
         if is_unified and not explicit_baseline:
-            baseline_mb = max(baseline_mb, system_mb - utils._RESERVE_SYSTEM)
+            baseline_mb = max(baseline_mb, system_mb - _RESERVE_SYSTEM)
             logger.info("unified memory: reserving %d MiB for the system (knob %d MiB)",
                         system_mb, system_mb)
 
