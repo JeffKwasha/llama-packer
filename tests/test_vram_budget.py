@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from llama_packer import utils
+from llama_packer.consts import _MIN_CTX_SIZE
 from llama_packer.vram import solve_matrix_ctx
 
 
@@ -34,7 +34,7 @@ def test_calc_ctx_floors_at_min(make_model):
           "cache_type": "q8_0", "parallel": 1}
     model = make_model("c", **{"fit-params": fm})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
-    assert ctx == utils._MIN_CTX_SIZE
+    assert ctx == _MIN_CTX_SIZE
 
 
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
@@ -168,7 +168,7 @@ def test_solve_matrix_ctx_no_chat_models():
         vram_total_mb=32768, spare_mb=0, chat_models=[],
         embed_params=None, rerank_params=None,
     )
-    assert ctx == utils._MIN_CTX_SIZE
+    assert ctx == _MIN_CTX_SIZE
 
 
 def test_solve_matrix_ctx_exhausted_budget(make_model):
@@ -179,7 +179,7 @@ def test_solve_matrix_ctx_exhausted_budget(make_model):
         embed_params=None, rerank_params=None,
     )
     # chat_budget = 30720 - 40000 < 0 -> skipped -> best_ctx 0 -> MIN_CTX
-    assert ctx == utils._MIN_CTX_SIZE
+    assert ctx == _MIN_CTX_SIZE
 
 
 def test_solve_matrix_ctx_fixed_overhead_mb(make_model):

@@ -175,9 +175,9 @@ def test_vllm_nvfp4_flag_emitted_and_sized(make_model):
     # nvfp4 is a valid --kv-cache-dtype value; whether the serving build
     # supports it (experimental, hardware-gated) is the operator's call —
     # we translate and size, we don't police.
-    from llama_packer import utils
 
-    assert utils._KV_CACHE_BYTES["nvfp4"] == pytest.approx(0.5625)
+    from llama_packer.consts import _KV_CACHE_BYTES
+    assert _KV_CACHE_BYTES["nvfp4"] == pytest.approx(0.5625)
     m = make_model("v", hf_repo="org/model")
     cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "nvfp4", _tvars())
     assert "--kv-cache-dtype nvfp4" in cmd
