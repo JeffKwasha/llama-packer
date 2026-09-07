@@ -2,8 +2,8 @@
 matrix solving.
 
 Extracted from ``model.py`` to separate VRAM calculation concerns from the
-Model class, and to provide a natural home for the persisted ``fit-params``
-block (``FitParams`` dataclass stored in sidecar frontmatter).
+Model class. ``FitParams`` values persist in the sidecar ``measured:``
+block (``Model.persist_measured`` is the single writer).
 """
 
 from __future__ import annotations
@@ -16,6 +16,20 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer import vllm_estimate
+from llama_packer.consts import (
+    _CTX_ROUND_TO,
+    _DEFAULT_CONTEXT_LENGTH,
+    _DRAFT_COMPUTE_MB,
+    _DRAFT_CTX_SAFETY,
+    _KV_CACHE_BYTES,
+    _MMPROJ_COMPUTE_MB,
+    _MIN_CTX_SIZE,
+    _RESERVE_SYSTEM,
+    _RESERVE_VIDEO,
+    _SD_COMPUTE_MB,
+    _WHISPER_COMPUTE_MB,
+    _KOKORO_COMPUTE_MB,
+)
 from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
                                    SD_BACKENDS, VLLM_BACKENDS,
                                    WHISPER_BACKENDS)
@@ -30,23 +44,7 @@ logger = logging.getLogger(__name__)
 # Required keys in the fit-params frontmatter block
 _FIT_PARAMS_REQUIRED = frozenset({"model_mib", "ctx_factor", "compute_mib"})
 
-# Companion VRAM fallback constants (see _companion_fit docstring).
-# mmproj: fixed compute buffer on top of its weights (vision projection buffers).
-_MMPROJ_COMPUTE_MB = 150
-# MTP draft: fixed compute overhead + per-token KV factor estimate safety margin.
-_DRAFT_COMPUTE_MB = 64
-_DRAFT_CTX_SAFETY = 1.6
-# sd-server/whisper: fixed VRAM overhead (file sizes + this buffer).
-# No per-token KV factor (ctx_factor=0) — calc_ctx returns design_ctx.
-_SD_COMPUTE_MB = 512
-# whisper-server s2t: measured on Vulkan (nemo-speech) the whole process
-# footprint ≈ Σ model files — activation memory is small and ggml compute
-# buffers are shared, so only a small buffer is charged per model.
-_WHISPER_COMPUTE_MB = 100
-# kokoro-podman: weights are baked into the container image (~330 MB), but the
-# PyTorch/CUDA runtime floors around 2.4 GiB and peaks near 4 GiB under load
-# (upstream /dev/unload benchmarks) — charge a conservative fixed buffer.
-_KOKORO_COMPUTE_MB = 3072
+# Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
                      **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
                      **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
@@ -143,20 +141,19 @@ class VramBudget:
         self._static_cache: dict[tuple, FitParams] = {}
         self._effective_cache: dict[tuple, tuple[int, float, int]] = {}
         self._companion_cache: dict[tuple, tuple[int, float, int]] = {}
-        self._sf_estimate: tuple[int, float] | None = None
         self._logged: set[str] = set()
 
     # ── saved fit-params from frontmatter ──
 
     def saved_for(self, cache_type: str, parallel: int) -> FitParams | None:
-        """Return the persisted fit-params block when it matches the *requested*
+        """Return the persisted measured block when it matches the *requested*
         cache type and parallel slot count.
 
         Validating against the requested values (not the sidecar-declared ones)
         is what makes a cache-type or parallel change invalidate a stale block
         and force a re-derivation instead of reusing mismatched numbers.
         """
-        raw = self.model.frontmatter.get("fit-params")
+        raw = self.model.measured_block()
         if raw is None:
             return None
         return FitParams.from_dict(raw, cache_type, parallel)
@@ -169,7 +166,7 @@ class VramBudget:
         weights and compute are precision-independent.  Round the factor up
         (never down) so the estimate errs toward reserving more.
         """
-        ratio = utils._KV_CACHE_BYTES[cache_type] / utils._KV_CACHE_BYTES.get(base.cache_type, 1.0625)
+        ratio = _KV_CACHE_BYTES[cache_type] / _KV_CACHE_BYTES.get(base.cache_type, 1.0625)
         ctx_factor = base.ctx_factor * ratio
         return FitParams(
             model_mib=base.model_mib,
@@ -182,7 +179,7 @@ class VramBudget:
 
     def _saved_base(self, parallel: int) -> FitParams | None:
         """Saved fit-params with a matching parallel count, any cache type."""
-        raw = self.model.frontmatter.get("fit-params")
+        raw = self.model.measured_block()
         if not isinstance(raw, dict):
             return None
         if int(raw.get("parallel", 1)) != int(parallel):
@@ -231,6 +228,7 @@ class VramBudget:
         if parallel > 1:
             cmd += ["--parallel", str(parallel)]
 
+        logger.info("measuring VRAM: %s via llama-fit-params", label)
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
@@ -294,7 +292,7 @@ class VramBudget:
         # 1b. A saved block for the same parallel but a different cache type is
         #     re-used by scaling its KV factor (see _scale_ctx_factor) instead of
         #     re-running the binary — KV-cache memory is linear in precision.
-        if cache_type in utils._KV_CACHE_BYTES:
+        if cache_type in _KV_CACHE_BYTES:
             base = self._saved_base(parallel)
             if base is not None:
                 params = self._scale_ctx_factor(base, cache_type)
@@ -378,28 +376,35 @@ class VramBudget:
     def _estimate_safetensors(
         self, cache_type: str, parallel: int, design: int,
     ) -> FitParams | None:
-        """Estimate FitParams from safetensors header (fallback for non-GGUF)."""
+        """Estimate FitParams from safetensors header (fallback for non-GGUF).
+
+        Header numbers come from the canonical file instance (parsed once
+        per process); the per-cache-type derivation below stays local.
+        """
         assert self.model.gguf_path is not None
         if not str(self.model.gguf_path).endswith(".safetensors"):
             return None
 
-        if self._sf_estimate is None:
-            try:
-                self._sf_estimate = utils.estimate_safetensors(
-                    self.model.gguf_path, cache_type
-                )
-            except Exception as e:
-                logger.warning(
-                    "fit-params failed and safetensors estimate unavailable "
-                    "for %s: %s", self.model.stem, e,
-                )
-                return None
-            logger.warning(
-                "fit-params failed for %s; estimating VRAM from safetensors header",
-                self.model.stem,
+        try:
+            nums = self.model.safetensors_numbers(cache_type)
+        except Exception as e:
+            self._warn_once(
+                "fit-params failed and safetensors estimate unavailable "
+                "for %s: %s", self.model.stem, e,
             )
+            return None
+        if nums is None:
+            self._warn_once(
+                "fit-params failed and safetensors estimate unavailable "
+                "for %s", self.model.stem,
+            )
+            return None
+        self._warn_once(
+            "fit-params failed for %s; estimating VRAM from safetensors header",
+            self.model.stem,
+        )
 
-        est_model_mib, est_kv_per_token_mib = self._sf_estimate
+        est_model_mib, est_kv_per_token_mib = nums
         compute_mib = int(0.02 * est_model_mib) + 128
         ctx_at_design_mib = int(est_kv_per_token_mib * design)
         context_factor = ctx_at_design_mib / design if design > 0 else 0.0
@@ -583,13 +588,13 @@ class VramBudget:
         if self.model.on_cpu:
             return self._design_ctx()
 
-        reserve = utils._RESERVE_SYSTEM + max(utils._RESERVE_VIDEO, baseline_mb)
+        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
         available = vram_total_mb - reserve - spare_mb
 
         if available <= 0:
             logger.warning("available VRAM <= 0 for %s (spare=%d)",
                            self.model.stem, spare_mb)
-            return utils._MIN_CTX_SIZE
+            return _MIN_CTX_SIZE
 
         design = design_ctx if design_ctx is not None else self._design_ctx()
 
@@ -617,7 +622,7 @@ class VramBudget:
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
             logger.warning("model + compute exceeds available VRAM for %s", self.model.stem)
-            return utils._MIN_CTX_SIZE
+            return _MIN_CTX_SIZE
 
         # Image token budget: image tokens are ordinary tokens inside -c (no
         # VRAM beyond the context itself), but a max-size image must *fit* —
@@ -639,10 +644,10 @@ class VramBudget:
 
         # Scale down linearly
         if ctx_factor <= 0:
-            return utils._MIN_CTX_SIZE
+            return _MIN_CTX_SIZE
         max_ctx = int(remaining / ctx_factor)
-        ctx = (max_ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
-        ctx = max(ctx, utils._MIN_CTX_SIZE)
+        ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
+        ctx = max(ctx, _MIN_CTX_SIZE)
         return self._raise_to_image_floor(ctx, img_floor,
                                           cap=max_ctx, affordable=max_ctx)
 
@@ -703,55 +708,12 @@ class VramBudget:
         return self.model.design_context
 
     def _persist(self, params: FitParams) -> None:
-        """Update only the fit-params block in the sidecar, preserving everything else.
+        """Persist measured VRAM numbers via the single sidecar writer.
 
-        Reads the raw .md file, round-trips the frontmatter with ruamel.yaml so
-        comments and formatting survive, injects the fit-params block, and
-        writes back.  All other frontmatter keys and the markdown body are
-        preserved unchanged.
+        Delegates to :meth:`Model.persist_measured` — the only place that
+        writes the dynamic ``measured:`` branch.
         """
-        md_path = self.model.md_path
-        try:
-            content = md_path.read_text(encoding="utf-8")
-        except (OSError, PermissionError) as e:
-            logger.debug("cannot read sidecar for fit-params persist (%s): %s", md_path, e)
-            return
-
-        if not content.startswith("---"):
-            return
-        parts = content.split("---", 2)
-        if len(parts) < 3:
-            return
-
-        try:
-            from ruamel.yaml import YAML
-        except ImportError:  # pragma: no cover - ruamel.yaml is a hard dependency
-            logger.debug("ruamel.yaml unavailable; skipping fit-params persist")
-            return
-
-        yml = YAML()
-        yml.preserve_quotes = True
-        try:
-            fm = yml.load(parts[1])
-        except Exception as e:
-            logger.debug("cannot parse sidecar frontmatter for persist: %s", e)
-            return
-        if fm is None:
-            from ruamel.yaml.comments import CommentedMap
-            fm = CommentedMap()
-
-        fm["fit-params"] = params.to_dict()
-
-        import io
-        buf = io.StringIO()
-        yml.dump(fm, buf)
-        new_content = "---\n" + buf.getvalue().rstrip("\n") + "\n---" + parts[2]
-
-        try:
-            md_path.write_text(new_content, encoding="utf-8")
-            logger.debug("persisted fit-params for %s", self.model.stem)
-        except (OSError, PermissionError) as e:
-            logger.debug("cannot write sidecar for fit-params persist (%s): %s", md_path, e)
+        self.model.persist_measured(params.to_dict())
 
 
 # ── Module-level: matrix context solver ──────────────────────────────────
@@ -796,7 +758,7 @@ def solve_matrix_ctx(
     Returns:
         Maximum chat context in tokens (rounded to _CTX_ROUND_TO)
     """
-    reserve = utils._RESERVE_SYSTEM + max(utils._RESERVE_VIDEO, baseline_mb)
+    reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
     available = vram_total_mb - reserve - spare_mb
 
     embed_overhead = 0
@@ -812,7 +774,7 @@ def solve_matrix_ctx(
     remaining_for_chat = available - embed_overhead - rerank_overhead \
         - fixed_overhead_mb
     if remaining_for_chat <= 0:
-        return utils._MIN_CTX_SIZE
+        return _MIN_CTX_SIZE
 
     best_ctx = 0
     for model, model_mib, context_factor, compute_mib, img_floor in chat_models:
@@ -829,16 +791,16 @@ def solve_matrix_ctx(
                     "the solved chat ctx %d; large images may not fit",
                     model.stem, img_floor, ctx)
         else:
-            ctx = model.gguf_context_length or utils._DEFAULT_CONTEXT_LENGTH
+            ctx = model.gguf_context_length or _DEFAULT_CONTEXT_LENGTH
             if img_floor > ctx:
                 logger.warning(
                     "matrix: %s image_max_tokens budget %d per slot exceeds "
                     "its context %d; large images may not fit",
                     model.stem, img_floor, ctx)
-        ctx = (ctx // utils._CTX_ROUND_TO) * utils._CTX_ROUND_TO
-        ctx = max(ctx, utils._MIN_CTX_SIZE)
+        ctx = (ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
+        ctx = max(ctx, _MIN_CTX_SIZE)
         arch_max = model.design_context
         ctx = min(ctx, arch_max)
         best_ctx = max(best_ctx, ctx)
 
-    return best_ctx if best_ctx > 0 else utils._MIN_CTX_SIZE
+    return best_ctx if best_ctx > 0 else _MIN_CTX_SIZE
