@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from llama_packer.profiles import Profiles
-from llama_packer.utils import _MIN_AGENTIC_CTX
+from llama_packer.consts import _MIN_AGENTIC_CTX
 from llama_packer.writer import (
     MatrixKnobs,
     Planner,
