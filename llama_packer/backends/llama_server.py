@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
 from llama_packer import utils
+from llama_packer.consts import _MTP_SPEC_TYPE
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -44,7 +45,7 @@ class LlamaServerBackend(BaseBackend):
         mtp_on, n_max = model._mtp_info()
         if not mtp_on:
             return [], {"mtp_enabled": False}
-        spec_type = model.frontmatter.get("mtp_spec_type", utils._MTP_SPEC_TYPE)
+        spec_type = model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
         args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max)]
         if model.mtp and model.mtp.gguf_path:
             args += ["--spec-draft-model", str(model.mtp.gguf_path)]
@@ -72,9 +73,7 @@ class LlamaServerBackend(BaseBackend):
             return []
         if not include_mmproj:
             return []  # text-only variant: vision not served, silently skip
-        arch = None
-        if model.gguf_path:
-            arch, _ = utils.gguf_header_probe(model.gguf_path)
+        arch = model.arch if model.gguf_path else None
         if arch in _STATIC_IMAGE_ARCHES:
             msg = (f"image tokens: {model.stem}: arch {arch!r} has a "
                    f"static-resolution vision encoder (fixed ~256 tokens per "

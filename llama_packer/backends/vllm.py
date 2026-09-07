@@ -16,6 +16,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar
 
 from llama_packer import utils
+from llama_packer.consts import (
+    _MTP_DRAFT_N_MAX,
+    VLLM_DEFAULT_GPU_MEM_UTIL,
+    VLLM_DEFAULT_BIN,
+    VLLM_DEFAULT_CONTAINER_PORT,
+    VLLM_DEFAULT_DOCKER_ARGS,
+    VLLM_DEFAULT_IMAGE,
+)
 from llama_packer.backends.base import BaseBackend
 
 if TYPE_CHECKING:
@@ -72,7 +80,7 @@ def _speculative_config(model: "Model") -> dict | None:
     if isinstance(cfg, dict) and cfg:
         return cfg
     if fm.get("mtp"):
-        n = int(fm.get("mtp_draft_n_max", utils._MTP_DRAFT_N_MAX))
+        n = int(fm.get("mtp_draft_n_max", _MTP_DRAFT_N_MAX))
         return {"method": "mtp", "num_speculative_tokens": n}
     if fm.get("speculative"):
         logger.warning("vllm: %s: GGUF speculative companion %r cannot be loaded "
@@ -194,8 +202,8 @@ class VllmHostBackend(BaseBackend):
         tvars: dict,
         include_mmproj: bool = True,
     ) -> tuple[str, dict]:
-        gpu_mem_util = tvars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)
-        vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
+        gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
+        vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
         flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util),
                                   cache_type=cache_type, parallel=parallel)
         cmd = utils.render_command(
@@ -222,10 +230,10 @@ class VllmDockerBackend(VllmHostBackend):
         include_mmproj: bool = True,
     ) -> tuple[str, dict]:
         # Per-model sidecar `vllm_image:` overrides the global default.
-        gpu_mem_util = tvars.get("gpu_mem_util", utils.VLLM_DEFAULT_GPU_MEM_UTIL)
-        container_port = tvars.get("container_port", utils.VLLM_DEFAULT_CONTAINER_PORT)
-        docker_args = tvars.get("docker_args", utils.VLLM_DEFAULT_DOCKER_ARGS)
-        image = model.vllm_image or tvars.get("vllm_image", utils.VLLM_DEFAULT_IMAGE)
+        gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
+        container_port = tvars.get("container_port", VLLM_DEFAULT_CONTAINER_PORT)
+        docker_args = tvars.get("docker_args", VLLM_DEFAULT_DOCKER_ARGS)
+        image = model.vllm_image or tvars.get("vllm_image", VLLM_DEFAULT_IMAGE)
         models_dirs = tvars.get("models_dirs") or [tvars.get("models_dir", "")]
         models_dirs = [d for d in models_dirs if d]
 
@@ -240,7 +248,7 @@ class VllmDockerBackend(VllmHostBackend):
         def _map(p: Path) -> str:
             return container_ct_ref if (ct is not None and p == ct) else str(p)
 
-        vllm_bin = tvars.get("vllm_bin", utils.VLLM_DEFAULT_BIN)
+        vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
         serve_flags = self._serve_flags(
             model, ctx_size, str(container_port), gpu_mem_util,
             cache_type=cache_type, parallel=parallel, map_path=_map
