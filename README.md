@@ -1,53 +1,64 @@
 # llama-packer
 
-It makes hosting a herd of local llamas just work.
+Because llama-swap doesn't pack itself
 
-[llama-swap](https://github.com/mostlygeek/llama-swap) wants one big complex config file where each model — and each of its aliases — gets an individual configuration, all simultaneously loaded in a `matrix`. Each entry can carry an mmproj, its own context window, KV-cache quantization, architecture-specific load parameters, and on and on.
+[llama-swap](https://github.com/mostlygeek/llama-swap) masterfully orchestrates dozens of models with aliases in a complex matrix defining which to run concurrently. Some have mmproj for vision, MTP or both. Each has options: KV-cache quantization, architecture-specific load parameters, and parallel slots trade context VRAM for concurrent chats.
 
-The interactions of just half a dozen models is grossly complicated busy work. Too hard for humans, and not much better to have AI "try" to juggle it.
+The interactions of just a few models is complicated busy work... Too hard for humans, and it's kinda silly to load all that data into an AI context and hope it writes the config correctly.
 
-So don't. Just record each model's relevant info into a sidecar `.md` file — a simple task for agents — then let `llama-packer` algorithmically pack your llama-swap matrix full of models and aliases. An Opencode plugin then sucks the model info right off the server, so you never hand-edit your Opencode config when you add a model or tweak a context.
+There has to be a better way!
+
+LLAMA-PACKER!
+
+Simple concept - each model has an .md file (sidecar) describing it, and all its options and capabilities.
+You point llama-packer at your models directory (and your HF_HOME) and it compiles a list of models and allocates each based on profiles, overrides, per directory models.yaml customizations and individual model sidecars.
+
+Out pops a config.yaml for llama-swap that really packs that LLAMA.
+
 
 Features:
-- Rewrite the config for all Qwen3.5+ models to use the sharp chat template? 3 lines.
-- Add low-temperature `coding` aliases to every model? 2 lines.
-- A `no-mmproj` variant of all your models to maximize context? Automatic.
-- Size your main chat context to leave VRAM for embedding and rerank? Automatic.
-- Have some models use `q8_0` for KV cache? Yes.
+- want all Qwen3.5+ models to use the sharp chat template? 3 lines in models.yaml
+- Add low-temperature `coding` aliases to every model? 2 lines in profiles.yaml
+- Want 'text-only' variants that skip mmproj to maximize context or parallel? Automatic.
+- budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the matrix squeezes chat context to keep them loaded instead of evicted.
+- pick some models to use `q8_0` KV cache for longer context? YES
 
-Scans model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across a matrix of models. Supports llama-server, vLLM, stable-diffusion, and whisper backends.
 
-## Quickstart ("It's alive" smoketest)
+## Quickstart ("It's alive")
 
-The goal is a complete, working llama-swap config file. No sidecars needed: models without a `.md` sidecar get an empty stub written automatically, and context windows are sized for you — llama-swap finds all your models with reasonable contexts out of the box:
+prerequisites: git + python 3.10 + uv + linux (and your GPU driver supports vulkan, sorry Intel)
 
 ```sh
 git clone https://github.com/JeffKwasha/llama-packer.git
 cd llama-packer
-./extras/update
+./extras/update     # fetches llama.cpp + llama-swap binaries
 uv run llama-packer --models-dir ~/models --output ~/llama-swap-config.yaml
 ./llama-swap --config ~/llama-swap-config.yaml
 ```
 
-Line 1 gets the code, line 2 enters it (the tool finds its binaries relative to here). Line 3 fetches the llama.cpp + llama-swap binaries. Line 4 builds the config from your models directory (swap `--output` for `--dry-run` to preview without writing files). Line 5 serves it.
-
-`llama-packer` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. `--models-dir` accepts several directories, each scanned independently. Use `--profiles` for a different profiles file, and `--llama-server` (or `LLAMA_BIN_DIR`) to point at your llama.cpp binaries. Pass `--hf-home` to keep Hugging Face cache paths in their own `${HF_HOME}` macro instead of widening `${MODELS_DIR}`.
-
-GGUF/safetensors files without a `.md` sidecar get an empty stub sidecar written automatically, so a directory of bare models works out of the box — fill it in whenever you like (until then identity comes from the filename, context from the default, role from the directory). Skip with `--no-stubs`. Stubs never land in HF `blobs/` trees; they sit beside the human-readable snapshot entry instead.
-
-Output goes to `config.yaml` (`--output` overrides the path) and a sibling `config.env` in the current directory. Print the version with `llama-packer --version`.
-
 ## Beyond the smoketest
 
-The smoketest gets every model served. These are the things that are miserable to juggle by hand in bare llama-swap config, and straightforward with llama-packer:
+You're thinking that wasn't impressive, llama-packer guessed poorly, didn't know capabilities like vision or tool calling .. etc 
+Sure it might work if you made sidecars for each model... but researching and writing them is TEDIOUS..!
+
+There has to be a better way!
+
+cp llama_packer/templates/models_AGENTS.md ${MODELS_DIR}/AGENTS.md.
+
+Tell your AI harness: 
+read models/AGENTS.md for each of my models in models/{chat, embed, rerank} research the model on huggingface and write a sidecar, use a subagent for each model
+
+Now you have capabilities, context windows, MTP support where available.
+
+mv profiles.yaml.example profiles.yaml
 
 - **Aliases.** Give one model several names — `instruct`, `coding`, `thinking` — each with its own sampling parameters, switched per-request with no reload. Declared once in the sidecar's `modes:` (or generated from `profiles.yaml`); emitted as `filters.setParamsByID` overrides.
-- **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a `-text` alias that drops the projection to reclaim VRAM for a much larger text-only context window (plus a `-vision-Nk` best-effort entry keeping vision available at reduced context).
 - **A packed matrix.** Keep small models (embedders, rerankers, a quick draft model) loaded simultaneously alongside your main chat model, with VRAM budgeted across all of them so nothing OOMs. Each gets its own context sized to what actually fits.
 - **Auto-parallel.** Unpinned chat models automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
+- **Opencode plugin.** Model info flows straight off the running server, so you never hand-edit Opencode config when you add a model (`extras/llamaswap.ts`).
+- **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a `-text` alias that drops the projection to reclaim VRAM for a much larger text-only context window (plus a `-vision-Nk` best-effort entry keeping vision available at reduced context).
 
-The smoketest guesses from filenames; accuracy comes from sidecars. Have an agent fill in each model's `.md` (name, parameters, context length, capabilities, mmproj block) and re-run — same commands, a much better config.
 
 ## What it does
 
@@ -107,7 +118,7 @@ modes:
 ---
 ```
 
-Any key not consumed by the builder passes through as `metadata` for clients — add descriptive fields without code changes (see [SPEC → Model Metadata](SPEC.md#model-metadata) for the consumed-key list).
+Unknown keys pass as `metadata` informing clients with descriptive fields (see [SPEC → Model Metadata](SPEC.md#model-metadata) for the consumed-key list).
 
 ### Profiles (`profiles.yaml`)
 
