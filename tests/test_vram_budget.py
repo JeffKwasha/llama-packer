@@ -64,8 +64,14 @@ def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
 def _vision(make_model, tmp_path, stem, fit, **extra):
     """Vision model (mmproj companion) with a fit-params block."""
     (tmp_path / f"{stem}-mmproj.gguf").write_bytes(b"mm")
-    return make_model(stem, mmproj=f"{stem}-mmproj.gguf",
-                      **{"fit-params": fit, **extra})
+    block = {"file": f"{stem}-mmproj.gguf", "capabilities": ["image"]}
+    tokens = {k: v for k, v in extra.items()
+              if k in ("image_min_tokens", "image_max_tokens")}
+    rest = {k: v for k, v in extra.items() if k not in tokens}
+    block.update(tokens)
+    fm = {"fit-params": fit, "mmproj": block}
+    fm.update(rest)
+    return make_model(stem, **fm)
 
 
 def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
@@ -74,7 +80,8 @@ def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
     fit = {"model_mib": 25000, "ctx_factor": 0.5, "compute_mib": 1000,
            "cache_type": "q8_0", "parallel": 1}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9000)
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+    ctx = model.view_for(True).vram.calc_ctx(
+        32768, fit_bin="unused", include_mmproj=True)
     # remaining = 30720 - 26000 - mmproj(0 + 150) = 4570; affordable 9140
     # tokens; rounded ctx 8192 -> raised to the 9000 floor (affordable)
     assert ctx == 9000
@@ -87,7 +94,8 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
            "cache_type": "q8_0", "parallel": 1}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=16384)
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+        ctx = model.view_for(True).vram.calc_ctx(
+            32768, fit_bin="unused", include_mmproj=True)
     # floor 16384 > affordable 9140: ctx raised to what fits (9140), warning
     assert ctx == 9140
     assert any("large images may still not fit" in r.message

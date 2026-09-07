@@ -41,7 +41,8 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
-- [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload)
+- [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
+- [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins)
 - [docs/reference.md](docs/reference.md) — external links
 
 ## Data dirs

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import logging
@@ -92,9 +93,10 @@ _DEFAULT_CONTEXT_LENGTH = 32768
 _CTX_ROUND_TO = 8192
 _MIN_CTX_SIZE = 4096
 
-# Chat models should be useful beyond this context; mmproj (vision) is dropped
-# from the main entry when keeping it would fall below this floor. 128k.
-_MIN_USEFUL_CTX = 131072
+# Minimum context for a chat model to be useful for agentic work (tool-call
+# loops, long sessions); mmproj (vision) is dropped from the main entry when
+# keeping it would fall below this floor. 128k.
+_MIN_AGENTIC_CTX = 131072
 
 # VRAM reservation breakdown (MB)
 _RESERVE_SYSTEM = 1024
@@ -796,15 +798,71 @@ def _eval_expr(expr: str, base_val: float) -> float:
         return base_val
 
 
-def resolve_params(overrides: dict, defaults: dict) -> dict:
-    """Resolve profile params with 'base * N' expressions."""
-    resolved = dict(defaults)
-    for k, v in (overrides or {}).items():
-        if isinstance(v, str) and v.startswith("base *") and k in defaults:
-            resolved[k] = _eval_expr(v, float(defaults[k]))
+def _merge_list(base: list, overlay: list) -> list:
+    """Union-append *overlay* onto *base*: order-preserving, de-duplicated.
+
+    String items starting with ``-`` remove instead (``-image`` drops
+    ``image``); removal of an absent item is a no-op.  Returns a new list.
+    """
+    result = [copy.deepcopy(i) for i in base]
+    for item in overlay:
+        if isinstance(item, str) and item.startswith("-") and len(item) > 1:
+            target = item[1:]
+            result = [i for i in result if i != target]
+        elif item not in result:
+            result.append(copy.deepcopy(item))
+    return result
+
+
+def merge_layer(below: dict | None, above: dict | None, *,
+                origin: str = "") -> dict:
+    """The single merge rule for every config layer.
+
+    Layers bottom-to-top: ``defaults:`` → profiles → sidecar frontmatter →
+    override rules → companion block.  At each boundary the upper layer wins:
+
+    - ``None`` in the upper layer **deletes** the key outright
+      (``top_p: None`` removes an inherited ``top_p``).
+    - dicts merge recursively, per sub-key, upper winning.
+    - lists union-append (order-preserving, de-duplicated); ``-item``
+      entries remove instead.
+    - scalars (and type changes) are replaced by the upper value.
+    - ``"base * N"`` strings on sampling keys evaluate against the merged
+      value from the layer below; with no numeric below they warn and are
+      skipped (never emitted raw).
+
+    Returns a new dict; inputs are never mutated or aliased.
+    """
+    result = copy.deepcopy(dict(below or {}))
+    for k, v in (above or {}).items():
+        if v is None:
+            result.pop(k, None)
+            continue
+        cur = result.get(k)
+        if isinstance(v, dict) and isinstance(cur, dict):
+            result[k] = merge_layer(cur, v, origin=origin)
+        elif isinstance(v, list) and isinstance(cur, list):
+            result[k] = _merge_list(cur, v)
+        elif isinstance(v, list) and cur is None:
+            result[k] = _merge_list([], v)
         else:
-            resolved[k] = v
-    return resolved
+            if (isinstance(v, str) and v.startswith("base *")
+                    and k in SAMPLING_KEYS):
+                if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+                    result[k] = _eval_expr(v, float(cur))
+                else:
+                    logger.warning(
+                        "%s: %r has no numeric value below to resolve "
+                        "against; skipping expression %r",
+                        origin or "merge", k, v)
+                continue
+            result[k] = copy.deepcopy(v)
+    return result
+
+
+def resolve_params(overrides: dict, defaults: dict) -> dict:
+    """Resolve profile params over defaults (one :func:`merge_layer`)."""
+    return merge_layer(defaults, overrides, origin="profile")
 
 
 def _dev(p: str | os.PathLike) -> int | None:

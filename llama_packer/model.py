@@ -113,13 +113,21 @@ class Model:
 
     })
 
+    # Frontmatter keys a companion block may NOT set: identity, placement,
+    # and backend selection stay model-level (planner gates and the matrix
+    # solve key off them).  Everything serving-conditional belongs in the
+    # block.
+    COMPANION_BLOCK_DENIED: ClassVar[frozenset[str]] = frozenset({
+        "name", "model", "ignore", "mmproj", "hf_repo", "backend", "role",
+    })
+
     # Known pass-through metadata keys (documented in models_AGENTS.md)
     # Any frontmatter key not in FIELDS and not in this set triggers a warning
     # but still flows through as metadata (elegance over backwards compat).
     KNOWN_METADATA: ClassVar[frozenset[str]] = frozenset({
         "parameters", "quantization", "hf_url", "license", "base_model",
-        "architecture", "finetune", "type", "mtp_accuracy", "strengths",
-        "weaknesses", "freethought",
+        "architecture", "family", "finetune", "type", "mtp_accuracy",
+        "strengths", "weaknesses", "freethought",
         # per-model calibration / quality metrics (kept for now, low signal)
         "quant_layout", "calibration_tokens", "top1_agreement_vs_bf16", "kld_vs_bf16",
     })
@@ -180,6 +188,11 @@ class Model:
         # say (frontmatter must be final before companion resolution).
         self.mmproj: Model | None = None
         self.mtp: Model | None = None
+        # Overlay keys from an mmproj mapping block (everything but `file`),
+        # merged over the frontmatter when the companion is served.
+        self.mmproj_overlay: dict = {}
+        self._view_on: Model | None = None  # cached companion-on view
+        self._is_view: bool = False  # True on copies returned by view_for
         # Register this sidecar↔weight claim globally so orphan detection can
         # ask Model.is_claimed(path) after the walk is complete.
         self.__class__._register(self)
@@ -194,6 +207,8 @@ class Model:
         """
         self.mmproj = None
         self.mtp = None
+        self.mmproj_overlay = {}
+        self._view_on = None
         if not self.gguf_path:
             logger.debug("no gguf_path, skipping companion resolution for %s", self.stem)
             return
@@ -211,22 +226,66 @@ class Model:
         if mmproj_val is False:
             # Explicit disable
             self.mmproj = None
-        elif mmproj_val:
-            # Explicit path in frontmatter — search both directories, then the
-            # hf_repo snapshot (readable snapshot filenames; globs allowed).
-            companion = None
-            for d in search_dirs:
-                candidate = d / mmproj_val
-                if candidate.is_file():
-                    companion = candidate
-                    break
-            if companion is None:
-                companion = self._resolve_hub_ref(str(mmproj_val),
-                                                  pattern_hint="*mmproj*.gguf")
-            if companion:
-                self.mmproj = Model._get_or_create_companion(companion)
+        elif isinstance(mmproj_val, dict):
+            # Mapping block: `file` locates the companion; every other key
+            # is a conditional overlay merged over the frontmatter when the
+            # companion is served (same single merge rule as every layer).
+            block = dict(mmproj_val)
+            file_val = block.pop("file", None)
+            denied = [k for k in block if k in self.COMPANION_BLOCK_DENIED]
+            unknown = [k for k in block if k not in self.FIELDS]
+            if not isinstance(file_val, str) or not file_val:
+                msg = (f"sidecar {self.md_path.name}: mmproj block needs "
+                       f"a `file:` string")
+                logger.error("%s", msg)
+                self._override_error = msg
+            elif denied:
+                msg = (f"sidecar {self.md_path.name}: mmproj block may not set "
+                       f"{', '.join(sorted(denied))} (model-level keys)")
+                logger.error("%s", msg)
+                self._override_error = msg
+            elif unknown:
+                intrinsic = sorted(k for k in unknown
+                                   if k in self.KNOWN_METADATA)
+                if intrinsic:
+                    msg = (f"sidecar {self.md_path.name}: mmproj block may "
+                           f"not set {', '.join(intrinsic)} (intrinsic model "
+                           f"properties belong in the sidecar)")
+                else:
+                    msg = (f"sidecar {self.md_path.name}: unknown mmproj "
+                           f"block key(s): {', '.join(sorted(unknown))}")
+                logger.error("%s", msg)
+                self._override_error = msg
             else:
-                logger.warning("mmproj: configured %s missing for %s", mmproj_val, self.stem)
+                companion = None
+                for d in search_dirs:
+                    candidate = d / file_val
+                    if candidate.is_file():
+                        companion = candidate
+                        break
+                if companion is None:
+                    companion = self._resolve_hub_ref(str(file_val),
+                                                      pattern_hint="*mmproj*.gguf")
+                if companion:
+                    self.mmproj = Model._get_or_create_companion(companion)
+                    self.mmproj_overlay = block
+                else:
+                    logger.warning("mmproj: configured %s missing for %s",
+                                   file_val, self.stem)
+        elif isinstance(mmproj_val, str):
+            msg = (f"sidecar {self.md_path.name}: mmproj must be a mapping "
+                   f"(`mmproj: {{file: ..., ...}}`) or false — bare filenames "
+                   f"carry no purpose; move conditional keys into the block")
+            logger.error("%s", msg)
+            self._override_error = msg
+            self.mmproj = None
+        elif mmproj_val:
+            msg = (f"sidecar {self.md_path.name}: mmproj must be a mapping "
+                   f"(`mmproj: {{file: ..., ...}}`) or false, got "
+                   f"{mmproj_val!r}")
+            logger.error("%s", msg)
+            self._override_error = msg
+            self.mmproj = None
         else:
             # No explicit mmproj — local models require explicit mmproj: (or
             # mmproj: false to silence). Only HF snapshots auto-discover, and
@@ -420,8 +479,13 @@ class Model:
         companion.gguf_path = utils.smart_resolve(path)
         companion._vram = None
         companion._hf_home = None
+        companion._gguf_ctx_cache = None
         companion.mmproj = None
         companion.mtp = None
+        companion.mmproj_overlay = {}
+        companion._view_on = None
+        companion._is_view = False
+        companion._override_error = None
         return companion
 
     @classmethod
@@ -571,11 +635,12 @@ class Model:
 
     @property
     def modes(self) -> dict[str, dict] | None:
-        """Sidecar-defined sampling modes (full profiles): name -> param dict.
+        """Sidecar-defined sampling modes: name -> param dict.
 
-        When declared, these fully replace the global profile sampling
-        overrides for this model. ``None`` keeps the legacy global-profile
-        behavior.
+        When declared, each mode layers over the same-named resolved profile
+        (or the fleet defaults) with the single merge rule, and the layered
+        modes replace the global profile sampling overrides for this model.
+        ``None`` keeps the legacy global-profile behavior.
         """
         m = self.frontmatter.get("modes")
         if not isinstance(m, dict):
@@ -707,6 +772,32 @@ class Model:
         """Declared capabilities (explicit; mmproj does not imply image/video)."""
         caps = [str(c) for c in (self.frontmatter.get("capabilities") or [])]
         return caps
+
+    def view_for(self, include_mmproj: bool) -> Model:
+        """Frontmatter view for a serving variant.
+
+        The companion-off variant is this model itself: overlay keys live
+        only inside the mmproj block, so the base frontmatter already
+        describes serving without the companion.  The companion-on variant
+        is a cached shallow copy with the block merged over the frontmatter
+        (single merge rule); resolved files are shared, the VRAM budget is
+        rebuilt lazily so it binds to the view.  Models without a block
+        return themselves either way (legacy behavior, untouched).
+        """
+        if (self._is_view or not include_mmproj
+                or not (self.mmproj and self.mmproj.gguf_path)
+                or not self.mmproj_overlay):
+            return self
+        if self._view_on is None:
+            view = copy.copy(self)
+            view.frontmatter = utils.merge_layer(
+                self.frontmatter, self.mmproj_overlay,
+                origin=f"mmproj:{self.stem}")
+            view._vram = None
+            view._view_on = None
+            view._is_view = True
+            self._view_on = view
+        return self._view_on
 
     @property
     def freethought(self) -> float | None:

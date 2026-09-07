@@ -197,13 +197,13 @@ def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
     hf_home = _hf_tree(tmp_path, files=("Dirk-Q4_K_M.gguf", "mmproj-F16.gguf"))
     md_path = tmp_path / "dirk.md"
     fm = {"name": "dirk", "model": "Dirk-Q4_K_M.gguf",
-          "mmproj": "mmproj-F16.gguf", "hf_repo": "org/repo"}
+          "mmproj": {"file": "mmproj-F16.gguf"}, "hf_repo": "org/repo"}
     m = Model(md_path, fm, hf_home=hf_home)
     m.resolve_companions()
     assert m.mmproj is not None and m.mmproj.gguf_path.name == "mmproj-F16.gguf"
 
     # Same via glob — covers repos that name it mmproj-model-f16 etc.
-    fm2 = {**fm, "name": "dirk2", "mmproj": "mmproj*.gguf"}
+    fm2 = {**fm, "name": "dirk2", "mmproj": {"file": "mmproj*.gguf"}}
     m2 = Model(md_path.parent / "dirk2.md", fm2, hf_home=hf_home)
     m2.resolve_companions()
     assert m2.mmproj is not None
@@ -226,7 +226,7 @@ def test_model_companion_cross_repo_hub_ref(tmp_path):
                 tmp_path / "hf" / "hub" / "models--other--vision-proj")
     md_path = tmp_path / "m.md"
     fm = {"name": "m", "model": "model.gguf", "hf_repo": "org/repo",
-          "mmproj": "hub:other/vision-proj:mmproj-F16.gguf"}
+          "mmproj": {"file": "hub:other/vision-proj:mmproj-F16.gguf"}}
     m = Model(md_path, fm, hf_home=hf_home)
     m.resolve_companions()
     assert m.mmproj is not None

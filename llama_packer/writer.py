@@ -96,39 +96,69 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
                          {"s2t":"whisper-server","t2s":"kokoro-podman","image":"sd-server"}[model.role])
             continue
 
-        # Capability / companion cross-check: mmproj is a file, not a
-        # capability — what it enables must be declared explicitly.
+        # Capability / companion cross-check: a companion file is not a
+        # capability — what it enables must be declared where it is served.
         caps_l = [str(c).lower() for c in model.capabilities]
         has_mmproj = bool(model.mmproj and model.mmproj.gguf_path)
         if "vision" in caps_l:
             logger.error("skipping capability 'vision' on %s: removed, use 'image' "
                          "(llama-swap modalities are text/audio/image/video)",
                          model.stem)
-        if has_mmproj and model.role not in ("s2t", "t2s", "image", "embeddings", "rerank") \
-                and "image" not in caps_l and "video" not in caps_l:
-            logger.warning("sidecar %s: mmproj companion present but neither 'image' nor 'video' "
-                           "declared — projection costs VRAM but is not advertised; "
-                           "declare capabilities: [image] (or [image, video])",
-                           model.stem)
+        if has_mmproj and model.role not in ("s2t", "t2s", "image", "embeddings", "rerank"):
+            block = model.mmproj_overlay
+            if not block:
+                # Legacy companion (no declared purpose): keep the
+                # historical warning.
+                if "image" not in caps_l and "video" not in caps_l:
+                    logger.warning(
+                        "sidecar %s: mmproj companion present but neither 'image' nor 'video' "
+                        "declared — projection costs VRAM but is not advertised; "
+                        "declare capabilities: [image] (or [image, video])",
+                        model.stem)
+            else:
+                block_caps = [str(c).lower()
+                              for c in (block.get("capabilities") or [])]
+                if not block_caps:
+                    logger.warning(
+                        "sidecar %s: mmproj block declares no capabilities — "
+                        "the companion's serving difference is not advertised; "
+                        "declare what it adds (e.g. capabilities: [image])",
+                        model.stem)
+                for c in ("image", "video"):
+                    if c in caps_l and c not in block_caps:
+                        logger.warning(
+                            "sidecar %s: capability %r claimed at top level but "
+                            "served only with the companion — off-variants "
+                            "advertise it without the file; move it into the "
+                            "mmproj block", model.stem, c)
 
-        fm = model.frontmatter
+        # Sanitize the serving views: the companion-on view (block merged)
+        # plus the base frontmatter (the companion-off serving).  Pops apply
+        # to every dict so a bad key dies on all variants.
+        eff = model.view_for(True)
+        fms = [model.frontmatter]
+        if eff is not model:
+            fms.append(eff.frontmatter)
+        fm = eff.frontmatter
 
         # Reasoning flags must name a known mode and apply to a reasoning model.
         rf = fm.get("reasoning-format")
         if rf is not None and str(rf).lower() not in _REASONING_FORMATS:
             logger.error("skipping %s: unknown reasoning-format %r (allowed: %s); ignored",
                          model.stem, rf, ", ".join(sorted(_REASONING_FORMATS)))
-            fm.pop("reasoning-format")
-        if not _model_can_reason(model):
+            for d in fms:
+                d.pop("reasoning-format", None)
+        if not _model_can_reason(eff):
             for k in _REASONING_FLAG_KEYS:
                 if k in fm:
                     logger.error("skipping %s: %s declared on a non-reasoning model "
                                  "(role=%r, capabilities=%s); ignored",
-                                 model.stem, k, model.role, model.capabilities)
-                    fm.pop(k)
+                                 model.stem, k, eff.role, eff.capabilities)
+                    for d in fms:
+                        d.pop(k, None)
 
         # cache_type must be a precision we can size memory for.
-        cache_type = model.cache_type_for(default_cache_type)
+        cache_type = eff.cache_type_for(default_cache_type)
         if cache_type not in utils._KV_CACHE_BYTES:
             logger.error("skipping %s: unknown cache_type %r (known: %s)",
                          model.stem, cache_type, ", ".join(sorted(utils._KV_CACHE_BYTES)))
@@ -140,11 +170,15 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
     return supported
 
 
-def _build_mode_params(model: Model) -> dict[str, dict]:
+def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
+                        profiles_defaults: dict) -> dict[str, dict]:
     """Build ``setParamsByID`` from a model's sidecar-declared ``modes``.
 
-    Full-profile definition: every declared numeric param is emitted — no
-    diff-vs-defaults suppression. The model's ``default_mode`` maps to the
+    Each declared mode layers over the same-named resolved profile (or the
+    fleet defaults when no profile shares the name) with the single merge
+    rule — unspecified keys inherit from below instead of being dropped.
+    Every merged numeric param is emitted (full-profile definition, no
+    diff-vs-defaults suppression). The model's ``default_mode`` maps to the
     bare ``${MODEL_ID}`` key; every other mode to ``${MODEL_ID}:<mode>``.
 
     Returns an empty dict when the model declares no modes (caller then keeps
@@ -154,13 +188,21 @@ def _build_mode_params(model: Model) -> dict[str, dict]:
     if not modes:
         return {}
 
+    prof_by_name = {pname: resolved for pname, resolved in profiles_group}
     set_params: dict[str, dict] = {}
     default_mode = model.default_mode
     for name, params in modes.items():
+        base = prof_by_name.get(name, profiles_defaults)
+        merged = utils.merge_layer(base, params,
+                                   origin=f"modes:{model.stem}:{name}")
         overrides: dict = {}
-        for k, v in params.items():
+        for k, v in merged.items():
             if k not in utils.SAMPLING_KEYS:
-                logger.warning("modes: %s: unknown sampling key %r (ignored)", model.stem, k)
+                # Inherited non-sampling keys (cache_type, parallel, …) are
+                # expected from the layer below — only warn about keys the
+                # sidecar itself authored.
+                if k in params:
+                    logger.warning("modes: %s: unknown sampling key %r (ignored)", model.stem, k)
                 continue
             if isinstance(v, bool):
                 logger.warning("modes: %s: %s.%s=%r is not numeric (ignored)", model.stem, name, k, v)
@@ -203,7 +245,14 @@ def _build_entry(
     ``tools_demoted=True`` drops the ``tools`` capability: the matrix solve
     served the model below ``tools_min_ctx``, so advertising tool calling
     would mislead clients — ``metadata.tools_demoted`` records why.
+
+    The first step resolves the serving view: with a companion block, the
+    companion-on variant serves the block merged over the frontmatter while
+    the companion-off variant serves the base frontmatter (strip-by-recompute
+    — purpose is emergent from the block, never hardcoded).  Pass the base
+    model here, not a view: views return themselves from ``view_for``.
     """
+    model = model.view_for(include_mmproj)
     base_id = model.template_id
 
     # Build the launch command via the model's backend.  The backend is chosen
@@ -237,9 +286,10 @@ def _build_entry(
             key = "${MODEL_ID}" if pname == "default" else f"${{MODEL_ID}}:{pname}"
             set_params[key] = overrides
 
-    # Sidecar-declared modes fully replace the global profile sampling
-    # overrides for this model.
-    mode_params = _build_mode_params(model)
+    # Sidecar-declared modes layer over the same-named profile (or the
+    # fleet defaults) and replace the global profile sampling overrides
+    # for this model.
+    mode_params = _build_mode_params(model, profiles_group, profiles_defaults)
     if mode_params:
         set_params = mode_params
 
@@ -293,7 +343,10 @@ def _build_entry(
 
     # When mmproj is dropped, remove its associated input modalities.
     # mmproj does not imply image/video - only explicit tokens are removed,
-    # and only when a companion exists (baked-in video stays).
+    # and only when a companion exists (baked-in video stays).  With a
+    # companion block, ``model`` is already the base (off) view so block
+    # capabilities are absent; this stays as a safety net for unconditional
+    # top-level image/video claims.
     if not include_mmproj and model.role != "image" and model.mmproj and model.mmproj.gguf_path:
         caps = [c for c in model.capabilities if str(c).lower() not in ("image", "video")]
         if "image" in caps_l and "image" in in_mods:
@@ -323,6 +376,8 @@ def _build_entry(
 
     # Image token budget (client-facing so callers can size requests): only
     # advertised on variants that actually serve the vision projection.
+    # ``model`` is the serving view, so block-declared token keys are
+    # present exactly on companion-on variants.
     if include_mmproj and model.mmproj and model.mmproj.gguf_path:
         if model.image_min_tokens is not None:
             metadata["image_min_tokens"] = model.image_min_tokens
@@ -414,12 +469,18 @@ class MatrixKnobs:
     floor) → ``min_chat_ctx`` (co-load decision floor) → ``tools_min_ctx``
     (tools advertisement threshold).  ``ctx_gain_min`` gates the squeeze
     adoption; ``estimate_headroom`` pads estimated co-load overheads.
+    ``auto_parallel`` enables the value-function (ctx, slots) solve for
+    unpinned chat models (see :func:`parallel_value`); ``auto_parallel_max``
+    caps the slots and ``parallel_power`` is the score's slot exponent.
     """
     min_chat_ctx: int = 65536
     tools_min_ctx: int = 131072
     coload_min_ctx: int = 20480
     ctx_gain_min: int = 4096
     estimate_headroom: float = 1.25
+    auto_parallel: bool = False
+    auto_parallel_max: int = 8
+    parallel_power: float = 0.75
 
     @classmethod
     def from_cfg(cls, matrix_cfg: dict | None) -> "MatrixKnobs":
@@ -450,7 +511,202 @@ class MatrixKnobs:
                                ">= 1.0; using default", v)
             else:
                 knobs["estimate_headroom"] = fv
+        v = cfg.get("auto_parallel")
+        if v is not None:
+            knobs["auto_parallel"] = _parse_bool_knob("auto_parallel", v)
+        v = cfg.get("auto_parallel_max")
+        if v is not None:
+            try:
+                iv = int(v)
+                assert iv > 0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("matrix: auto_parallel_max=%r is not a "
+                               "positive integer; using default", v)
+            else:
+                knobs["auto_parallel_max"] = iv
+        v = cfg.get("parallel_power")
+        if v is not None:
+            try:
+                fv = float(v)
+                assert fv > 0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("matrix: parallel_power=%r is not a float "
+                               "> 0; using default", v)
+            else:
+                knobs["parallel_power"] = fv
         return cls(**knobs)
+
+
+def _parse_bool_knob(key: str, v: object) -> bool:
+    """Parse an opt-in knob; warn and return False on garbage."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in (
+            "true", "yes", "on", "1"):
+        return True
+    if isinstance(v, str) and v.strip().lower() in (
+            "false", "no", "off", "0"):
+        return False
+    logger.warning("matrix: %s=%r is not a boolean; using default", key, v)
+    return False
+
+
+def parallel_value(ctx: int, floor: int, slots: int, power: float) -> float:
+    """Rank a (context, slots) candidate: ``(ctx/floor)^0.5 × slots^power``.
+
+    Context is the ratio over the model's floor, square-rooted so each
+    doubling is worth less than the last; slots carry the operator-set
+    parallel power (B).  Absolute values are meaningless — only the ranking
+    of feasible candidates matters.  ``floor`` must be positive.
+    """
+    return (ctx / floor) ** 0.5 * slots ** power
+
+
+def resolve_min_ctx(view, *, pin_ctx: int | None = None,
+                    tools_min_ctx: int = 131072,
+                    fallback_min_ctx: int = utils._MIN_AGENTIC_CTX,
+                    fallback_explicit: bool = False) -> int:
+    """Per-model minimum useful context: the hard floor of the (ctx, slots)
+    search and the context-ratio normalizer in :func:`parallel_value`.
+
+    Cascade, first match wins: explicit sidecar ``min_context:`` → pinned
+    serving ctx (a fixed ctx is its own floor) → tool callers get the
+    agentic floor → everyone else gets half their max context (two slots are
+    then only considered when nearly two full windows fit).  The global
+    ``--min-context`` flag overrides the last two rows when explicitly set,
+    never an explicit sidecar key or a hard pin.  A pin below an explicit
+    floor warns (the pin is honoured; the floor is reported unmet).
+    """
+    fm = view.frontmatter or {}
+    explicit = fm.get("min_context")
+    if explicit is not None:
+        try:
+            floor = int(explicit)
+            assert floor > 0
+        except (TypeError, ValueError, AssertionError):
+            logger.warning("min_context=%r on %s is not a positive integer; "
+                           "ignoring", explicit, view.stem)
+        else:
+            if pin_ctx is not None and pin_ctx < floor:
+                logger.warning(
+                    "min_context=%d on %s is above the pinned context %d; "
+                    "honouring the pin, floor unmet", floor, view.stem,
+                    pin_ctx)
+            return floor
+    if pin_ctx is not None:
+        return pin_ctx
+    if "tools" in [c.lower() for c in (view.capabilities or [])]:
+        return fallback_min_ctx if fallback_explicit else tools_min_ctx
+    if fallback_explicit:
+        return fallback_min_ctx
+    return max(int(view.design_context // 2), utils._MIN_CTX_SIZE)
+
+
+# Size buckets for resident accounting: footprints bucket by size class, not
+# model type.  Tiny residents (speech, RAG) join every set on their GPU for
+# pocket change; huge residents (diffusion) are chat-scale and tracked as
+# exclusive candidates; chat models evict each other within a set.
+BUCKET_TINY_ROLES = frozenset({"s2t", "t2s", "embeddings", "rerank"})
+BUCKET_HUGE_BACKENDS = frozenset({"sd-server"})
+
+
+def footprint_bucket(model) -> str:
+    """Size bucket of a model for ledger accounting: tiny/huge/chat."""
+    if model.role in BUCKET_TINY_ROLES:
+        return "tiny"
+    if model.role == "image" or model.backend in BUCKET_HUGE_BACKENDS:
+        return "huge"
+    return "chat"
+
+
+class PoolLedger:
+    """One shared VRAM ledger: every claimant charged to a named pool.
+
+    Single-pool math today (the detected total), keyed by pool id so
+    per-GPU attribution slots in later: ``pool_id_for`` maps a model's
+    ``device:`` pin to ``gpuN``, unpinned models land on ``default``.  An
+    operator-declared ``pools: <id>: vram:`` overrides the pool size;
+    per-pool ``spare:`` overrides the global spare; ``reserve_extra:`` and
+    explicit ``pins:`` (``"auto"`` = derived math stays authoritative)
+    accumulate into :meth:`extra_reserve_mb`, which callers add to the
+    solve's spare.  Residents (RAG at solved ctx, adopted co-loads) are
+    registered by the planner after the matrix solve.
+    """
+
+    def __init__(self, vram_total_mb: int, pools_cfg: dict | None = None):
+        self.vram_total_mb = vram_total_mb
+        self.pools_cfg = pools_cfg or {}
+        self.residents: list[tuple[str, str, int]] = []  # (label, pool, mb)
+
+    def pool_id_for(self, model) -> str:
+        dev = (model.frontmatter or {}).get("device")
+        if dev is None:
+            return "default"
+        try:
+            return f"gpu{int(dev)}"
+        except (TypeError, ValueError):
+            return str(dev)
+
+    def pool_vram_mb(self, pool_id: str) -> int:
+        raw = self.pools_cfg.get(pool_id, {}).get("vram")
+        if raw is not None:
+            try:
+                return int(utils.parse_mem_mb(str(raw), self.vram_total_mb))
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("pools: %s vram=%r unreadable; using detected "
+                               "total", pool_id, raw)
+        return self.vram_total_mb
+
+    def add_resident(self, label: str, mb: int, pool_id: str = "default"
+                     ) -> None:
+        if mb > 0:
+            self.residents.append((label, pool_id, int(mb)))
+
+    def _explicit_pin_mb(self, pool_id: str, raw: object,
+                         claimant: str) -> int:
+        if raw is None:
+            return 0
+        if isinstance(raw, str) and raw.strip().lower() == "auto":
+            return 0  # derived math stays authoritative
+        try:
+            return int(utils.parse_mem_mb(str(raw),
+                                          self.pool_vram_mb(pool_id)))
+        except (TypeError, ValueError, AssertionError):
+            logger.warning("pools: %s pins %s=%r unreadable; ignoring",
+                           pool_id, claimant, raw)
+            return 0
+
+    def spare_for(self, pool_id: str, global_spare_mb: int) -> int:
+        raw = self.pools_cfg.get(pool_id, {}).get("spare")
+        if raw is None:
+            return global_spare_mb
+        try:
+            return int(utils.parse_mem_mb(str(raw),
+                                          self.pool_vram_mb(pool_id)))
+        except (TypeError, ValueError, AssertionError):
+            logger.warning("pools: %s spare=%r unreadable; using global",
+                           pool_id, raw)
+            return global_spare_mb
+
+    def extra_reserve_mb(self, pool_id: str = "default") -> int:
+        """MB to add to the solve's spare for this pool: unmodelled
+        residents, explicit pins, and registered co-residents."""
+        spec = self.pools_cfg.get(pool_id, {})
+        total = 0
+        raw_extra = spec.get("reserve_extra")
+        if raw_extra is not None:
+            try:
+                total += int(utils.parse_mem_mb(str(raw_extra),
+                                                self.pool_vram_mb(pool_id)))
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("pools: %s reserve_extra=%r unreadable; "
+                               "ignoring", pool_id, raw_extra)
+        for claimant, raw in (spec.get("pins") or {}).items():
+            total += self._explicit_pin_mb(pool_id, raw, claimant)
+        total += sum(mb for _, pool, mb in self.residents if pool == pool_id)
+        return total
 
 
 @dataclass(frozen=True)
@@ -514,7 +770,8 @@ class Planner:
         embed_model: Model | None = None,
         rerank_model: Model | None = None,
         baseline_mb: int = 0,
-        min_context: int = utils._MIN_USEFUL_CTX,
+        min_context: int = utils._MIN_AGENTIC_CTX,
+        min_context_explicit: bool = False,
     ):
         self.models = models
         self.profiles = profiles
@@ -528,6 +785,8 @@ class Planner:
         self.rerank_model = rerank_model
         self.baseline_mb = baseline_mb
         self.min_context = min_context
+        self.min_context_explicit = min_context_explicit
+        self.ledger = PoolLedger(vram_total, self.profiles.pools_cfg)
         self.chat_ctx: int | None = None  # matrix-solved shared context, if any
         self.matrix_result: MatrixSolve | None = None
 
@@ -562,6 +821,85 @@ class Planner:
             ctx = min(ctx, self.max_context)
         return ctx
 
+    # ── auto-parallel: value-function (ctx, slots) solve ──
+
+    def _serving_pin(self, view) -> int | None:
+        """Explicitly pinned serving ctx, or None.
+
+        A sidecar/block ``context_length:`` or the CLI ``--max-context``
+        fixes the per-slot size (cascade row 2: a fixed ctx is its own
+        floor).  Returns the tighter of the two when both are present.
+        """
+        pins = []
+        sidecar_ctx = (view.frontmatter or {}).get("context_length")
+        if sidecar_ctx is not None:
+            try:
+                pins.append(int(sidecar_ctx))
+            except (TypeError, ValueError):
+                logger.warning("context_length=%r on %s is not an integer; "
+                               "ignoring pin", sidecar_ctx, view.stem)
+        if self.max_context is not None:
+            pins.append(self.max_context)
+        return min(pins) if pins else None
+
+    def _auto_parallel(
+        self,
+        view,
+        *,
+        cache_type: str,
+        spare_mb: int,
+        include_mmproj: bool,
+        cap_ctx: int,
+        floor: int,
+        pin_ctx: int | None,
+        group_parallel: int,
+    ) -> tuple[int, int]:
+        """Solve (parallel, ctx) for one unpinned chat variant.
+
+        Scores ``(ctx/floor)^0.5 × slots^B`` over feasible candidates and
+        returns the winner.  Feasibility for a slot count comes from the
+        existing budget path (:meth:`_bounded_ctx`); the score rises with
+        ctx, so only the max affordable ctx per slot count is scored.  The
+        loop breaks at the first unaffordable slot count (affordability
+        falls as slots rise).  Falls back to today's outcome (group
+        parallel, max affordable ctx) when the floor is unreachable.
+        """
+        power = self.knobs.parallel_power
+        pmax = self.knobs.auto_parallel_max
+
+        def maxctx(p: int) -> int:
+            return self._bounded_ctx(
+                view, parallel=p, cache_type=cache_type,
+                spare_mb=spare_mb, include_mmproj=include_mmproj,
+                design_ctx=self.chat_ctx, context_length=cap_ctx)
+
+        fallback = (group_parallel,
+                    min(maxctx(group_parallel), cap_ctx))
+        best: tuple[float, int, int] | None = None  # (score, p, ctx)
+        for p in range(1, pmax + 1):
+            m = maxctx(p)
+            if m < floor:
+                break
+            ctx = min(m, cap_ctx)
+            if pin_ctx is not None:
+                if m < pin_ctx:
+                    continue
+                ctx = min(pin_ctx, cap_ctx)
+            if ctx < floor:
+                continue
+            score = parallel_value(ctx, floor, p, power)
+            if best is None or score > best[0]:
+                best = (score, p, ctx)
+        if best is None:
+            logger.info("auto-parallel: %s floor %d unreachable; keeping "
+                        "parallel=%d", view.stem, floor, group_parallel)
+            return fallback
+        _, p_star, ctx_star = best
+        if (p_star, ctx_star) != fallback:
+            logger.info("auto-parallel: %s parallel=%d ctx=%d (floor %d)",
+                        view.stem, p_star, ctx_star, floor)
+        return p_star, ctx_star
+
     # ── planning passes ──
 
     def _mmproj_drop_pass(self) -> dict[str, bool]:
@@ -582,10 +920,11 @@ class Planner:
                 continue
             if not (model.mmproj and model.mmproj.gguf_path):
                 continue
-            cache_type = model.cache_type_for(self.profiles.default_cache_type)
-            parallel = model.parallel_for(self.profiles.default_parallel)
+            on_view = model.view_for(True)
+            cache_type = on_view.cache_type_for(self.profiles.default_cache_type)
+            parallel = on_view.parallel_for(self.profiles.default_parallel)
             ctx_with = self._bounded_ctx(
-                model, parallel=parallel, cache_type=cache_type,
+                on_view, parallel=parallel, cache_type=cache_type,
                 spare_mb=global_spare_mb, include_mmproj=True)
             if ctx_with >= self.min_context:
                 drop[model.stem] = False
@@ -623,6 +962,58 @@ class Planner:
                         [s for s, _ in result.coloads])
         return result
 
+    def _build_ledger(self) -> PoolLedger:
+        """Shared VRAM ledger from the matrix result + ``pools:`` overrides.
+
+        Residents = RAG models at their solved contexts plus adopted
+        co-loads (the models actually served alongside chat), each charged
+        to its device pool with its size bucket logged.  Per-model chat
+        solves add this pool's extra reserve to their spare so slots can't
+        OOM co-residents.
+        """
+        ledger = PoolLedger(self.vram_total,
+                            self.profiles.pools_cfg)
+        res = self.matrix_result
+        if res is not None:
+            for model, ctx, label in ((self.embed_model, res.embed_ctx,
+                                       "embed"),
+                                      (self.rerank_model, res.rerank_ctx,
+                                       "rerank")):
+                if model is None:
+                    continue
+                mb = self._resident_overhead(model, ctx)
+                pool = ledger.pool_id_for(model)
+                ledger.add_resident(f"{label}:{model.stem}", mb, pool)
+                logger.info("ledger: %s resident %s (%s bucket, pool %s)",
+                            label, model.stem, footprint_bucket(model), pool)
+            by_stem = {m.stem: m for m in self.models}
+            for stem, mb in res.coloads:
+                m = by_stem.get(stem)
+                pool = ledger.pool_id_for(m) if m is not None else "default"
+                ledger.add_resident(f"coload:{stem}", mb, pool)
+                logger.info("ledger: co-load resident %s (%s bucket, pool "
+                            "%s)", stem,
+                            footprint_bucket(m) if m is not None else "?",
+                            pool)
+        return ledger
+
+    def _resident_overhead(self, model, ctx: int) -> int:
+        """VRAM (MB) of a resident model at its served context, 0 on error."""
+        if model is None or model.on_cpu:
+            return 0
+        try:
+            triple = _static_params(
+                model, self.fit_bin, self.profiles.default_cache_type,
+                self.profiles.default_parallel)
+            if triple is None:
+                return 0
+            mib, factor, compute = triple
+            return mib + compute + int(factor * ctx)
+        except Exception as e:  # keep planning alive; matrix already solved
+            logger.warning("ledger: cannot size resident %s (%s)",
+                           model.stem, e)
+            return 0
+
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
@@ -641,40 +1032,81 @@ class Planner:
             self.chat_ctx = self.matrix_result.chat_ctx
         coload_stems = ({s for s, _ in self.matrix_result.coloads}
                         if self.matrix_result else set())
+        # Shared ledger: matrix residents + pools: overrides.  Per-model
+        # chat solves charge this pool's extra reserve to their spare.
+        self.ledger = self._build_ledger()
 
         plan: dict[str, list[Variant]] = {}
         for model in self.models:
-            context_length = model.design_context
+            include_mmproj = not drop_mmproj.get(model.stem, False)
+            view = model.view_for(include_mmproj)
+            on_view = model.view_for(True)
+            context_length = view.design_context
             # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
             # RAG entry's served context (the emit is what frees the VRAM).
-            if model.role == "embeddings" and self.matrix_result:
+            if view.role == "embeddings" and self.matrix_result:
                 context_length = min(context_length,
                                      self.matrix_result.embed_ctx)
-            elif model.role == "rerank" and self.matrix_result:
+            elif view.role == "rerank" and self.matrix_result:
                 context_length = min(context_length,
                                      self.matrix_result.rerank_ctx)
             tools_demoted = (
-                model.role == "chat"
+                view.role == "chat"
                 and self.chat_ctx is not None
                 and self.chat_ctx < self.knobs.tools_min_ctx
-                and "tools" in [c.lower() for c in model.capabilities])
+                and "tools" in [c.lower() for c in view.capabilities])
             is_coload = model.stem in coload_stems
 
-            include_mmproj = not drop_mmproj.get(model.stem, False)
-
-            groups = self.profiles.groups_for(model, self.vram_total, self.spare)
+            groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
             for (parallel, cache_type, spare_mb), group in groups.items():
-                ctx_size = self._bounded_ctx(
-                    model, parallel=parallel, cache_type=cache_type,
-                    spare_mb=spare_mb, include_mmproj=include_mmproj,
-                    design_ctx=self.chat_ctx, context_length=context_length)
+                # Ledger charge: this pool's extra reserve (pools: overrides
+                # + co-residents) joins the spare for chat solves only — RAG
+                # and fixed-overhead roles ARE residents; charging them
+                # themselves would double-count.
+                pool_id = self.ledger.pool_id_for(view)
+                spare_mb = self.ledger.spare_for(pool_id, spare_mb)
+                spare_eff = spare_mb
+                if view.role == "chat":
+                    spare_eff += self.ledger.extra_reserve_mb(pool_id)
+                # Auto-parallel: unpinned chat models on slot-based backends
+                # get a value-function (parallel, ctx) solve instead of the
+                # group parallel.  Pinned = sidecar/block `parallel:` or any
+                # profile in the group declaring `parallel`.
+                auto = (
+                    self.knobs.auto_parallel
+                    and view.role == "chat"
+                    and view.backend in ("llama-server", "vllm", "vllm-docker")
+                    and "parallel" not in (view.frontmatter or {})
+                    and not any("parallel" in resolved
+                                for _, resolved in group))
+                if auto:
+                    pin_ctx = self._serving_pin(view)
+                    floor = resolve_min_ctx(
+                        view, pin_ctx=pin_ctx,
+                        tools_min_ctx=self.knobs.tools_min_ctx,
+                        fallback_min_ctx=self.min_context,
+                        fallback_explicit=self.min_context_explicit)
+                    cap_ctx = context_length
+                    if self.max_context is not None:
+                        cap_ctx = min(cap_ctx, self.max_context)
+                    parallel, ctx_size = self._auto_parallel(
+                        view, cache_type=cache_type, spare_mb=spare_eff,
+                        include_mmproj=include_mmproj, cap_ctx=cap_ctx,
+                        floor=floor, pin_ctx=pin_ctx,
+                        group_parallel=parallel)
+                else:
+                    ctx_size = self._bounded_ctx(
+                        view, parallel=parallel, cache_type=cache_type,
+                        spare_mb=spare_eff, include_mmproj=include_mmproj,
+                        design_ctx=self.chat_ctx,
+                        context_length=context_length)
 
                 vision_ctx: int | None = None
                 if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
                     vision_ctx = self._bounded_ctx(
-                        model, parallel=parallel, cache_type=cache_type,
-                        spare_mb=spare_mb, include_mmproj=True,
+                        on_view, parallel=parallel, cache_type=cache_type,
+                        spare_mb=spare_eff, include_mmproj=True,
                         design_ctx=self.chat_ctx, context_length=context_length)
 
                 variants.append(Variant(
@@ -688,11 +1120,11 @@ class Planner:
                 # clients can pick the lower-memory serving.  When the main
                 # entry was auto-dropped it IS the ``-text`` entry, so no
                 # separate variant is needed.
-                if (include_mmproj and model.role == "chat"
+                if (include_mmproj and view.role == "chat"
                         and model.mmproj and model.mmproj.gguf_path):
                     text_ctx = self._bounded_ctx(
                         model, parallel=parallel, cache_type=cache_type,
-                        spare_mb=spare_mb, include_mmproj=False,
+                        spare_mb=spare_eff, include_mmproj=False,
                         design_ctx=self.chat_ctx, context_length=context_length)
                     variants.append(Variant(
                         parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
@@ -760,17 +1192,20 @@ def _solve_matrix_context(
         # diffusion model would collapse the chat budget, so exclude it.
         if m.role in utils.NON_CHAT_ROLES or m.on_cpu:
             continue
-        cache_type = m.cache_type_for(profiles.default_cache_type)
-        parallel = m.parallel_for(profiles.default_parallel)
-        fp = m.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
-                                     include_mmproj=m.stem not in drop_stems)
+        # Overlay keys (cache_type/parallel/context_length/image_max_tokens)
+        # live in the block and are only visible on the companion-on view.
+        on = m.view_for(m.stem not in drop_stems)
+        cache_type = on.cache_type_for(profiles.default_cache_type)
+        parallel = on.parallel_for(profiles.default_parallel)
+        fp = on.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
+                                      include_mmproj=m.stem not in drop_stems)
         if fp is None:
             logger.warning("matrix: could not get fit params for %s", m.stem)
             continue
         img_floor = 0
         if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
-                and m.image_max_tokens):
-            img_floor = parallel * m.image_max_tokens
+                and on.image_max_tokens):
+            img_floor = parallel * on.image_max_tokens
         chat_params.append((m, fp[0], fp[1], fp[2], img_floor))
 
     if not chat_params:
@@ -931,13 +1366,14 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
     ids_by_stem: dict[str, list[str]] = {}
     coload_stems: set[str] = set()
     for model in models:
-        context_length = model.design_context
         for v in plan.get(model.stem, []):
+            view = model.view_for(v.include_mmproj)
+            context_length = view.design_context
             text_only = not v.include_mmproj
             if v.coload:
                 coload_stems.add(model.stem)
             entry_id, entry = _build_entry(
-                model, v.parallel, v.cache_type, v.profiles_group,
+                view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
                 name_suffix=" [text]" if text_only else "",
@@ -956,9 +1392,11 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
             if v.vision_ctx is None:
                 continue
             n_k = v.vision_ctx // 1000
+            on_view = model.view_for(True)
             vision_id, vision_entry = _build_entry(
-                model, v.parallel, v.cache_type, v.profiles_group,
-                profiles.defaults, template_vars, context_length, v.vision_ctx,
+                on_view, v.parallel, v.cache_type, v.profiles_group,
+                profiles.defaults, template_vars, on_view.design_context,
+                v.vision_ctx,
                 include_mmproj=True,
                 name_suffix=f" [vision {n_k}k]",
                 tools_demoted=v.tools_demoted,
@@ -1018,7 +1456,8 @@ def build_config(
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
     baseline_mb: int = 0,
-    min_context: int = utils._MIN_USEFUL_CTX,
+        min_context: int = utils._MIN_AGENTIC_CTX,
+        min_context_explicit: bool = False,
 ) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
 
@@ -1041,7 +1480,11 @@ def build_config(
             with an mmproj companion cannot reach this WITH vision, the vision
             projection is dropped from the main entry, which is renamed
             ``<id>-text`` (a ``vision-<N>k`` variant is emitted alongside,
-            still exposing vision at best-effort context).
+            still exposing vision at best-effort context).  Pass
+            ``min_context_explicit=True`` when the value came from an
+            explicit ``--min-context`` flag (as opposed to the default): the
+            explicit flag overrides the per-model floor cascade's default
+            rows, the default does not.
     """
     profiles = profiles_cfg if isinstance(profiles_cfg, Profiles) else Profiles(profiles_cfg)
 
@@ -1054,7 +1497,7 @@ def build_config(
         spare=spare, max_context=max_context,
         matrix_cfg=matrix_cfg, embed_model=embed_model,
         rerank_model=rerank_model, baseline_mb=baseline_mb,
-        min_context=min_context,
+        min_context=min_context, min_context_explicit=min_context_explicit,
     )
     return emit_config(supported, planner.plan(), profiles, template_vars)
 

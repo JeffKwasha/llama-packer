@@ -52,8 +52,9 @@ models_dirs:
 # ── Profile definitions ────────────────────────────────
 # Each profile overlays `defaults` and emits llama-swap setParamsByID
 # overrides. `allow_profiles` in a model sidecar can filter which profiles
-# apply to that model. Sidecar `modes:` fully replace profile sampling params
-# per-model when present.
+# apply to that model. Sidecar `modes:` layer over the same-named profile
+# (single merge rule: dicts merge, lists append, None deletes) and replace
+# the profile sampling overrides per-model when present.
 profiles:
   default:
 
@@ -183,6 +184,9 @@ profiles:
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.
 # `when` is map of frontmatter field → regex (re.search); list fields joined with spaces.
 # Later matching rules win per-key; dir models.yaml overrides win over global.
+# One merge rule everywhere: dicts merge per key, lists union-append
+# (`-item` removes an inherited entry), None deletes a key outright.
+# A rule declares only its delta — no restating full lists per model.
 # overrides:
 #   - when: {base_model: 'qwen3'}
 #     chat_template: qwen_chat_template.jinja
@@ -190,6 +194,10 @@ profiles:
 #   - when: {stem: 'Qwen3-32B.*safetensors'}
 #     backend: vllm-docker
 #     hf_repo: Qwen/Qwen3-32B
+#   - when: {base_model: 'qwen3'}
+#     loras: [shared-uncensored.gguf]   # appended to each model's loras
+#   - when: {name: 'tiny-.*'}
+#     cache_type: None                  # delete: fall back to built-in q8_0
 
 # ── Swap matrix (optional) ──────────────────────────────
 # Enables the llama-swap matrix router: every chat model shares a set with the
@@ -207,6 +215,20 @@ profiles:
 #     rnk: 100
 #   sets:
 #     rag: "__CHAT_VARS__ & emb & rnk"
+#   auto_parallel: false        # value-function (ctx, slots) solve for unpinned chat
+#   auto_parallel_max: 8        # hard cap on auto slots
+#   parallel_power: 0.75        # slot exponent: what each extra chat is worth
+#
+# ── VRAM pools (optional) ───────────────────────────────────
+# One shared ledger per pool: per-pool spare override, unmodelled residents,
+# and explicit claimant reservations. "auto" keeps the derived math.
+# pools:
+#   default:
+#     spare: 2G
+#     reserve_extra: 8G          # VM, game, other tenant
+#     pins:
+#       image: 40G
+#       embeddings: auto
 
 # ── Flag macros (optional) ──────────────────────────────────
 # Named flag chunks for cmd readability (llama-swap macros). Auto-derived

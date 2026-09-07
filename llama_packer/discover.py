@@ -224,6 +224,14 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
 def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
            hf_home, out: list[Model]) -> None:
     """The single model pipeline: merge → construct → rules → companions → finalize."""
+    caps = frontmatter.get("capabilities")
+    if isinstance(caps, list) and any(
+            isinstance(c, str) and c.startswith("-") and len(c) > 1
+            for c in caps):
+        logger.warning(
+            "sidecar %s: capabilities removes inherited entries — sidecars "
+            "add capabilities; conditional serving belongs in an mmproj "
+            "block", path.name)
     merged = stack.merge_defaults(frontmatter)
     # A model in embed//rerank/image/s2t/t2s inherits its role from the
     # location when its own data (sidecar or defaults) does not declare one.
