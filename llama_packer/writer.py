@@ -23,6 +23,12 @@ from llama_packer.model import Model
 from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
+from llama_packer.consts import (
+    _DIFFUSION_ARCH_RES,
+    _KV_CACHE_BYTES,
+    _MIN_AGENTIC_CTX,
+    _MIN_CTX_SIZE,
+)
 from llama_packer.profiles import Profiles, parse_spare_mb
 from llama_packer.backends import (
     SETTING_KEYS,
@@ -76,8 +82,8 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
         # Diffusion/image-generation GGUF under a non-image role would
         # incorrectly emit a llama-server entry. Classify by header, not filename.
         if model.gguf_path and model.gguf_path.is_file():
-            arch, _ = utils.gguf_header_probe(model.gguf_path)
-            if arch and any(rx.search(arch) for rx in utils._DIFFUSION_ARCH_RES):
+            arch = model.arch
+            if arch and any(rx.search(arch) for rx in _DIFFUSION_ARCH_RES):
                 if model.role != "image":
                     logger.error("skipping %s: diffusion arch %r requires role: image (sd-server); "
                                  "move to img/ with dirs:{img:image} or set ignore:true (found role=%r)",
@@ -159,9 +165,9 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
 
         # cache_type must be a precision we can size memory for.
         cache_type = eff.cache_type_for(default_cache_type)
-        if cache_type not in utils._KV_CACHE_BYTES:
+        if cache_type not in _KV_CACHE_BYTES:
             logger.error("skipping %s: unknown cache_type %r (known: %s)",
-                         model.stem, cache_type, ", ".join(sorted(utils._KV_CACHE_BYTES)))
+                         model.stem, cache_type, ", ".join(sorted(_KV_CACHE_BYTES)))
             continue
 
         declared = {k for k in SETTING_KEYS if k in fm}
@@ -569,7 +575,7 @@ def parallel_value(ctx: int, floor: int, slots: int, power: float) -> float:
 
 def resolve_min_ctx(view, *, pin_ctx: int | None = None,
                     tools_min_ctx: int = 131072,
-                    fallback_min_ctx: int = utils._MIN_AGENTIC_CTX,
+                    fallback_min_ctx: int = _MIN_AGENTIC_CTX,
                     fallback_explicit: bool = False) -> int:
     """Per-model minimum useful context: the hard floor of the (ctx, slots)
     search and the context-ratio normalizer in :func:`parallel_value`.
@@ -604,7 +610,7 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
         return fallback_min_ctx if fallback_explicit else tools_min_ctx
     if fallback_explicit:
         return fallback_min_ctx
-    return max(int(view.design_context // 2), utils._MIN_CTX_SIZE)
+    return max(int(view.design_context // 2), _MIN_CTX_SIZE)
 
 
 # Size buckets for resident accounting: footprints bucket by size class, not
@@ -773,8 +779,9 @@ class Planner:
         embed_model: Model | None = None,
         rerank_model: Model | None = None,
         baseline_mb: int = 0,
-        min_context: int = utils._MIN_AGENTIC_CTX,
+        min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
+        progress_cb=None,
     ):
         self.models = models
         self.profiles = profiles
@@ -792,6 +799,8 @@ class Planner:
         self.ledger = PoolLedger(vram_total, self.profiles.pools_cfg)
         self.chat_ctx: int | None = None  # matrix-solved shared context, if any
         self.matrix_result: MatrixSolve | None = None
+        # Optional per-model tick (stem) for the progress bar; None in tests.
+        self.progress_cb = progress_cb
 
     # ── bounded ctx: the single home of the clamp invariant ──
 
@@ -1135,6 +1144,8 @@ class Planner:
                         include_mmproj=False, coload=is_coload,
                         tools_demoted=tools_demoted))
             plan[model.stem] = variants
+            if self.progress_cb is not None:
+                self.progress_cb(model.stem)
         return plan
 
 
@@ -1459,8 +1470,9 @@ def build_config(
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
     baseline_mb: int = 0,
-        min_context: int = utils._MIN_AGENTIC_CTX,
+        min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
+        progress_cb=None,
 ) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
 
@@ -1501,6 +1513,7 @@ def build_config(
         matrix_cfg=matrix_cfg, embed_model=embed_model,
         rerank_model=rerank_model, baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
+        progress_cb=progress_cb,
     )
     return emit_config(supported, planner.plan(), profiles, template_vars)
 
