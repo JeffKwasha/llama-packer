@@ -121,11 +121,16 @@ def test_floor_garbage_min_context_ignored(caplog):
 
 # ── knobs parsing ─────────────────────────────────────────────────────────
 
-def test_knobs_auto_parallel_defaults_off():
+def test_knobs_auto_parallel_defaults_on():
     k = MatrixKnobs.from_cfg({})
-    assert k.auto_parallel is False
+    assert k.auto_parallel is True
     assert k.auto_parallel_max == 8
     assert k.parallel_power == 0.75
+
+
+def test_knobs_auto_parallel_disable():
+    assert MatrixKnobs.from_cfg({"auto_parallel": False}).auto_parallel is False
+    assert MatrixKnobs.from_cfg({"auto_parallel": "off"}).auto_parallel is False
 
 
 def test_knobs_auto_parallel_parsing():
@@ -233,7 +238,8 @@ def test_plan_auto_parallel_off_keeps_today(make_model):
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768})
     planner = Planner([m], _profiles_no_pin(), fit_bin="unused",
-                      vram_total=48 * 1024, matrix_cfg={})
+                      vram_total=48 * 1024,
+                      matrix_cfg={"auto_parallel": False})
     variants = planner.plan()["ap"]
     assert variants[0].parallel == 1
     assert variants[0].ctx_size == 32768

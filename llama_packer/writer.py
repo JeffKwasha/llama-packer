@@ -472,13 +472,16 @@ class MatrixKnobs:
     ``auto_parallel`` enables the value-function (ctx, slots) solve for
     unpinned chat models (see :func:`parallel_value`); ``auto_parallel_max``
     caps the slots and ``parallel_power`` is the score's slot exponent.
+    Auto-parallel is on by default; ``matrix: auto_parallel: false``
+    disables it fleet-wide and a sidecar/block ``parallel:`` pin opts a
+    single model out.
     """
     min_chat_ctx: int = 65536
     tools_min_ctx: int = 131072
     coload_min_ctx: int = 20480
     ctx_gain_min: int = 4096
     estimate_headroom: float = 1.25
-    auto_parallel: bool = False
+    auto_parallel: bool = True
     auto_parallel_max: int = 8
     parallel_power: float = 0.75
 
