@@ -35,3 +35,22 @@ they need different backends entirely.
 
 See also `models_AGENTS.md` ("Hub-downloaded files need no symlink") and
 SPEC.md "Model Discovery".
+
+## Why is my small model stuck at low context and `parallel: 1`?
+
+Three separate causes — check in order:
+
+1. **Low context is usually the ceiling, not the budget.** Served context
+   never exceeds the GGUF architectural max (`capabilities.context` in the
+   entry tells you the ceiling). A 4B quant capped at 40960 in its header
+   serves 40960 no matter how much VRAM is free — small weights buy *slots*,
+   never more context than the file allows.
+2. **`parallel: 1` means the solve skipped the model.** Auto-parallel only
+   runs for `role: chat` on llama-server/vLLM with no `parallel:` pin in the
+   sidecar/block or any profile. It is on by default; `matrix:
+   auto_parallel: false` turns it off fleet-wide.
+3. **The floor-ceiling trap.** A tool-calling model defaults to a 131072
+   floor; if its max context is below that *and* it has no `context_length:`
+   pin or explicit `min_context:`, the floor is unreachable and the model
+   silently stays at 1 slot. Fix: set `min_context:` (e.g. half the max) or
+   pin `context_length:` in the sidecar.
