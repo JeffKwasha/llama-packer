@@ -64,6 +64,8 @@ vllm:
 # Match models by sidecar fields and set backend / hf_repo / chat_template /
 # chat_template_kwargs / loras / cli_args / reasoning-format /
 # reasoning-preserve. `when` is required; use `when: true` to match all.
+# One merge rule everywhere (SPEC.md "Layer merge rule"): dicts merge per
+# key, lists union-append (`-item` removes), None deletes a key outright.
 # See SPEC.md "Override Rules" + "Reasoning".
 #
 # overrides:
@@ -71,3 +73,7 @@ vllm:
 #     chat_template: qwen_chat_template.jinja
 #     reasoning-format: deepseek
 #     reasoning-preserve: true
+#   # - when: {base_model: 'qwen3'}
+#   #   loras: [shared-uncensored.gguf]  # appended to each model's loras
+#   # - when: {name: 'tiny-.*'}
+#   #   cache_type: None                 # delete: fall back to built-in q8_0

@@ -21,18 +21,27 @@ def profiles():
 
 
 def _scripted_ctx(model, by_mmproj):
-    """Replace calc_ctx with a fake keyed on include_mmproj."""
+    """Replace calc_ctx with a fake keyed on include_mmproj.
+
+    Companion-on variants carry their own VRAM budget (bound to the serving
+    view), so the fake is installed on the base budget and every view.
+    """
     def fake(vram_total_mb, *, fit_bin=None, parallel=1, spare_mb=0,
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
              design_ctx=None, **kw):
         return by_mmproj[bool(include_mmproj)]
     model.vram.calc_ctx = fake
+    for flag in (True, False):
+        view = model.view_for(flag)
+        if view is not model:
+            view.vram.calc_ctx = fake
 
 
 def _vision_model(tmp_path, make_model, name):
     """Model with an mmproj companion; file must exist before construction."""
     (tmp_path / f"{name}-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    return make_model(name, mmproj=f"{name}-mmproj.gguf")
+    return make_model(name, mmproj={"file": f"{name}-mmproj.gguf",
+                                    "capabilities": ["image"]})
 
 
 def test_profiles_spare_precedence():
@@ -69,7 +78,9 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     # Design ctx 256k so only the budget clamps: vision misses min-context,
     # text-only reaches it → mmproj is dropped and vision kept as a variant.
     (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model("vis", mmproj="vis-mmproj.gguf", context_length=262144)
+    m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
+                                  "capabilities": ["image"]},
+                   context_length=262144)
     _scripted_ctx(m, {True: 65536, False: 200000})
 
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
@@ -114,7 +125,9 @@ def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
     # used; text ctx < vision ctx proves the variant was budgeted WITHOUT the
     # mmproj (include_mmproj=False path).
     (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model("vis", mmproj="vis-mmproj.gguf", context_length=262144)
+    m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
+                                  "capabilities": ["image"]},
+                   context_length=262144)
     _scripted_ctx(m, {True: 131072, False: 100000})
 
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
@@ -266,6 +279,40 @@ def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
     assert result.chat_ctx == 32768
     # s2t (640 MB) fits; image (40000 MB) leaves a negative chat budget.
     assert result.coloads == (("s2t", 640),)
+
+
+def test_solve_matrix_reads_block_tokens_from_on_view(
+        tmp_path, make_model, profiles, monkeypatch):
+    # image_max_tokens living only in the mmproj block must still reserve
+    # the image floor in the matrix solve (read via the companion-on view).
+    from llama_packer import writer
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x" * 1024)
+    m = make_model("v", mmproj={"file": "v-mmproj.gguf",
+                                "capabilities": ["image"],
+                                "image_max_tokens": 9000})
+    assert m.image_max_tokens is None  # base frontmatter: no floor visible
+    e = make_model("e", role="embeddings", context_length=8192)
+    r = make_model("r", role="rerank", context_length=8192)
+    # The matrix solve reads VRAM through the companion-on view (its own
+    # budget object), so the fake goes there; the floor under test comes
+    # from the view's merged frontmatter, not from VRAM.
+    _fake_vram(m.view_for(True), (8000, 0.4, 500))
+    _fake_vram(e, (500, 0.1, 100))
+    _fake_vram(r, (500, 0.1, 100))
+    captured = {}
+
+    def fake_solver(**kwargs):
+        captured.update(kwargs)
+        return 8192
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
+    result = _solve_matrix_context(
+        [m, e, r], e, r, fit_bin="unused", vram_total=48 * 1024, spare=None,
+        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
+    assert result is not None
+    floors = {mod.stem: floor for mod, _, _, _, floor
+              in captured["chat_models"]}
+    assert floors == {"v": 9000}
 
 
 def test_solve_matrix_floor_blocks_all_coloads(profiles):

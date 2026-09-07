@@ -52,6 +52,43 @@ class Profiles:
         > *cli_override* (global ``--spare``) > 0."""
         return parse_spare_mb(preferred or cli_override, vram_total)
 
+    @property
+    def pools_cfg(self) -> dict:
+        """Raw ``pools:`` section: ``{pool_id: {vram, spare, reserve_extra,
+        pins}}`` with non-dict garbage dropped (warned, never fatal).
+
+        Pools are VRAM ledgers keyed by id (``gpu0`` … or ``default``).
+        ``vram:`` declares a pool's size (otherwise the detected total);
+        ``spare:`` overrides the global spare for that pool; ``reserve_extra:``
+        holds unmodelled residents (VM, game, other tenant); ``pins:`` maps a
+        claimant name to an explicit reservation or ``"auto"`` (derived math
+        stays authoritative).  Resolution against pool sizes happens in the
+        ledger (:class:`writer.PoolLedger`), not here.
+        """
+        raw = self._cfg.get("pools")
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("pools: section is not a mapping; ignoring")
+            return {}
+        pools = {}
+        for pid, spec in raw.items():
+            if not isinstance(spec, dict):
+                logger.warning("pools: %r is not a mapping; ignoring", pid)
+                continue
+            pins = spec.get("pins") or {}
+            if not isinstance(pins, dict):
+                logger.warning("pools: %r pins is not a mapping; ignoring",
+                               pid)
+                pins = {}
+            pools[str(pid)] = {
+                "vram": spec.get("vram"),
+                "spare": spec.get("spare"),
+                "reserve_extra": spec.get("reserve_extra"),
+                "pins": {str(k): v for k, v in pins.items()},
+            }
+        return pools
+
     # ── per-model selection ──
 
     def matched_for(self, model) -> list[tuple[str, dict]]:

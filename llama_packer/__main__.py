@@ -22,7 +22,7 @@ from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
 from llama_packer.utils import (
-    _MIN_USEFUL_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
+    _MIN_AGENTIC_CTX, compute_env_prefixes, make_subst, _detect_drive_speed,
     _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
@@ -615,7 +615,8 @@ def main(argv: list[str] | None = None) -> None:
             spare=args.spare, max_context=max_ctx,
             matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
             baseline_mb=gpu.baseline_mb,
-            min_context=min_ctx if min_ctx is not None else _MIN_USEFUL_CTX,
+            min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
+            min_context_explicit=min_ctx is not None,
         )
     except ValueError as e:
         fatal("%s", e)

@@ -496,9 +496,12 @@ def test_llama_server_multiple_loras_comma_joined(make_model):
 def test_llama_server_image_token_flags(make_model, tmp_path):
     # Declared image token bounds on a vision model are emitted as CLI flags.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
-    m = make_model("v", mmproj="v-mmproj.gguf",
-                   **{"image_min_tokens": 1024, "image_max_tokens": 4096})
-    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+    m = make_model("v", mmproj={"file": "v-mmproj.gguf",
+                                "capabilities": ["image"],
+                                "image_min_tokens": 1024,
+                                "image_max_tokens": 4096})
+    cmd, _ = LlamaServerBackend().build_cmd(m.view_for(True), 32768, 1,
+                                            "q8_0", _tvars())
     assert "--mmproj" in cmd
     assert "--image-min-tokens 1024" in cmd
     assert "--image-max-tokens 4096" in cmd
@@ -524,11 +527,14 @@ def test_llama_server_image_tokens_static_arch_skipped(make_model, tmp_path,
     # Static-resolution vision archs (Gemma/SigLIP, ~256 tokens/image fixed)
     # ignore the flags — declared bounds are warned about and skipped.
     (tmp_path / "g-mmproj.gguf").write_bytes(b"mm")
-    m = make_model("g", mmproj="g-mmproj.gguf", **{"image_min_tokens": 1024})
+    m = make_model("g", mmproj={"file": "g-mmproj.gguf",
+                                "capabilities": ["image"],
+                                "image_min_tokens": 1024})
     monkeypatch.setattr("llama_packer.utils.gguf_header_probe",
                         lambda p: ("gemma4", True))
     with caplog.at_level(logging.WARNING):
-        cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
+        cmd, _ = LlamaServerBackend().build_cmd(m.view_for(True), 32768, 1,
+                                                "q8_0", _tvars())
     assert "--image-min-tokens" not in cmd
     assert any("static-resolution" in r.message for r in caplog.records)
 
@@ -536,8 +542,11 @@ def test_llama_server_image_tokens_static_arch_skipped(make_model, tmp_path,
 def test_llama_server_image_tokens_text_variant_skipped(make_model, tmp_path):
     # The -text variant serves no vision: flags dropped without a warning.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
-    m = make_model("v", mmproj="v-mmproj.gguf", **{"image_min_tokens": 1024})
-    cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars(),
+    m = make_model("v", mmproj={"file": "v-mmproj.gguf",
+                                "capabilities": ["image"],
+                                "image_min_tokens": 1024})
+    cmd, _ = LlamaServerBackend().build_cmd(m.view_for(False), 32768, 1,
+                                            "q8_0", _tvars(),
                                             include_mmproj=False)
     assert "--image-min-tokens" not in cmd
     assert "--mmproj" not in cmd

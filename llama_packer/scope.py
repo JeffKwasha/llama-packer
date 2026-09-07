@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 
+from llama_packer import utils
 from llama_packer.backends import BACKENDS, infer_backend
 from llama_packer.overrides import (
     compile_rule_list,
@@ -29,6 +30,18 @@ from llama_packer.overrides import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Frontmatter keys whose correct value is a property of the model itself,
+# not a serving choice.  They belong in sidecars (identity, file resolution,
+# what the model *is*); fleet layers are for how it *behaves*.  Setting one
+# in a scope's ``defaults:`` is legal but questionable — it papers over an
+# incomplete sidecar — so it warns.  (Rules cannot set most of these at all;
+# see ``overrides.OVERRIDE_KEYS``.)
+INTRINSIC_KEYS = frozenset({
+    "capabilities", "parameters", "quantization", "architecture",
+    "base_model", "family", "finetune", "type",
+})
 
 
 class ScopeStack:
@@ -56,7 +69,14 @@ class ScopeStack:
         """Enter a scope: layer its ``defaults`` and append its ``overrides``."""
         cfg = cfg or {}
         rules = compile_rule_list(cfg.get("overrides") or [], origin)
-        self._defaults.append(cfg.get("defaults") or {})
+        defaults = cfg.get("defaults") or {}
+        for k in defaults:
+            if k in INTRINSIC_KEYS:
+                logger.warning(
+                    "%s defaults: %r is an intrinsic model property — "
+                    "declare it in sidecars instead of layering it from "
+                    "fleet config", origin, k)
+        self._defaults.append(defaults)
         self._rule_counts.append(len(rules))
         self._rules.extend(rules)
 
@@ -73,27 +93,34 @@ class ScopeStack:
 
     @property
     def defaults(self) -> dict:
-        """Folded defaults of every open scope, outermost → innermost."""
+        """Folded defaults of every open scope, outermost → innermost.
+
+        One merge rule everywhere (:func:`llama_packer.utils.merge_layer`):
+        dicts merge per key, lists union-append, ``None`` deletes.
+        """
         merged: dict = {}
         for d in self._defaults:
-            merged.update(d)
+            merged = utils.merge_layer(merged, d, origin="defaults")
         return merged
 
     def merge_defaults(self, frontmatter: dict) -> dict:
         """Sidecar frontmatter layered over folded scope defaults.
 
-        The sidecar always wins over defaults; defaults win over built-in
-        property fallbacks by virtue of being present in the dict at all.
+        Same single merge rule: the sidecar wins per key/sub-key, appends
+        to default lists, and deletes with ``None``.
         """
-        return {**self.defaults, **frontmatter}
+        return utils.merge_layer(self.defaults, frontmatter,
+                                 origin="sidecar")
 
     # ── layer 2: rules ──
 
     def apply_rules(self, model) -> set[str]:
         """Apply every open scope's override rules to *model* in place.
 
-        Last match wins per key.  Returns the set of frontmatter keys that
-        changed, so the caller can invalidate derived state (see
+        Last match wins per key across rules; the collected settings then
+        merge over the frontmatter with the single merge rule (dicts merge,
+        lists append, ``None`` deletes).  Returns the set of frontmatter
+        keys that changed, so the caller can invalidate derived state (see
         :data:`COMPANION_KEYS`).
         """
         updates: dict = {}
@@ -105,7 +132,8 @@ class ScopeStack:
                         logger.debug("override: %s: %s %r -> %r",
                                      model.stem, k, prev, v)
                     updates[k] = v
-        model.frontmatter.update(updates)
+        model.frontmatter = utils.merge_layer(model.frontmatter, updates,
+                                              origin="override")
         return set(updates)
 
     # ── post-merge finalization ──

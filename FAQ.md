@@ -16,7 +16,9 @@ parameters: 9B
 quantization: Q6_K
 model: Ornith-1.5-9B-AD-Q8_0-Q6_K.gguf   # exact snapshot filename
 hf_repo: AtomicChat/Ornith-1.5-9B-GGUF   # resolved offline from $HF_HOME/hub
-# mmproj: mmproj-...gguf                 # optional companion, same snapshot
+# mmproj:                               # optional companion, same snapshot
+#   file: mmproj-...gguf
+#   capabilities: [image]
 ---
 ```
 

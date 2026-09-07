@@ -46,10 +46,34 @@ referenced by filename from the parent sidecar — they are never main models:
 
 | Companion | Field |
 |-----------|-------|
-| `*mmproj*.gguf` (vision projection) | `mmproj: <file>` |
+| `*mmproj*.gguf` (vision projection) | `mmproj:` mapping (see below) |
 | `*.mtp.gguf` / `*-mtp.gguf` (MTP draft) | `speculative: <file>` |
 
 Set `mtp: true` when MTP heads are baked into the main GGUF (no companion).
+
+`mmproj:` is a mapping, not a bare filename (bare filenames are an error —
+a filename alone records no purpose). `file:` locates the companion; every
+other key is served only while the companion is served:
+
+```yaml
+mmproj:
+  file: model-mmproj.gguf
+  capabilities: [image]   # what serving this file adds
+```
+
+A draft-head projector instead declares its draft purpose:
+
+```yaml
+mmproj:
+  file: model-mtp.gguf
+  mtp: true
+  mtp_spec_type: draft-mtp
+```
+
+Block keys must be builder-consumed serving keys — `name`, `model`,
+`ignore`, `mmproj`, `hf_repo`, `backend`, `role` are model-level and rejected
+in the block, as are intrinsic properties (`parameters`, `quantization`,
+`architecture`, …), which belong in the sidecar.
 
 ## Classify before you fill
 
@@ -93,7 +117,9 @@ description: "one-line summary."
 model: model.gguf            # snapshot filename when the file lives in the HF cache (with hf_repo:)
 hf_repo: org/model           # HF cache repo id — required with model: for cache files
 hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one line
-# mmproj: model-mmproj.gguf  # only if the snapshot actually contains *mmproj*.gguf
+# mmproj:                       # only if the snapshot actually contains *mmproj*.gguf
+#   file: model-mmproj.gguf
+#   capabilities: [image]       # + image_max_tokens etc. while served
 # speculative: model.mtp.gguf  # only if the snapshot actually contains *mtp*.gguf
 # mtp: true                  # only when MTP heads are baked into the main GGUF
 # --- serving ---
@@ -121,7 +147,8 @@ weaknesses: ["slow on 32GB"]
 # cache_type: q8_0
 # parallel: 1
 # default_mode: instruct
-# modes: { instruct: {temperature: 0.6, pres_pen: 1.5} }
+# modes: { instruct: {temperature: 0.6, pres_pen: 1.5} }  # layered over the
+#   # same-named profile: unspecified keys inherit, so state only the delta
 ---
 ```
 
@@ -131,10 +158,25 @@ defaults/profiles or a directory `models.yaml`, not per-sidecar. The sidecar is
 for identity, file resolution, and what the model *is*; the fleet config is for
 how it *behaves*.
 
+One merge rule everywhere: at each layer (defaults → profiles → sidecar →
+rules → companion block) dicts merge per key, lists union-append, `None`
+deletes a key outright. So a `modes:` entry or rule states only its delta —
+`{temperature: 0.6}` keeps the profile's other params. To drop inherited list
+items use `-item`; to drop a key use `None` (`top_p: None`). `"base * N"` on
+a sampling key scales the value from the layer below
+(`temperature: "base * 0.8"`).
+
+Sidecars add capabilities, never remove them — nothing strips what a model
+is. If a capability needs the companion file, it goes in the `mmproj:` block
+(served exactly while the file is served), not in a `-item` removal. Fleet
+`defaults:` setting intrinsic keys (`capabilities`, `parameters`,
+`quantization`, `architecture`, …) warns: intrinsics belong in sidecars.
+
 Do not invent keys. `template:` is invalid (use fleet-level `chat_template:`);
 `backend:` is fleet-level and inferred from file type — don't set it unless
-pinning. `mmproj:` is a companion filename, not a capability: declare
-`capabilities: [image]` (or `[image, video]`) explicitly. `vision` is not a
+pinning. `mmproj:` is a mapping (see Companions), not a capability: declare
+`capabilities: [image]` (or `[image, video]`) inside the block so the purpose
+is served exactly where the file is served. `vision` is not a
 capability — use `image`/`video`. Unknown keys pass through as `metadata` but
 log a warning.
 
@@ -192,11 +234,13 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | Key | Meaning |
 |-----|---------|
 | `model: <file>` | Model file when stem differs; with `hf_repo:` it names the snapshot file |
+| `mmproj: {file: …}` | Companion block: `file:` locates the projector/draft file; other keys form a conditional overlay served only while the file is served (see Companions) |
 | `device: N` / `device: cpu` | Pin to GPU N or run on CPU |
 | `concurrency: N` | Per-model concurrency limit |
 | `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
 | `reasoning-format` / `reasoning-preserve` | Chat + reasoning only (see above) |
-| `cache_type` / `parallel` | KV-cache precision / parallel slots (chat); fixed-overhead roles (image/s2t/t2s) use a fixed budget — `vram_mb` overrides |
+| `cache_type` / `parallel` | KV-cache precision / parallel slots (chat); fixed-overhead roles (image/s2t/t2s) use a fixed budget — `vram_mb` overrides. Declaring `parallel:` opts out of auto-parallel for this model |
+| `min_context` | Smallest context (tokens) at which this model still does useful agentic work (multi-step tool loops, not single replies). Rule of thumb: tool callers 131072, others half the max context. Floor of the auto-parallel search; a pinned `context_length` overrides it |
 | `vram_mb` | Fixed-overhead backends (s2t/image/t2s): pin total process VRAM (e.g. measured via nvidia-smi); wins over the file-size + buffer estimate |
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
 | `image_min_tokens` / `image_max_tokens` | Image input (mmproj) only, dynamic-resolution archs (Qwen-VL family): floor/cap on image tokens per image, emitted as `--image-min-tokens`/`--image-max-tokens`. Qwen math: 1 token ≈ 28×28 px (2.5-VL) / 32×32 px (3-VL); 1024 tokens ≈ 1 MP — good floor for art/artifact critique. Gemma/SigLIP is fixed ~256 tokens/image: keys are ignored there (warned). The cap also floors the solved context (parallel × max tokens must fit `-c`) |

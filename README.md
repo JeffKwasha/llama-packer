@@ -1,35 +1,52 @@
 # llama-packer
 
-Generate configs for [llama-swap](https://github.com/mostlygeek/llama-swap) from GGUF (llama.cpp) or HF (vLLM) model metadata. Takes a directory of models and produces ready-to-run server configurations with optimal flags tuned to your hardware.
+It makes hosting a herd of local llamas just work.
 
-Scans model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across models, and writes `config.yaml` — no manual flag wrangling. Serves models with llama-server (GGUF) or vLLM (`backend: vllm` for the host binary, `backend: vllm-docker` for a container). Both backends share the same accurate context-length budgeting and per-request alias support.
+[llama-swap](https://github.com/mostlygeek/llama-swap) wants one big complex config file where each model — and each of its aliases — gets an individual configuration, all simultaneously loaded in a `matrix`. Each entry can carry an mmproj, its own context window, KV-cache quantization, architecture-specific load parameters, and on and on.
 
-## Install
+The interactions of just half a dozen models is grossly complicated busy work. Too hard for humans, and not much better to have AI "try" to juggle it.
 
-Python 3.10+ and [uv](https://docs.astral.sh/uv/) (or pip):
+So don't. Just record each model's relevant info into a sidecar `.md` file — a simple task for agents — then let `llama-packer` algorithmically pack your llama-swap matrix full of models and aliases. An Opencode plugin then sucks the model info right off the server, so you never hand-edit your Opencode config when you add a model or tweak a context.
+
+Features:
+- Rewrite the config for all Qwen3.5+ models to use the sharp chat template? 3 lines.
+- Add low-temperature `coding` aliases to every model? 2 lines.
+- A `no-mmproj` variant of all your models to maximize context? Automatic.
+- Size your main chat context to leave VRAM for embedding and rerank? Automatic.
+- Have some models use `q8_0` for KV cache? Yes.
+
+Scans model directories, reads YAML sidecar files, detects GPU VRAM, budgets memory across a matrix of models. Supports llama-server, vLLM, stable-diffusion, and whisper backends.
+
+## Quickstart ("It's alive" smoketest)
+
+The goal is a complete, working llama-swap config file. No sidecars needed: models without a `.md` sidecar get an empty stub written automatically, and context windows are sized for you — llama-swap finds all your models with reasonable contexts out of the box:
 
 ```sh
-uvx llama-packer --dry-run    # one-shot, no install (fetches from PyPI)
+git clone https://github.com/JeffKwasha/llama-packer.git
+cd llama-packer
+./extras/update
+uv run llama-packer --models-dir ~/models --output ~/llama-swap-config.yaml
+./llama-swap --config ~/llama-swap-config.yaml
 ```
 
-Or install it as a persistent, editable command (tracks source changes):
+Line 1 gets the code, line 2 enters it (the tool finds its binaries relative to here). Line 3 fetches the llama.cpp + llama-swap binaries. Line 4 builds the config from your models directory (swap `--output` for `--dry-run` to preview without writing files). Line 5 serves it.
 
-```sh
-uv pip install -e .          # exposes `llama-packer` on PATH
-llama-packer --dry-run
-```
-
-Or run straight from source without installing:
-
-```sh
-uv run llama-packer --dry-run
-```
-
-`llama-packer` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. Point it elsewhere with `--models-dir` (accepts several directories, each scanned independently), `--profiles`, and `--llama-server` (or `LLAMA_BIN_DIR`). Pass `--hf-home` to keep Hugging Face cache paths in their own `${HF_HOME}` macro instead of widening `${MODELS_DIR}`.
+`llama-packer` resolves `models/`, `profiles.yaml` (falls back to the bundled default), and `llama-b*/` build dirs relative to the current directory. `--models-dir` accepts several directories, each scanned independently. Use `--profiles` for a different profiles file, and `--llama-server` (or `LLAMA_BIN_DIR`) to point at your llama.cpp binaries. Pass `--hf-home` to keep Hugging Face cache paths in their own `${HF_HOME}` macro instead of widening `${MODELS_DIR}`.
 
 GGUF/safetensors files without a `.md` sidecar get an empty stub sidecar written automatically, so a directory of bare models works out of the box — fill it in whenever you like (until then identity comes from the filename, context from the default, role from the directory). Skip with `--no-stubs`. Stubs never land in HF `blobs/` trees; they sit beside the human-readable snapshot entry instead.
 
 Output goes to `config.yaml` (`--output` overrides the path) and a sibling `config.env` in the current directory. Print the version with `llama-packer --version`.
+
+## Beyond the smoketest
+
+The smoketest gets every model served. These are the things that are miserable to juggle by hand in bare llama-swap config, and straightforward with llama-packer:
+
+- **Aliases.** Give one model several names — `instruct`, `coding`, `thinking` — each with its own sampling parameters, switched per-request with no reload. Declared once in the sidecar's `modes:` (or generated from `profiles.yaml`); emitted as `filters.setParamsByID` overrides.
+- **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a `-text` alias that drops the projection to reclaim VRAM for a much larger text-only context window (plus a `-vision-Nk` best-effort entry keeping vision available at reduced context).
+- **A packed matrix.** Keep small models (embedders, rerankers, a quick draft model) loaded simultaneously alongside your main chat model, with VRAM budgeted across all of them so nothing OOMs. Each gets its own context sized to what actually fits.
+- **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
+
+The smoketest guesses from filenames; accuracy comes from sidecars. Have an agent fill in each model's `.md` (name, parameters, context length, capabilities, mmproj block) and re-run — same commands, a much better config.
 
 ## What it does
 
@@ -60,9 +77,10 @@ was removed — llama-swap modalities are text/audio/image/video), `[video]`
 adds video *input* (and *output* for omni/video-arch), `[audio]` adds audio
 *input* (Transcription badge), `[speech]` adds audio *output* — so a VLM
 never advertises "Image Gen", and output stays text unless `speech`/`video`
-output is declared. `mmproj:` is a companion filename, not a capability:
-declare `capabilities: [image]` explicitly or the projection costs VRAM
-without being advertised (warned in the run log). Dedicated `s2t`/`image` roles are for standalone STT /
+output is declared. `mmproj:` is a mapping, not a capability: declare
+`capabilities: [image]` (or `[image, video]`) inside the block — a bare
+filename is an error, and `image`/`video` claimed at top level instead is
+advertised by the text-only variant too (warned in the run log). Dedicated `s2t`/`image` roles are for standalone STT /
 diffusion micro-services; their modalities are fixed regardless of declared
 capabilities (`proxy` + `checkEndpoint: /` are emitted for them too).
 
@@ -74,8 +92,10 @@ name: gemma-4-12B-it-qat-UD-Q4_K_XL
 parameters: 12B
 context_length: 262144
 quantization: Q4_K_XL
-mmproj: gemma-4-12B-it-mmproj-F16.gguf
-capabilities: [image, tools, reasoning]
+mmproj:
+  file: gemma-4-12B-it-mmproj-F16.gguf
+  capabilities: [image]
+capabilities: [tools, reasoning]
 freethought: 0.55
 strengths: ["strong multimodal", "full 256K context"]
 weaknesses: ["MTP adds VRAM"]

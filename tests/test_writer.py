@@ -121,8 +121,11 @@ def test_chat_template_kwargs_exposed(make_model, tmp_path):
 def test_image_token_metadata_exposed(make_model, tmp_path):
     # Declared image token bounds flow to metadata (client-facing) and cmd.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
-    _, entry = _entry(make_model, "v", mmproj="v-mmproj.gguf",
-                      **{"image_min_tokens": 1024, "image_max_tokens": 4096})
+    _, entry = _entry(make_model, "v",
+                      mmproj={"file": "v-mmproj.gguf",
+                              "capabilities": ["image"],
+                              "image_min_tokens": 1024,
+                              "image_max_tokens": 4096})
     assert entry["metadata"]["image_min_tokens"] == 1024
     assert entry["metadata"]["image_max_tokens"] == 4096
     assert "--image-min-tokens 1024 --image-max-tokens 4096" in entry["cmd"]
@@ -264,8 +267,8 @@ def test_video_omni_outputs_video(make_model):
 
 def test_dropped_mmproj_removes_video_input(make_model, tmp_path):
     (tmp_path / "d-mmproj.gguf").write_bytes(b"x")
-    model = make_model("d", mmproj="d-mmproj.gguf",
-                       capabilities=["image", "video"])
+    model = make_model("d", mmproj={"file": "d-mmproj.gguf",
+                                    "capabilities": ["image", "video"]})
     _, entry = _build_entry(
         model,
         parallel=1,
@@ -286,7 +289,7 @@ def test_dropped_mmproj_removes_video_input(make_model, tmp_path):
 def test_mmproj_without_capability_warns(make_model, tmp_path, caplog):
     # Projection costs VRAM but is not advertised — must warn.
     (tmp_path / "w-mmproj.gguf").write_bytes(b"x")
-    model = make_model("w", mmproj="w-mmproj.gguf")
+    model = make_model("w", mmproj={"file": "w-mmproj.gguf"})
     with caplog.at_level(logging.WARNING, logger="llama_packer.writer"):
         _filter_supported([model], "q8_0")
     assert any("neither 'image' nor 'video'" in r.message
@@ -318,7 +321,8 @@ def test_speech_capability_adds_audio_output(make_model):
 
 def test_dropped_mmproj_removes_image_input_not_output(make_model, tmp_path):
     (tmp_path / "t-mmproj.gguf").write_bytes(b"x")
-    model = make_model("t", mmproj="t-mmproj.gguf", capabilities=["image"])
+    model = make_model("t", mmproj={"file": "t-mmproj.gguf",
+                                    "capabilities": ["image"]})
     _, entry = _build_entry(
         model,
         parallel=1,

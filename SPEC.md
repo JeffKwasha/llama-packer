@@ -219,7 +219,7 @@ max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-co
 
 ### Minimum useful context and vision (mmproj) skipping
 
-Chat models target a minimum useful context (`_MIN_USEFUL_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without vision (at the global `--spare`):
+Chat models target a minimum useful context (`_MIN_AGENTIC_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without the companion (at the global `--spare`) — the companion-on variant serving the block merged over the frontmatter, the companion-off variant serving the base frontmatter:
 
 - `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `image` capability. An on-demand **text-only variant** `<id>-text` (no `--mmproj`, `image` removed, `metadata.mmproj_skipped: true`, display name `[text]`) is emitted alongside so clients can pick the lower-memory serving.
 - `ctx_with < min_context` → the main entry **drops** mmproj and is renamed `<id>-text` — the invariant is that the bare `<id>` always serves vision when the model has one; every no-mmproj entry carries the `-text` suffix and `[text]` label so a client that knows nothing of server config can tell it is text-only from `/v1/models`. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, id-suffixed `-vision-<N>k` where `N = ctx_with // 1000` (e.g. 92567 → `-vision-92k`), display name `[vision Nk]`, keeping vision available at reduced context.
@@ -250,6 +250,9 @@ Embed/rerank models are auto-selected as the smallest model of each type, or mat
 | `coload_min_ctx` | 20480 | emb/rerank squeeze floor |
 | `ctx_gain_min` | 4096 | Minimum chat-context gain for a squeeze to be adopted |
 | `estimate_headroom` | 1.25 | Padding applied to *estimated* (not measured/pinned) co-load overheads |
+| `auto_parallel` | false | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins |
+| `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
+| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth |
 
 Invalid values warn and fall back to the default; the solve never fails on a bad knob.
 
@@ -444,9 +447,13 @@ modes:
 ---
 ```
 
-- **`modes`**: a map of mode name → full param set. The declared block is authoritative —
-  global profile sampling overrides are not applied for this model. Models may declare any
-  number of modes (commonly 1–3).
+- **`modes`**: a map of mode name → param set. Each declared mode layers over the
+  same-named resolved profile (or the fleet `defaults:` when no profile shares the
+  name) with the [single merge rule](#layer-merge-rule) — unspecified keys inherit
+  from below instead of being dropped, so `modes: {coding: {temperature: 0.2}}`
+  keeps the profile's `top_p`/`min_p`. The layered modes replace the global profile
+  sampling overrides for this model. Models may declare any number of modes
+  (commonly 1–3).
 - **`default_mode`**: which mode is the model's default. It is emitted under the bare
   `${MODEL_ID}` `setParamsByID` key; every other mode under `${MODEL_ID}:<mode>`. Falls back to
   the first declared mode.
@@ -454,11 +461,13 @@ modes:
   `repeat_penalty`, `freq_pen` (see `SAMPLING_KEYS`). Unknown or non-numeric values are
   ignored with a warning. Emission translates to the request-body JSON names llama-server
   parses (`pres_pen` → `presence_penalty`, `freq_pen` → `frequency_penalty`).
-- **Expressions**: a profile value of the form `"base * N"` (string starting with
-  `base *`) is evaluated against the `defaults:` value for that key — e.g.
-  `temperature: "base * 0.7"` with `defaults.temperature: 1.0` yields `0.7`.
-  Evaluation is sandboxed to the single name `base`; a failed expression warns
-  and falls back to the base value. Only keys present in `defaults:` can use it.
+- **Expressions**: a value of the form `"base * N"` (string starting with
+  `base *`) on a sampling key is evaluated against the merged value from the
+  layer below — e.g. `temperature: "base * 0.7"` over a below-value of `1.0`
+  yields `0.7`, so a high-temperature model stays high (only less so) while a
+  low one never increases. Evaluation is sandboxed to the single name `base`;
+  with no numeric value below it warns and the key is skipped (never emitted
+  raw).
 - **Schema**: per llama-swap, `setParamsByID` is a *filter* and is always nested under
   `filters:` in each model entry — a top-level key is silently ignored.
 - **Alias visibility**: each mode/profile key (`${MODEL_ID}`, `${MODEL_ID}:<mode>`,
@@ -794,10 +803,46 @@ Use `when: true` to match every model. Regex literals are easiest in YAML
 **single-quoted** or unquoted scalars — only double quotes interpret
 backslashes (`\.` stays literal in single quotes).
 
-**Merge semantics.** Settings seed from the model's own sidecar fields, then
-each matching rule is layered on top **last-match-wins per key** (CSS-like:
-rules read top→bottom as increasing specificity). So a later rule that changes
-`backend` does not clobber a `chat_template` set by an earlier rule.
+**Merge semantics.** One merge rule governs every layer
+(`utils.merge_layer`) — `defaults:` → profiles → sidecar frontmatter →
+override rules → companion block (see [Layer merge rule](#layer-merge-rule)).
+Settings seed from the model's own sidecar fields, then each matching rule is
+layered on top (CSS-like: rules read top→bottom as increasing specificity).
+So a later rule that changes `backend` does not clobber a `chat_template` set
+by an earlier rule — and a rule setting `loras:` appends to (rather than
+replacing) the sidecar's list.
+
+### Layer merge rule
+
+Layers bottom-to-top: directory/global `defaults:` → profiles → sidecar
+frontmatter → override rules (global, then directory-scoped outermost →
+innermost) → companion block. At each boundary the upper layer wins:
+
+- **Scalars** are replaced by the upper value.
+- **Dicts** merge recursively, per sub-key, upper winning
+  (`modes: {coding: {temperature: 0.2}}` keeps the below layer's `top_p`).
+- **Lists** union-append: order-preserving, de-duplicated
+  (`capabilities: [tools]` below + `[image]` above → `[tools, image]`).
+  String items starting with `-` remove instead (`[-image]` drops `image`);
+  removing an absent item is a no-op.
+- **`None` deletes the key outright** (`top_p: None` removes an inherited
+  `top_p`).
+- **`"base * N"`** strings on sampling keys evaluate against the merged
+  numeric value from the layer below (see [Sampling Modes](#sampling-modes)).
+
+A rule therefore never needs to restate a full list or dict for every model
+it applies to — it declares only the delta. To *remove* inherited list items
+use `-item`; to drop a key entirely use `None`.
+
+**Intrinsics.** Some keys are properties of the model itself, not serving
+choices: `capabilities`, `parameters`, `quantization`, `architecture`,
+`base_model`, `family`, `finetune`, `type` (`scope.INTRINSIC_KEYS`). They
+belong in sidecars — a scope's `defaults:` setting one warns (legal but
+questionable: it papers over an incomplete sidecar), and a sidecar *removing*
+an inherited capability (`capabilities: [-tools]`) warns too. Sidecars add;
+conditional serving belongs in a companion block, which appends exactly while
+served. No replace semantics exist anywhere: nothing in the codebase or its
+history needed lists to replace, so the rule has no replace case.
 
 **Precedence across scopes.** Global rules apply first, then directory-scoped
 rules outermost → innermost — so a closer scope beats a broader one beats
@@ -823,11 +868,14 @@ overrides:
 
 - **Scope**: both keys apply only to models under that directory.
 - **`defaults:`**: merged into each subtree sidecar's frontmatter, outermost →
-  innermost; authored sidecar values always win. Empty stub sidecars carry no
-  data, so defaults fill them naturally. The per-model identity keys `name`,
-  `model`, `ignore` may not be defaulted (validation error).
+  innermost, with the [single merge rule](#layer-merge-rule) — authored
+  sidecar values win per key, append to default lists, and delete with `None`.
+  Empty stub sidecars carry no data, so defaults fill them naturally. The
+  per-model identity keys `name`, `model`, `ignore` may not be defaulted
+  (validation error).
 - **`overrides:`**: standard rules (same validation and matching); applied
-  after global rules, outer scopes first — innermost wins per key.
+  after global rules, outer scopes first — innermost wins per key, same
+  merge rule (a rule declares only its delta).
 - **Paths**: `chat_template:` / `loras:` resolve relative to each *sidecar's*
   directory (not the models.yaml), so reference shared files with `../`.
 - **Entry-id collisions** are fatal: if two models slug to the same llama-swap
@@ -838,7 +886,8 @@ overrides:
 `reasoning-preserve`, plus the serving/companion choices `cache_type`,
 `parallel`, `mmproj`, `speculative`. Rules setting `mmproj`/`speculative`
 re-trigger companion resolution, so a rule can add or remove vision /
-speculative decoding per pattern.
+speculative decoding per pattern — an `mmproj` mapping block in a rule works
+exactly like one in a sidecar (same merge rule, same validation).
 
 **Backend inference.** When neither the sidecar nor any rule declares a
 `backend`, one is inferred from the model's file format (`backends.infer_backend`):
@@ -1059,14 +1108,53 @@ readable — blob hashes never appear in sidecars. Resolution:
 2. `$HF_HOME/hub/models--org--repo/snapshots/<rev>/file.gguf`, revision from
    `refs/main`, else the sole snapshot dir, else the newest by mtime.
 
-Companions resolve the same way after the local search misses:
-`mmproj:` / `speculative:` values are looked up in the sidecar's repo
-snapshot, with a single-glob fallback (`mmproj*.gguf`) covering HF's naming
+Companions resolve the same way after the local search misses: the block's
+`file:` (or the `speculative:` filename) is looked up in the sidecar's repo
+snapshot, with a single-glob fallback (`*mmproj*.gguf`) covering HF's naming
 variants (`mmproj-F16.gguf`, `mmproj-model-f16.gguf`, …). When no `mmproj:`
-is declared at all, the snapshot is fuzzy-scanned for a family-matching
-`*mmproj*.gguf`, mirroring the local-directory behavior. A value may also
-address another cached repo explicitly: `hub:<org>/<repo>:<file-or-glob>`.
-An ambiguous glob logs a warning and does not resolve.
+is declared at all, an HF snapshot that contains the model's own gguf is
+fuzzy-scanned for a family-matching `*mmproj*.gguf` (preferring
+`mmproj-(bf|fp|f)16`); local models require an explicit block (`false`
+silences). A value may also address another cached repo explicitly:
+`hub:<org>/<repo>:<file-or-glob>`. An ambiguous glob logs a warning and does
+not resolve.
+
+**Companion blocks.** `mmproj:` accepts `false` (disabled) or a mapping —
+bare filenames are an error, since a filename alone records no purpose:
+
+```yaml
+mmproj:
+  file: gemma-4-mmproj-F16.gguf
+  capabilities: [image]          # what serving this file adds
+  image_max_tokens: 4096         # only meaningful while served
+```
+
+`file` locates the companion; every other key is a conditional overlay
+merged over the frontmatter **only while the companion is served** (the same
+[layer merge rule](#layer-merge-rule) as every layer — lists append, `None`
+deletes). The companion-off variant serves the base frontmatter, so purpose
+is emergent: dropping the file strips exactly what the block contributed
+(`image` above), never hardcoded vision assumptions. A second serving form
+declares a draft purpose instead of vision:
+
+```yaml
+mmproj:
+  file: qwen3-mtp.gguf
+  mtp: true
+  mtp_spec_type: draft-mtp
+```
+
+Block keys must be builder-consumed serving keys; identity, placement, and
+backend selection (`name`, `model`, `ignore`, `mmproj`, `hf_repo`, `backend`,
+`role`) stay model-level and are rejected in the block. The standalone
+`speculative:` key (a separate draft file) is unchanged; a model may not
+declare MTP serving from both at once.
+
+The writer enforces the advertised-purpose invariant: a block declaring no
+`capabilities` warns (the companion's serving difference is unadvertised),
+and `image`/`video` claimed at top level but absent from the block warns too
+— the companion-off variant would advertise it without the file, so move it
+into the block.
 
 The HF cache root is `--hf-home` > profiles.yaml `hf_home:` >
 `$HF_HOME`/`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`. By default it
@@ -1173,7 +1261,9 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `reasoning-format` | str | llama-server `--reasoning-format` (`none`/`deepseek`/`deepseek-legacy`/`auto`). Chat + reasoning-capable models only; see [Reasoning](#reasoning) |
 | `reasoning-preserve` | bool | Emit `--reasoning-preserve`. Chat + reasoning-capable models only |
 | `cache_type` | str | KV-cache precision for `--cache-type-k/v` and VRAM sizing (sidecar > profile > `q8_0`); see [Cache precision](#cache-precision-cache_type) |
-| `parallel` | int | Parallel slots for `--parallel` and VRAM sizing (sidecar > profile > 1) |
+| `parallel` | int | Parallel slots for `--parallel` and VRAM sizing (sidecar > profile > 1). Declaring it opts out of auto-parallel for this model |
+| `min_context` | int | Per-model minimum useful context (tokens): explicit floor of the auto-parallel search and its score normalizer. Default cascade: pinned ctx → tool callers 131072 → half the max context (`--min-context` overrides the last two when explicitly set, never this key or a pin) |
+| `mmproj` | `false` \| mapping | Companion block: `file:` locates the projector/draft file (required); all other keys form a conditional overlay served only with the file (same merge rule as every layer). Bare filenames are an error. See [Companion blocks](#model-discovery-and-stub-sidecars) |
 | `image_min_tokens` / `image_max_tokens` | int | Vision (mmproj) only: floor/cap on image tokens per image → `--image-min-tokens`/`--image-max-tokens`. Dynamic-resolution archs only (Qwen-VL family; Gemma/SigLIP is fixed ~256 and warned+skipped). The cap also floors the solved context (`parallel × max` must fit); see [Image token budget](#image-token-budget-vision-sidecars) |
 | `ignore` | bool | Skip this model entirely |
 
@@ -1253,7 +1343,7 @@ This block is:
 | `_DEFAULT_CONTEXT_LENGTH` | 32768 | Fallback when no `.md` sidecar or GGUF context exists |
 | `_CTX_ROUND_TO` | 8192 | Round context size down to nearest boundary |
 | `_MIN_CTX_SIZE` | 4096 | Hard floor for context size |
-| `_MIN_USEFUL_CTX` | 131072 | Min useful chat context; mmproj dropped below this (`--min-context`) |
+| `_MIN_AGENTIC_CTX` | 131072 | Min useful chat context; mmproj dropped below this (`--min-context`) |
 | `_RESERVE_SYSTEM` | 1024 | MB reserved for OS/driver/scratch buffers |
 | `_RESERVE_VIDEO` | 1024 | MB reserved for GPU video output framebuffer |
 
