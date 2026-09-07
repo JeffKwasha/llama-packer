@@ -1,5 +1,9 @@
 # llama_packer/utils.py
-"""Shared utilities for llama-packer."""
+"""Shared utilities for llama-packer.
+
+Constants live in :mod:`llama_packer.consts`; this module holds
+general-purpose functions with simple input→output semantics.
+"""
 
 from __future__ import annotations
 
@@ -17,8 +21,18 @@ from pathlib import Path
 
 import yaml
 
-logger = logging.getLogger(__name__)
+from llama_packer.consts import (
+    _SAFETENSORS_DTYPE_BYTES,
+    _KV_CACHE_BYTES,
+    _NVME_READ_MBPS,
+    _SSD_READ_MBPS,
+    _HDD_READ_MBPS,
+    _UNKNOWN_READ_MBPS,
+    _DEFAULT_DIR_ROLES,
+    _DIFFUSION_ARCH_RES,
+)
 
+logger = logging.getLogger(__name__)
 
 # ── Command-line composition ──────────────────────────────────────────────
 # Launch commands are assembled from an ordered flag→value map so that a flag
@@ -88,38 +102,7 @@ def render_command(head: list[str], builtin_flags: list[str], global_args: str =
     return " ".join(out)
 
 
-# ── Defaults (can be overridden via profiles.yaml `defaults` section or env) ──
-_DEFAULT_CONTEXT_LENGTH = 32768
-_CTX_ROUND_TO = 8192
-_MIN_CTX_SIZE = 4096
-
-# Minimum context for a chat model to be useful for agentic work (tool-call
-# loops, long sessions); mmproj (vision) is dropped from the main entry when
-# keeping it would fall below this floor. 128k.
-_MIN_AGENTIC_CTX = 131072
-
-# VRAM reservation breakdown (MB)
-_RESERVE_SYSTEM = 1024
-_RESERVE_VIDEO = 1024
-
-# MTP defaults (per-model overrides via frontmatter keys)
-_MTP_SPEC_TYPE = "draft-mtp"
-_MTP_DRAFT_N_MAX = 2
-_MTP_DRAFT_P_MIN = 0.75
-
-# Launch commands are now composed per-backend in ``llama_packer/backends``
-# (llama-server, vLLM host/docker).  Each backend owns its own cmd shape, role
-# flags and feature flags; the model's `backend:` selection is driven entirely
-# by override rules (see ``llama_packer.overrides``).
-
-# Built-in defaults for the vLLM backend. Override via the `vllm:` section of
-# profiles.yaml and, for the image only, via --vllm-image.
-VLLM_DEFAULT_IMAGE = "vllm/vllm-openai:latest"
-VLLM_DEFAULT_BIN = "vllm"
-VLLM_DEFAULT_CONTAINER_PORT = 8000
-VLLM_DEFAULT_DOCKER_ARGS = "--runtime=nvidia --gpus all --shm-size=16g"
-VLLM_DEFAULT_GPU_MEM_UTIL = 0.9
-
+# ── Sampling parameter names ──────────────────────────────────
 # Sidecar/profile sampling parameter names accepted in llama-packer input.
 # These are llama.cpp CLI-style names.
 SAMPLING_KEYS = frozenset({
@@ -139,6 +122,7 @@ REQUEST_SAMPLING_KEYS = {
 def request_sampling_key(key: str) -> str:
     """Map a sidecar/profile sampling key to the request-body JSON key."""
     return REQUEST_SAMPLING_KEYS.get(key, key)
+
 
 _RE_Q_SUFFIX = re.compile(r"[-_.][iI]?Q\d[_A-Z0-9]*$")
 _RE_V_SUFFIX = re.compile(r"[-_][vV]\d.*")
@@ -211,6 +195,7 @@ def read_gguf_context_length(path: str | os.PathLike) -> int | None:
     architectural context limit as shipped — no RoPE/YaRN extension applied.
     """
     import struct
+    logger.info("reading GGUF header: %s", path)
     try:
         with open(path, "rb") as f:
             if f.read(4) != b"GGUF":
@@ -263,28 +248,6 @@ def read_gguf_context_length(path: str | os.PathLike) -> int | None:
     return None
 
 
-# Bytes per element for safetensors dtypes (used to size model weights).
-_SAFETENSORS_DTYPE_BYTES = {
-    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
-    "F8": 1, "F6E4M3FN": 1, "F6E5M2": 1, "F4": 1, "F6E2M1FN": 0.5,
-    "F3": 0.375, "F2": 0.25, "F1": 0.125,
-}
-
-# Approx bytes per element for KV-cache quantization (incl. block overhead).
-# Values are rounded up so any derived memory estimate errs toward reserving
-# more (avoid OOM).  This is also the set of cache types llama-packer can size.
-_KV_CACHE_BYTES = {
-    "q8_0": 1.0625, "q8_1": 1.0625, "q8_k": 1.0625,
-    "f16": 2.0, "bf16": 2.0, "f32": 4.0,
-    "q4_0": 0.5625, "q4_1": 0.625, "q4_k": 0.5625,
-    "q5_0": 0.6875, "q5_1": 0.75, "q5_k": 0.6875,
-    "q6_0": 0.8125, "q6_k": 0.8125,
-    "iq4_nl": 0.5625,
-    # 4-bit E2M1 + FP8 E4M3 block scales per 16 elements ≈ 0.5625 B/elem.
-    "nvfp4": 0.5625,
-}
-
-
 def estimate_safetensors(
     model_path: str | os.PathLike,
     cache_type: str = "q8_0",
@@ -299,6 +262,7 @@ def estimate_safetensors(
     per-layer k/v projection can be found to size the KV cache.
     """
     path = Path(model_path)
+    logger.info("reading safetensors header: %s", path)
     with path.open("rb") as fh:
         magic = fh.read(8)
         if len(magic) < 8:
@@ -342,15 +306,6 @@ def estimate_safetensors(
     return model_mib, kv_per_token_mib
 
 
-# Conservative real-world sequential read estimates (MB/s) by device class.
-# Not best-case marketing figures; chosen to bound the health-check timeout
-# safely. NVMe is set conservatively; SATA SSD/HDD use the operator's figures.
-_NVME_READ_MBPS = 1500
-_SSD_READ_MBPS = 300
-_HDD_READ_MBPS = 100
-_UNKNOWN_READ_MBPS = 100
-
-
 def _detect_drive_speed(model_paths: list[Path]) -> int:
     """Detect the slowest drive speed (MB/s) among the drives holding *model_paths*.
 
@@ -382,13 +337,13 @@ def _detect_drive_speed(model_paths: list[Path]) -> int:
                 speed, kind = _HDD_READ_MBPS, "HDD"
             else:
                 speed, kind = _SSD_READ_MBPS, "SATA SSD"
-            logger.info("drive: %s (%s) estimated %d MB/s", dev_name, kind, speed)
+            logger.debug("drive: %s (%s) estimated %d MB/s", dev_name, kind, speed)
             speeds.append(speed)
         except Exception:
             speeds.append(_UNKNOWN_READ_MBPS)
 
     if not speeds:
-        logger.info("drive: unknown, defaulting to %d MB/s", _UNKNOWN_READ_MBPS)
+        logger.debug("drive: unknown, defaulting to %d MB/s", _UNKNOWN_READ_MBPS)
         return _UNKNOWN_READ_MBPS
     return min(speeds)
 
@@ -503,26 +458,7 @@ def _is_ignored(rel_parts: tuple[str, ...], rel_path: str,
             return True
     return False
 
-# Default directory-name → role map for discovery.  The FIRST path component
-# of a model file (relative to a models-dir root) selects the role; files at
-# the root itself are chat.  Subdirectories absent from this map are not
-# served at all (e.g. ``img/`` for stable-diffusion-only models, ``misc/``,
-# ``tmp/``).  Extend or override via the profiles.yaml ``dirs:`` mapping;
-# ``--extra-dirs`` entries merge in too (backcompat).  Keys are matched
-# case-insensitively.
-_DEFAULT_DIR_ROLES = {
-    "chat": "chat",
-    "t2t": "chat",  # legacy name for the chat dir
-    "vision": "chat",
-    "doc": "chat",
-    "ocr": "chat",  # legacy name for the doc dir
-    "embed": "embeddings",
-    "rerank": "rerank",
-}
-
-# Roles a served directory may map to (companions are detected by filename,
-# never by directory).  ``s2t`` (whisper.cpp speech-to-text) and ``t2s``
-# (kokoro text-to-speech) are opt-in via profiles.yaml ``dirs:``, mirroring
+# Roles a served directory may map to
 # ``img: image``.
 SERVED_ROLES = ("chat", "embeddings", "rerank", "image", "s2t", "t2s")
 
@@ -559,17 +495,7 @@ def companion_kind(stem: str) -> str | None:
 # out of served text roles; the vocabulary below comes from converter
 # architecture strings and tensor names, never filenames.
 
-# Prefixes of stable-diffusion.cpp / ComfyUI ``general.architecture``
-# values (flux1, sdxl, sd3.5, wan2.1, …).  Architecture names are a
-# controlled vocabulary set by the gguf conversion scripts, so prefix
-# matching here is reliable — unlike filename matching (e.g. MiniMax H3).
-_DIFFUSION_ARCH_RES = tuple(re.compile(p, re.I) for p in (
-    r"^flux", r"^sd\d", r"^sdxl$", r"^ssd1", r"^stable-diffusion",
-    r"^chroma", r"^wan\d?", r"^hidream", r"^ltxv?$", r"^hunyuan",
-    r"^mochi", r"^cosmos", r"^auraflow", r"^pixart", r"^kandinsky",
-    r"^sana", r"^ace-?step", r"^omnigen", r"^qwen[-_]?image",
-    r"^z-?image", r"^ernie[-_]?image", r"^lumina", r"^sdx?-?l",
-))
+# Diffusion arch prefixes live in llama_packer.consts (_DIFFUSION_ARCH_RES).
 
 # Safetensors tensor-name fragments unique to diffusion weights (DiT/UNet/
 # VAE blocks).  Text-model transformers never use these block layouts.
@@ -603,6 +529,7 @@ def gguf_header_probe(path: str | os.PathLike) -> tuple[str | None, bool]:
     key = (str(path), st.st_mtime_ns)
     if key in _GGUF_PROBE_CACHE:
         return _GGUF_PROBE_CACHE[key]
+    logger.info("reading GGUF header: %s", path)
     arch: str | None = None
     has_ctx = False
     try:
@@ -658,6 +585,7 @@ def sniff_safetensors(path: str | os.PathLike, limit: int = 64) -> str:
     Reads only the JSON header, never tensor data.
     """
     import json
+    logger.info("reading safetensors header: %s", path)
     try:
         with open(path, "rb") as fh:
             magic = fh.read(8)
