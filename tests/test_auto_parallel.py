@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from llama_packer.profiles import Profiles
 from llama_packer.consts import _MIN_AGENTIC_CTX
 from llama_packer.writer import (
@@ -374,3 +372,22 @@ def test_plan_pools_spare_override_applies(make_model):
     _scripted_by_parallel(m, {1: 40000, 2: 0})
     v = _planner_with_pools(m, {"default": {"spare": "4G"}}).plan()["ap"][0]
     assert v.ctx_size == 40000 - 4096 * 2
+
+
+# ── serving pin guards ────────────────────────────────────────────────────
+
+def test_serving_pin_rejects_non_positive():
+    # a 0/negative pin previously crashed auto-parallel (ZeroDivisionError
+    # in parallel_value); treat it as absent instead
+    p = Planner.__new__(Planner)
+    p.max_context = None
+    assert p._serving_pin(_view(context_length=0)) is None
+    assert p._serving_pin(_view(context_length=-4096)) is None
+    p.max_context = 0
+    assert p._serving_pin(_view()) is None
+
+
+def test_serving_pin_positive_sidecar_survives_zero_cli():
+    p = Planner.__new__(Planner)
+    p.max_context = 0
+    assert p._serving_pin(_view(context_length=8192)) == 8192

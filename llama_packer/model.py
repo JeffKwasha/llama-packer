@@ -419,7 +419,7 @@ class Model:
         "role", "targets", "allow_profiles", "spare", "capabilities",
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
-        "cache_type", "parallel",
+        "cache_type", "parallel", "min_context",
         "image_min_tokens", "image_max_tokens",
 
     })
