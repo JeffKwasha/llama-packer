@@ -485,3 +485,112 @@ def test_coload_estimate_gets_headroom(profiles):
     assert result is not None
     # overhead = (1 + 100) * 1.25 = 126
     assert result.coloads == (("s2t", 126),)
+
+
+# ── unestimable models: conservative bound, never a crash ─────────────────
+
+
+def test_plan_unestimable_chat_floor_and_metadata(make_model, profiles):
+    from llama_packer.consts import ESTIMATE_ERROR_REASON
+
+    # No sidecar context_length: the floor cascade (no pin, no tools) is
+    # half the design context.
+    m = make("ue")
+    del m.frontmatter["context_length"]
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
+                      min_context=131072)
+    variants = planner.plan()["ue"]
+    assert len(variants) == 1
+    v = variants[0]
+    assert v.ctx_size == 16384
+    assert v.estimate_error == ESTIMATE_ERROR_REASON
+    config = emit_config([m], {"ue": variants}, profiles, TVARS)
+    meta = config["models"]["ue"]["metadata"]
+    assert meta["estimated"] is False
+    assert meta["estimate_error"] == ESTIMATE_ERROR_REASON
+    assert meta["ctx_size"] == 16384
+
+
+def test_matrix_unestimable_chat_joins_with_conservative_bound(
+        profiles, monkeypatch):
+    from llama_packer import writer
+
+    good = make("good", role="chat")
+    bad = make("bad", role="chat")
+    embed = make("e", role="embeddings")
+    for m in (good, embed):
+        _fake_vram(m, (1000, 0.5, 100))
+    bad.vram.effective_static = lambda *a, **k: None
+    bad.vram.fit_params_static = lambda *a, **k: None
+
+    captured = {}
+
+    def fake_solver(**kwargs):
+        captured.update(kwargs)
+        return 8192
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
+
+    planner = Planner([good, bad, embed], profiles, fit_bin="unused",
+                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
+                      embed_model=embed, rerank_model=embed)
+    plan = planner.plan()
+    # The unestimable chat model stays in the shared solve with the
+    # componentwise max of the measured quads (here == FP_PARAMS).
+    assert len(captured["chat_models"]) == 2
+    assert captured["chat_models"][1][1:5] == FP_PARAMS
+    assert "bad" in planner.synthetic_quads
+    assert bad.vram.unestimated_reason is not None
+    # It serves at the shared solved context and is flagged.
+    v = plan["bad"][0]
+    assert v.ctx_size == 8192
+    assert v.estimate_error is not None
+    # The measurable chat model plans normally at the same shared ctx.
+    assert plan["good"][0].ctx_size == 8192
+    assert plan["good"][0].estimate_error is None
+
+
+def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
+    from llama_packer import writer
+
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings", context_length=32768)
+    rerank = make("r", role="rerank", context_length=32768)
+    _fake_vram(chat, (8000, 0.5, 500))
+    for m in (embed, rerank):
+        m.vram.effective_static = lambda *a, **k: None
+        m.vram.fit_params_static = lambda *a, **k: None
+
+    captured = {}
+
+    def fake_solver(**kwargs):
+        captured.update(kwargs)
+        return 12000
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
+
+    planner = Planner([chat, embed, rerank], profiles, fit_bin="unused",
+                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
+                      embed_model=embed, rerank_model=rerank)
+    plan = planner.plan()
+    # Residents reserve the conservative bound (== measured chat quad here)
+    # and serve at the RAG minimum, not their design context.
+    assert captured["embed_params"] == (8000, 0.5, 0.0, 500)
+    assert captured["embed_ctx"] == 20480
+    assert "e" in planner.synthetic_quads and "r" in planner.synthetic_quads
+    for stem in ("e", "r"):
+        v = plan[stem][0]
+        assert v.ctx_size == 20480
+        assert v.estimate_error is not None
+
+
+def test_solve_matrix_aborts_when_nothing_measurable(profiles):
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings")
+    chat.vram.effective_static = lambda *a, **k: None
+    embed.vram.fit_params_static = lambda *a, **k: None
+    result = _solve_matrix_context(
+        [chat], embed, embed,
+        fit_bin="unused", vram_total=48 * 1024, spare=None,
+        profiles=profiles)
+    assert result is None

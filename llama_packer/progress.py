@@ -16,13 +16,49 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+#: Per-level style used when log records are rendered through the rich
+#: console while the bar is live (keeps the `X | message` log shape).
+_LEVEL_STYLES: dict[int, str] = {
+    logging.DEBUG: "dim",
+    logging.WARNING: "yellow",
+    logging.ERROR: "bold red",
+    logging.CRITICAL: "bold red",
+}
+
 try:
+    import rich.console as _rc
     import rich.progress as _rp
 
     _RICH_AVAILABLE = True
 except ImportError:  # rich is optional; every method below no-ops then
     _rp = None  # type: ignore[assignment]
+    _rc = None  # type: ignore[assignment]
     _RICH_AVAILABLE = False
+
+
+class _ConsoleLogHandler(logging.Handler):
+    """Render log records through the progress bar's rich console.
+
+    While a rich Live bar is on screen, plain writes to another stream
+    land *after* the bar and force it to redraw ("scrolling"). Records
+    printed via the bar's own console are positioned above it by rich.
+    """
+
+    def __init__(self, progress: "PackerProgress") -> None:
+        super().__init__()
+        self._progress = progress
+
+    def emit(self, record: logging.LogRecord) -> None:
+        progress = self._progress._progress
+        if progress is None:
+            return
+        text = f"{record.levelname[:1]} | {record.getMessage()}"
+        try:
+            progress.console.print(
+                text, style=_LEVEL_STYLES.get(record.levelno),
+                markup=False, highlight=False)
+        except Exception:
+            self.handleError(record)
 
 
 class PackerProgress:
@@ -39,6 +75,8 @@ class PackerProgress:
         self._task: Any = None
         self._total = 0
         self._done = 0
+        self._log_handler: _ConsoleLogHandler | None = None
+        self._saved_handlers: list[logging.Handler] | None = None
 
     def _active(self) -> bool:
         if not self._enabled or not _RICH_AVAILABLE or _rp is None:
@@ -62,11 +100,16 @@ class PackerProgress:
             assert _rp is not None
             # Fixed-width columns first (bar, counts, elapsed stay put);
             # the variable-width action label goes last so nothing jumps.
+            # Own console bound to stderr: log output (also stderr) shares
+            # this stream, and records printed via it land above the bar
+            # instead of fighting a separate stdout Live display.
+            console = _rc.Console(stderr=True, highlight=False)  # type: ignore[union-attr]
             self._progress = _rp.Progress(
                 _rp.BarColumn(),
                 _rp.TextColumn("{task.completed}/{task.total}"),
                 _rp.TimeElapsedColumn(),
                 _rp.TextColumn("[progress.description]{task.description}"),
+                console=console,
             )
             self._task = self._progress.add_task(description, total=total)
             self._progress.start()
@@ -74,6 +117,15 @@ class PackerProgress:
             logger.debug("progress bar start failed (%s); continuing without it", e)
             self._progress = None
             self._task = None
+            return
+        # Route logging through the bar's console so messages print above
+        # it; the plain stderr handler is restored on stop().
+        root = logging.getLogger()
+        self._saved_handlers = root.handlers[:]
+        for handler in self._saved_handlers:
+            root.removeHandler(handler)
+        self._log_handler = _ConsoleLogHandler(self)
+        root.addHandler(self._log_handler)
 
     def advance(self, description: str = "") -> None:
         """Tick one completed item, optionally updating the action label."""
@@ -98,3 +150,13 @@ class PackerProgress:
         finally:
             self._progress = None
             self._task = None
+        # Restore the handlers that were active before the bar started.
+        root = logging.getLogger()
+        if self._log_handler is not None:
+            root.removeHandler(self._log_handler)
+            self._log_handler = None
+        if self._saved_handlers is not None:
+            for handler in self._saved_handlers:
+                if handler not in root.handlers:
+                    root.addHandler(handler)
+            self._saved_handlers = None

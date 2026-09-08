@@ -29,6 +29,7 @@ from llama_packer.consts import (
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
+    ESTIMATE_ERROR_REASON,
 )
 from llama_packer.profiles import Profiles, parse_spare_mb
 from llama_packer.backends import (
@@ -241,6 +242,7 @@ def _build_entry(
     include_mmproj: bool = True,
     name_suffix: str = "",
     tools_demoted: bool = False,
+    estimate_error: str | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -421,6 +423,12 @@ def _build_entry(
         entry["description"] = model.description
     # The VRAM-served -c limit (vs. capabilities.context = max trained).
     metadata["ctx_size"] = ctx_size
+    # Client-facing estimate health: when no VRAM estimate source worked,
+    # the entry is served at its minimum useful context with a conservative
+    # matrix reserve — tell clients so they can treat it differently.
+    if estimate_error is not None:
+        metadata["estimated"] = False
+        metadata["estimate_error"] = estimate_error
     if metadata:
         entry["metadata"] = metadata
 
@@ -755,6 +763,9 @@ class Variant:
     vision_ctx: int | None = None
     coload: bool = False
     tools_demoted: bool = False
+    #: Non-None when the model has no usable VRAM estimate — surfaced to
+    #: clients as metadata.estimated=false / metadata.estimate_error.
+    estimate_error: str | None = None
 
 
 class Planner:
@@ -806,6 +817,10 @@ class Planner:
         self.matrix_result: MatrixSolve | None = None
         # Optional per-model tick (stem) for the progress bar; None in tests.
         self.progress_cb = progress_cb
+        # Quads synthesized for unestimable matrix participants (stem →
+        # (model_mib, kv_per_token, slot_mib, compute_mib)); see
+        # _solve_matrix_context. Kept for ledger resident charging.
+        self.synthetic_quads: dict[str, tuple[int, float, float, int]] = {}
 
     # ── bounded ctx: the single home of the clamp invariant ──
 
@@ -839,6 +854,30 @@ class Planner:
         if self.max_context is not None:
             ctx = min(ctx, self.max_context)
         return ctx
+
+    def _unestimated_ctx(self, view) -> int:
+        """Minimum useful context for a model with no VRAM estimate.
+
+        Type-based floor: a matrix chat model follows the shared solved
+        context like every chat (the solve charged exactly that for it);
+        chat without a matrix gets the per-model floor cascade; embeddings
+        and rerank get the matrix's RAG minimum.  Capped by the trained
+        design context and ``--max-context``.
+        """
+        if view.role in ("embeddings", "rerank"):
+            ctx = min(view.design_context, self.knobs.coload_min_ctx)
+        elif view.role == "chat" and self.chat_ctx is not None:
+            ctx = self.chat_ctx
+        else:
+            ctx = resolve_min_ctx(
+                view, pin_ctx=self._serving_pin(view),
+                tools_min_ctx=self.knobs.tools_min_ctx,
+                fallback_min_ctx=self.min_context,
+                fallback_explicit=self.min_context_explicit)
+        cap = view.design_context
+        if self.max_context is not None:
+            cap = min(cap, self.max_context)
+        return max(_MIN_CTX_SIZE, min(ctx, cap))
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
@@ -976,13 +1015,22 @@ class Planner:
         """Shared chat context when a matrix section is configured."""
         if not (self.matrix_cfg and self.embed_model and self.rerank_model):
             return None
+        synthetic: dict[str, tuple[int, float, float, int]] = {}
         result = _solve_matrix_context(
             self.models, self.embed_model, self.rerank_model,
             self.fit_bin, self.vram_total, self.spare, self.profiles,
             baseline_mb=self.baseline_mb, drop_stems=drop_stems,
             knobs=self.knobs, memory_margin=self.memory_margin,
-            llama_args=self.llama_args,
+            llama_args=self.llama_args, synthetic=synthetic,
         )
+        self.synthetic_quads = synthetic
+        # Flag the synthesized models so plan() serves them at their
+        # minimum useful context and emission marks them unestimated.
+        for stem in synthetic:
+            for m in self.models:
+                if m.stem == stem:
+                    m.vram.unestimated_reason = ESTIMATE_ERROR_REASON
+                    break
         if result is not None:
             logger.info("matrix: solved chat_ctx=%d (squeeze=%s, coloads=%s)",
                         result.chat_ctx, result.squeeze,
@@ -1011,8 +1059,10 @@ class Planner:
                 mb = self._resident_overhead(model, ctx)
                 pool = ledger.pool_id_for(model)
                 ledger.add_resident(f"{label}:{model.stem}", mb, pool)
-                logger.info("ledger: %s resident %s (%s bucket, pool %s)",
-                            label, model.stem, footprint_bucket(model), pool)
+                logger.info("ledger: %s resident %s (%s bucket, pool %s%s)",
+                            label, model.stem, footprint_bucket(model), pool,
+                            " — conservative bound"
+                            if model.stem in self.synthetic_quads else "")
             by_stem = {m.stem: m for m in self.models}
             for stem, mb in res.coloads:
                 m = by_stem.get(stem)
@@ -1032,6 +1082,10 @@ class Planner:
             quad = _static_params(
                 model, self.fit_bin, self.profiles.default_cache_type,
                 self.llama_args)
+            if quad is None:
+                # Unestimable resident: charge the same conservative bound
+                # the matrix solve used (see _solve_matrix_context).
+                quad = self.synthetic_quads.get(model.stem)
             if quad is None:
                 return 0
             mib, kv_factor, slot_mib, compute = quad
@@ -1071,6 +1125,11 @@ class Planner:
             view = model.view_for(include_mmproj)
             on_view = model.view_for(True)
             context_length = view.design_context
+            # Unestimable model: no measurement source worked. Serve at the
+            # minimum useful context (type-based floor) — the matrix solve
+            # already reserved a conservative bound for it — and mark every
+            # entry for client-facing metadata.
+            est_error = getattr(model.vram, "unestimated_reason", None)
             # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
             # RAG entry's served context (the emit is what frees the VRAM).
             if view.role == "embeddings" and self.matrix_result:
@@ -1109,7 +1168,10 @@ class Planner:
                     and "parallel" not in (view.frontmatter or {})
                     and not any("parallel" in resolved
                                 for _, resolved in group))
-                if auto:
+                group_parallel = parallel
+                if est_error is not None:
+                    ctx_size = self._unestimated_ctx(view)
+                elif auto:
                     pin_ctx = self._serving_pin(view)
                     floor = resolve_min_ctx(
                         view, pin_ctx=pin_ctx,
@@ -1130,19 +1192,30 @@ class Planner:
                         spare_mb=spare_eff, include_mmproj=include_mmproj,
                         design_ctx=self.chat_ctx,
                         context_length=context_length)
+                if est_error is None:
+                    # Discovery during this model's own solve: calc_ctx
+                    # flagged the model unestimable (no measurement source
+                    # worked) — re-plan it at the type floor.
+                    est_error = getattr(model.vram, "unestimated_reason", None)
+                    if est_error is not None:
+                        parallel = group_parallel
+                        ctx_size = self._unestimated_ctx(view)
 
                 vision_ctx: int | None = None
                 if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
-                    vision_ctx = self._bounded_ctx(
-                        on_view, parallel=parallel, cache_type=cache_type,
-                        spare_mb=spare_eff, include_mmproj=True,
-                        design_ctx=self.chat_ctx, context_length=context_length)
+                    vision_ctx = ctx_size if est_error is not None else (
+                        self._bounded_ctx(
+                            on_view, parallel=parallel, cache_type=cache_type,
+                            spare_mb=spare_eff, include_mmproj=True,
+                            design_ctx=self.chat_ctx,
+                            context_length=context_length))
 
                 variants.append(Variant(
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                     profiles_group=group, ctx_size=ctx_size,
                     include_mmproj=include_mmproj, vision_ctx=vision_ctx,
-                    coload=is_coload, tools_demoted=tools_demoted))
+                    coload=is_coload, tools_demoted=tools_demoted,
+                    estimate_error=est_error))
 
                 # On-demand text-only variant: when the main entry keeps its
                 # mmproj, also plan a no-vision entry (``<id>-text``) so
@@ -1151,15 +1224,18 @@ class Planner:
                 # separate variant is needed.
                 if (include_mmproj and view.role == "chat"
                         and model.mmproj and model.mmproj.gguf_path):
-                    text_ctx = self._bounded_ctx(
-                        model, parallel=parallel, cache_type=cache_type,
-                        spare_mb=spare_eff, include_mmproj=False,
-                        design_ctx=self.chat_ctx, context_length=context_length)
+                    text_ctx = ctx_size if est_error is not None else (
+                        self._bounded_ctx(
+                            model, parallel=parallel, cache_type=cache_type,
+                            spare_mb=spare_eff, include_mmproj=False,
+                            design_ctx=self.chat_ctx,
+                            context_length=context_length))
                     variants.append(Variant(
                         parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                         profiles_group=group, ctx_size=text_ctx,
                         include_mmproj=False, coload=is_coload,
-                        tools_demoted=tools_demoted))
+                        tools_demoted=tools_demoted,
+                        estimate_error=est_error))
             plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
@@ -1191,6 +1267,7 @@ def _solve_matrix_context(
     knobs: MatrixKnobs | None = None,
     memory_margin: float = _MEMORY_MARGIN,
     llama_args: str = "",
+    synthetic: dict[str, tuple[int, float, float, int]] | None = None,
 ) -> MatrixSolve | None:
     """Solve the shared VRAM budget for chat context plus co-loads.
 
@@ -1209,8 +1286,14 @@ def _solve_matrix_context(
     3. *Opportunistic co-loads* (§2): enabled ``s2t``/``image`` models not on
        the GPU pool's excluded list, smallest fixed overhead first, are
        included while the chat solve stays at or above the floor
-       (``tools_min_ctx`` when a tools chat model can keep it, else
-       ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+        (``tools_min_ctx`` when a tools chat model can keep it, else
+        ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+
+    Unestimable participants (every estimate source failed) stay in the
+    solve with a conservative bound — the componentwise max over the
+    measured quads — charged at their minimum useful context; synthesized
+    quads are reported through ``synthetic`` (stem → quad) so the planner
+    can flag the models and charge the ledger the same numbers.
 
     Returns the :class:`MatrixSolve` (chat context, adopted RAG contexts,
     included co-loads) or None on failure.
@@ -1223,7 +1306,13 @@ def _solve_matrix_context(
     # Get static params for chat models (companion VRAM folded in).
     # The drop decision (mmproj skipped to reach the min useful context) is
     # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
-    chat_params = []
+    # Two-phase: measure everything first, then give models with no
+    # estimate a conservative bound — the componentwise max over the
+    # measured quads — so an unestimable participant neither claims too
+    # little (under-reserve → OOM) nor kills the solve.
+    chat_params: list[tuple[Model, int, float, float, int, int, int]] = []
+    chat_meta: list[tuple[Model, int, int, tuple[int, float, float, int] | None]] = []
+    real_quads: list[tuple[int, float, float, int]] = []
     for m in chat_models:
         # Embed/rerank/image/s2t models are handled outside the shared chat
         # budget (fixed overhead / separate pool). Including a 40 GB
@@ -1235,22 +1324,16 @@ def _solve_matrix_context(
         on = m.view_for(m.stem not in drop_stems)
         cache_type = on.cache_type_for(profiles.default_cache_type)
         parallel = on.parallel_for(profiles.default_parallel)
-        fp = on.vram.effective_static(fit_bin, cache_type=cache_type,
-                                      include_mmproj=m.stem not in drop_stems,
-                                      llama_args=llama_args)
-        if fp is None:
-            logger.warning("matrix: could not get fit params for %s", m.stem)
-            continue
         img_floor = 0
         if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
                 and on.image_max_tokens):
             img_floor = on.image_max_tokens
-        model_mib, kv_factor, slot_mib, compute_mib = fp
-        chat_params.append((m, model_mib, kv_factor, slot_mib, compute_mib,
-                            parallel, img_floor))
-
-    if not chat_params:
-        return None
+        fp = on.vram.effective_static(fit_bin, cache_type=cache_type,
+                                      include_mmproj=m.stem not in drop_stems,
+                                      llama_args=llama_args)
+        if fp is not None:
+            real_quads.append(fp)
+        chat_meta.append((m, parallel, img_floor, fp))
 
     # Get static params for embed/rerank. CPU-resident models cost 0 VRAM.
     embed_params = None
@@ -1263,13 +1346,55 @@ def _solve_matrix_context(
         rerank_params = _static_params(rerank_model, fit_bin,
                                        profiles.default_cache_type,
                                        llama_args)
+    for quad in (embed_params, rerank_params):
+        if quad is not None:
+            real_quads.append(quad)
+
+    if not chat_meta:
+        # No chat participants: the shared solve has nothing to solve.
+        return None
+    if not real_quads:
+        logger.warning("matrix: no measurable model to bound unestimated "
+                       "participants; aborting shared solve")
+        return None
+    bound = (max(q[0] for q in real_quads), max(q[1] for q in real_quads),
+             max(q[2] for q in real_quads), max(q[3] for q in real_quads))
+
+    def _with_bound(quad: tuple[int, float, float, int] | None,
+                    stem: str) -> tuple[int, float, float, int]:
+        """Measured quad, or the conservative bound for an unestimable one."""
+        if quad is not None:
+            return quad
+        if synthetic is not None:
+            synthetic[stem] = bound
+        logger.warning(
+            "matrix: %s has no VRAM estimate; reserving a conservative "
+            "bound (weights %d MiB, KV %.3f MiB/token) at its minimum "
+            "useful context", stem, bound[0], bound[1])
+        return bound
+
+    for m, parallel, img_floor, fp in chat_meta:
+        quad = _with_bound(fp, m.stem)
+        chat_params.append((m, quad[0], quad[1], quad[2], quad[3],
+                            parallel, img_floor))
+
+    if embed_params is None and not embed_model.on_cpu:
+        embed_params = _with_bound(None, embed_model.stem)
+    if rerank_params is None and not rerank_model.on_cpu:
+        rerank_params = _with_bound(None, rerank_model.stem)
 
     # Reserve for embed/rerank at their own declared context (sidecar
     # context_length > GGUF architectural max), not an arbitrary constant —
     # a 32k reranker costs ~4x the KV of an 8k one and must be budgeted as
-    # declared.
+    # declared. An unestimable RAG resident serves at the matrix's minimum
+    # useful context instead: its KV is a bound, not a measurement, so it
+    # must not multiply an unknown KV factor by its full design context.
     embed_ctx = embed_model.design_context
     rerank_ctx = rerank_model.design_context
+    if synthetic and embed_model.stem in synthetic:
+        embed_ctx = min(embed_ctx, knobs.coload_min_ctx)
+    if synthetic and rerank_model.stem in synthetic:
+        rerank_ctx = min(rerank_ctx, knobs.coload_min_ctx)
 
     def _solve(embed_ctx_: int, rerank_ctx_: int,
                fixed_overhead_mb: int = 0) -> int:
@@ -1423,6 +1548,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 include_mmproj=v.include_mmproj,
                 name_suffix=" [text]" if text_only else "",
                 tools_demoted=v.tools_demoted,
+                estimate_error=v.estimate_error,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX
@@ -1445,6 +1571,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 include_mmproj=True,
                 name_suffix=f" [vision {n_k}k]",
                 tools_demoted=v.tools_demoted,
+                estimate_error=v.estimate_error,
             )
             vision_id += f"-vision-{n_k}k"
             if vision_id in entries:

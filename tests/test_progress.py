@@ -30,6 +30,49 @@ def test_progress_noop_under_pytest():
     p.stop()
 
 
+def test_active_bar_routes_logs_through_console(monkeypatch):
+    """While the bar is live, log records render through the bar's rich
+    console (which prints them ABOVE the bar) and the previous handlers are
+    restored on stop."""
+    import llama_packer.progress as prog
+
+    p = prog.PackerProgress(enabled=True)
+    monkeypatch.setattr(prog.PackerProgress, "_active", lambda self: True)
+    root = logging.getLogger()
+    before = [(type(h), h) for h in root.handlers]
+    p.start(2, "budgeting")
+    try:
+        assert p._progress is not None
+        assert any(isinstance(h, prog._ConsoleLogHandler)
+                   for h in root.handlers)
+        calls = []
+        monkeypatch.setattr(p._progress.console, "print",
+                            lambda *a, **k: calls.append(a))
+        logging.getLogger("test.active").warning("boom")
+        assert calls and "boom" in str(calls[0][0])
+    finally:
+        p.stop()
+    after = [(type(h), h) for h in root.handlers]
+    assert not any(isinstance(h, prog._ConsoleLogHandler) for h, _ in after)
+    assert after == before
+
+
+def test_active_bar_restores_handlers_even_on_stop_error(monkeypatch):
+    import llama_packer.progress as prog
+
+    p = prog.PackerProgress(enabled=True)
+    monkeypatch.setattr(prog.PackerProgress, "_active", lambda self: True)
+    root = logging.getLogger()
+    before = [(type(h), h) for h in root.handlers]
+    p.start(2, "budgeting")
+    assert any(isinstance(h, prog._ConsoleLogHandler) for h in root.handlers)
+    monkeypatch.setattr(p._progress, "stop",
+                        lambda: (_ for _ in ()).throw(RuntimeError("nope")))
+    p.stop()  # must not raise
+    after = [(type(h), h) for h in root.handlers]
+    assert after == before
+
+
 def test_estimator_forces_offline_and_restores(monkeypatch):
     from llama_packer import vllm_estimate
 

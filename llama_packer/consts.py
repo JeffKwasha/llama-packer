@@ -22,6 +22,16 @@ _MIN_CTX_SIZE = 4096
 # (tool-call loops, long sessions). 128k.
 _MIN_AGENTIC_CTX = 131072
 
+# Reason string emitted as metadata.estimate_error on entries for models
+# with no usable VRAM estimate (metadata.estimated=false): every estimate
+# source failed (fit-params measurement, safetensors header, vLLM
+# estimator). Such models are served at their minimum useful context, and
+# matrix participants reserve the largest measured model in the pool.
+ESTIMATE_ERROR_REASON = (
+    "no VRAM estimate available (measurement failed); served at minimum "
+    "useful context with a conservative (largest-measured) VRAM reserve"
+)
+
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # VRAM reservation (MB)
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
