@@ -54,3 +54,40 @@ Three separate causes — check in order:
    pin or explicit `min_context:`, the floor is unreachable and the model
    silently stays at 1 slot. Fix: set `min_context:` (e.g. half the max) or
    pin `context_length:` in the sidecar.
+
+## I deleted `derived:` from sidecars — do I have to run `--probe-memory`?
+
+No. Probes are **opt-in per-arch calibration** and run only when you pass
+`--probe-memory` explicitly. Deleting a `derived:` block triggers the
+normal pack-time path: the header-only llama-fit-params trio (~0.6 s × 3
+per model — a whole fleet re-measures in minutes, no VRAM used, no server).
+What you probably saw was the per-arch note
+
+    estimate uncorrected for arch 'qwen35' (mtp=False) — ctx/fit may
+    undercount draft and allocator terms; optional: --probe-memory qwen35 calibrates
+
+which is informational: uncalibrated arches estimate uncorrected (the
+estimate errs slightly optimistic about allocator overhead). The
+corrections live in the durable machine-local `serve-corrections.yaml`
+beside `profiles.yaml` — rows carry the witness `shape` and `ts`. Also:
+`llama-packer --remeasure` ignores saved blocks for one run without
+touching any files.
+
+## How do I tune `-b` / `-ub`?
+
+They are first-class planning keys, resolved sidecar > profile >
+`llama_server:` fleet section > role defaults (chat 2048/512, embed/rerank
+4096/512 — the llama.cpp builtins):
+
+```yaml
+llama_server:
+  ubatch: 512      # per-pass tokens: shapes the compute buffer
+  # batch: 2048    # logical batch: throughput only, no VRAM effect
+```
+
+or per model in the sidecar (`batch:` / `ubatch:`). Both render explicitly
+on every llama-server command; `ubatch` also stamps the VRAM measurement
+shape, so a change re-measures automatically. Do **not** put `-b`/`-ub` in
+`llama_server.args` or sidecar `cli_args:` — the named keys render after
+them and win per flag, and `cli_args` values are invisible to the
+measurement (a warning points this out).

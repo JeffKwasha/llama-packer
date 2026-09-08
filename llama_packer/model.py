@@ -1123,6 +1123,49 @@ class Model:
         """Sidecar ``cache_type`` when declared, else *default*."""
         return str(self.frontmatter.get("cache_type", default))
 
+    def batch_ubatch_for(
+        self,
+        profile: dict | None,
+        fleet: dict | None,
+        role_defaults: tuple[int, int],
+    ) -> tuple[int, int]:
+        """Resolved ``(batch, ubatch)`` for the serve command and the VRAM
+        measurement shape — sidecar ``batch:``/``ubatch:`` > profile keys >
+        fleet ``llama_server: batch:/ubatch:`` > role defaults (the llama.cpp
+        builtins).  Both render explicitly on every llama-server command;
+        ``ubatch`` also stamps the measurement shape (``-ub`` shapes the
+        compute buffer, ``batch`` measurably does not)."""
+        def tier(value: object, fallback: int, key: str) -> int:
+            if value is None:
+                return fallback
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                logger.warning("%s: %s=%r is not a positive integer; using %d",
+                               self.stem, key, value, fallback)
+                return fallback
+            try:
+                parsed = int(value)
+                assert parsed > 0
+            except (ValueError, AssertionError):
+                logger.warning("%s: %s=%r is not a positive integer; using %d",
+                               self.stem, key, value, fallback)
+                return fallback
+            return parsed
+
+        fm = self.frontmatter or {}
+        profile = profile or {}
+        fleet = fleet or {}
+        batch = tier(fm.get("batch"),
+                     tier(profile.get("batch"),
+                          tier(fleet.get("batch"), role_defaults[0], "batch"),
+                          "batch"),
+                     "batch")
+        ubatch = tier(fm.get("ubatch"),
+                      tier(profile.get("ubatch"),
+                           tier(fleet.get("ubatch"), role_defaults[1], "ubatch"),
+                           "ubatch"),
+                      "ubatch")
+        return batch, ubatch
+
     @property
     def cli_args(self) -> str:
         return self.frontmatter.get("cli_args", "")

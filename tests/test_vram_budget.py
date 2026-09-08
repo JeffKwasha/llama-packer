@@ -187,7 +187,7 @@ def test_calc_ctx_fits_design(make_model, fit_params_block):
 
 def test_calc_ctx_scales_down_and_rounds(make_model):
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
-          "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server"}
+          "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b", **{"derived": fm})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
     # remaining = 30720 - 26000 = 4720; X = 4720/(0.5*1) = 9440 -> rounded 8192
@@ -198,7 +198,7 @@ def test_calc_ctx_slot_mib_charged_per_slot(make_model):
     # A nonzero D is charged once per slot: at p=2 the KV pool doubles AND
     # the slot cost doubles, so the affordable per-slot context shrinks.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 300.0,
-          "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server"}
+          "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b2", **{"derived": fm})
     p1 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=1)
     p2 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=2)
@@ -207,13 +207,24 @@ def test_calc_ctx_slot_mib_charged_per_slot(make_model):
     assert p1 == 8192
     assert p2 == 4096
 
+def test_calc_ctx_floors_at_min(make_model, caplog):
+    import logging
 
-def test_calc_ctx_floors_at_min(make_model):
     fm = {"model_mib": 30000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
-          "compute_mib": 0, "cache_type": "q8_0", "source": "llama-server"}
+          "compute_mib": 0, "cache_type": "q8_0",
+          "source": "llama-server", "shape": ""}
     model = make_model("c", **{"derived": fm})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    with caplog.at_level(logging.WARNING):
+        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=1024)
     assert ctx == _MIN_CTX_SIZE
+    # The warning must say what the user gets and why: needs vs budget and
+    # the effect (served at minimum context).
+    msg = next(r.message for r in caplog.records
+               if "need" in r.message and "budget" in r.message)
+    assert "30000" in msg          # needs MiB
+    assert "29696" in msg          # budgeted MiB (32768 - 2048 - 1024)
+    assert "minimum context" in msg
+    assert str(_MIN_CTX_SIZE) in msg
 
 
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
@@ -226,7 +237,7 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
 
 def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
     fm = {"model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
-          "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server"}
+          "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("mm", **{"derived": fm})
     plain = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.0)
     margined = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.01)
@@ -396,7 +407,7 @@ def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
     # raised from the rounded-down value to the floor when affordable.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
-           "source": "llama-server"}
+           "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9000)
     ctx = model.view_for(True).vram.calc_ctx(
         32768, fit_bin="unused", include_mmproj=True)
@@ -410,7 +421,7 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
 
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
-           "source": "llama-server"}
+           "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=16384)
     with caplog.at_level(logging.WARNING):
         ctx = model.view_for(True).vram.calc_ctx(
@@ -425,7 +436,7 @@ def test_calc_ctx_image_floor_no_mmproj_no_floor(make_model, tmp_path):
     # image_max_tokens without an attached mmproj: no flags, no floor.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
-           "source": "llama-server"}
+           "source": "llama-server", "shape": ""}
     model = make_model("i", **{"derived": fit, "image_max_tokens": 9440})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
     assert ctx == 8192
@@ -435,7 +446,7 @@ def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
     # The -text variant serves no vision, so the floor must not apply.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
-           "source": "llama-server"}
+           "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9440)
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=False)
     assert ctx == 8192

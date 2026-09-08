@@ -89,6 +89,14 @@ class Profiles:
             }
         return pools
 
+    @property
+    def llama_server_cfg(self) -> dict:
+        """Raw ``llama_server:`` section (``args``, ``batch``, ``ubatch``,
+        ``env``).  ``batch``/``ubatch`` are the fleet tier of the named
+        batch-key cascade (sidecar > profile > fleet > role)."""
+        raw = self._cfg.get("llama_server")
+        return dict(raw) if isinstance(raw, dict) else {}
+
     # ── per-model selection ──
 
     def matched_for(self, model) -> list[tuple[str, dict]]:
@@ -105,24 +113,39 @@ class Profiles:
 
     def groups_for(self, model, vram_total: int,
                    spare_override: str | None = None) -> dict[tuple, list[tuple[str, dict]]]:
-        """Group the model's allowed profiles by (parallel, cache_type, spare_mb).
+        """Group the model's allowed profiles by
+        (parallel, cache_type, spare_mb, batch, ubatch).
 
         Each group shares one VRAM solve and one llama-swap entry; the profile
-        names within a group become ``setParamsByID`` keys.  When no profile
-        matches, a single group derived from ``defaults`` is returned.
+        names within a group become ``setParamsByID`` keys.  ``batch``/``ubatch``
+        are part of the key so per-profile values cannot collide inside one
+        entry's command (they render per entry and stamp the measurement
+        shape).  When no profile matches, a single group derived from
+        ``defaults`` is returned.
         """
+        try:
+            from llama_packer.backends import get_backend
+            role_defaults = get_backend(model.backend).default_batch_ubatch(model.role)
+        except Exception:
+            role_defaults = (2048, 512)
         groups: dict[tuple, list] = {}
         for pname, resolved in self.matched_for(model):
             parallel = model.parallel_for(resolved.get("parallel", 1))
             cache_type = model.cache_type_for(
                 str(resolved.get("cache_type", self.default_cache_type)))
             spare = self.spare_mb(resolved.get("spare"), spare_override, vram_total)
-            groups.setdefault((int(parallel), cache_type, spare), []).append((pname, resolved))
+            batch, ubatch = model.batch_ubatch_for(
+                resolved, self.llama_server_cfg, role_defaults)
+            groups.setdefault(
+                (int(parallel), cache_type, spare, batch, ubatch), []
+            ).append((pname, resolved))
 
         if not groups:
+            batch, ubatch = model.batch_ubatch_for(
+                None, self.llama_server_cfg, role_defaults)
             groups = {
                 (model.parallel_for(1), model.cache_type_for(self.default_cache_type),
-                 self.global_spare_mb(spare_override, vram_total)): [
+                 self.global_spare_mb(spare_override, vram_total), batch, ubatch): [
                     ("default", dict(self.defaults)),
                 ],
             }

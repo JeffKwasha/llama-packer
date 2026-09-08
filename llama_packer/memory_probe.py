@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 from llama_packer import gpu_state
 from llama_packer.consts import _MEASURE_CTX_CAP, _MIN_CTX_SIZE
+from llama_packer.profiles import Profiles
 from llama_packer.vram import (
     save_serve_correction,
 )
@@ -224,7 +225,8 @@ def affine_report(
                 "delta_c": c - est.kv_per_token_mib,
                 "delta_d": d - est.slot_mib,
                 "rep_stem": model.stem,
-                "cache_type": cache_type}
+                "cache_type": cache_type,
+                "shape": (llama_args or "").strip()}
         mtp_on, _ = model._mtp_info()
         save_serve_correction(model.arch or "unknown", cache_type, mtp_on,
                               corr)
@@ -293,6 +295,7 @@ def run_probe(
     only_archs: tuple[str, ...] | None = None,
     llama_args: str = "",
     is_fast: Callable[[str], bool] | None = None,
+    profiles: "Profiles | None" = None,
 ) -> str:
     """Full probe: pick representatives, calibrate corrections, validate.
 
@@ -301,8 +304,11 @@ def run_probe(
     Refuses to start beside a resident llama process (measurement
     validity is the whole point) and runs single-flight under the
     measurement lock; every serve run is journaled by
-    ``VramBudget._run_measure_server``.
+    ``VramBudget._run_measure_server``.  Each witness measures (and stamps
+    its correction row) under its resolved measurement shape
+    (:func:`writer.measurement_args`); *profiles* supplies the fleet tier.
     """
+    from llama_packer.writer import measurement_args
     residents = gpu_state.llama_residents()
     if residents:
         return ("probe: refusing to measure — llama processes resident:\n  "
@@ -315,8 +321,10 @@ def run_probe(
         gpu_state.journal({"mode": "probe", "archs": ", ".join(reps)})
         reports: list[dict | None] = []
         for arch, model in reps.items():
+            shape_args = (measurement_args(profiles, model, llama_args)
+                          if profiles is not None else llama_args)
             logger.info("probe: %s (arch %s) grid %s", model.stem, arch,
                         _probe_grid(model.design_context))
             reports.append(affine_report(model, fit_bin, server_bin,
-                                         cache_type, llama_args))
+                                         cache_type, shape_args))
         return format_reports(reports)

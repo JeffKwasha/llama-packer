@@ -84,7 +84,7 @@ def render_command(head: list[str], builtin_flags: list[str], global_args: str =
 
     1. ``builtin_flags`` — backend built-ins (``-c``, ``--parallel``, …)
     2. ``global_args``  — fleet-wide tuning flags (profiles.yaml ``<section>.args``)
-    3. ``role_flags``   — per-role flags (embed/rerank ``-b/-ub 4096``)
+    3. ``role_flags``   — per-role flags (embed/rerank ``-b/-ub`` batch sizes)
     4. ``cli_args``     — per-model sidecar ``cli_args:``
 
     The free-form sources are shlex-parsed here, so quoting errors surface at

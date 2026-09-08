@@ -67,6 +67,8 @@ class KokoroPodmanBackend(BaseBackend):
         cache_type: str,
         tvars: dict,
         include_mmproj: bool = True,
+        batch: int | None = None,
+        ubatch: int | None = None,
     ) -> tuple[str, dict]:
         image = tvars.get("kokoro_image") or _kokoro_image("cpu")
         vendor = tvars.get("kokoro_vendor", "cpu")

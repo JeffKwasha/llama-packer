@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # declaring them in a sidecar is flagged instead of silently doing nothing.
 _STATIC_IMAGE_ARCHES = frozenset({"gemma3", "gemma4"})
 _warned_static_arch: set[str] = set()
+_warned_cli_batch: set[str] = set()
 
 
 class LlamaServerBackend(BaseBackend):
@@ -29,13 +30,32 @@ class LlamaServerBackend(BaseBackend):
     handles = frozenset({
         "cli_args", "chat_template", "loras",
         "reasoning-format", "reasoning-preserve",
+        "batch", "ubatch",
     })
 
     # Per-role server-mode flags, appended after the shared core arguments.
+    # The batch half moved to first-class ``batch:``/``ubatch:`` planning
+    # keys (:meth:`default_batch_ubatch` holds the role defaults): ``-ub``
+    # sets the per-pass activation/logits buffer (~6 MiB per token on
+    # Vulkan, dominated by the vocab-sized logits rows) — -ub 4096 cost
+    # ~2.9 GiB of compute buffer per model where 512 (the llama.cpp default)
+    # costs ~0.3 GiB with no measurable throughput difference (2026-09-08).
     _ROLE_FLAGS = {
-        "embeddings": "--embedding --embd-normalize 2 -b 4096 -ub 4096",
-        "rerank": "--rerank --pooling rank -b 4096 -ub 4096",
+        "embeddings": "--embedding --embd-normalize 2",
+        "rerank": "--rerank --pooling rank",
     }
+
+    # (batch, ubatch) per role — the llama.cpp builtins for chat, tuned
+    # depth for embed/rerank.  Consulted by the Planner's resolution
+    # cascade (sidecar > profile > fleet > role).
+    _ROLE_BATCH = {
+        "chat": (2048, 512),
+        "embeddings": (4096, 512),
+        "rerank": (4096, 512),
+    }
+
+    def default_batch_ubatch(self, role: str) -> tuple[int, int]:
+        return self._ROLE_BATCH.get(role, (2048, 512))
 
     def is_available(self, avail: dict) -> bool:
         return bool(avail.get("llama_bin"))
@@ -97,7 +117,24 @@ class LlamaServerBackend(BaseBackend):
         cache_type: str,
         tvars: dict,
         include_mmproj: bool = True,
+        batch: int | None = None,
+        ubatch: int | None = None,
     ) -> tuple[str, dict]:
+        # First-class batch keys render explicitly in the per-role slot
+        # (named flags win over conflicting fleet args, lose to cli_args —
+        # which is why cli_args -b/-ub is warned about).
+        role_flags = self._ROLE_FLAGS.get(model.role, "")
+        if batch is not None or ubatch is not None:
+            default_batch, default_ubatch = self.default_batch_ubatch(model.role)
+            role_flags += f" -b {batch or default_batch} -ub {ubatch or default_ubatch}"
+        cli = (model.frontmatter.get("cli_args") or "").strip()
+        if any(tok in ("-b", "-ub") for tok in cli.split()):
+            msg = (f"{model.stem}: cli_args carries -b/-ub — shadowed by the "
+                   f"rendered batch/ubatch and invisible to the VRAM "
+                   f"measurement; use the batch:/ubatch: keys instead")
+            if msg not in _warned_cli_batch:
+                _warned_cli_batch.add(msg)
+                logger.warning(msg)
         flags = [
             "--port", "${PORT}",
             "-m", str(model.gguf_path),
@@ -139,7 +176,7 @@ class LlamaServerBackend(BaseBackend):
         cmd = utils.render_command(
             [tvars.get("llama_bin", "")], flags,
             global_args=tvars.get("llama_args") or "",
-            role_flags=self._ROLE_FLAGS.get(model.role, ""),
-            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
+            role_flags=role_flags,
+            cli_args=cli,
         )
         return cmd, meta

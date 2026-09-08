@@ -178,14 +178,19 @@ A single measurement cannot separate `c` from `D`, so the system measures a
 former per-parallel sweeps.
 
 Values are persisted to the model's `.md` sidecar `derived:` block — **per
-`cache_type`, parallel-independent by construction** (the `parallel` and
+`cache_type` and per measured flag `shape`** (the exact measurement flag
+string: global args + the resolved `-ub`; the compute buffer depends on
+batch size and flash attention, so blocks are never reused across shapes —
+a profiles/batch-key change re-measures instead of serving stale compute
+terms).  **Parallel-independent by construction** (the `parallel` and
 legacy `ctx_factor` keys of the pre-affine schema are removed on rewrite).
 A `cache_type` change invalidates the block and re-measures: `c` would scale
 with KV precision (`_KV_CACHE_BYTES` byte ratios), but `D`'s precision
 behavior is arch-dependent (SWA ring buffers scale, fixed slot overhead does
 not), so blocks are never derived across cache types — re-measuring costs
-~1 s. Pre-affine blocks (no `slot_mib`) are stale by definition and are
-re-measured + rewritten on the next run.
+~1 s. Pre-affine blocks (no `slot_mib`) and pre-shape blocks (no `shape`)
+are stale by definition and are re-measured + rewritten on the next run.
+`--remeasure` skips the saved-block path for one run (never a server).
 
 **Fallback chain:** saved frontmatter → in-memory cache → `llama-fit-params` (p=1/p=2 pair) → safetensors header estimation (`c` only, `D=0`).
 
@@ -1022,9 +1027,13 @@ sources overwrite earlier values). The same order applies to every backend:
 
 1. backend built-in flags (`-c`, `--parallel`, …) — including per-model
    feature flags (mmproj, loras, MTP, reasoning)
-2. global `<section>.args` — so e.g. `-b 512` tunes chat models only:
-   llama-server's per-role `-b`/`-ub` (next tier) win on embed/rerank
-3. per-role flags (`embeddings`/`rerank` `-b 4096 -ub 4096`)
+2. global `<section>.args` — so e.g. `-b 512` tunes chat models only
+3. per-role flags (embed/rerank mode flags) **+ the resolved named batch
+   keys** — `batch:`/`ubatch:` (sidecar > profile > `llama_server:` fleet
+   section > role defaults: chat 2048/512, embed/rerank 4096/512) render
+   explicitly on every llama-server command and win over conflicting
+   `args` values; `cli_args` `-b`/`-ub` is warned about (shadowed, and
+   invisible to the VRAM measurement)
 4. per-model sidecar `cli_args:`
 
 Note that the map keys on exact flag spelling: `-fa` and `--flash-attn` are
@@ -1368,8 +1377,10 @@ derived:
   kv_per_token_mib: 0.0312
   slot_mib: 12.5
   compute_mib: 512
-  source: fit-params
+  source: fit-estimate
   cache_type: q8_0
+  shape: "--flash-attn on -ub 512"
+  ts: 2026-09-08T18:11:17-0400
   file:
     size_mb: 4848
     size_bytes: 5084001234
@@ -1378,6 +1389,16 @@ derived:
     context_length: 131072
     kind: text
 ```
+
+**Serve corrections.** Per-arch family rows measured by the opt-in
+`--probe-memory` (fit-params estimate vs real llama-server truth) live in
+the durable machine-local `serve-corrections.yaml` beside `profiles.yaml`
+(gitignored; `LLAMA_PACKER_CORRECTIONS` relocates it; the retired
+`~/.cache` JSON stays readable as a fallback). Each row records the
+witness `shape` + `ts`; rows measured under a different shape still apply
+(the deltas are mostly allocator-level bias), with a one-time per-arch
+note. Uncalibrated arches estimate uncorrected — one note per arch, never
+an error, and never a probe requirement.
 
 This block is:
 - Read automatically on subsequent runs (avoids re-measurement and

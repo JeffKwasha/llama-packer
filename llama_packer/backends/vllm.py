@@ -201,6 +201,8 @@ class VllmHostBackend(BaseBackend):
         cache_type: str,
         tvars: dict,
         include_mmproj: bool = True,
+        batch: int | None = None,
+        ubatch: int | None = None,
     ) -> tuple[str, dict]:
         gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
         vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
@@ -228,6 +230,8 @@ class VllmDockerBackend(VllmHostBackend):
         cache_type: str,
         tvars: dict,
         include_mmproj: bool = True,
+        batch: int | None = None,
+        ubatch: int | None = None,
     ) -> tuple[str, dict]:
         # Per-model sidecar `vllm_image:` overrides the global default.
         gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
