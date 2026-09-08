@@ -1061,7 +1061,7 @@ class Planner:
                 ledger.add_resident(f"{label}:{model.stem}", mb, pool)
                 logger.info("ledger: %s resident %s (%s bucket, pool %s%s)",
                             label, model.stem, footprint_bucket(model), pool,
-                            " — conservative bound"
+                            " — no reserve (unestimated)"
                             if model.stem in self.synthetic_quads else "")
             by_stem = {m.stem: m for m in self.models}
             for stem, mb in res.coloads:
@@ -1083,8 +1083,8 @@ class Planner:
                 model, self.fit_bin, self.profiles.default_cache_type,
                 self.llama_args)
             if quad is None:
-                # Unestimable resident: charge the same conservative bound
-                # the matrix solve used (see _solve_matrix_context).
+                # Unestimable resident: charged 0 — the no-expansion rider
+                # policy (see _solve_matrix_context).
                 quad = self.synthetic_quads.get(model.stem)
             if quad is None:
                 return 0
@@ -1127,8 +1127,8 @@ class Planner:
             context_length = view.design_context
             # Unestimable model: no measurement source worked. Serve at the
             # minimum useful context (type-based floor) — the matrix solve
-            # already reserved a conservative bound for it — and mark every
-            # entry for client-facing metadata.
+            # carries it with no extra reserve — and mark every entry for
+            # client-facing metadata.
             est_error = getattr(model.vram, "unestimated_reason", None)
             # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
             # RAG entry's served context (the emit is what frees the VRAM).
@@ -1290,10 +1290,11 @@ def _solve_matrix_context(
         ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
 
     Unestimable participants (every estimate source failed) stay in the
-    solve with a conservative bound — the componentwise max over the
-    measured quads — charged at their minimum useful context; synthesized
-    quads are reported through ``synthetic`` (stem → quad) so the planner
-    can flag the models and charge the ledger the same numbers.
+    solve with a zero-cost placeholder — charged nothing extra — served at
+    their minimum useful context, assumed to fit within the set's measured
+    allocation. Synthesized stems are reported through ``synthetic`` (stem
+    → quad) so the planner can flag the models and charge the ledger the
+    same numbers.
 
     Returns the :class:`MatrixSolve` (chat context, adopted RAG contexts,
     included co-loads) or None on failure.
@@ -1307,9 +1308,9 @@ def _solve_matrix_context(
     # The drop decision (mmproj skipped to reach the min useful context) is
     # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     # Two-phase: measure everything first, then give models with no
-    # estimate a conservative bound — the componentwise max over the
-    # measured quads — so an unestimable participant neither claims too
-    # little (under-reserve → OOM) nor kills the solve.
+    # estimate a zero-cost placeholder — the rider stays in the set at its
+    # minimum useful context and is assumed to fit the measured allocation
+    # without expanding it (no extra reserve).
     chat_params: list[tuple[Model, int, float, float, int, int, int]] = []
     chat_meta: list[tuple[Model, int, int, tuple[int, float, float, int] | None]] = []
     real_quads: list[tuple[int, float, float, int]] = []
@@ -1357,21 +1358,25 @@ def _solve_matrix_context(
         logger.warning("matrix: no measurable model to bound unestimated "
                        "participants; aborting shared solve")
         return None
-    bound = (max(q[0] for q in real_quads), max(q[1] for q in real_quads),
-             max(q[2] for q in real_quads), max(q[3] for q in real_quads))
 
     def _with_bound(quad: tuple[int, float, float, int] | None,
                     stem: str) -> tuple[int, float, float, int]:
-        """Measured quad, or the conservative bound for an unestimable one."""
+        """Measured quad, or a zero-cost placeholder for an unestimable one.
+
+        Policy: the rider stays in the set at its minimum useful context and
+        is assumed to fit within the set's measured allocation — it does not
+        expand it (no extra reserve). Runtime OOM on such a rider is the
+        accepted risk; the entry is flagged ``estimated: false``.
+        """
         if quad is not None:
             return quad
         if synthetic is not None:
-            synthetic[stem] = bound
+            synthetic[stem] = (0, 0.0, 0.0, 0)
         logger.warning(
-            "matrix: %s has no VRAM estimate; reserving a conservative "
-            "bound (weights %d MiB, KV %.3f MiB/token) at its minimum "
-            "useful context", stem, bound[0], bound[1])
-        return bound
+            "matrix: %s has no VRAM estimate; serving it in the set at its "
+            "minimum useful context with no extra reserve (assumed to fit "
+            "the measured allocation)", stem)
+        return (0, 0.0, 0.0, 0)
 
     for m, parallel, img_floor, fp in chat_meta:
         quad = _with_bound(fp, m.stem)
@@ -1387,7 +1392,7 @@ def _solve_matrix_context(
     # context_length > GGUF architectural max), not an arbitrary constant —
     # a 32k reranker costs ~4x the KV of an 8k one and must be budgeted as
     # declared. An unestimable RAG resident serves at the matrix's minimum
-    # useful context instead: its KV is a bound, not a measurement, so it
+    # useful context instead: with no measurement its KV is unknown, so it
     # must not multiply an unknown KV factor by its full design context.
     embed_ctx = embed_model.design_context
     rerank_ctx = rerank_model.design_context

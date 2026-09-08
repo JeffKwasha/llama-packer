@@ -241,6 +241,39 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
     return min(cands, key=lambda m: m.vram_mb)
 
 
+def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
+    """Resolve the swap-matrix configuration before build_config.
+
+    Returns (matrix_cfg, embed_model, rerank_model). Without a ``matrix:``
+    section the matrix is disabled — make that state visible when the fleet
+    actually has RAG models, otherwise a silently missing co-loading setup
+    looks exactly like a bug (it has, repeatedly).
+    """
+    matrix_cfg = profiles_cfg.get("matrix")
+    embed_model = None
+    rerank_model = None
+    if not matrix_cfg:
+        emb = _select_model(models, "embeddings", args.embed, logger)
+        rnk = _select_model(models, "rerank", args.rerank, logger)
+        if emb is not None or rnk is not None:
+            logger.warning(
+                "matrix: disabled — profiles.yaml has no matrix: section; "
+                "RAG co-loading off (emb: %s, rnk: %s)",
+                emb.stem if emb else "none", rnk.stem if rnk else "none")
+        return None, None, None
+    embed_model = _select_model(models, "embeddings", args.embed, logger)
+    rerank_model = _select_model(models, "rerank", args.rerank, logger)
+    if embed_model is None:
+        logger.warning("no embeddings model found; skipping matrix")
+        return None, None, None
+    if rerank_model is None:
+        logger.warning("no rerank model found; skipping matrix")
+        return None, None, None
+    logger.info("matrix embed: %s", embed_model.stem)
+    logger.info("matrix rerank: %s", rerank_model.stem)
+    return matrix_cfg, embed_model, rerank_model
+
+
 # Var-name prefix per co-load role, used in set expressions
 # (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
 _COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
@@ -619,21 +652,8 @@ def main(argv: list[str] | None = None) -> None:
                     template_vars["gpu_mem_util"])
 
     # Detect matrix configuration before build_config
-    matrix_cfg = profiles_cfg.get("matrix")
-    embed_model = None
-    rerank_model = None
-    if matrix_cfg:
-        embed_model = _select_model(models, "embeddings", args.embed, logger)
-        rerank_model = _select_model(models, "rerank", args.rerank, logger)
-        if embed_model is None:
-            logger.warning("no embeddings model found; skipping matrix")
-            matrix_cfg = None
-        elif rerank_model is None:
-            logger.warning("no rerank model found; skipping matrix")
-            matrix_cfg = None
-        else:
-            logger.info("matrix embed: %s", embed_model.stem)
-            logger.info("matrix rerank: %s", rerank_model.stem)
+    matrix_cfg, embed_model, rerank_model = _detect_matrix(
+        profiles_cfg, models, args, logger)
 
     # Build config (progress bar appears only once the denominator is
     # known — total=len(models); without rich / non-TTY it is a no-op).
