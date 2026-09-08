@@ -161,3 +161,59 @@ def test_expand_matrix_sets_no_coloads_drops_placeholder(caplog):
     assert out["rag"] == "(c1) & emb & rnk"
     assert out["leading"] == "(c1)"
     assert "__COLOAD_VARS__" in caplog.text
+
+
+def _stub_model(stem, role):
+    from types import SimpleNamespace
+    return SimpleNamespace(stem=stem, role=role, frontmatter={},
+                           name=stem, template_id=stem, vram_mb=100)
+
+
+def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
+              _stub_model("c1", "chat")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    with caplog.at_level(logging.WARNING):
+        cfg, emb, rnk = _detect_matrix({}, models, args,
+                                       logging.getLogger("test"))
+    assert cfg is None and emb is None and rnk is None
+    assert "matrix: disabled" in caplog.text
+    assert "emb1" in caplog.text and "rnk1" in caplog.text
+
+
+def test_detect_matrix_silent_without_rag_models(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("c1", "chat")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    with caplog.at_level(logging.WARNING):
+        cfg, _, _ = _detect_matrix({}, models, args,
+                                   logging.getLogger("test"))
+    assert cfg is None
+    assert "matrix: disabled" not in caplog.text
+
+
+def test_detect_matrix_selects_when_section_present(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
+              _stub_model("c1", "chat")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    matrix_cfg = {"sets": {"rag": "__CHAT_VARS__ & emb & rnk"}}
+    with caplog.at_level(logging.WARNING):
+        cfg, emb, rnk = _detect_matrix({"matrix": matrix_cfg}, models, args,
+                                       logging.getLogger("test"))
+    assert cfg is matrix_cfg
+    assert emb.stem == "emb1" and rnk.stem == "rnk1"
+    assert "matrix: disabled" not in caplog.text

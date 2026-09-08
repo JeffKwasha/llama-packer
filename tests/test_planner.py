@@ -511,8 +511,7 @@ def test_plan_unestimable_chat_floor_and_metadata(make_model, profiles):
     assert meta["ctx_size"] == 16384
 
 
-def test_matrix_unestimable_chat_joins_with_conservative_bound(
-        profiles, monkeypatch):
+def test_matrix_unestimable_chat_rides_free(profiles, monkeypatch):
     from llama_packer import writer
 
     good = make("good", role="chat")
@@ -535,11 +534,11 @@ def test_matrix_unestimable_chat_joins_with_conservative_bound(
                       vram_total=64 * 1024, matrix_cfg={"sets": {}},
                       embed_model=embed, rerank_model=embed)
     plan = planner.plan()
-    # The unestimable chat model stays in the shared solve with the
-    # componentwise max of the measured quads (here == FP_PARAMS).
+    # The unestimable chat model stays in the shared solve but rides free:
+    # zero quad — no expansion of the set's measured allocation.
     assert len(captured["chat_models"]) == 2
-    assert captured["chat_models"][1][1:5] == FP_PARAMS
-    assert "bad" in planner.synthetic_quads
+    assert captured["chat_models"][1][1:5] == (0, 0.0, 0.0, 0)
+    assert planner.synthetic_quads["bad"] == (0, 0.0, 0.0, 0)
     assert bad.vram.unestimated_reason is not None
     # It serves at the shared solved context and is flagged.
     v = plan["bad"][0]
@@ -573,9 +572,10 @@ def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
                       vram_total=64 * 1024, matrix_cfg={"sets": {}},
                       embed_model=embed, rerank_model=rerank)
     plan = planner.plan()
-    # Residents reserve the conservative bound (== measured chat quad here)
-    # and serve at the RAG minimum, not their design context.
-    assert captured["embed_params"] == (8000, 0.5, 0.0, 500)
+    # Riders are charged nothing extra (zero quads) and serve at the RAG
+    # minimum, not their design context.
+    assert captured["embed_params"] == (0, 0.0, 0.0, 0)
+    assert captured["rerank_params"] == (0, 0.0, 0.0, 0)
     assert captured["embed_ctx"] == 20480
     assert "e" in planner.synthetic_quads and "r" in planner.synthetic_quads
     for stem in ("e", "r"):
