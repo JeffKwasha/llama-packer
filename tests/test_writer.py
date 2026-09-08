@@ -44,7 +44,8 @@ def test_cpu_resident_uses_cpu_layers(make_model):
 
 def test_capabilities_context_is_max_trained_not_served(make_model):
     # capabilities.context must advertise the model's max trained context, not
-    # the VRAM-served -c limit; the served limit stays in metadata.ctx_size.
+    # the VRAM-served per-slot limit; the served limit stays in
+    # metadata.ctx_size.
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -54,7 +55,7 @@ def test_capabilities_context_is_max_trained_not_served(make_model):
     )
     assert entry["capabilities"]["context"] == 32768
     assert entry["metadata"]["ctx_size"] == 4096
-    assert "--ctx-size 4096" in entry["cmd"] or "-c 4096" in entry["cmd"]
+    assert "--kv-unified-per-slot 4096" in entry["cmd"]
 
 
 def test_vllm_binary_cmd(make_model):

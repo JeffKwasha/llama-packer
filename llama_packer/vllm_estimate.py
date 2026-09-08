@@ -44,6 +44,14 @@ def estimate_vllm(
         logger.debug("vllm-memory-estimator not installed; skipping")
         return None
 
+    logger.info("estimating vLLM memory: %s", hf_repo)
+    import os
+    # Never download model weights: the estimator only needs config/tokenizer
+    # metadata, and any weight fetch would be far over the 5MB budget. Force
+    # the HF hub client offline for the duration of the call; the caller falls
+    # back to the local safetensors-header estimate when this returns None.
+    prev_offline = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
     try:
         _summary, est = estimate_from_inputs(EstimatorInputs(
             model_id=hf_repo,
@@ -54,6 +62,11 @@ def estimate_vllm(
     except Exception as e:
         logger.warning("vllm-memory-estimator failed for %s: %s", hf_repo, e)
         return None
+    finally:
+        if prev_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = prev_offline
 
     model_mib = int(est.parameters.nominal_gib * 1024)
     compute_mib = int(

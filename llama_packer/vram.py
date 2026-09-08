@@ -1,15 +1,45 @@
-"""VRAM budget calculation: fit-params measurement, context sizing, and
+"""VRAM budget calculation: affine memory measurement, context sizing, and
 matrix solving.
 
-Extracted from ``model.py`` to separate VRAM calculation concerns from the
-Model class. ``FitParams`` values persist in the sidecar ``measured:``
-block (``Model.persist_measured`` is the single writer).
+The VRAM law (validated across families; see :mod:`llama_packer.memory_probe`
+and docs/plans/auto-parallel.md):
+
+    VRAM(C, p) = model_mib + compute_mib + c*C + p*D
+
+``C`` is the *total* shared KV pool (llama.cpp ``-c``; byte-identical to
+``--kv-unified-per-slot X -np p`` with pool ``p*X``), ``c`` the shared
+per-token cost, and ``D`` the fixed per-slot cost.  Every serve-shaped
+extra — MTP draft weights and KV, hybrid-arch recurrent-state (RS) caches,
+batch-size compute, slot overhead — is affine in ``(C, p)``, so a
+three-run measurement trio under the exact flags the server will run
+with pins the law from device totals alone:
+
+    D = t(C, 2) - t(C, 1)          # the fixed term cancels
+    c = 2 * (t(C, 1) - t(C/2, 1)) / C   # the pool difference cancels it
+    fixed = t(C, 1) - c*C - D
+
+Measurements come from real ``llama-server`` runs (device buffer lines in
+the ``-lv 5`` log), not ``llama-fit-params`` — fit-params reports the KV
+pool only, blind to the RS cache, the draft, and the batch-dependent
+compute, which is exactly the undercount that made Dirk spill 4.8 GB into
+GTT (2026-09-07; see docs/plans/auto-parallel.md).
+
+``FitParams`` values persist in the sidecar ``measured:`` block — per
+``cache_type`` (blocks are never derived across cache types) — and are
+keyed by ``source``: blocks from the retired fit-params measurement are
+rejected on load and re-measured.  ``Model.persist_measured`` is the
+single writer.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,9 +51,12 @@ from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DRAFT_COMPUTE_MB,
     _DRAFT_CTX_SAFETY,
-    _KV_CACHE_BYTES,
-    _MMPROJ_COMPUTE_MB,
     _MIN_CTX_SIZE,
+    _MMPROJ_COMPUTE_MB,
+    _MEASURE_CTX_CAP,
+    _MEASURE_TIMEOUT_S,
+    _MTP_DRAFT_N_MAX,
+    _MTP_SPEC_TYPE,
     _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
     _SD_COMPUTE_MB,
@@ -41,45 +74,218 @@ logger = logging.getLogger(__name__)
 
 # ── FitParams: persisted categorized VRAM measurements ──────────────────
 
-# Required keys in the fit-params frontmatter block
-_FIT_PARAMS_REQUIRED = frozenset({"model_mib", "ctx_factor", "compute_mib"})
+# Required keys in the measured frontmatter block
+_FIT_PARAMS_REQUIRED = frozenset(
+    {"model_mib", "kv_per_token_mib", "slot_mib", "compute_mib"})
 
 # Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
                      **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
                      **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
 
+# Persisted blocks acceptable without re-measurement.  The retired plain
+# fit-params measurement (KV-pool only, no corrections) is deliberately
+# absent.
+_MEASURED_SOURCES = frozenset(
+    {"llama-server", "fit-estimate", "vllm-estimate",
+     "safetensors-estimate"})
+
+# Device buffer lines in a llama.cpp ``-lv 5`` log: weights, per-context KV
+# and recurrent-state pools, compute reserves, output buffers.
+_BUFFER_RE = re.compile(
+    r"(?:load_tensors|llama_kv_cache|llama_memory_recurrent|sched_reserve"
+    r"|llama_context):\s+(\S+)\s+(model|KV|RS|compute|output)"
+    r"\s+buffer size\s*=\s*([\d.]+)\s*MiB")
+
+
+def _is_device_buffer(dev: str) -> bool:
+    """True when *dev* names device-resident memory (not host-visible)."""
+    return not (dev.endswith("_Host") or dev.startswith("CPU")
+                or "Mapped" in dev)
+
+
+def parse_device_buffers(log_text: str) -> dict[str, float]:
+    """Sum device-resident buffer lines of a llama-server ``-lv 5`` log.
+
+    Returns MiB per component: ``weights`` (max across load passes — the
+    final pass reports real numbers, earlier fit-projection passes may
+    print 0 under on-demand loading), ``kv``, ``rs``, ``compute`` and
+    ``output`` (sums across every context the process created: the main
+    context plus the MTP draft context when one is built).  Host-visible
+    buffers (``Vulkan_Host``, ``CPU_Mapped``) are excluded: they live in
+    GTT/system RAM, not VRAM.
+    """
+    weights: dict[str, float] = {}
+    totals = {"kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
+    comp_by_token = {"model": "weights", "KV": "kv", "RS": "rs",
+                     "compute": "compute", "output": "output"}
+    for m in _BUFFER_RE.finditer(log_text):
+        dev, token, mib = m.group(1), m.group(2), float(m.group(3))
+        if not _is_device_buffer(dev):
+            continue
+        comp = comp_by_token[token]
+        if comp == "weights":
+            weights[dev] = max(weights.get(dev, 0.0), mib)
+        else:
+            totals[comp] += mib
+    return {"weights": sum(weights.values()), **totals}
+
+
+def _free_port() -> int:
+    """A bindable localhost port for a throwaway measurement server."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def affine_from_pair(
+    ctx_mib_1: float, ctx_mib_2: float, total_ctx: float,
+) -> tuple[float, float]:
+    """Derive ``(c, D)`` from two measurements at the same total context.
+
+    ``D`` is the per-slot cost (``ctx(2) − ctx(1)``); ``c`` the remaining
+    per-token KV share.  ``total_ctx`` must be the full ``-c`` pool the two
+    measurements were taken at.  Negative measurement noise clamps ``D``
+    to zero (err toward reserving more).
+    """
+    slot_mib = max(float(ctx_mib_2 - ctx_mib_1), 0.0)
+    kv_per_token = (ctx_mib_1 - slot_mib) / total_ctx if total_ctx > 0 else 0.0
+    return kv_per_token, slot_mib
+
+
+# llama-fit-params ``-lv 5`` log lines (0.6 s per run, no tensor data read):
+# the device report row plus the exact KV-pool and recurrent-state sizes.
+_FIT_REPORT_RE = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", re.M)
+_FIT_KV_RE = re.compile(r"llama_kv_cache:\s+size =\s*([\d.]+) MiB")
+_FIT_RS_RE = re.compile(
+    r"llama_memory_recurrent:\s+size =\s*([\d.]+) MiB \( *(\d+) cells")
+
+
+def parse_fit_log(log_text: str) -> dict[str, float] | None:
+    """Parse a llama-fit-params ``--fit-print on --fit off -lv 5`` run.
+
+    Returns ``{model, context, compute, kv, rs, rs_cells}`` (MiB; the
+    device row only — the ``Host`` row is skipped), or None when the
+    report row is missing.
+    """
+    for m in _FIT_REPORT_RE.finditer(log_text):
+        dev = m.group(1)
+        if dev == "Host" or dev.endswith("_Host"):
+            continue
+        kv = _FIT_KV_RE.search(log_text)
+        rs = _FIT_RS_RE.search(log_text)
+        return {
+            "model": int(m.group(2)),
+            "context": int(m.group(3)),
+            "compute": int(m.group(4)),
+            "kv": float(kv.group(1)) if kv else 0.0,
+            "rs": float(rs.group(1)) if rs else 0.0,
+            "rs_cells": int(rs.group(2)) if rs else 0,
+        }
+    return None
+
+
+# ── per-arch serve corrections (measured once by --probe-memory) ─────────
+
+
+def _corrections_path() -> Path:
+    """Cache file holding the measured per-arch serve corrections.
+
+    Corrections are hardware/backend-specific (allocator overhead, RS
+    geometry differences between estimate and serve), so they live in a
+    machine-local cache, not in the repo.
+    """
+    base = os.environ.get("LLAMA_PACKER_CACHE_DIR")
+    root = Path(base) if base else Path.home() / ".cache" / "llama-packer"
+    return root / "serve-corrections.json"
+
+
+def get_serve_correction(
+    arch: str, cache_type: str, mtp_on: bool,
+) -> dict | None:
+    """The measured ``(delta_fixed, delta_c, delta_d)`` row for an arch.
+
+    Rows are written by ``--probe-memory`` (serve-shaped llama-server grid
+    on the family representative minus the fast fit-params estimate) and
+    keyed by ``arch | cache_type | mtp``.  Returns None when uncalibrated.
+    """
+    try:
+        with open(_corrections_path()) as f:
+            table = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return table.get(f"{arch}|{cache_type}|{int(mtp_on)}")
+
+
+def save_serve_correction(
+    arch: str, cache_type: str, mtp_on: bool, row: dict,
+) -> None:
+    """Persist one correction row (merges into the existing table)."""
+    path = _corrections_path()
+    table: dict = {}
+    try:
+        with open(path) as f:
+            table = json.load(f)
+    except (OSError, ValueError):
+        table = {}
+    table[f"{arch}|{cache_type}|{int(mtp_on)}"] = row
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(table, f, indent=1, sort_keys=True)
+
+
+# The llama-server readiness marker: every buffer line precedes it.
+_MEASURE_READY = "listening on http"
+
+# Role batch flags repeated after the global args (later flags win in
+# llama.cpp), so the measurement sees the same compute the serve does.
+_MEASURE_ROLE_BATCH = {
+    "embeddings": ("-b", "4096", "-ub", "4096"),
+    "rerank": ("-b", "4096", "-ub", "4096"),
+}
+
 
 @dataclass
 class FitParams:
-    """Categorized VRAM measurements for a model.
+    """Affine VRAM constants for a model at one cache precision.
 
-    These are constant for a given (model, cache_type, parallel) combination,
-    so they can be persisted to sidecar frontmatter and reused across runs.
+    Constant for a given (model, cache_type) pair — parallel-independent by
+    construction — so they persist to sidecar frontmatter and are reused
+    across runs.
 
     Attributes:
-        model_mib:   Weight-loading cost (constant regardless of context)
-        ctx_factor:  MiB per token (linear KV-cache factor)
-        compute_mib: Fixed compute overhead
-        source:      How values were obtained ("fit-params" or "safetensors-estimate")
-        cache_type:  KV cache quantization these values were measured with
-        parallel:    Parallel slots these values were measured with
+        model_mib:         Weight-loading cost (constant regardless of
+                           context or slots)
+        kv_per_token_mib:  ``c`` — per-token cost of everything that scales
+                           with the total pool (full-attention KV + MTP
+                           draft KV when the server runs one)
+        slot_mib:          ``D`` — fixed VRAM per parallel slot (recurrent
+                           state cells + SWA ring buffers + slot overhead)
+        compute_mib:       Compute/workspace buffers and any other constant
+                           term (max over the p=1/p=2 measurement pair)
+        source:            How values were obtained ("llama-server",
+                           "vllm-estimate", "safetensors-estimate")
+        cache_type:        KV cache quantization these values were measured
+                           with (blocks are never derived across types)
     """
 
     model_mib: int
-    ctx_factor: float
+    kv_per_token_mib: float
+    slot_mib: float
     compute_mib: int
     source: str
     cache_type: str
-    parallel: int
 
     @classmethod
-    def from_dict(cls, d: object, cache_type: str, parallel: int) -> FitParams | None:
+    def from_dict(cls, d: object, cache_type: str) -> FitParams | None:
         """Validate and construct from a frontmatter dict.
 
         Returns None if the block is missing, incomplete, has non-numeric
-        values, or if cache_type/parallel don't match the current request
-        (stale values trigger re-computation).
+        values, if cache_type doesn't match the current request, or if the
+        block predates the serve-shaped measurement (``source`` "fit-params"
+        or absent: those numbers undercount the RS cache, the MTP draft and
+        the batch-dependent compute, so they are re-measured).
         """
         if not isinstance(d, dict):
             return None
@@ -87,35 +293,45 @@ class FitParams:
             return None
         try:
             model_mib = int(d["model_mib"])
-            ctx_factor = float(d["ctx_factor"])
+            kv_per_token_mib = float(d["kv_per_token_mib"])
+            slot_mib = float(d["slot_mib"])
             compute_mib = int(d["compute_mib"])
         except (TypeError, ValueError):
             return None
-        if model_mib <= 0 or ctx_factor <= 0 or compute_mib < 0:
+        if model_mib <= 0 or kv_per_token_mib <= 0 or slot_mib < 0 \
+                or compute_mib < 0:
             return None
         saved_cache = str(d.get("cache_type", ""))
-        saved_parallel = int(d.get("parallel", 1))
-        if saved_cache != str(cache_type) or saved_parallel != int(parallel):
+        if saved_cache != str(cache_type):
+            return None
+        source = str(d.get("source", ""))
+        if source not in _MEASURED_SOURCES:
             return None
         return cls(
             model_mib=model_mib,
-            ctx_factor=ctx_factor,
+            kv_per_token_mib=kv_per_token_mib,
+            slot_mib=slot_mib,
             compute_mib=compute_mib,
-            source=str(d.get("source", "fit-params")),
+            source=source,
             cache_type=saved_cache,
-            parallel=saved_parallel,
         )
 
     def to_dict(self) -> dict:
         """Serialize to a frontmatter nested dict."""
         return {
             "model_mib": self.model_mib,
-            "ctx_factor": self.ctx_factor,
+            "kv_per_token_mib": self.kv_per_token_mib,
+            "slot_mib": self.slot_mib,
             "compute_mib": self.compute_mib,
             "source": self.source,
             "cache_type": self.cache_type,
-            "parallel": self.parallel,
         }
+
+    def vram_mib(self, ctx_per_slot: int, parallel: int = 1) -> int:
+        """Predicted VRAM at (per-slot context, slots) — the affine law."""
+        pool = ctx_per_slot * parallel
+        return int(self.model_mib + self.compute_mib
+                   + self.kv_per_token_mib * pool + self.slot_mib * parallel)
 
 
 # ── VramBudget: per-model VRAM calculator ────────────────────────────────
@@ -127,9 +343,9 @@ class VramBudget:
     Holds a reference to the ``Model`` for gguf_path, design context, and
     companion sizes.  Fit-params values are checked in this order:
 
-    1. ``saved`` property (persisted in sidecar frontmatter)
+    1. ``saved_for`` (persisted in sidecar frontmatter, per cache_type)
     2. in-memory ``_static_cache`` (within process lifetime)
-    3. ``llama-fit-params`` binary subprocess
+    3. ``llama-fit-params`` binary subprocess (one p=1/p=2 pair)
     4. safetensors header estimation (fallback)
 
     When values are newly computed, they are persisted to the sidecar.
@@ -137,79 +353,62 @@ class VramBudget:
 
     def __init__(self, model: Model) -> None:
         self.model = model
-        self._cache: dict[tuple, tuple[int, int, int]] = {}
-        self._static_cache: dict[tuple, FitParams] = {}
-        self._effective_cache: dict[tuple, tuple[int, float, int]] = {}
-        self._companion_cache: dict[tuple, tuple[int, float, int]] = {}
+        self._cache: dict[tuple, dict[str, float]] = {}
+        self._serve_cache: dict[tuple, dict[str, float]] = {}
+        self._static_cache: dict[str, FitParams] = {}
+        self._effective_cache: dict[tuple, tuple[int, float, float, int]] = {}
+        self._companion_cache: dict[tuple, tuple[int, float, float, int]] = {}
         self._logged: set[str] = set()
 
     # ── saved fit-params from frontmatter ──
 
-    def saved_for(self, cache_type: str, parallel: int) -> FitParams | None:
+    def saved_for(self, cache_type: str) -> FitParams | None:
         """Return the persisted measured block when it matches the *requested*
-        cache type and parallel slot count.
+        cache type.
 
-        Validating against the requested values (not the sidecar-declared ones)
-        is what makes a cache-type or parallel change invalidate a stale block
-        and force a re-derivation instead of reusing mismatched numbers.
+        Validating against the requested value (not the sidecar-declared
+        one) is what makes a cache-type change invalidate a stale block and
+        force a re-measurement instead of reusing mismatched numbers.  Any
+        legacy block (pre-affine: no ``slot_mib``) also fails validation and
+        is re-measured + rewritten.
         """
         raw = self.model.measured_block()
         if raw is None:
             return None
-        return FitParams.from_dict(raw, cache_type, parallel)
-
-    def _scale_ctx_factor(self, base: FitParams, cache_type: str) -> FitParams:
-        """Derive params for *cache_type* from *base* by scaling the KV factor.
-
-        KV-cache memory per token is linear in per-element bytes, so the
-        context factor scales by the byte ratio between the two precisions;
-        weights and compute are precision-independent.  Round the factor up
-        (never down) so the estimate errs toward reserving more.
-        """
-        ratio = _KV_CACHE_BYTES[cache_type] / _KV_CACHE_BYTES.get(base.cache_type, 1.0625)
-        ctx_factor = base.ctx_factor * ratio
-        return FitParams(
-            model_mib=base.model_mib,
-            ctx_factor=ctx_factor,
-            compute_mib=base.compute_mib,
-            source="fit-params-scaled",
-            cache_type=cache_type,
-            parallel=base.parallel,
-        )
-
-    def _saved_base(self, parallel: int) -> FitParams | None:
-        """Saved fit-params with a matching parallel count, any cache type."""
-        raw = self.model.measured_block()
-        if not isinstance(raw, dict):
-            return None
-        if int(raw.get("parallel", 1)) != int(parallel):
-            return None
-        return FitParams.from_dict(raw, str(raw.get("cache_type", "q8_0")), parallel)
+        return FitParams.from_dict(raw, cache_type)
 
     # ── raw fit-params binary call ──
 
+    #: Cache value of :meth:`fit_params`: the report triple plus the
+    #: KV-pool and recurrent-state lines of the ``-lv 5`` log.
     def fit_params(
         self,
         fit_bin: str,
         fit_ctx: int | None = None,
-        fit_target_mib: int | None = None,
         cache_type: str = "q8_0",
         parallel: int = 1,
         model_path: str | None = None,
         label: str | None = None,
-    ) -> tuple[int, int, int] | None:
-        """Run llama-fit-params and return (model_mib, context_mib, compute_mib).
+        llama_args: str = "",
+    ) -> dict[str, float] | None:
+        """Run llama-fit-params and parse its buffer report.
 
-        Returns None on failure (binary missing, timeout, parse error).
-        ``label`` is used in log messages instead of the model stem (useful
-        when measuring a companion GGUF).
+        Returns a dict with ``model``/``context``/``compute`` (the report
+        triple, MiB), ``kv`` (the KV pool size from the ``-lv 5`` log) and
+        ``rs``/``rs_cells`` (the recurrent-state cache total and cell
+        count — hybrid models only, zeros otherwise), or None on failure
+        (binary missing, timeout, parse error).  ``llama_args`` are the
+        profiles global flags (flash attention, batch sizes) the eventual
+        serve will run with — compute depends on them.  ``label`` is used
+        in log messages instead of the model stem (useful when measuring a
+        companion GGUF).
         """
         if model_path is None:
             if self.model.gguf_path is None:
                 return None
             model_path = str(self.model.gguf_path)
         label = label or self.model.stem
-        cache_key = (model_path, fit_ctx, fit_target_mib, cache_type, parallel)
+        cache_key = (model_path, fit_ctx, cache_type, parallel, llama_args)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -217,20 +416,21 @@ class VramBudget:
             fit_bin,
             "--fit-print", "on",
             "--fit", "off",
+            "-lv", "5",
             "-m", str(model_path),
             "--cache-type-k", cache_type,
             "--cache-type-v", cache_type,
         ]
-        if fit_target_mib is not None:
-            cmd += ["--fit-target", str(fit_target_mib)]
         if fit_ctx is not None:
             cmd += ["-c", str(fit_ctx)]
         if parallel > 1:
             cmd += ["--parallel", str(parallel)]
+        cmd += llama_args.split()
 
         logger.info("measuring VRAM: %s via llama-fit-params", label)
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=60)
         except subprocess.TimeoutExpired:
             logger.warning("fit-params timeout for %s", label)
             return None
@@ -241,17 +441,10 @@ class VramBudget:
             logger.warning("fit-params failed for %s: %s", label, e)
             return None
 
-        for line in out.stdout.splitlines():
-            parts = line.strip().split()
-            if len(parts) == 4 and parts[0].startswith("Vulkan"):
-                try:
-                    model_mib = int(parts[1])
-                    context_mib = int(parts[2])
-                    compute_mib = int(parts[3])
-                    self._cache[cache_key] = (model_mib, context_mib, compute_mib)
-                    return model_mib, context_mib, compute_mib
-                except ValueError:
-                    pass
+        parsed = parse_fit_log(out.stdout + "\n" + out.stderr)
+        if parsed is not None:
+            self._cache[cache_key] = parsed
+            return parsed
 
         if out.returncode != 0:
             msg = f"fit-params crashed for {label} (exit {out.returncode})"
@@ -266,87 +459,269 @@ class VramBudget:
                 logger.warning(msg)
         return None
 
-    # ── static params (model_mib, ctx_factor, compute_mib) ──
+    # ── serve-shaped llama-server measurement ──
+
+    def _mtp_measure_flags(self) -> list[str]:
+        """Speculative-decode flags mirroring the serve emission exactly."""
+        mtp_on, n_max = self.model._mtp_info()
+        if not mtp_on:
+            return []
+        companion = self.model.mtp
+        if companion is None and self.model.frontmatter.get("speculative"):
+            return []  # declared companion missing: serve skips MTP too
+        flags = ["--spec-type",
+                 str(self.model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)),
+                 "--spec-draft-n-max", str(n_max)]
+        if companion is not None and companion.gguf_path:
+            flags += ["--spec-draft-model", str(companion.gguf_path)]
+        return flags
+
+    def _run_measure_server(
+        self,
+        server_bin: str,
+        cache_type: str,
+        ctx: int,
+        parallel: int,
+        llama_args: str,
+    ) -> dict[str, float] | None:
+        """One serve-shaped llama-server run → device buffer MiB, or None.
+
+        Flags mirror what the emitted command will run with (cache types,
+        all layers on GPU, MTP draft, the profiles global args — flash
+        attention and the role batch sizes — plus the embed/rerank batch
+        override), because compute and recurrent-state allocations depend
+        on them.  The process is killed as soon as the server reports
+        ready; every buffer line precedes that point.
+        """
+        cache_key = ("serve", cache_type, ctx, parallel, llama_args)
+        if cache_key in self._serve_cache:
+            return self._serve_cache[cache_key]
+
+        if self.model.gguf_path is None:
+            return None
+        cmd = [
+            str(server_bin), "-m", str(self.model.gguf_path),
+            "-c", str(ctx), "--parallel", str(parallel),
+            "--cache-type-k", cache_type, "--cache-type-v", cache_type,
+            "-ngl", "999",
+            "--port", str(_free_port()), "-lv", "5",
+        ]
+        cmd += self._mtp_measure_flags()
+        cmd += llama_args.split()
+        cmd += _MEASURE_ROLE_BATCH.get(self.model.role, ())
+
+        logger.info("measuring VRAM: %s via llama-server (ctx=%d, p=%d)",
+                    self.model.stem, ctx, parallel)
+        with tempfile.NamedTemporaryFile(
+                "w+b", suffix=".log", prefix="lp-measure-") as tf:
+            try:
+                proc = subprocess.Popen(cmd, stdout=tf,
+                                        stderr=subprocess.STDOUT)
+            except (OSError, ValueError) as e:
+                self._warn_once("llama-server measurement: cannot launch %s: %s",
+                                server_bin, e)
+                return None
+            ready_token = _MEASURE_READY.encode("ascii", "ignore")
+            deadline = time.monotonic() + _MEASURE_TIMEOUT_S
+            ready = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+                tf.seek(0)
+                # bytes-level read: the server may have written half of a
+                # multi-byte sequence when we poll
+                if ready_token in tf.read():
+                    ready = True
+                    break
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            tf.seek(0)
+            text = tf.read().decode("utf-8", errors="replace") if ready else ""
+
+        if not ready:
+            self._warn_once("llama-server measurement failed for %s "
+                            "(ctx=%d, p=%d)", self.model.stem, ctx, parallel)
+            return None
+        buffers = parse_device_buffers(text)
+        self._serve_cache[cache_key] = buffers
+        return buffers
+
+    def _fit_params_serve(
+        self,
+        fit_bin: str,
+        cache_type: str,
+        llama_args: str = "",
+    ) -> FitParams | None:
+        """Serve-shaped estimate from the fast fit-params pair (+ corrections).
+
+        Two llama-fit-params runs (~0.6 s each, header-only — no tensor data,
+        no server) with the exact serve flags give the KV pool (``c``), the
+        fit slot term (``D_fit``), the recurrent-state geometry (per-cell
+        size from the ``-lv 5`` log) and serve-shaped compute.  The MTP
+        draft and the allocator-level terms are not observable this way, so
+        the measured per-arch correction (``--probe-memory``, machine-local
+        cache) closes the gap:
+
+            c   = c_kv                       (+ delta_c)
+            D   = D_fit + per_cell * (mtp ? 2 : 1)   (+ delta_d)
+            fix = model + compute + per_cell * (mtp ? 1 : 0)  (+ delta_fixed)
+
+        Normal packer runs never start a server; this is the only
+        measurement they do.  Not persisted — persistence belongs to
+        :meth:`fit_params_static`.
+        """
+        design = self._design_ctx()
+        r1 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
+                             cache_type=cache_type, parallel=1,
+                             llama_args=llama_args)
+        r2 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
+                             cache_type=cache_type, parallel=2,
+                             llama_args=llama_args)
+        if r1 is None or r2 is None or r1["kv"] <= 0:
+            return None
+        mtp_on, _ = self.model._mtp_info()
+        rs_cell = r1["rs"] / r1["rs_cells"] if r1["rs_cells"] else 0.0
+        kv_per_token = r1["kv"] / design
+        slot_mib = max(float(r2["context"] - r1["context"]), 0.0) \
+            + rs_cell * (2.0 if mtp_on else 1.0)
+        compute_mib = max(r1["compute"], r2["compute"]) \
+            + int(round(rs_cell * (1.0 if mtp_on else 0.0)))
+        params = FitParams(
+            model_mib=int(r1["model"]),
+            kv_per_token_mib=kv_per_token,
+            slot_mib=slot_mib,
+            compute_mib=compute_mib,
+            source="fit-estimate",
+            cache_type=cache_type,
+        )
+        corr = get_serve_correction(self.model.arch, cache_type, mtp_on)
+        if corr is not None:
+            params = FitParams(
+                model_mib=params.model_mib,
+                kv_per_token_mib=params.kv_per_token_mib + corr["delta_c"],
+                slot_mib=params.slot_mib + corr["delta_d"],
+                compute_mib=params.compute_mib + int(corr["delta_fixed"]),
+                source="fit-estimate",
+                cache_type=cache_type,
+            )
+        else:
+            self._warn_once(
+                "%s: no serve correction measured for arch %r (mtp=%s) — "
+                "run --probe-memory to calibrate; the estimate may "
+                "undercount the draft and allocator overhead",
+                self.model.stem, self.model.arch, mtp_on)
+        return params
+
+    def _fit_params_fast(self, cache_type: str, fit_bin: str) -> FitParams | None:
+        """Transient fit-params pair — the retired fast approximation.
+
+        Used only when the serve-shaped measurement is impossible (no
+        usable GPU at pack time).  The numbers undercount the RS cache,
+        the MTP draft and the batch-dependent compute, so they are never
+        persisted: the next run re-attempts the real measurement.
+        """
+        design = self._design_ctx()
+        r1 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
+                             cache_type=cache_type, parallel=1)
+        r2 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
+                             cache_type=cache_type, parallel=2)
+        if r1 is None or r2 is None:
+            return None
+        kv_per_token = r1["kv"] / design if design > 0 and r1["kv"] > 0 else 0.0
+        slot_mib = max(float(r2["context"] - r1["context"]), 0.0)
+        if kv_per_token <= 0:
+            return None
+        return FitParams(
+            model_mib=int(r1["model"]),
+            kv_per_token_mib=kv_per_token,
+            slot_mib=slot_mib,
+            compute_mib=max(r1["compute"], r2["compute"]),
+            source="fit-params",
+            cache_type=cache_type,
+        )
+
+    # ── static params (model_mib, kv_per_token_mib, slot_mib, compute_mib) ──
 
     def fit_params_static(
         self,
         fit_bin: str,
         cache_type: str = "q8_0",
-        parallel: int = 1,
+        llama_args: str = "",
     ) -> FitParams | None:
-        """Get static VRAM parameters for this model.
+        """Get affine VRAM constants for this model at *cache_type*.
 
-        Checks: saved frontmatter → in-memory cache → binary → safetensors.
-        Persists new values to sidecar on computation.
+        Checks: saved frontmatter → in-memory cache → the fast fit-params
+        estimate (never a server; normal runs pay ~1-2 s once per model)
+        → plain fit-params pair (transient) → safetensors estimate.  New
+        estimates are persisted to the sidecar so later runs pay nothing.
         """
-        cache_key = (cache_type, parallel)
-        if cache_key in self._static_cache:
-            return self._static_cache[cache_key]
+        if cache_type in self._static_cache:
+            return self._static_cache[cache_type]
 
-        # 1. Saved values from frontmatter.
-        saved = self.saved_for(cache_type, parallel)
+        if self.model.backend in FIXED_OVERHEAD_BACKENDS \
+                or getattr(self.model, "on_cpu", False):
+            # Fixed-overhead backends are sized from file size + a fixed
+            # buffer (effective_static); CPU-resident models are not
+            # VRAM-bound.  Neither has meaningful FitParams.
+            return None
+
+        # 1. Saved values from frontmatter (legacy fit-params blocks are
+        #    rejected by FitParams.from_dict and re-measured).
+        saved = self.saved_for(cache_type)
         if saved is not None:
-            self._static_cache[cache_key] = saved
+            self._static_cache[cache_type] = saved
             return saved
 
-        # 1b. A saved block for the same parallel but a different cache type is
-        #     re-used by scaling its KV factor (see _scale_ctx_factor) instead of
-        #     re-running the binary — KV-cache memory is linear in precision.
-        if cache_type in _KV_CACHE_BYTES:
-            base = self._saved_base(parallel)
-            if base is not None:
-                params = self._scale_ctx_factor(base, cache_type)
-                self._static_cache[cache_key] = params
-                return params
-
         # 2. vLLM backends: estimate from the HF repo (vllm-memory-estimator)
-        #    or a local safetensors header — llama-fit-params only measures GGUF.
+        #    or a local safetensors header — the server measures GGUF only.
         if self.model.backend in VLLM_BACKENDS:
-            params = self._fit_params_vllm(cache_type, parallel)
+            params = self._fit_params_vllm(cache_type)
             if params is not None:
-                self._static_cache[cache_key] = params
+                self._static_cache[cache_type] = params
                 self._persist(params)
             return params
 
-        # 3. Compute via binary or safetensors
-        design = self._design_ctx()
-        result = self.fit_params(
-            fit_bin=fit_bin,
-            fit_ctx=design,
-            fit_target_mib=None,
-            cache_type=cache_type,
-            parallel=parallel,
-        )
-
-        if result is not None:
-            model_mib, ctx_at_design_mib, compute_mib = result
-            context_factor = ctx_at_design_mib / design if design > 0 else 0.0
-            params = FitParams(
-                model_mib=model_mib,
-                ctx_factor=context_factor,
-                compute_mib=compute_mib,
-                source="fit-params",
-                cache_type=cache_type,
-                parallel=parallel,
-            )
-        else:
-            # 4. Try safetensors estimation fallback
-            params = self._estimate_safetensors(cache_type, parallel, design)
-
+        # 3. Fast serve-shaped estimate (fit-params + arch corrections) —
+        #    normal runs never start a server.
+        params = self._fit_params_serve(fit_bin, cache_type, llama_args)
         if params is not None:
-            self._static_cache[cache_key] = params
+            self._static_cache[cache_type] = params
             self._persist(params)
+            return params
 
+        # 4. Plain fit-params pair as a transient fallback (no corrections;
+        #    never persisted — the next run retries the calibrated path).
+        params = self._fit_params_fast(cache_type, fit_bin)
+        if params is not None:
+            self._warn_once(
+                "%s: llama-server measurement unavailable; using the "
+                "fit-params approximation (not persisted)", self.model.stem)
+            self._static_cache[cache_type] = params
+            return params
+
+        # 5. Try safetensors estimation fallback
+        params = self._estimate_safetensors(cache_type, self._design_ctx())
+        if params is not None:
+            self._static_cache[cache_type] = params
+            self._persist(params)
         return params
 
     def _fit_params_vllm(
-        self, cache_type: str, parallel: int,
+        self, cache_type: str,
     ) -> FitParams | None:
-        """Estimate VRAM params for a vLLM-served model.
+        """Estimate VRAM constants for a vLLM-served model.
 
         Sources, in order:
         1. ``vllm-memory-estimator`` on the HF repo (accurate; reuses vLLM's
            own config/KV-cache logic) — requires ``hf_repo`` and the package.
+           vLLM's paged KV pool is shared, so there is no per-slot term
+           (``slot_mib=0``); ``--max-num-seqs`` does not change KV size.
         2. local ``.safetensors`` header estimate (``utils.estimate_safetensors``).
 
         Returns None when neither is available (no estimator, no local file):
@@ -357,29 +732,31 @@ class VramBudget:
         if self.model.hf_repo:
             est = vllm_estimate.estimate_vllm(
                 self.model.hf_repo, design,
-                max_active_seqs=parallel,
+                max_active_seqs=1,
             )
             if est is not None:
-                model_mib, ctx_factor, compute_mib = est
+                model_mib, kv_per_token, compute_mib = est
                 return FitParams(
                     model_mib=model_mib,
-                    ctx_factor=ctx_factor,
+                    kv_per_token_mib=kv_per_token,
+                    slot_mib=0.0,
                     compute_mib=compute_mib,
                     source="vllm-estimate",
                     cache_type=cache_type,
-                    parallel=parallel,
                 )
         if self.model.gguf_path and str(self.model.gguf_path).endswith(".safetensors"):
-            return self._estimate_safetensors(cache_type, parallel, design)
+            return self._estimate_safetensors(cache_type, design)
         return None
 
     def _estimate_safetensors(
-        self, cache_type: str, parallel: int, design: int,
+        self, cache_type: str, design: int,
     ) -> FitParams | None:
         """Estimate FitParams from safetensors header (fallback for non-GGUF).
 
         Header numbers come from the canonical file instance (parsed once
         per process); the per-cache-type derivation below stays local.
+        The header gives only a per-token KV number — the per-slot term is
+        unknown and conservatively zero.
         """
         assert self.model.gguf_path is not None
         if not str(self.model.gguf_path).endswith(".safetensors"):
@@ -406,15 +783,13 @@ class VramBudget:
 
         est_model_mib, est_kv_per_token_mib = nums
         compute_mib = int(0.02 * est_model_mib) + 128
-        ctx_at_design_mib = int(est_kv_per_token_mib * design)
-        context_factor = ctx_at_design_mib / design if design > 0 else 0.0
         return FitParams(
             model_mib=est_model_mib,
-            ctx_factor=context_factor,
+            kv_per_token_mib=est_kv_per_token_mib,
+            slot_mib=0.0,
             compute_mib=compute_mib,
             source="safetensors-estimate",
             cache_type=cache_type,
-            parallel=parallel,
         )
 
     # ── companion measurement / estimation ──
@@ -422,40 +797,41 @@ class VramBudget:
     def _companion_fit(
         self,
         companion: "Model",
-        fit_bin: str,
         main_fp: FitParams | None,
-        design_ctx: int,
         cache_type: str = "q8_0",
-        parallel: int = 1,
         is_mmproj: bool = False,
-    ) -> tuple[int, float, int] | None:
-        """Estimate a companion (mmproj or MTP draft) static VRAM params.
+    ) -> tuple[int, float, float, int] | None:
+        """Estimate a companion (mmproj or MTP draft) affine VRAM constants.
 
-        Returns (model_mib, ctx_factor, compute_mib). Companion GGUFs cannot be
-        measured by llama-fit-params — mmproj fails to load as a standalone
-        model and MTP draft heads abort on a missing ``ctx_other`` — so the
-        binary is not even attempted; instead VRAM is estimated directly from
-        the file size (with the MTP draft's per-token KV factor scaled from the
-        main model). This avoids launching a subprocess that would only crash
-        (SIGABRT), which on a GPU that already has a model resident is both
-        noisy and risky. Results are cached per companion.
+        Returns (model_mib, kv_per_token_mib, slot_mib, compute_mib).
+        Companion GGUFs cannot be measured by llama-fit-params — mmproj fails
+        to load as a standalone model and MTP draft heads abort on a missing
+        ``ctx_other`` — so the binary is not even attempted; instead VRAM is
+        estimated directly from the file size, with the MTP draft's affine
+        terms scaled from the main model.  This avoids launching a subprocess
+        that would only crash (SIGABRT).  Results are cached per companion.
         """
-        cache_key = ("companion", companion.stem, cache_type, parallel)
+        cache_key = ("companion", companion.stem, cache_type, is_mmproj)
         if cache_key in self._companion_cache:
             return self._companion_cache[cache_key]
 
-        # Conservative file-size estimate. The MTP draft holds its own KV cache
-        # that scales with context, so we estimate its per-token factor from
-        # the main model scaled by relative size, padded by a safety factor so
-        # the estimate errs on the side of reserving more.
         size_mb = utils.get_model_size_mb(str(companion.gguf_path))
         if is_mmproj:
-            params = (size_mb, 0.0, _MMPROJ_COMPUTE_MB)
-        elif main_fp is not None and main_fp.ctx_factor > 0 and main_fp.model_mib > 0:
-            draft_factor = main_fp.ctx_factor * (size_mb / main_fp.model_mib) * _DRAFT_CTX_SAFETY
-            params = (size_mb, draft_factor, _DRAFT_COMPUTE_MB)
+            # The projection has no KV cache: weight + fixed compute only,
+            # independent of context and slots.
+            params = (size_mb, 0.0, 0.0, _MMPROJ_COMPUTE_MB)
+        elif main_fp is not None and main_fp.kv_per_token_mib > 0 \
+                and main_fp.model_mib > 0:
+            # The draft holds its own KV cache that scales with context, so
+            # both affine terms scale from the main model by relative size,
+            # padded by a safety factor so the estimate errs on reserving more.
+            ratio = (size_mb / main_fp.model_mib) * _DRAFT_CTX_SAFETY
+            params = (size_mb,
+                      main_fp.kv_per_token_mib * ratio,
+                      main_fp.slot_mib * ratio,
+                      _DRAFT_COMPUTE_MB)
         else:
-            params = (size_mb, 0.0, _DRAFT_COMPUTE_MB)
+            params = (size_mb, 0.0, 0.0, _DRAFT_COMPUTE_MB)
         msg = f"companion {companion.stem} VRAM estimated from file size (fit-params cannot measure mmproj/MTP)"
         if msg not in self._logged:
             self._logged.add(msg)
@@ -468,27 +844,28 @@ class VramBudget:
         self,
         fit_bin: str,
         cache_type: str = "q8_0",
-        parallel: int = 1,
         design_ctx: int | None = None,
         include_mmproj: bool = True,
-    ) -> tuple[int, float, int] | None:
-        """Combined static VRAM params for main model plus its companions.
+        llama_args: str = "",
+    ) -> tuple[int, float, float, int] | None:
+        """Combined affine VRAM constants for main model plus its companions.
 
-        Returns (model_mib, ctx_factor, compute_mib) where the MTP draft's
-        weight and per-token KV factor and the mmproj's weight/compute are
-        folded into the main model's numbers, so downstream context math sees a
-        single budget.  This is what fixes companion VRAM being under-budgeted
-        (previously charged by raw file size only).
+        Returns (model_mib, kv_per_token_mib, slot_mib, compute_mib) where
+        the mmproj's weight/compute is folded into the main model's
+        numbers, so downstream context math sees a single budget.  The MTP
+        draft is folded only when the main block did *not* come from the
+        serve-shaped measurement — those blocks are measured with the
+        draft running and already carry it.
         """
-        cache_key = ("effective", cache_type, parallel, include_mmproj)
+        cache_key = ("effective", cache_type, include_mmproj, llama_args)
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
         # Fixed-overhead backends (sd-server diffusion, whisper-server s2t,
         # kokoro-podman t2s): VRAM = weights (file size, 0 when baked into the
-        # image) + a fixed runtime buffer, no per-token KV factor.  These are
-        # excluded from the shared chat matrix, so precise ctx_factor is
-        # irrelevant; calc_ctx will return design_ctx when ctx_factor==0.
+        # image) + a fixed runtime buffer, no KV terms.  These are excluded
+        # from the shared chat matrix, so precise factors are irrelevant;
+        # calc_ctx returns design_ctx when kv_per_token_mib==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Operator-pinned total VRAM (`vram_mb` in the sidecar) is the
             # sizing: it *is* the fixed overhead, no measurement or estimate.
@@ -502,59 +879,57 @@ class VramBudget:
                         "vram_mb: %s: %r is not an integer; ignoring",
                         self.model.stem, pin)
                 if pinned > 0:
-                    return (pinned, 0.0, 0)
+                    return (pinned, 0.0, 0.0, 0)
             main_mb = 0
             try:
                 if self.model.gguf_path and self.model.gguf_path.is_file():
                     main_mb = utils.get_model_size_mb(str(self.model.gguf_path))
             except OSError:
                 main_mb = 0
-            # Try fit-params static size when available for a more accurate weight
-            # estimate — GGUF only; GGML .bin / ONNX cannot be measured and a
-            # subprocess attempt would just fail noisily. ctx_factor stays 0.
-            if self.model.gguf_path and str(self.model.gguf_path).endswith(".gguf"):
-                fit = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
-                if fit is not None and fit.model_mib > 0:
-                    main_mb = fit.model_mib
-            params = (main_mb, 0.0,
+            params = (main_mb, 0.0, 0.0,
                       _FIXED_COMPUTE_MB.get(self.model.backend, _SD_COMPUTE_MB))
             self._effective_cache[cache_key] = params
             return params
 
-        main = self.fit_params_static(fit_bin, cache_type=cache_type, parallel=parallel)
+        main = self.fit_params_static(fit_bin, cache_type=cache_type,
+                                      llama_args=llama_args)
         if main is None:
             return None
 
         # vLLM serves safetensors from an HF repo — vision/draft companions are
         # baked into the repo, not separate GGUF files, so nothing to fold in.
         if self.model.backend in VLLM_BACKENDS:
-            params = (main.model_mib, main.ctx_factor, main.compute_mib)
+            params = (main.model_mib, main.kv_per_token_mib, main.slot_mib,
+                      main.compute_mib)
             self._effective_cache[cache_key] = params
             return params
 
-        design = design_ctx if design_ctx is not None else self._design_ctx()
         model_mib = main.model_mib
-        ctx_factor = main.ctx_factor
+        kv_per_token = main.kv_per_token_mib
+        slot_mib = main.slot_mib
         compute_mib = main.compute_mib
 
-        if self.model.mtp and self.model.mtp.gguf_path:
-            draft = self._companion_fit(self.model.mtp, fit_bin, main, design,
-                                        cache_type=cache_type, parallel=parallel)
+        if main.source != "llama-server" and self.model.mtp \
+                and self.model.mtp.gguf_path:
+            draft = self._companion_fit(self.model.mtp, main,
+                                        cache_type=cache_type)
             if draft:
                 model_mib += draft[0]
-                ctx_factor += draft[1]
-                compute_mib += draft[2]
+                kv_per_token += draft[1]
+                slot_mib += draft[2]
+                compute_mib += draft[3]
 
         if include_mmproj and self.model.mmproj and self.model.mmproj.gguf_path:
-            proj = self._companion_fit(self.model.mmproj, fit_bin, main, design,
-                                       cache_type=cache_type, parallel=parallel,
+            proj = self._companion_fit(self.model.mmproj, main,
+                                       cache_type=cache_type,
                                        is_mmproj=True)
             if proj:
                 model_mib += proj[0]
-                ctx_factor += proj[1]
-                compute_mib += proj[2]
+                kv_per_token += proj[1]
+                slot_mib += proj[2]
+                compute_mib += proj[3]
 
-        params = (model_mib, ctx_factor, compute_mib)
+        params = (model_mib, kv_per_token, slot_mib, compute_mib)
         self._effective_cache[cache_key] = params
         return params
 
@@ -570,17 +945,23 @@ class VramBudget:
         baseline_mb: int = 0,
         cache_type: str = "q8_0",
         design_ctx: int | None = None,
+        memory_margin: float = 0.0,
+        llama_args: str = "",
     ) -> int:
-        """Calculate max context size for given VRAM.
+        """Calculate max per-slot context size for given VRAM.
 
-        Uses saved fit-params if available; otherwise runs the binary (or
-        safetensors estimation) and persists the results.  Companion (MTP draft,
-        mmproj) VRAM is folded in via :meth:`effective_static`.
+        The solved value is the context available to *each* parallel slot;
+        the emitted server flag is ``--kv-unified-per-slot X`` (shared pool
+        ``parallel * X``).  Uses saved affine constants when available,
+        otherwise measures the (p=1, p=2) pair and persists them.
 
         ``include_mmproj=False`` drops the vision projection from the budget
         (used when skipping mmproj to reach the minimum useful context).
         ``baseline_mb`` is the driver/compositor VRAM already in use; the
         effective reserve is ``_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline)``.
+        ``memory_margin`` inflates every measured term (safety against
+        measurement residual).  ``llama_args`` are the profiles global
+        server flags the measurement mirrors (flash attention, batch).
         """
         # CPU-resident models (--n-gpu-layers 0) are not VRAM-bound, so size
         # them to their own architectural/sidecar context limit rather than the
@@ -589,7 +970,7 @@ class VramBudget:
             return self._design_ctx()
 
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
-        available = vram_total_mb - reserve - spare_mb
+        available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
         if available <= 0:
             logger.warning("available VRAM <= 0 for %s (spare=%d)",
@@ -600,40 +981,40 @@ class VramBudget:
 
         # Try saved or compute combined static params (main + companions)
         static = self.effective_static(
-            fit_bin, cache_type=cache_type, parallel=parallel,
+            fit_bin, cache_type=cache_type,
             design_ctx=design, include_mmproj=include_mmproj,
+            llama_args=llama_args,
         )
 
         if static is None:
             if self.model.backend in VLLM_BACKENDS:
                 # No memory estimate available (no estimator, no local
-                # safetensors): size to the declared context and let vLLM's own
-                # startup profiling bound the actual allocation.
+                # safetensors): size to the declared context and let vLLM's
+                # own startup profiling bound the actual allocation.
                 return self._design_ctx()
             # Fatal: no way to estimate VRAM for this model
             raise RuntimeError(
-                f"fit-params failed to measure VRAM for {self.model.stem}; "
-                f"cannot estimate a safe context size. Ensure llama-fit-params "
+                f"VRAM measurement failed for {self.model.stem}; "
+                f"cannot estimate a safe context size. Ensure llama-server "
                 f"is available/built and the model format is supported "
                 f"(safetensors may be unsupported)."
             )
 
-        model_mib, ctx_factor, compute_mib = static
+        model_mib, kv_per_token, slot_mib, compute_mib = static
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
             logger.warning("model + compute exceeds available VRAM for %s", self.model.stem)
             return _MIN_CTX_SIZE
 
-        # Image token budget: image tokens are ordinary tokens inside -c (no
-        # VRAM beyond the context itself), but a max-size image must *fit* —
-        # every parallel slot needs image_max_tokens of its share of the
-        # context. The solved context is therefore never allowed to drop
-        # below parallel × image_max_tokens when the budget affords it.
-        img_floor = self._image_floor_tokens(parallel, include_mmproj)
+        # Image token budget: image tokens are ordinary tokens inside the
+        # slot's context (no VRAM beyond it), but a max-size image must *fit*
+        # in each slot — the per-slot context is never allowed to drop below
+        # image_max_tokens when the budget affords it.
+        img_floor = self._image_floor_tokens(include_mmproj)
 
         # If design context fits, use it (capped by sidecar context_length)
-        ctx_at_design_mib = int(ctx_factor * design)
-        if ctx_at_design_mib <= remaining:
+        design_cost = (kv_per_token * design + slot_mib) * parallel
+        if design_cost <= remaining:
             sidecar_ctx = self.model.frontmatter.get("context_length")
             if sidecar_ctx is not None:
                 ctx = min(design, sidecar_ctx)
@@ -642,29 +1023,27 @@ class VramBudget:
             return self._raise_to_image_floor(ctx, img_floor, cap=ctx,
                                               affordable=ctx)
 
-        # Scale down linearly
-        if ctx_factor <= 0:
+        # Solve the affine equation for the per-slot context
+        if kv_per_token <= 0:
             return _MIN_CTX_SIZE
-        max_ctx = int(remaining / ctx_factor)
+        max_ctx = int((remaining - slot_mib * parallel)
+                      / (kv_per_token * parallel))
         ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)
         return self._raise_to_image_floor(ctx, img_floor,
                                           cap=max_ctx, affordable=max_ctx)
 
-    def _image_floor_tokens(self, parallel: int, include_mmproj: bool) -> int:
-        """KV slots per process that must stay reservable for image tokens.
+    def _image_floor_tokens(self, include_mmproj: bool) -> int:
+        """Per-slot token floor that must stay reservable for image tokens.
 
-        ``parallel × image_max_tokens`` when the vision projection is served
-        and the sidecar declares a cap; 0 otherwise.
+        ``image_max_tokens`` when the vision projection is served and the
+        sidecar declares a cap; 0 otherwise.
         """
         if not include_mmproj:
             return 0
         if not (self.model.mmproj and self.model.mmproj.gguf_path):
             return 0
-        imax = self.model.image_max_tokens
-        if not imax:
-            return 0
-        return parallel * imax
+        return self.model.image_max_tokens or 0
 
     def _raise_to_image_floor(
         self, ctx: int, floor: int, cap: int, affordable: int,
@@ -708,7 +1087,7 @@ class VramBudget:
         return self.model.design_context
 
     def _persist(self, params: FitParams) -> None:
-        """Persist measured VRAM numbers via the single sidecar writer.
+        """Persist measured VRAM constants via the single sidecar writer.
 
         Delegates to :meth:`Model.persist_measured` — the only place that
         writes the dynamic ``measured:`` branch.
@@ -722,54 +1101,57 @@ class VramBudget:
 def solve_matrix_ctx(
     vram_total_mb: int,
     spare_mb: int,
-    chat_models: list[tuple[Model, int, float, int, int]],
-    embed_params: tuple[int, float, int] | None,
-    rerank_params: tuple[int, float, int] | None,
+    chat_models: list[tuple[Model, int, float, float, int, int, int]],
+    embed_params: tuple[int, float, float, int] | None,
+    rerank_params: tuple[int, float, float, int] | None,
     embed_ctx: int = 0,
     rerank_ctx: int = 0,
     baseline_mb: int = 0,
     fixed_overhead_mb: int = 0,
+    memory_margin: float = 0.0,
 ) -> int:
-    """Solve the VRAM budget equation for chat context.
+    """Solve the shared per-slot chat context under the affine VRAM law.
 
-    The VRAM budget is:
-        available = Σ(chat_weight + chat_factor*chat_ctx)
-                   + (embed_weight + embed_factor*embed_ctx)
-                   + (rerank_weight + rerank_factor*rerank_ctx)
+    The VRAM budget for a co-resident group sharing one per-slot context X:
 
-    Since all chat models share the same VRAM pool (llama-swap evicts),
-    we solve for the chat context that the LARGEST chat model needs.
-    The fit-params for each chat model already accounts for its own weight.
+        available = Σ_i (model_i + compute_i + c_i*(p_i*X) + p_i*D_i)
+                  + (embed_weight + embed_factor*embed_ctx + embed_slots)
+                  + (rerank_weight + rerank_factor*rerank_ctx + rerank_slots)
 
     Args:
         vram_total_mb: Total VRAM in MB
         spare_mb: Reserved VRAM in MB
-        chat_models: List of (model, model_mib, context_factor, compute_mib,
-            image_floor_tokens) — the floor being ``parallel ×
-            image_max_tokens`` for served vision, 0 otherwise
-        embed_params: (model_mib, context_factor, compute_mib) for embedder
-        rerank_params: (model_mib, context_factor, compute_mib) for reranker
-        embed_ctx: Requested context for embedding model
-        rerank_ctx: Requested context for reranking model
+        chat_models: List of (model, model_mib, kv_per_token_mib, slot_mib,
+            compute_mib, parallel, image_floor_tokens) — the floor being
+            ``image_max_tokens`` per slot for served vision, 0 otherwise
+        embed_params: (model_mib, kv_per_token_mib, slot_mib, compute_mib)
+            for embedder (runs at its own parallel count)
+        rerank_params: same, for reranker
+        embed_ctx: Requested per-slot context for embedding model
+        rerank_ctx: Requested per-slot context for reranking model
         baseline_mb: Driver/compositor VRAM already in use (added to the reserve)
         fixed_overhead_mb: Extra fixed VRAM held by opportunistic co-loads
             (subtracted from the chat budget before solving)
+        memory_margin: Fraction inflated against every measured term
 
     Returns:
-        Maximum chat context in tokens (rounded to _CTX_ROUND_TO)
+        Maximum shared per-slot chat context in tokens (rounded to
+        _CTX_ROUND_TO)
     """
     reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
-    available = vram_total_mb - reserve - spare_mb
+    available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
     embed_overhead = 0
     if embed_params and embed_ctx > 0:
-        e_mib, e_factor, e_compute = embed_params
-        embed_overhead = e_mib + e_compute + int(e_factor * embed_ctx)
+        e_mib, e_factor, e_slots, e_compute = embed_params
+        embed_overhead = e_mib + e_compute \
+            + int(e_factor * embed_ctx + e_slots)
 
     rerank_overhead = 0
     if rerank_params and rerank_ctx > 0:
-        r_mib, r_factor, r_compute = rerank_params
-        rerank_overhead = r_mib + r_compute + int(r_factor * rerank_ctx)
+        r_mib, r_factor, r_slots, r_compute = rerank_params
+        rerank_overhead = r_mib + r_compute \
+            + int(r_factor * rerank_ctx + r_slots)
 
     remaining_for_chat = available - embed_overhead - rerank_overhead \
         - fixed_overhead_mb
@@ -777,12 +1159,14 @@ def solve_matrix_ctx(
         return _MIN_CTX_SIZE
 
     best_ctx = 0
-    for model, model_mib, context_factor, compute_mib, img_floor in chat_models:
+    for model, model_mib, kv_factor, slot_mib, compute_mib, parallel, \
+            img_floor in chat_models:
         chat_budget = remaining_for_chat - model_mib - compute_mib
         if chat_budget <= 0:
             continue
-        if context_factor > 0:
-            ctx = int(chat_budget / context_factor)
+        if kv_factor > 0:
+            ctx = int((chat_budget - slot_mib * parallel)
+                      / (kv_factor * parallel))
             # The image token floor is raise-to-fit only when it was already
             # affordable; a larger floor cannot buy VRAM it doesn't have.
             if img_floor > ctx:

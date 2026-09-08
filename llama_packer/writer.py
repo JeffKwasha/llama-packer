@@ -26,6 +26,7 @@ from llama_packer import utils
 from llama_packer.consts import (
     _DIFFUSION_ARCH_RES,
     _KV_CACHE_BYTES,
+    _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
 )
@@ -781,11 +782,14 @@ class Planner:
         baseline_mb: int = 0,
         min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
+        memory_margin: float = _MEMORY_MARGIN,
+        llama_args: str = "",
         progress_cb=None,
     ):
         self.models = models
         self.profiles = profiles
         self.fit_bin = fit_bin
+        self.llama_args = llama_args
         self.vram_total = vram_total
         self.spare = spare
         self.max_context = max_context
@@ -796,6 +800,7 @@ class Planner:
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.min_context_explicit = min_context_explicit
+        self.memory_margin = memory_margin
         self.ledger = PoolLedger(vram_total, self.profiles.pools_cfg)
         self.chat_ctx: int | None = None  # matrix-solved shared context, if any
         self.matrix_result: MatrixSolve | None = None
@@ -826,6 +831,8 @@ class Planner:
             baseline_mb=self.baseline_mb,
             cache_type=cache_type,
             design_ctx=design_ctx,
+            memory_margin=self.memory_margin,
+            llama_args=self.llama_args,
         )
         if context_length is not None:
             ctx = min(ctx, context_length)
@@ -966,7 +973,8 @@ class Planner:
             self.models, self.embed_model, self.rerank_model,
             self.fit_bin, self.vram_total, self.spare, self.profiles,
             baseline_mb=self.baseline_mb, drop_stems=drop_stems,
-            knobs=self.knobs,
+            knobs=self.knobs, memory_margin=self.memory_margin,
+            llama_args=self.llama_args,
         )
         if result is not None:
             logger.info("matrix: solved chat_ctx=%d (squeeze=%s, coloads=%s)",
@@ -1014,13 +1022,15 @@ class Planner:
         if model is None or model.on_cpu:
             return 0
         try:
-            triple = _static_params(
+            quad = _static_params(
                 model, self.fit_bin, self.profiles.default_cache_type,
-                self.profiles.default_parallel)
-            if triple is None:
+                self.llama_args)
+            if quad is None:
                 return 0
-            mib, factor, compute = triple
-            return mib + compute + int(factor * ctx)
+            mib, kv_factor, slot_mib, compute = quad
+            parallel = model.parallel_for(self.profiles.default_parallel)
+            return mib + compute + int(
+                kv_factor * ctx * parallel + slot_mib * parallel)
         except Exception as e:  # keep planning alive; matrix already solved
             logger.warning("ledger: cannot size resident %s (%s)",
                            model.stem, e)
@@ -1150,11 +1160,15 @@ class Planner:
 
 
 def _static_params(model: Model, fit_bin: str, cache_type: str,
-                   parallel: int) -> tuple[int, float, int] | None:
-    """(model_mib, ctx_factor, compute_mib) triple, or None when unmeasurable."""
+                   llama_args: str = "",
+                   ) -> tuple[int, float, float, int] | None:
+    """(model_mib, kv_per_token_mib, slot_mib, compute_mib) quad, or None
+    when unmeasurable."""
     fp = model.vram.fit_params_static(fit_bin, cache_type=cache_type,
-                                      parallel=parallel)
-    return (fp.model_mib, fp.ctx_factor, fp.compute_mib) if fp else None
+                                      llama_args=llama_args)
+    if fp is None:
+        return None
+    return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)
 
 
 def _solve_matrix_context(
@@ -1168,13 +1182,16 @@ def _solve_matrix_context(
     baseline_mb: int = 0,
     drop_stems: set[str] | None = None,
     knobs: MatrixKnobs | None = None,
+    memory_margin: float = _MEMORY_MARGIN,
+    llama_args: str = "",
 ) -> MatrixSolve | None:
     """Solve the shared VRAM budget for chat context plus co-loads.
 
-    Runs fit-params once per model to get static parameters, then solves:
-        available = Σ(chat_weight + chat_factor*chat_ctx)
-                   + (embed_weight + embed_factor*embed_ctx)
-                   + (rerank_weight + rerank_factor*rerank_ctx)
+    Runs the affine measurement once per model to get static constants, then
+    solves:
+        available = Σ(chat_weight + chat_kv*slots*chat_ctx + slots*chat_slot)
+                  + (embed_weight + embed_kv*embed_ctx + embed_slot)
+                  + (rerank_weight + rerank_kv*rerank_ctx + rerank_slot)
 
     Three passes, in order:
 
@@ -1211,16 +1228,19 @@ def _solve_matrix_context(
         on = m.view_for(m.stem not in drop_stems)
         cache_type = on.cache_type_for(profiles.default_cache_type)
         parallel = on.parallel_for(profiles.default_parallel)
-        fp = on.vram.effective_static(fit_bin, cache_type=cache_type, parallel=parallel,
-                                      include_mmproj=m.stem not in drop_stems)
+        fp = on.vram.effective_static(fit_bin, cache_type=cache_type,
+                                      include_mmproj=m.stem not in drop_stems,
+                                      llama_args=llama_args)
         if fp is None:
             logger.warning("matrix: could not get fit params for %s", m.stem)
             continue
         img_floor = 0
         if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
                 and on.image_max_tokens):
-            img_floor = parallel * on.image_max_tokens
-        chat_params.append((m, fp[0], fp[1], fp[2], img_floor))
+            img_floor = on.image_max_tokens
+        model_mib, kv_factor, slot_mib, compute_mib = fp
+        chat_params.append((m, model_mib, kv_factor, slot_mib, compute_mib,
+                            parallel, img_floor))
 
     if not chat_params:
         return None
@@ -1230,12 +1250,12 @@ def _solve_matrix_context(
     if not embed_model.on_cpu:
         embed_params = _static_params(embed_model, fit_bin,
                                       profiles.default_cache_type,
-                                      profiles.default_parallel)
+                                      llama_args)
     rerank_params = None
     if not rerank_model.on_cpu:
         rerank_params = _static_params(rerank_model, fit_bin,
                                        profiles.default_cache_type,
-                                       profiles.default_parallel)
+                                       llama_args)
 
     # Reserve for embed/rerank at their own declared context (sidecar
     # context_length > GGUF architectural max), not an arbitrary constant —
@@ -1256,6 +1276,7 @@ def _solve_matrix_context(
             rerank_ctx=rerank_ctx_,
             baseline_mb=baseline_mb,
             fixed_overhead_mb=fixed_overhead_mb,
+            memory_margin=memory_margin,
         )
 
     # 1. Baseline.
@@ -1298,7 +1319,8 @@ def _solve_matrix_context(
         for m in chat_models:
             if m.role not in ("s2t", "image"):
                 continue
-            oh = _coload_overhead(m, fit_bin, profiles, knobs)
+            oh = _coload_overhead(m, fit_bin, profiles, knobs,
+                                  llama_args)
             if oh is None:
                 logger.warning("matrix: co-load %s skipped: cannot size it",
                                m.stem)
@@ -1324,11 +1346,12 @@ def _solve_matrix_context(
 
 def _coload_overhead(
     m: Model, fit_bin: str, profiles: Profiles, knobs: MatrixKnobs,
+    llama_args: str = "",
 ) -> int | None:
     """Fixed VRAM overhead (MB) of an opportunistic co-load candidate.
 
-    Uses the backend's effective static params (weights + fixed compute;
-    ctx_factor is 0 for these backends).  Overheads that are *estimated*
+    Uses the backend's effective static params (weights + fixed compute; the
+    KV terms are 0 for these backends).  Overheads that are *estimated*
     rather than measured or pinned carry ``estimate_headroom`` so a bad
     guess errs toward reserving more.
     """
@@ -1337,18 +1360,19 @@ def _coload_overhead(
     # An operator-pinned vram_mb is authoritative — no headroom.
     pinned = m.frontmatter.get("vram_mb") is not None
     cache_type = m.cache_type_for(profiles.default_cache_type)
-    parallel = m.parallel_for(profiles.default_parallel)
     fp = m.vram.fit_params_static(fit_bin, cache_type=cache_type,
-                                  parallel=parallel)
-    measured = pinned or (fp is not None and fp.source == "fit-params")
-    triple = m.vram.effective_static(fit_bin, cache_type=cache_type,
-                                     parallel=parallel)
-    if triple is None:
+                                  llama_args=llama_args)
+    measured = pinned or (fp is not None
+                          and fp.source in ("llama-server", "vllm-estimate"))
+    quad = m.vram.effective_static(fit_bin, cache_type=cache_type,
+                                   llama_args=llama_args)
+    if quad is None:
         return None
-    model_mib, ctx_factor, compute_mib = triple
-    # These backends have ctx_factor 0; a nonzero factor would mean a
+    model_mib, kv_factor, slot_mib, compute_mib = quad
+    # These backends have zero KV terms; nonzero factors would mean a
     # context-driven model wrongly landed in the pool — charge design ctx.
-    overhead = model_mib + compute_mib + int(ctx_factor * m.design_context)
+    overhead = model_mib + compute_mib + int(
+        kv_factor * m.design_context + slot_mib)
     if not measured:
         overhead = int(overhead * knobs.estimate_headroom)
     return overhead
@@ -1470,9 +1494,10 @@ def build_config(
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
     baseline_mb: int = 0,
-        min_context: int = _MIN_AGENTIC_CTX,
-        min_context_explicit: bool = False,
-        progress_cb=None,
+    min_context: int = _MIN_AGENTIC_CTX,
+    min_context_explicit: bool = False,
+    memory_margin: float = _MEMORY_MARGIN,
+    progress_cb=None,
 ) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
 
@@ -1483,7 +1508,7 @@ def build_config(
         models: List of Model instances
         profiles_cfg: Full profiles.yaml config (or a prepared Profiles object)
         template_vars: Template variables (llama_bin, models_dirs)
-        fit_bin: Path to llama-fit-params binary
+        fit_bin: Path to the llama-server binary (measurement runs)
         vram_total: Total VRAM in MB
         spare: Global spare VRAM string (overridden by profile.spare if present)
         max_context: Hard cap on context length
@@ -1500,6 +1525,8 @@ def build_config(
             explicit ``--min-context`` flag (as opposed to the default): the
             explicit flag overrides the per-model floor cascade's default
             rows, the default does not.
+        memory_margin: Fraction inflated against every measured VRAM term
+            when solving (accuracy safety against measurement residual).
     """
     profiles = profiles_cfg if isinstance(profiles_cfg, Profiles) else Profiles(profiles_cfg)
 
@@ -1513,6 +1540,8 @@ def build_config(
         matrix_cfg=matrix_cfg, embed_model=embed_model,
         rerank_model=rerank_model, baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
+        memory_margin=memory_margin,
+        llama_args=template_vars.get("llama_args", ""),
         progress_cb=progress_cb,
     )
     return emit_config(supported, planner.plan(), profiles, template_vars)

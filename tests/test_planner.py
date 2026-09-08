@@ -26,7 +26,7 @@ def _scripted_ctx(model, by_mmproj):
     Companion-on variants carry their own VRAM budget (bound to the serving
     view), so the fake is installed on the base budget and every view.
     """
-    def fake(vram_total_mb, *, fit_bin=None, parallel=1, spare_mb=0,
+    def fake(vram_total_mb, *, server_bin=None, parallel=1, spare_mb=0,
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
              design_ctx=None, **kw):
         return by_mmproj[bool(include_mmproj)]
@@ -168,7 +168,7 @@ def test_bounded_ctx_clamps_design_then_cli(make_model, profiles):
     assert ctx == 32768
 
 
-FP_TRIPLE = (1000.0, 0.5, 100.0)
+FP_PARAMS = (1000.0, 0.5, 0.0, 100.0)
 
 
 def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
@@ -182,14 +182,16 @@ def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
 
     seen = {}
 
-    def fake_effective_static(fit_bin, cache_type="q8_0", parallel=1,
+    def fake_effective_static(fit_bin, cache_type="q8_0",
                               design_ctx=None, include_mmproj=True, **kw):
         seen[include_mmproj] = seen.get(include_mmproj, 0) + 1
-        return FP_TRIPLE
+        return FP_PARAMS
 
-    def fake_fit_params_static(fit_bin, cache_type="q8_0", parallel=1, **kw):
-        return SimpleNamespace(model_mib=FP_TRIPLE[0], ctx_factor=FP_TRIPLE[1],
-                               compute_mib=FP_TRIPLE[2])
+    def fake_fit_params_static(fit_bin, cache_type="q8_0", **kw):
+        return SimpleNamespace(model_mib=FP_PARAMS[0],
+                               kv_per_token_mib=FP_PARAMS[1],
+                               slot_mib=FP_PARAMS[2],
+                               compute_mib=FP_PARAMS[3], source="fit-params")
 
     for m in (chat_a, chat_b, embed):
         m.vram.effective_static = fake_effective_static
@@ -215,7 +217,7 @@ def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
     # chat_b's mmproj is omitted via drop_stems.
     assert seen == {True: 1, False: 1}
     assert len(captured["chat_models"]) == 2
-    assert captured["embed_params"] == FP_TRIPLE
+    assert captured["embed_params"] == FP_PARAMS
 
 
 # ── matrix knobs ──────────────────────────────────────────────────────────
@@ -245,11 +247,12 @@ def test_matrix_knobs_invalid_values_warn_and_default(caplog):
 # ── opportunistic co-load pass ────────────────────────────────────────────
 
 
-def _fake_vram(m, triple):
-    m.vram.effective_static = lambda *a, **k: triple
+def _fake_vram(m, params):
+    mib, kv_factor, compute = params
+    m.vram.effective_static = lambda *a, **k: (mib, kv_factor, 0.0, compute)
     m.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
-        model_mib=triple[0], ctx_factor=triple[1], compute_mib=triple[2],
-        source="fit-params")
+        model_mib=mib, kv_per_token_mib=kv_factor, slot_mib=0.0,
+        compute_mib=compute, source="fit-params")
 
 
 def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
@@ -264,9 +267,9 @@ def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
     for m in (embed, rerank):
         _fake_vram(m, (500, 0.1, 100))
     # Pinned vram_mb: authoritative fixed overhead (no headroom).
-    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0)
+    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0.0, 0)
     s2t.vram.fit_params_static = lambda *a, **k: None
-    img.vram.effective_static = lambda *a, **k: (40000, 0.0, 0)
+    img.vram.effective_static = lambda *a, **k: (40000, 0.0, 0.0, 0)
     img.vram.fit_params_static = lambda *a, **k: None
 
     result = _solve_matrix_context(
@@ -310,7 +313,7 @@ def test_solve_matrix_reads_block_tokens_from_on_view(
         [m, e, r], e, r, fit_bin="unused", vram_total=48 * 1024, spare=None,
         profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
     assert result is not None
-    floors = {mod.stem: floor for mod, _, _, _, floor
+    floors = {mod.stem: floor for mod, _, _, _, _, _, floor
               in captured["chat_models"]}
     assert floors == {"v": 9000}
 
@@ -323,7 +326,7 @@ def test_solve_matrix_floor_blocks_all_coloads(profiles):
     _fake_vram(chat, (8000, 1.0, 500))
     for m in (embed, rerank):
         _fake_vram(m, (500, 0.1, 100))
-    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0)
+    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0.0, 0)
     s2t.vram.fit_params_static = lambda *a, **k: None
 
     from llama_packer.writer import MatrixKnobs
@@ -346,7 +349,7 @@ def test_solve_matrix_tools_floor_blocks_coload(profiles):
     _fake_vram(chat, (8000, 1.0, 500))
     for m in (embed, rerank):
         _fake_vram(m, (500, 0.1, 100))
-    img.vram.effective_static = lambda *a, **k: (20000, 0.0, 0)
+    img.vram.effective_static = lambda *a, **k: (20000, 0.0, 0.0, 0)
     img.vram.fit_params_static = lambda *a, **k: None
 
     from llama_packer.writer import MatrixKnobs
@@ -419,7 +422,7 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
     _fake_vram(chat, (8000, 1.0, 500))
     for m in (embed, rerank):
         _fake_vram(m, (500, 0.5, 100))
-    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0)
+    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0.0, 0)
     s2t.vram.fit_params_static = lambda *a, **k: None
 
     # calc_ctx: echo the design_ctx the planner proposes, else the model's own.

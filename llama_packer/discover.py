@@ -81,6 +81,7 @@ def discover(
     for root in models_dirs:
         if not root.is_dir():
             continue
+        logger.info("scanning models dir: %s", root)
         ignore = utils.load_model_ignore(root)
         _walk(root, root, None, role_map, ignore, stack,
               hf_home, models, orphan_candidates, skipped)
@@ -222,8 +223,12 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
 
 
 def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
-           hf_home, out: list[Model]) -> None:
-    """The single model pipeline: merge → construct → rules → companions → finalize."""
+           hf_home, out: list[Model], stub: bool = False) -> None:
+    """The single model pipeline: merge → construct → rules → companions → finalize.
+
+    *stub* marks freshly materialized orphan sidecars: their measured-file
+    sync stays memory-only so the stub on disk remains pristine.
+    """
     caps = frontmatter.get("capabilities")
     if isinstance(caps, list) and any(
             isinstance(c, str) and c.startswith("-") and len(c) > 1
@@ -244,6 +249,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
         return
     stack.apply_rules(model)
     model.resolve_companions()
+    model.sync_measured_file(write=not stub)
     stack.finalize(model)
     # Guard: keep generative-media weights out of served text roles.  The
     # classification is header-only (GGUF metadata / safetensors names /
@@ -251,9 +257,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     # offending file, then the model is excluded from the config.
     # The `image` role is exempt — diffusion weights are expected there.
     if model.role in utils.SERVED_ROLES and model.role != "image" and model.gguf_path:
-        kind = utils.classify_file(model.gguf_path)
-        if kind == "unknown" and model.hf_repo:
-            kind = utils.hf_readme_kind(model.hf_repo, hf_home) or "unknown"
+        kind = model.file_kind
         if kind == "image":
             logger.error(
                 "%s: diffusion/image weights classified in a served %s role "
@@ -265,9 +269,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     # textual-inversion embeddings, loras, and other assets that live under
     # img/ but are not diffusion models themselves (they are companions).
     if model.role == "image" and model.gguf_path:
-        kind = utils.classify_file(model.gguf_path)
-        if kind == "unknown" and model.hf_repo:
-            kind = utils.hf_readme_kind(model.hf_repo, hf_home) or "unknown"
+        kind = model.file_kind
         if kind != "image":
             logger.info("skipping %s: not diffusion/image weights in image role (kind=%s)",
                         path.name, kind)
@@ -328,7 +330,7 @@ def _model_from_orphan(gguf: Path, root: Path, role: str | None,
     sidecar behave identically through the pipeline.
     """
     md_path = _materialize_sidecar(gguf, root, generate_stubs)
-    _build(md_path, {}, role, stack, hf_home, out)
+    _build(md_path, {}, role, stack, hf_home, out, stub=True)
 
 
 def _write_stub(md_path: Path) -> None:

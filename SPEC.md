@@ -141,7 +141,7 @@ When `--llama-server` is not given, the binary directory resolves via
 `utils.find_bin_dir`:
 
 1. `$LLAMA_BIN_DIR` — explicit build dir, wins over everything
-2. `-v/--llama-version N` → `./llama-bN` if it exists
+2. `--llama-version N` → `./llama-bN` if it exists
 3. default (`latest`) → the highest-numbered `./llama-b[0-9]*` directory
 
 `llama-server` and `llama-fit-params` are both taken from the resolved
@@ -153,37 +153,62 @@ The tool calculates `ctx_size` dynamically based on measured VRAM costs, not sta
 
 ### Measurement via `llama-fit-params`
 
-For each (model, cache_type, parallel) combination, the system runs `llama-fit-params` to measure three VRAM cost components:
+VRAM follows a validated affine law (see `llama_packer/memory_probe.py` and
+docs/plans/auto-parallel.md):
 
-| Component | Type | Meaning |
+```
+VRAM(C, p) = model_mib + compute_mib + c*C + p*D
+```
+
+`C` is the **total** shared KV pool (llama.cpp `-c`; byte-identical to
+`--kv-unified-per-slot X -np p` with pool `p*X`), `p` the slot count, and the
+constants are:
+
+| Constant | Key | Meaning |
 |-----------|------|---------|
-| `model_mib` | Fixed | Weight-loading cost (constant regardless of context) |
-| `ctx_factor` | Linear | MiB per token (KV-cache + attention scratch) |
-| `compute_mib` | Fixed | Fixed compute overhead (activations, scratch buffers) |
+| `model_mib` | weight cost | Constant regardless of context or slots |
+| `kv_per_token_mib` | `c` | Shared full-attention KV per token (the pool is `X * p` tokens for per-slot context `X`) |
+| `slot_mib` | `D` | Fixed cost per parallel slot (SWA ring buffers + slot overhead) |
+| `compute_mib` | fixed | Compute/workspace buffers (max over the p=1/p=2 pair) |
 
-Values are persisted to the model's `.md` sidecar as a `fit-params` block, avoiding re-measurement across runs. Values are invalidated when `cache_type` or `parallel` changes.
+A single measurement cannot separate `c` from `D`, so the system measures a
+**(p=1, p=2) pair** at the design context: `D = ctx(2) − ctx(1)`,
+`c = (ctx(1) − D)/C`. The pair pins the law exactly (validated residuals
+< 0.1% across dense/MoE/SWA families and q8_0/f16/bf16/q4_0) and replaces the
+former per-parallel sweeps.
 
-**Cache-type scaling.** The KV-cache component of `ctx_factor` is linear in
-cache precision (per-element bytes, `utils._KV_CACHE_BYTES`), while `model_mib`
-and `compute_mib` are precision-independent. So a `cache_type` change does
-**not** trigger a re-measure: the persisted `ctx_factor` is scaled by the
-byte ratio between the old and new precisions (`_scale_ctx_factor`), rounding
-up to avoid under-reserving. A `parallel` change still invalidates (batching
-buffers don't scale linearly).
+Values are persisted to the model's `.md` sidecar `measured:` block — **per
+`cache_type`, parallel-independent by construction** (the `parallel` and
+legacy `ctx_factor` keys of the pre-affine schema are removed on rewrite).
+A `cache_type` change invalidates the block and re-measures: `c` would scale
+with KV precision (`_KV_CACHE_BYTES` byte ratios), but `D`'s precision
+behavior is arch-dependent (SWA ring buffers scale, fixed slot overhead does
+not), so blocks are never derived across cache types — re-measuring costs
+~1 s. Pre-affine blocks (no `slot_mib`) are stale by definition and are
+re-measured + rewritten on the next run.
 
-**Fallback chain:** saved frontmatter → cache-type-scaled derivation → in-memory cache → `llama-fit-params` binary → safetensors header estimation.
+**Fallback chain:** saved frontmatter → in-memory cache → `llama-fit-params` (p=1/p=2 pair) → safetensors header estimation (`c` only, `D=0`).
 
 `llama-fit-params` is always invoked with `--fit off` so it measures the explicit `-c` (or design) context rather than auto-adjusting arguments — `--fit on` (the default) would otherwise change `-ngl`/`-c` when the GPU is busy, corrupting the measurement.
+
+**Validation probe.** `llama-packer --probe-memory [ARCH...]` sweeps one
+representative per GGUF arch family at p ∈ {1,2,4,8}, derives `(c, D)`, and
+reports the max residual against the law (FAIL above 0.5%) — the fast
+sanity check when a new architecture family appears. The underlying helpers
+(`llama_packer.memory_probe`) are importable by other tools.
 
 ### Companion (mmproj / MTP) VRAM accounting
 
 Companion GGUFs cannot be measured by `llama-fit-params` — mmproj files fail to load as standalone models, and MTP draft heads abort on a missing `ctx_other`. Their VRAM is therefore folded into the main model's budget via a combined "effective static" pass (`llama_packer/vram.py:effective_static`):
 
-- **Main model**: measured fit-params values.
-- **MTP draft**: file-size weight plus an estimated per-token `ctx_factor` (the draft holds its own KV cache that scales with context) and a fixed compute buffer.
-- **mmproj**: file-size weight plus a fixed compute buffer (`_MMPROJ_COMPUTE_MB`, ~150 MiB for the vision projection buffers); no per-token factor.
+- **Main model**: measured affine constants.
+- **MTP draft**: file-size weight plus estimated affine terms (both `c` and
+  `D` scaled from the main model by the size ratio, padded by
+  `_DRAFT_CTX_SAFETY` — the draft holds its own KV cache that scales with
+  context) and a fixed compute buffer.
+- **mmproj**: file-size weight plus a fixed compute buffer (`_MMPROJ_COMPUTE_MB`, ~150 MiB for the vision projection buffers); no KV terms — projection cost is independent of context and slots.
 
-An attempt is made to run `llama-fit-params` on each companion first (cached per companion); on failure it falls back to the file-size estimate with a warning. This fixes companion VRAM being under-budgeted by raw file size alone (a Gemma4-31B + MTP + mmproj combination was measured to need ~1.8 GiB more than the sum of companion file sizes).
+Companion GGUFs are never measured: `llama-fit-params` cannot load them (mmproj fails as a standalone model; MTP draft heads abort on a missing `ctx_other`), so the file-size estimate is used directly (cached per companion). This fixes companion VRAM being under-budgeted by raw file size alone (a Gemma4-31B + MTP + mmproj combination was measured to need ~1.8 GiB more than the sum of companion file sizes).
 
 ### Image token budget (vision sidecars)
 
@@ -195,27 +220,37 @@ Semantics:
 - **max**: large images are downscaled to this token ceiling — the control for bounding KV cost and prompt size. Diminishing quality returns beyond ~4k tokens.
 - **Static-resolution archs** (Gemma 3/4, SigLIP: fixed resize, ~256 tokens/image) ignore both flags; declaring them there logs a one-time warning and skips emission, as does declaring them on a model with no mmproj companion.
 
-VRAM accounting: image tokens are ordinary tokens inside `-c` — they consume KV slots already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved context is never allowed to drop below `parallel × image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the matrix solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
+VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the matrix solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
 
 ### Context calculation formula
 
+The solve returns the **per-slot** context `X`; the emitted llama-server flag
+is `--kv-unified-per-slot X` (shared pool `parallel * X`) and
+`metadata.ctx_size` advertises `X`. vLLM's `--max-model-len` is per-sequence
+already, so no flag translation is needed there.
+
 ```
 reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
-available = vram_total - reserve - spare
-remaining = available - model_mib - compute_mib        # model/ctx/compute now include companions
-max_ctx = remaining / ctx_factor
-max_ctx = floor(max_ctx / CTX_ROUND_TO) * CTX_ROUND_TO    # round down to 8192 boundary
-max_ctx = max(max_ctx, MIN_CTX_SIZE)                       # floor at 4096
-max_ctx = min(max_ctx, gguf_context_length)                # cap at GGUF architectural max
-max_ctx = min(max_ctx, sidecar_context_length)             # cap at sidecar ceiling
-max_ctx = min(max_ctx, max_context)                        # cap at CLI --max-context
+available = (vram_total - reserve - spare) / (1 + memory_margin)
+remaining = available - model_mib - compute_mib        # includes companions
+X_max = (remaining - p*D) / (c*p)                      # affine solve
+X = floor(X_max / CTX_ROUND_TO) * CTX_ROUND_TO             # round down to 8192 boundary
+X = max(X, MIN_CTX_SIZE)                                   # floor at 4096
+X = min(X, gguf_context_length)                            # cap at GGUF architectural max
+X = min(X, sidecar_context_length)                         # cap at sidecar ceiling
+X = min(X, max_context)                                    # cap at CLI --max-context
 ```
+
+If the design context fits (`(c*design + D) * p ≤ remaining`), it is used
+directly without scaling down. `memory_margin` (profiles.yaml
+`hardware.memory_margin`, default 0.01) inflates every measured term so
+measurement residual errs toward reserving more.
 
 `baseline_mb` is the VRAM already consumed by the driver/compositor/other processes. It is **opt-in**: set via `--baseline` or `profiles.yaml` `hardware.baseline_mb`, and defaults to **0**. The fixed `_RESERVE_VIDEO` (1024 MiB) already covers driver/compositor overhead, so auto-detection of the live `used_vram` is intentionally NOT performed — llama-swap keeps model servers resident, and counting that usage would make the budget assume a blank GPU and collapse every context to the minimum. The effective reserve is the fixed system reserve (1024) plus the larger of the fixed video reserve (1024) and any explicit `baseline_mb`. `--spare` is subtracted on top of this reserve. CPU-resident models (`device: cpu`) are excluded from VRAM budgeting entirely and are sized to their own architectural/sidecar context.
 
-**Design context:** When `llama-fit-params` measures `ctx_factor`, it uses the model's GGUF architectural context length as the reference point (or sidecar `context_length`, or 32768 default). If the design context fits within the remaining budget, it is used directly without scaling down.
+**Design context:** When the affine pair is measured, it uses the model's GGUF architectural context length as the reference point (or sidecar `context_length`, or 32768 default). If the design context fits within the remaining budget, it is used directly without scaling down.
 
-**Note:** `parallel` slots are accounted for inside `llama-fit-params` measurement — no separate division step.
+**Note:** parallel slots cost the fixed `p*D` term plus their share of the pool (`c * p * X`) — both scale with the slot count, so the solve charges them exactly.
 
 ### Minimum useful context and vision (mmproj) skipping
 
@@ -266,7 +301,7 @@ After the squeeze pass, enabled `s2t` and `image` models (not `t2s` — containe
 
 - floor = `tools_min_ctx` when a chat model declares `tools` and the baseline still keeps it; otherwise `min_chat_ctx`.
 - A candidate that would drop chat below the floor is skipped with a warning naming model and MB; it does not block smaller candidates later in the list.
-- Fixed overhead = weights + fixed compute (`ctx_factor = 0` for these backends). An operator-pinned `vram_mb` sidecar field is authoritative (`source: config`); otherwise the file-size + per-backend-buffer estimate applies, padded by `estimate_headroom` when no measurement exists. CPU-resident candidates cost 0.
+- Fixed overhead = weights + fixed compute (zero KV terms for these backends). An operator-pinned `vram_mb` sidecar field is authoritative (`source: config`); otherwise the file-size + per-backend-buffer estimate applies, padded by `estimate_headroom` when no measurement exists. CPU-resident candidates cost 0.
 - Shared process overhead is counted once per process, not per model — a multi-model entry (e.g. a speech server hosting ASR + VAD + diarization) is budgeted as Σ(weights + per-model activations) + one shared constant; pin the entry with `vram_mb` to encode the sum directly.
 
 Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision), and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
@@ -518,13 +553,15 @@ overrides:
 ### Memory estimation
 
 vLLM has no `llama-fit-params` analog, so VRAM params are sourced differently but flow
-through the same `FitParams` pipeline (`model_mib`, `ctx_factor`, `compute_mib`), and are
-persisted to the sidecar `fit-params:` block with `source:` `vllm-estimate` /
+through the same `FitParams` pipeline (`model_mib`, `kv_per_token_mib`,
+`slot_mib=0` — vLLM's paged KV pool is shared, `--max-num-seqs` does not
+change KV size — and `compute_mib`), and are
+persisted to the sidecar `measured:` block with `source:` `vllm-estimate` /
 `safetensors-estimate`. Sources, in order (`vram.py:_fit_params_vllm`):
 
 1. `vllm-memory-estimator` (optional dependency) on the `hf_repo` — reuses vLLM's own
    `ModelConfig`/`KVCacheSpec` logic; maps weights→`model_mib`, activations+workspace+
-   overhead→`compute_mib`, per-token KV→`ctx_factor`.
+   overhead→`compute_mib`, per-token KV→`kv_per_token_mib`.
 2. Local `.safetensors` header estimate (`utils.estimate_safetensors`).
 
 When neither is available, context falls back to the declared `context_length` (or GGUF
@@ -597,7 +634,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Memory estimation
 
-`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, `ctx_factor = 0`, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM; the entry is excluded from the shared chat budget solve itself, but (unlike before) is a candidate for the opportunistic co-load pass when a matrix section is configured — included only while chat keeps its floor (a 40 GB diffusion model simply won't fit after the RAG set).
+`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, zero KV terms, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM; the entry is excluded from the shared chat budget solve itself, but (unlike before) is a candidate for the opportunistic co-load pass when a matrix section is configured — included only while chat keeps its floor (a 40 GB diffusion model simply won't fit after the RAG set).
 
 ### Binary precedence
 
@@ -669,7 +706,7 @@ skips the model. Docker variant is future work.
 `role: s2t` emits `capabilities: {in: [audio], out: [text]}` (Transcription
 badge); declared `image/audio/speech` capabilities are chat-only and ignored
 for s2t roles. VRAM is fixed overhead like sd-server: `model_mib = file-size`,
-`ctx_factor = 0`, `compute_mib = 100` (measured on Vulkan: process footprint
+zero KV terms, `compute_mib = 100` (measured on Vulkan: process footprint
 ≈ Σ model files — activation memory is small; sd-server keeps its 512 MiB
 diffusion buffer); a sidecar `vram_mb` pins the total outright.
 `ctx_size` tracks `design_context` (sidecar `context_length` or default)
@@ -1032,21 +1069,22 @@ The KV cache is linear in tokens and in cache precision:
 
 ```
 kv_bytes_per_token = 2 × Σ_layers (k_proj_out_dim + v_proj_out_dim) × bytes_per_element
-ctx_factor [MiB/token] = kv_bytes_per_token / 2²⁰   (+ attention scratch, measured)
+kv_per_token_mib [MiB/token] = kv_bytes_per_token / 2²⁰
 ```
 
 - The per-layer K/V output dims come from a `llama-fit-params` measurement of
   the main model; the safetensors fallback (`utils.estimate_safetensors`) reads
-  them from `k_proj`/`v_proj` tensor shapes in the header.
-- **Cache-type scaling**: only the `bytes_per_element` term depends on
-  precision, so a `cache_type` change reuses the persisted measurement and
-  rescales it — `ctx_factor_new = ctx_factor_old × bytes(new) / bytes(old)`
-  (`vram.py:_scale_ctx_factor`, rounding up so estimates err toward reserving
-  more). `model_mib` and `compute_mib` are precision-independent and carry
-  over unchanged. A `parallel` change still triggers a fresh measure.
-- Example: a model measured at `ctx_factor = 0.5` MiB/token under `f16`
-  serves `q8_0` at `0.5 × 1.0625/2 ≈ 0.266` MiB/token — roughly half the KV
-  footprint, doubling the affordable context for the same VRAM.
+  them from `k_proj`/`v_proj` tensor shapes in the header. The safetensors
+  path yields only `c` (per-token KV); the per-slot `D` is unknown there and
+  conservatively zero.
+- **Cache-type**: measured blocks are stored per `cache_type` and never
+  derived across types. `c` *would* scale by the byte ratio
+  (`_KV_CACHE_BYTES`), but `D`'s precision behavior is arch-dependent (SWA
+  ring buffers scale with KV precision; fixed slot overhead does not), and
+  re-measuring the (p=1, p=2) pair costs ~1 s.
+- Example: a model measured under `f16` serves `q8_0` with roughly half the
+  KV footprint (`1.0625/2`), doubling the affordable context for the same
+  VRAM — verified empirically (×0.529–0.531 across families).
 
 ## Model Discovery and Stub Sidecars
 
@@ -1316,23 +1354,39 @@ weaknesses:
 ---
 ```
 
-## Fit-Params Persistence
+## Measured-Block Persistence
 
-Measured VRAM parameters are stored in the sidecar `.md` file under a `fit-params` nested block:
+Machine-written values live in the sidecar `.md` file under a single
+`measured` nested block — the only dynamically generated branch (a legacy
+`fit-params` block is still located, but its pre-affine numbers are
+stale: the block is re-measured and rewritten as `measured` with the
+affine schema on next persist):
 
 ```yaml
-fit-params:
+measured:
   model_mib: 4800
-  ctx_factor: 0.0312
+  kv_per_token_mib: 0.0312
+  slot_mib: 12.5
   compute_mib: 512
   source: fit-params
   cache_type: q8_0
-  parallel: 1
+  file:
+    size_mb: 4848
+    size_bytes: 5084001234
+    mtime_ns: 1788804721239187032
+    arch: qwen3
+    context_length: 131072
+    kind: text
 ```
 
 This block is:
-- Read automatically on subsequent runs (avoids re-measurement).
-- Invalidated when `cache_type` or `parallel` changes.
+- Read automatically on subsequent runs (avoids re-measurement and
+  re-reading weight headers).
+- The VRAM constants are invalidated when `cache_type` changes (re-measured;
+  blocks are per cache type and never derived across precisions), and any
+  pre-affine block (missing `slot_mib`) is re-measured + rewritten on the
+  next run; the `file:` intrinsics are invalidated when the weight file's
+  size or mtime changes (then re-read once and re-persisted).
 - Updated when new values are computed.
 - Preserved alongside all other frontmatter keys.
 

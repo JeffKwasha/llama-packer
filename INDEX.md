@@ -10,12 +10,14 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Modules
 
-- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, `image_min/max_tokens`, ...), companion resolution
+- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, `image_min/max_tokens`, ...), companion resolution; file identity (`from_file`/`from_ref`/`Model[…]` registry, `GGUFModel`/`SafetensorsModel` subclasses, `WeightFinder`), `measured:` block persist/sync
 - [`llama_packer/profiles.py`](llama_packer/profiles.py) — `Profiles` value object: defaults, spare precedence, `allow_profiles` filtering, per-model variant grouping
+- [`llama_packer/progress.py`](llama_packer/progress.py) — optional `rich` progress bar (models completed/total); every method no-ops without `rich`/non-TTY/under pytest
 - [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + always-on `-text` variant, renamed auto-dropped main, matrix solve: squeeze + opportunistic s2t/image co-loads + tools demotion, bounded ctx) → `emit_config` (llama-swap entries with bare `<id>` = image-capable / `<id>-text` = text-only; exposes `entry_ids_by_stem`, `coload_stems`), `_filter_supported` (validation boundary incl. capability/companion cross-check), `write_yaml`
+- [`llama_packer/memory_probe.py`](llama_packer/memory_probe.py) — importable VRAM probe: raw `llama-fit-params` sweeps, the affine `(c, D)` pair derivation, and the `--probe-memory [ARCH...]` per-family law validator
 - [`llama_packer/backends/`](llama_packer/backends/) — backend package: `base` (ABC + support matrix + `is_available`), `llama_server`, `vllm` (host + docker); `BACKENDS` registry, `infer_backend`, `VLLM_BACKENDS`, `get_backend`
 - [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules (global profiles.yaml + directory-scoped `models.yaml`, inner scope wins) → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
-- [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` fit-params (incl. `vram_mb` pin for fixed-overhead backends), `solve_matrix_ctx` (+`fixed_overhead_mb`)
+- [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` affine fit-params (`kv_per_token_mib` c, `slot_mib` D; per cache_type, parallel-independent; `vram_mb` pin for fixed-overhead backends), per-slot `calc_ctx` / `solve_matrix_ctx` (+`fixed_overhead_mb`, `memory_margin`)
 - [`llama_packer/vllm_estimate.py`](llama_packer/vllm_estimate.py) — vLLM memory estimation via `vllm-memory-estimator` (+ safetensors fallback)
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
 - [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)

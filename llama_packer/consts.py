@@ -29,6 +29,25 @@ _MIN_AGENTIC_CTX = 131072
 _RESERVE_SYSTEM = 1024
 _RESERVE_VIDEO = 1024
 
+# Fraction inflated against every measured VRAM term when solving, so the
+# law errs toward reserving more.  Beyond measurement residual this covers
+# the VRAM the backend allocator consumes outside llama.cpp's own buffers
+# (driver overhead, fragmentation — ~4% observed on Vulkan/radv) plus the
+# desktop/compositor.  profiles.yaml `hardware.memory_margin` overrides.
+_MEMORY_MARGIN = 0.04
+
+# Serve-shaped measurement (VramBudget llama-server pair): the pair runs at
+# min(design context, this cap) — small enough that both members fit VRAM,
+# large enough to sit far above any SWA window so the per-token KV term is
+# in its linear regime.
+_MEASURE_CTX_CAP = 65536
+
+# Per-run timeout (s) — generous enough for a ~30 GB model on a platter
+# drive (~4-6 min load) — and the stall window (s): a run whose log stops
+# growing for this long is hung and gets killed.
+_MEASURE_TIMEOUT_S = 900
+_MEASURE_STALL_S = 120
+
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # MTP defaults
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -

@@ -23,6 +23,8 @@ chat/
 # Scratch / temp
 ~*
 *.bak
+log
+parallel.log
 
 # Large build artifacts / model weights (not source)
 .old/

@@ -204,8 +204,64 @@ unchanged), so no change there beyond using the solved `p`.
 ## Answered questions (previously "open")
 
 - **`concurrencyLimit`.** If declared, it caps queued+active requests: `p = min(p*, concurrencyLimit)`. One line, no discussion.
-- **Per-slot vs aggregate `ctx_factor`.** Validation task, not a design question: measure one model at p=1 and p=2 and diff; state explicitly whether the factor is per-slot (`total = p × ctx × f_slot`) or aggregate. The current single-ctx equation hides the distinction at p=1.
-- **Compute-buffer growth with p.** v1 scales analytically with `estimate_headroom`; later, the fit-params block is already keyed by `(cache_type, parallel)`, so a measured block for the chosen p is the exact path — cost is one extra `llama-fit-params` subprocess per auto-parallelled model.
+- **Per-slot vs aggregate `ctx_factor`.** *Answered 2026-09-07* — see the
+  findings addendum below: the law is affine, not per-slot proportional.
+- **Compute-buffer growth with p.** *Answered 2026-09-07* — compute is
+  ~constant across p (max over the p=1/p=2 pair, ±32 MiB Vulkan alignment
+  quanta; one +128 MiB f16 spike covered by the max).
+
+## Findings: the affine VRAM law (2026-09-07, SEAL record)
+
+Measured with the `--probe-memory` probe across qwen3.8-27B (dense,
+arch `qwen35`), gemma-4-12B-QAT (dense+SWA+MTP, arch `gemma4`) and
+gemma-4-26B-A4B (MoE+SWA), at p ∈ {1,2,4,8}, C ∈ {64k,128k,256k},
+q8_0/f16/bf16/q4_0 (raw data: `parallel.log` in the repo root at the time
+of measurement):
+
+```
+VRAM(C, p) = model_mib + compute_mib + c*C + p*D
+```
+
+- `C` is the **total** KV pool: `-c` in llama.cpp terms, byte-identical to
+  `--kv-unified-per-slot X -np p` (verified exactly on both arches).
+- Residuals of the two-point fit: ≤ 3 MiB (< 0.1 %) on every measured cell.
+- `D` = per-slot cost; SWA archs spend it on ring buffers (gemma4-12B:
+  255 MiB q8_0, scaling exactly with KV byte ratios ×1.882 f16 / ×0.529
+  q4_0), non-SWA archs on fixed overhead (qwen35: 150 MiB at *every*
+  precision). **`D` is therefore not derivable across cache types** —
+  blocks are measured per `cache_type` (~1 s per model).
+- `c` scales between precisions by exactly the `_KV_CACHE_BYTES` byte ratio.
+- The v1 assumption `ctx_factor(p) = p × ctx_factor(1)` over-reserved p=8
+  by ~19 GB on qwen3.8-27B (23 GB charged vs ~10 GB real) — auto-parallel
+  was choosing p=1 almost everywhere because parallel looked unaffordable.
+  Emitted configs are expected to change (more slots / larger contexts);
+  that is the fix working, not a regression.
+- mmproj: `llama-fit-params` SIGABRTs on projection GGUFs (exit −6, both
+  witnesses); the analytic weight + fixed-compute model stands, and
+  projection cost is provably independent of context and slots (no KV).
+  Live-VRAM validation of the 150 MiB buffer constant was left as an
+  optional follow-up (touches the running llama-swap).
+- Solve-side safety: `hardware.memory_margin` (default 0.01) inflates every
+  measured term; the solve is exact closed-form
+  `X = (remaining − p·D)/(c·p)`, so the sweep costs zero binary calls
+  beyond the one (p=1, p=2) pair per (model, cache_type).
+
+Fleet validation (`--probe-memory`, all 11 GGUF families): PASS. Constants
+of record (`c` MiB/token, `D` MiB/slot, q8_0):
+
+| arch | witness | c | D | max err |
+|------|---------|---|---|---------|
+| deepseek2 | GLM47-Flash | 0.027428 | 0 | 0.000% |
+| gemma3 | gemma-3-12b-it-heretic-v2 | 0.033203 | 255 | 0.000% |
+| gemma4 | gemma-4-26B-A4B | 0.010376 | 159 | 0.075% |
+| laguna | Laguna-XS-2.1 | 0.020748 | 64 | 0.017% |
+| lfm2 | LFM2.5-VL-1.6B | 0.006227 | 0 | 0.87% (16 MiB abs — sub-MiB per-slot cost on a tiny KV; verdict uses an absolute floor) |
+| llama | Nous-Hermes-2-Vision | 0.066406 | 0 | 0.000% |
+| muse-glimmer | Glimmer-30B | 0.006737 | 52 | 0.077% |
+| qwen3 | qwen3-4B | 0.074707 | 0 | 0.000% |
+| qwen35 | Qwen3.8-27B | 0.033199 | 150 | 0.020% |
+| qwen35moe | Qwen3.6-35B-A3B | 0.010372 | 63 | 0.031% |
+| qwen3vl | Qwen3-VL-8B | 0.074707 | 0 | 0.000% |
 
 ## Non-goals (v1)
 

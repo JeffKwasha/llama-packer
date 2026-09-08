@@ -16,7 +16,7 @@ def make_model(tmp_path):
 
     The GGUF file is not a real GGUF, so ``gguf_context_length`` reads None and
     ``_design_ctx`` falls back to the sidecar ``context_length``.  No
-    subprocess is invoked because tests seed a ``fit-params`` block.
+    subprocess is invoked because tests seed a ``llama-server`` block.
     """
 
     def _make(stem: str = "test", **frontmatter) -> Model:
@@ -34,12 +34,12 @@ def make_model(tmp_path):
 
 @pytest.fixture
 def fit_params_block():
-    """A valid fit-params frontmatter block (cache_type q8_0, parallel 1)."""
+    """A valid serve-shaped measured block (cache_type q8_0)."""
     return {
         "model_mib": 10000,
-        "ctx_factor": 0.5,
+        "kv_per_token_mib": 0.5,
+        "slot_mib": 0.0,
         "compute_mib": 1000,
-        "source": "fit-params",
+        "source": "llama-server",
         "cache_type": "q8_0",
-        "parallel": 1,
     }
