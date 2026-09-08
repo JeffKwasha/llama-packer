@@ -270,10 +270,11 @@ def test_fit_params_static_measure_failure_uses_transient_fit_params(
 
     def fake_fit_params(*, fit_bin, fit_ctx, cache_type, parallel,
                         model_path=None, label=None, llama_args=""):
-        kv = round(c_true * fit_ctx)
-        ctx_mib = kv + int(d_true * parallel)
-        return {"model": 18114, "context": ctx_mib, "compute": 505,
-                "kv": float(kv), "rs": 0.0, "rs_cells": 0}
+        # The KV pool line carries the per-slot cost (SWA ring / RS cells)
+        # exactly as the real -lv 5 log does.
+        return {"model": 18114, "context": 500, "compute": 505,
+                "kv": c_true * fit_ctx + d_true * parallel,
+                "rs": 0.0, "rs_cells": 0}
 
     monkeypatch.setattr(model.vram, "_fit_params_serve",
                         lambda *a, **k: None)

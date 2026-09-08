@@ -201,22 +201,30 @@ def parse_fit_log(log_text: str) -> dict[str, float] | None:
     """Parse a llama-fit-params ``--fit-print on --fit off -lv 5`` run.
 
     Returns ``{model, context, compute, kv, rs, rs_cells}`` (MiB; the
-    device row only — the ``Host`` row is skipped), or None when the
-    report row is missing.
+    device report row only — the ``Host`` row is skipped), or None when
+    the report row is missing.  ``kv`` sums *every* KV pool the context
+    creates — for SWA architectures that is the C-scaling full-attention
+    pool plus the fixed-size per-slot sliding ring — and ``rs`` sums the
+    recurrent-state caches (``rs_cells`` their cells), so the
+    ``(C, C/2)`` pool difference isolates the per-token term exactly.
     """
     for m in _FIT_REPORT_RE.finditer(log_text):
         dev = m.group(1)
         if dev == "Host" or dev.endswith("_Host"):
             continue
-        kv = _FIT_KV_RE.search(log_text)
-        rs = _FIT_RS_RE.search(log_text)
+        kv = sum(float(x.group(1)) for x in _FIT_KV_RE.finditer(log_text))
+        rs = 0.0
+        rs_cells = 0
+        for x in _FIT_RS_RE.finditer(log_text):
+            rs += float(x.group(1))
+            rs_cells += int(x.group(2))
         return {
             "model": int(m.group(2)),
             "context": int(m.group(3)),
             "compute": int(m.group(4)),
-            "kv": float(kv.group(1)) if kv else 0.0,
-            "rs": float(rs.group(1)) if rs else 0.0,
-            "rs_cells": int(rs.group(2)) if rs else 0,
+            "kv": kv,
+            "rs": rs,
+            "rs_cells": rs_cells,
         }
     return None
 
@@ -642,21 +650,77 @@ class VramBudget:
                 self.model.stem, ctx, parallel, outcome)
         return buffers
 
+    def _measure_affine_trio(
+        self,
+        design: int,
+        cache_type: str,
+        llama_args: str,
+        source: str,
+        fit_bin: str,
+    ) -> FitParams | None:
+        """The (C, p) measurement trio from llama-fit-params — exact.
+
+        Three header-only runs (~0.6 s each: no tensor data, no server,
+        no meaningful VRAM use) with the exact serve flags pin the affine
+        constants from the KV/recurrent-state pool lines alone:
+
+            c = 2 * (pool(C) - pool(C/2)) / C     # ring/cells cancel
+            D = pool(C, p=2) - pool(C, p=1)       # per-slot fixed cost
+
+        where *pool* sums every KV pool and recurrent-state cache the
+        ``-lv 5`` log reports (for SWA models that includes the
+        fixed-size per-slot sliding ring, which the difference cancels).
+        The compute row is *not* part of the fit — under serve batch
+        flags it is not affine in (C, p) (deepseek2: −64 MiB per ctx
+        halving, −168 per extra slot) — so its max over the trio is the
+        constant term, and the per-arch serve correction measured by
+        ``--probe-memory`` closes the remaining fit-params-vs-serve gap
+        (allocator overhead, MTP draft, compute shaping).
+        """
+        r1 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
+                             cache_type=cache_type, parallel=1,
+                             llama_args=llama_args)
+        r2 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
+                             cache_type=cache_type, parallel=2,
+                             llama_args=llama_args)
+        r3 = self.fit_params(fit_bin=fit_bin,
+                             fit_ctx=max(design // 2, _MIN_CTX_SIZE),
+                             cache_type=cache_type, parallel=1,
+                             llama_args=llama_args)
+        if r1 is None or r2 is None or r3 is None \
+                or design <= 0 or r1["kv"] <= 0 or r3["kv"] <= 0:
+            return None
+        kv_per_token = 2.0 * (r1["kv"] - r3["kv"]) / design
+        if kv_per_token <= 0:
+            return None
+        mtp_on, _ = self.model._mtp_info()
+        rs_cell = r1["rs"] / r1["rs_cells"] if r1["rs_cells"] else 0.0
+        pool1 = r1["kv"] + r1["rs"]
+        slot_mib = max((r2["kv"] + r2["rs"]) - pool1, 0.0) \
+            + rs_cell * (2.0 if mtp_on else 1.0)
+        compute_mib = int(max(r1["compute"], r2["compute"], r3["compute"])) \
+            + int(round(rs_cell * (1.0 if mtp_on else 0.0)))
+        return FitParams(
+            model_mib=int(r1["model"]),
+            kv_per_token_mib=kv_per_token,
+            slot_mib=slot_mib,
+            compute_mib=compute_mib,
+            source=source,
+            cache_type=cache_type,
+        )
+
     def _fit_params_serve(
         self,
         fit_bin: str,
         cache_type: str,
         llama_args: str = "",
     ) -> FitParams | None:
-        """Serve-shaped estimate from the fast fit-params pair (+ corrections).
+        """Serve-shaped estimate from the fast fit-params trio (+ corrections).
 
-        Two llama-fit-params runs (~0.6 s each, header-only — no tensor data,
-        no server) with the exact serve flags give the KV pool (``c``), the
-        fit slot term (``D_fit``), the recurrent-state geometry (per-cell
-        size from the ``-lv 5`` log) and serve-shaped compute.  The MTP
-        draft and the allocator-level terms are not observable this way, so
-        the measured per-arch correction (``--probe-memory``, machine-local
-        cache) closes the gap:
+        The trio (:meth:`_measure_affine_trio`) is exact for ``c`` and
+        ``D``; the MTP draft and the allocator-level terms are not
+        observable this way, so the measured per-arch correction
+        (``--probe-memory``, machine-local cache) closes the gap:
 
             c   = c_kv                       (+ delta_c)
             D   = D_fit + per_cell * (mtp ? 2 : 1)   (+ delta_d)
@@ -666,30 +730,12 @@ class VramBudget:
         measurement they do.  Not persisted — persistence belongs to
         :meth:`fit_params_static`.
         """
-        design = self._design_ctx()
-        r1 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
-                             cache_type=cache_type, parallel=1,
-                             llama_args=llama_args)
-        r2 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
-                             cache_type=cache_type, parallel=2,
-                             llama_args=llama_args)
-        if r1 is None or r2 is None or r1["kv"] <= 0:
+        params = self._measure_affine_trio(self._design_ctx(), cache_type,
+                                           llama_args, source="fit-estimate",
+                                           fit_bin=fit_bin)
+        if params is None:
             return None
         mtp_on, _ = self.model._mtp_info()
-        rs_cell = r1["rs"] / r1["rs_cells"] if r1["rs_cells"] else 0.0
-        kv_per_token = r1["kv"] / design
-        slot_mib = max(float(r2["context"] - r1["context"]), 0.0) \
-            + rs_cell * (2.0 if mtp_on else 1.0)
-        compute_mib = int(max(r1["compute"], r2["compute"])) \
-            + int(round(rs_cell * (1.0 if mtp_on else 0.0)))
-        params = FitParams(
-            model_mib=int(r1["model"]),
-            kv_per_token_mib=kv_per_token,
-            slot_mib=slot_mib,
-            compute_mib=compute_mib,
-            source="fit-estimate",
-            cache_type=cache_type,
-        )
         corr = get_serve_correction(self.model.arch or "unknown", cache_type,
                                     mtp_on)
         if corr is not None:
@@ -710,32 +756,16 @@ class VramBudget:
         return params
 
     def _fit_params_fast(self, cache_type: str, fit_bin: str) -> FitParams | None:
-        """Transient fit-params pair — the retired fast approximation.
+        """Transient fit-params trio — the uncalibrated approximation.
 
         Used only when the serve-shaped measurement is impossible (no
-        usable GPU at pack time).  The numbers undercount the RS cache,
-        the MTP draft and the batch-dependent compute, so they are never
-        persisted: the next run re-attempts the real measurement.
+        usable GPU at pack time).  The numbers miss the MTP draft and
+        the allocator-level terms, so they are never persisted: the next
+        run re-attempts the calibrated measurement.
         """
-        design = self._design_ctx()
-        r1 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
-                             cache_type=cache_type, parallel=1)
-        r2 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
-                             cache_type=cache_type, parallel=2)
-        if r1 is None or r2 is None:
-            return None
-        kv_per_token = r1["kv"] / design if design > 0 and r1["kv"] > 0 else 0.0
-        slot_mib = max(float(r2["context"] - r1["context"]), 0.0)
-        if kv_per_token <= 0:
-            return None
-        return FitParams(
-            model_mib=int(r1["model"]),
-            kv_per_token_mib=kv_per_token,
-            slot_mib=slot_mib,
-            compute_mib=int(max(r1["compute"], r2["compute"])),
-            source="fit-params",
-            cache_type=cache_type,
-        )
+        return self._measure_affine_trio(self._design_ctx(), cache_type,
+                                         llama_args="", source="fit-params",
+                                         fit_bin=fit_bin)
 
     # ── static params (model_mib, kv_per_token_mib, slot_mib, compute_mib) ──
 

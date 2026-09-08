@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""fit-sweep — llama-fit-params data points for the affine VRAM law.
+
+    VRAM(C, p) = fixed + c*C + D*p
+
+``llama-fit-params`` is header-only (~0.6 s per run: no tensor data, no
+server, no meaningful VRAM use), so sweeping a (pool ctx x parallel)
+grid is safe on platter storage and beside a busy GPU.  Per model the
+sweep least-squares-fits the three constants over the probe grid and
+reports them with the max residual and the cross-check of ``c`` against
+the single-point KV pool.  This is the *estimate* side of the law;
+``llama-packer --probe-memory`` measures the serve-shaped truth that
+the per-arch corrections are derived from.
+
+Usage (from the repo root):
+
+    ./extras/fit-sweep [--archs ARCH ...] [--cache-type TYPE]
+                       [--llama-args FLAGS] [--fit-bin PATH]
+                       [--profiles PATH] [--model-dir DIR] [GGUF ...]
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.resources
+import logging
+import sys
+from pathlib import Path
+
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from llama_packer import Model, gpu_state  # noqa: E402
+from llama_packer.discover import discover  # noqa: E402
+from llama_packer.memory_probe import (  # noqa: E402
+    AFFINE_ABS_TOLERANCE_MIB, AFFINE_TOLERANCE,
+    pick_family_representatives)
+from llama_packer.profiles import Profiles  # noqa: E402
+from llama_packer.scope import ScopeStack  # noqa: E402
+from llama_packer.utils import (find_bin_dir,  # noqa: E402
+                                make_fast_storage_predicate)
+
+logger = logging.getLogger("fit-sweep")
+
+
+def load_profiles(path: Path) -> dict:
+    """profiles.yaml contents, falling back to the bundled defaults."""
+    if not path.is_file():
+        bundled = importlib.resources.files("llama_packer").joinpath(
+            "profiles.yaml")
+        if Path(str(bundled)).is_file():
+            path = Path(str(bundled))
+        else:
+            return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def collect_models(args, profiles_cfg: dict, llama_bin: str) -> list[Model]:
+    """Explicit GGUF paths, or the discovered fleet (read-only).
+
+    The scope stack carries ``llama_bin`` availability exactly like the
+    packer run does — without it no backend claims GGUF models and the
+    sweep would see nothing.
+    """
+    if args.paths:
+        models = []
+        for p in args.paths:
+            m = Model.from_file(Path(p).absolute())
+            if m is not None:
+                m.resolve_companions()
+                models.append(m)
+        return models
+    models_dirs = [Path(d).absolute() for d in
+                   (args.model_dir or profiles_cfg.get("models_dirs")
+                    or ["models"])]
+    return discover(models_dirs,
+                    stack=ScopeStack(avail={"llama_bin": llama_bin}),
+                    generate_stubs=False,
+                    hf_home=profiles_cfg.get("hf_home"))
+
+
+def sweep_model(model: Model, fit_bin: str, cache_type: str,
+                llama_args: str) -> dict | None:
+    """Exact (c, D) data points for one model from the pool lines.
+
+    Four header-only fit-params runs over the (C, p) grid: the trio
+    ``(C,1), (C,2), (C/2,1)`` determines ``c``, ``D`` and the per-slot
+    ring exactly (the (C, C/2) difference cancels every fixed-size
+    pool), and the 4th point ``(C/2, 2)`` leaves one residual degree of
+    freedom that can falsify the affine pool law:
+
+        pool(C, p) = ring + c*C + D*p
+    """
+    vb = model.vram
+    design = model.design_context
+    ctx2 = max(design // 2, 4096)
+    runs: dict[tuple[int, int], dict] = {}
+    for ctx, parallel in ((design, 1), (design, 2), (ctx2, 1), (ctx2, 2)):
+        r = vb.fit_params(fit_bin=fit_bin, fit_ctx=ctx,
+                          cache_type=cache_type, parallel=parallel,
+                          llama_args=llama_args)
+        if r is None:
+            return None
+        runs[(ctx, parallel)] = r
+
+    def pool(key: tuple[int, int]) -> float:
+        r = runs[key]
+        return r["kv"] + r["rs"]
+
+    if design <= 0 or runs[(design, 1)]["kv"] <= 0 \
+            or runs[(ctx2, 1)]["kv"] <= 0:
+        return None
+    c = 2.0 * (runs[(design, 1)]["kv"] - runs[(ctx2, 1)]["kv"]) / design
+    d = pool((design, 2)) - pool((design, 1))
+    if c <= 0:
+        return None
+    ring = pool((design, 1)) - c * design - d
+    residuals = {k: pool(k) - (ring + c * k[0] + d * k[1]) for k in runs}
+    max_err = max(abs(e) / pool(k) for k, e in residuals.items())
+    r1 = runs[(design, 1)]
+    return {
+        "model": model, "c": c, "d": d, "ring": ring,
+        "fixed": r1["model"] + max(r["compute"] for r in runs.values()),
+        "grid": sorted(runs), "max_err": max_err,
+        "ok": (max_err <= AFFINE_TOLERANCE
+               or max(abs(e) for e in residuals.values())
+               <= AFFINE_ABS_TOLERANCE_MIB),
+    }
+
+
+def format_rows(rows: list[dict | None]) -> str:
+    head = ("stem", "arch", "size_mb", "c_mib/tok", "D_mib", "ring_mib",
+            "fixed_mib", "pts", "max_err", "verdict")
+    body = []
+    for row in rows:
+        if row is None:
+            body.append(("-", "-", "-", "-", "-", "-", "-", "-", "-", "FAIL"))
+            continue
+        m = row["model"]
+        body.append((
+            m.stem, m.arch or "?", str(m.size_mb),
+            f"{row['c']:.6f}", f"{row['d']:.1f}", f"{row['ring']:.1f}",
+            str(round(row["fixed"])), str(len(row["grid"])),
+            f"{row['max_err']:.4%}", "PASS" if row["ok"] else "FAIL",
+        ))
+    widths = [len(h) for h in head]
+    for line in body:
+        widths = [max(w, len(col)) for w, col in zip(widths, line)]
+    out = ["  ".join(h.ljust(w) for h, w in zip(head, widths))]
+    out += ["  ".join(col.ljust(w) for col, w in zip(line, widths))
+            for line in body]
+    return "\n".join(out)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--archs", nargs="*", metavar="ARCH",
+                    help="restrict to these GGUF arch families")
+    ap.add_argument("--cache-type", default=None, metavar="TYPE",
+                    help="KV cache type (default: profiles default_cache_type)")
+    ap.add_argument("--llama-args", default="", metavar="FLAGS",
+                    help="serve-shaped global flags (default: profiles "
+                         "llama_server.args)")
+    ap.add_argument("--fit-bin", default=None, metavar="PATH",
+                    help="llama-fit-params path (default: newest llama-b*)")
+    ap.add_argument("--model-dir", action="append", metavar="DIR",
+                    help="discovery root (default: profiles models_dirs)")
+    ap.add_argument("--profiles", default="profiles.yaml")
+    ap.add_argument("paths", nargs="*",
+                    help="explicit GGUF files (skip discovery)")
+    args = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    profiles_cfg = load_profiles(Path(args.profiles).absolute())
+    profiles = Profiles(profiles_cfg)
+    cache_type = args.cache_type or profiles.default_cache_type
+    llama_args = args.llama_args or str(
+        (profiles_cfg.get("llama_server") or {}).get("args") or "")
+    fit_bin = args.fit_bin or str(
+        Path.cwd() / find_bin_dir("latest", Path.cwd()) / "llama-fit-params")
+
+    if args.model_dir:
+        profiles_cfg = {**profiles_cfg,
+                        "models_dirs": args.model_dir}
+    models = collect_models(args, profiles_cfg, str(Path(fit_bin).parent
+                                                    / "llama-server"))
+    reps = pick_family_representatives(
+        models, tuple(args.archs) if args.archs else None,
+        is_fast=make_fast_storage_predicate(
+            (profiles_cfg.get("hardware") or {}).get("fast_storage")))
+    if not reps:
+        print("fit-sweep: no measurable GGUF models found")
+        return 1
+    print(f"fit-sweep: {len(reps)} families, cache_type {cache_type}, "
+          f"grid ((C,1), (C,2), (C/2,1), (C/2,2))")
+
+    rows: list[dict | None] = []
+    with gpu_state.measurement_lock("fit-sweep"):
+        for arch, model in reps.items():
+            logger.info("fit-sweep: %s (arch %s)", model.stem, arch)
+            row = sweep_model(model, fit_bin, cache_type, llama_args)
+            gpu_state.journal({
+                "mode": "fit-sweep", "model": model.stem, "arch": arch,
+                "points": 0 if row is None else len(row["grid"]),
+                "outcome": "ok" if row and row["ok"] else
+                           ("fit" if row else "fail"),
+            })
+            rows.append(row)
+
+    print(format_rows(rows))
+    print("estimate side only — serve truth: llama-packer --probe-memory "
+          "[ARCH ...]")
+    return 0 if all(r is not None and r["ok"] for r in rows) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
