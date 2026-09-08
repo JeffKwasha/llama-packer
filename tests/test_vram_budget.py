@@ -52,9 +52,9 @@ def test_parse_device_buffers_empty_log():
 
 # ── spill validity check (2026-09-07 post-mortem) ─────────────────────────
 
-def test_parse_spill_mib_counts_host_weights_and_kv():
-    """CPU-mapped weights and host KV = spill; host compute/output staging
-    is a normal Vulkan cost and is not spill."""
+def test_parse_spill_mib_host_kv_is_spill():
+    """Host KV = the capacity-spill signature; structural CPU-mapped
+    weights (<= 2 GiB) and host compute/output staging are not spill."""
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB
 0.24.044 I load_tensors:   CPU_Mapped model buffer size =   994.63 MiB
@@ -63,7 +63,17 @@ def test_parse_spill_mib_counts_host_weights_and_kv():
 0.28.928 I sched_reserve: Vulkan_Host compute buffer size =  1104.34 MiB
 0.00.440 I llama_context: Vulkan_Host  output buffer size =     0.95 MiB
 """
-    assert parse_spill_mib(text) == pytest.approx(994.63 + 4352.00)
+    assert parse_spill_mib(text) == pytest.approx(4352.00)
+
+
+def test_parse_spill_mib_cpu_map_beyond_tolerance():
+    """CPU-mapped weights above the structural headroom = offload failure."""
+    text = """\
+0.00.437 I load_tensors:      Vulkan0 model buffer size =  8000.00 MiB
+0.24.044 I load_tensors:   CPU_Mapped model buffer size =  12000.00 MiB
+0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  1000.00 MiB
+"""
+    assert parse_spill_mib(text) == pytest.approx(12000.00 - 2048.0)
 
 
 def test_parse_spill_mib_clean_log_is_zero():

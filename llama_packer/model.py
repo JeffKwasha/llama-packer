@@ -1415,10 +1415,33 @@ class Model:
     def _mtp_info(self) -> tuple[bool, int]:
         has_mtp = self.frontmatter.get("mtp")
         speculative = self.frontmatter.get("speculative")
-        if has_mtp or (speculative and "mtp" in str(speculative).lower()):
-            n_max = int(self.frontmatter.get("mtp_draft_n_max", _MTP_DRAFT_N_MAX))
-            return True, n_max
-        return False, 0
+        if not has_mtp and not (speculative
+                                and "mtp" in str(speculative).lower()):
+            return False, 0
+        n_max = int(self.frontmatter.get("mtp_draft_n_max", _MTP_DRAFT_N_MAX))
+        # Baked-in MTP (no companion GGUF): the target must actually
+        # carry nextn layers.  Conversions sometimes strip them while
+        # the sidecar keeps ``mtp:`` — llama-server then aborts on
+        # draft-mtp at load (GLM-4.7-Flash UD quant, 2026-09-08).  One
+        # gate feeds emission, measurement and throughput alike.
+        if self.mtp is None and not self._gguf_has_real_mtp():
+            return False, 0
+        return True, n_max
+
+    def _gguf_has_real_mtp(self) -> bool:
+        """Header reality check for baked-in MTP; undecidable keeps intent."""
+        path = self.gguf_path
+        if path is None or not str(path).endswith(".gguf"):
+            return True
+        has = utils.gguf_has_mtp_layers(str(path))
+        if has is False and not getattr(self, "_mtp_gate_logged", False):
+            self._mtp_gate_logged = True
+            logger.warning(
+                "%s: sidecar declares mtp but the GGUF has no nextn layers "
+                "(stripped by the conversion?) — serving without MTP; use a "
+                "conversion that keeps them or declare the draft companion",
+                self.stem)
+        return has is not False
 
     def throughput_factor(self) -> float | None:
         """Heuristic relative throughput index (higher = faster). Not real tok/s.

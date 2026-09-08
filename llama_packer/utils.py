@@ -578,6 +578,77 @@ def gguf_header_probe(path: str | os.PathLike) -> tuple[str | None, bool]:
     return arch, has_ctx
 
 
+_GGUF_MTP_CACHE: dict[tuple[str, int], bool | None] = {}
+
+
+def gguf_has_mtp_layers(path: str | os.PathLike) -> bool | None:
+    """Whether a GGUF carries MTP layers, from header tensor names alone.
+
+    ``nextn`` is the tensor-name marker every GGUF MTP conversion uses
+    (deepseek2/GLM/qwen nextn blocks); conversions sometimes strip them
+    while the sidecar keeps ``mtp:``.  Reads metadata and tensor names
+    only — a few hundred KiB, no tensor data — and caches per mtime.
+    Returns True / False, or None when the header cannot be parsed
+    (the caller then keeps the declared intent rather than guessing).
+    """
+    import struct
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns)
+    if key in _GGUF_MTP_CACHE:
+        return _GGUF_MTP_CACHE[key]
+    result: bool | None = None
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                raise ValueError
+            f.read(4)  # version
+            (n_tensors,) = struct.unpack("<Q", f.read(8))
+            (n_kv,) = struct.unpack("<Q", f.read(8))
+            widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+                      10: 8, 11: 8, 12: 8}
+
+            def skip_value() -> None:
+                (vtype,) = struct.unpack("<I", f.read(4))
+                if vtype == 8:
+                    (slen,) = struct.unpack("<Q", f.read(8))
+                    f.seek(slen, 1)
+                elif vtype == 9:
+                    (etype,) = struct.unpack("<I", f.read(4))
+                    (count,) = struct.unpack("<Q", f.read(8))
+                    if etype == 8:
+                        for _ in range(count):
+                            (slen,) = struct.unpack("<Q", f.read(8))
+                            f.seek(slen, 1)
+                    elif etype == 9:
+                        raise ValueError  # nested arrays: not seen in the wild
+                    else:
+                        f.seek(widths[etype] * count, 1)
+                else:
+                    f.seek(widths[vtype], 1)
+
+            for _ in range(n_kv):
+                (klen,) = struct.unpack("<Q", f.read(8))
+                f.seek(klen, 1)
+                skip_value()
+            for _ in range(n_tensors):
+                (nlen,) = struct.unpack("<Q", f.read(8))
+                name = f.read(nlen)
+                (ndims,) = struct.unpack("<I", f.read(4))
+                f.seek(8 * ndims + 12, 1)  # ne[] + type + offset
+                if b"nextn" in name.lower():
+                    result = True
+                    break
+            else:
+                result = False
+    except (OSError, ValueError, struct.error):
+        result = None
+    _GGUF_MTP_CACHE[key] = result
+    return result
+
+
 def sniff_safetensors(path: str | os.PathLike, limit: int = 64) -> str:
     """Classify a safetensors file by its header tensor names.
 
