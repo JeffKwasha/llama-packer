@@ -212,35 +212,43 @@ unchanged), so no change there beyond using the solved `p`.
 
 ## Findings: the affine VRAM law (2026-09-07, SEAL record)
 
-> **2026-09-08 re-derivation.** The probe session that produced the table
-> below ran ~24 h and, for its final ~8 h, took readings beside a
-> measurement `llama-server` it had failed to kill (a constant offset an
-> affine fit absorbs with zero residual penalty — every poisoned run still
-> reported PASS). Post-mortem guardrails are now structural
-> (`llama_packer/gpu_state.py`: process-group kill on every exit path,
-> stall window, resident pre-flight, single-flight lock, run journal;
-> `parse_spill_mib` rejects points whose weights/KV/RS landed host-visible).
-> The correction rows derived during the incident were quarantined
-> (`~/.cache/llama-packer/serve-corrections.json.contaminated-20260907`).
+> **2026-09-08 recalibration complete** (branch `vram-parallel-formula`).
+> The 2026-09-07 probe session ran ~24 h and, for its final ~8 h, took
+> readings beside a measurement `llama-server` it had failed to kill (a
+> constant offset an affine fit absorbs with zero residual penalty — every
+> poisoned run still reported PASS). Post-mortem guardrails are now
+> structural (`llama_packer/gpu_state.py`: process-group kill on every
+> exit path, io-aware stall window, resident pre-flight, single-flight
+> lock, run journal; `parse_spill_mib` rejects host-KV capacity spills
+> while tolerating llama.cpp's structural ~0.8-1 GiB CPU weight placement).
 >
-> The constants themselves mostly survived re-derivation — `extras/fit-sweep`
-> (header-only llama-fit-params, exact pool-line math, zero tensor reads,
-> max_err 0.0000% on all 4-point grids, q8_0):
+> Constants of record — serve truth via `--probe-memory` (q8_0, 5-point
+> grids, pool-line exact math on both sides, max_err ≤ 0.0013 %):
 >
-> | arch | witness | c (MiB/tok) | D_fit (MiB/slot) |
-> |------|---------|-------------|------------------|
-> | deepseek2 | GLM47-Flash | 0.027432 | 0.0 |
-> | gemma3 | gemma-3-12b | 0.033203 | 510.0 |
-> | gemma4 | gemma4-12B | 0.008301 | 510.0 |
-> | qwen35 | qwen38-27B-Dirk | 0.033203 | 149.6 |
-> | qwen35moe | qwen36-35B-Nail | 0.010376 | 62.8 |
+> | arch | witness | c (MiB/tok) | D (MiB/slot) | δ fixed | δ c | δ D |
+> |------|---------|-------------|--------------|---------|------|------|
+> | deepseek2 | GLM47-Flash | 0.027431 | 0.0 | −1147 | 0.0000 | 0.0 |
+> | gemma3 | gemma-3-12b | 0.033203 | 510.0 | −1615 | 0.0000 | 0.0 |
+> | gemma4 | gemma4-12B (MTP) | 0.008301 | 510.0 | −1020 | 0.0000 | 0.0 |
+> | qwen35 | qwen38-27B-Dirk (MTP) | 0.037109 | 897.7 | −105 | +0.0039 | +448.9 |
 >
-> `c` matches the serve truth exactly; non-SWA `D` matches to < 0.5 MiB
-> (149.6 ≈ 150, 62.8 ≈ 63). Open for the serve-truth recalibration
-> (`--probe-memory`): the gemma family's fit-params SWA ring is 2× what
-> llama-server allocates (510 vs 255 — ring geometry differs between the
-> tools), and the fit-params compute shaping gap that the per-arch
-> `delta_fixed` corrections absorb.
+> Findings that supersede the 2026-09-07 notes:
+> - `c` and non-draft `D` from `llama-fit-params` pool lines are **exact**
+>   (`extras/fit-sweep`): δc = δD = 0 for every arch without a baked-in
+>   draft. The serve SWA ring really is 510 MiB/slot for the gemma family —
+>   the earlier 255 was contaminated-era data.
+> - `delta_fixed` (−1.0 to −1.6 GB) is fit-params' compute-shaping gap:
+>   under serve batch flags the compute reserve is not affine in (C, p),
+>   and fit-params reserves several× the server's compute. Corrections
+>   absorb it per arch; it never pollutes c/D.
+> - Baked-in-MTP archs (qwen35/Dirk) carry a real draft cost the
+>   fit-params trio cannot see: δc +0.0039 MiB/tok, δD +448.9 MiB/slot —
+>   the undercount that made Dirk spill 4.8 GB into GTT. The corrections
+>   exist for exactly this row.
+> - Sidecars declaring `mtp:` on conversions that stripped the nextn
+>   layers (GLM-4.7-Flash UD) crash llama-server on draft-mtp; `_mtp_info`
+>   is header-gated (`utils.gguf_has_mtp_layers`) so emission and
+>   measurement skip MTP for them.
 
 Measured with the `--probe-memory` probe across qwen3.8-27B (dense,
 arch `qwen35`), gemma-4-12B-QAT (dense+SWA+MTP, arch `gemma4`) and
