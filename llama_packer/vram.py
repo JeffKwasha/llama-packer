@@ -24,7 +24,7 @@ pool only, blind to the RS cache, the draft, and the batch-dependent
 compute, which is exactly the undercount that made Dirk spill 4.8 GB into
 GTT (2026-09-07; see docs/plans/auto-parallel.md).
 
-``FitParams`` values persist in the sidecar ``measured:`` block — per
+``FitParams`` values persist in the sidecar ``derived:`` block — per
 ``cache_type`` (blocks are never derived across cache types) — and are
 keyed by ``source``: blocks from the retired fit-params measurement are
 rejected on load and re-measured.  ``Model.persist_measured`` is the
@@ -828,9 +828,14 @@ class VramBudget:
             return None
 
         # 1. Saved values from frontmatter (legacy fit-params blocks are
-        #    rejected by FitParams.from_dict and re-measured).
+        #    rejected by FitParams.from_dict and re-measured).  A valid
+        #    block living under a legacy key is rewritten under
+        #    ``derived:`` — the label is the documentation.
         saved = self.saved_for(cache_type)
         if saved is not None:
+            from llama_packer.model import MEASURED_KEY
+            if MEASURED_KEY not in self.model.frontmatter:
+                self._persist(saved)
             self._static_cache[cache_type] = saved
             return saved
 
@@ -1246,7 +1251,7 @@ class VramBudget:
         """Persist measured VRAM constants via the single sidecar writer.
 
         Delegates to :meth:`Model.persist_measured` — the only place that
-        writes the dynamic ``measured:`` branch.
+        writes the dynamic ``derived:`` branch.
         """
         self.model.persist_measured(params.to_dict())
 

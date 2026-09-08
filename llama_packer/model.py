@@ -33,8 +33,9 @@ _CL_RE = re.compile(r"^context_limit_\d+G$")
 # (fit-params VRAM numbers, file intrinsics) live here and only here;
 # everything else in the sidecar is authored. ``fit-params`` is the legacy
 # name, still read as a fallback but never written.
-MEASURED_KEY = "measured"
-_LEGACY_MEASURED_KEY = "fit-params"
+MEASURED_KEY = "derived"
+# Older names for the same auto-generated branch, migrated on write.
+_LEGACY_MEASURED_KEYS = ("fit-params", "measured")
 
 
 class WeightFinder:
@@ -416,7 +417,7 @@ class Model:
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "speculative_config",
         "role", "targets", "allow_profiles", "spare", "capabilities",
-        "ignore", "device", "concurrency", "measured", "fit-params", "vllm_image",
+        "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel",
         "image_min_tokens", "image_max_tokens",
@@ -911,16 +912,22 @@ class Model:
     # ── measured block: the single dynamically generated sidecar branch ──
 
     def measured_block(self) -> dict | None:
-        """Machine-written ``measured:`` block (legacy ``fit-params:`` fallback).
+        """Machine-written ``derived:`` block (legacy names fall back).
 
-        Holds fit-params VRAM numbers plus a ``file:`` sub-block of header
-        intrinsics. Returns None when the sidecar has neither.
+        Holds llama-packer-calculated model requirements — the affine
+        VRAM constants today, header intrinsics under ``file:``; more
+        discoverable constants may join later. Auto-generated: never
+        hand-edit, delete to force re-evaluation. Returns None when the
+        sidecar has none.
         """
         raw = self.frontmatter.get(MEASURED_KEY)
         if isinstance(raw, dict):
             return raw
-        legacy = self.frontmatter.get(_LEGACY_MEASURED_KEY)
-        return legacy if isinstance(legacy, dict) else None
+        for key in _LEGACY_MEASURED_KEYS:
+            legacy = self.frontmatter.get(key)
+            if isinstance(legacy, dict):
+                return legacy
+        return None
 
     def _file_stat_sig(self) -> tuple[int, int] | None:
         """Current (size_bytes, mtime_ns) of the weight file, if statable."""
@@ -1056,8 +1063,9 @@ class Model:
             from ruamel.yaml.comments import CommentedMap
             fm = CommentedMap()
         fm[MEASURED_KEY] = copy.deepcopy(block)
-        if _LEGACY_MEASURED_KEY in fm:
-            del fm[_LEGACY_MEASURED_KEY]
+        for key in _LEGACY_MEASURED_KEYS:
+            if key in fm:
+                del fm[key]
         import io
         buf = io.StringIO()
         yml.dump(fm, buf)

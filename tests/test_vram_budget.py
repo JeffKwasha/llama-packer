@@ -178,7 +178,7 @@ def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
 
 
 def test_calc_ctx_fits_design(make_model, fit_params_block):
-    model = make_model("a", **{"measured": fit_params_block})
+    model = make_model("a", **{"derived": fit_params_block})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
     # available = 32768 - 2048 = 30720; remaining = 30720 - 10000 - 1000 = 19720
     # design cost = (0.5*32768 + 0) * 1 = 16384 <= 19720 -> design context
@@ -188,7 +188,7 @@ def test_calc_ctx_fits_design(make_model, fit_params_block):
 def test_calc_ctx_scales_down_and_rounds(make_model):
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server"}
-    model = make_model("b", **{"measured": fm})
+    model = make_model("b", **{"derived": fm})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
     # remaining = 30720 - 26000 = 4720; X = 4720/(0.5*1) = 9440 -> rounded 8192
     assert ctx == 8192
@@ -199,7 +199,7 @@ def test_calc_ctx_slot_mib_charged_per_slot(make_model):
     # the slot cost doubles, so the affordable per-slot context shrinks.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 300.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server"}
-    model = make_model("b2", **{"measured": fm})
+    model = make_model("b2", **{"derived": fm})
     p1 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=1)
     p2 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=2)
     # p=1: X = (4720 - 300)/0.5 = 8840 -> 8192
@@ -211,13 +211,13 @@ def test_calc_ctx_slot_mib_charged_per_slot(make_model):
 def test_calc_ctx_floors_at_min(make_model):
     fm = {"model_mib": 30000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 0, "cache_type": "q8_0", "source": "llama-server"}
-    model = make_model("c", **{"measured": fm})
+    model = make_model("c", **{"derived": fm})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
     assert ctx == _MIN_CTX_SIZE
 
 
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
-    model = make_model("d", **{"measured": fit_params_block})
+    model = make_model("d", **{"derived": fit_params_block})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=3072)
     # available = 32768 - 2048 - 3072 = 27648; remaining = 27648-11000 = 16648
     # design cost = 16384 <= 16648 -> design still fits
@@ -227,7 +227,7 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
 def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
     fm = {"model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server"}
-    model = make_model("mm", **{"measured": fm})
+    model = make_model("mm", **{"derived": fm})
     plain = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.0)
     margined = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.01)
     # available = 63520 (plain) vs 63520/1.01 = 62891.1 (margined)
@@ -254,7 +254,7 @@ def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
 
 
 def test_fit_params_static_derives_affine_pair(make_model, monkeypatch):
-    model = make_model("ap", **{"measured": None})
+    model = make_model("ap", **{"derived": None})
 
     def fake_pair(fit_bin, cache_type, llama_args=""):
         return FitParams(model_mib=18905, kv_per_token_mib=0.0332,
@@ -275,7 +275,7 @@ def test_fit_params_static_derives_affine_pair(make_model, monkeypatch):
 
 def test_fit_params_static_measure_failure_uses_transient_fit_params(
         make_model, monkeypatch):
-    model = make_model("ap2", **{"measured": None})
+    model = make_model("ap2", **{"derived": None})
     c_true, d_true = 0.0332, 150.0
 
     def fake_fit_params(*, fit_bin, fit_ctx, cache_type, parallel,
@@ -300,7 +300,7 @@ def test_fit_params_static_measure_failure_uses_transient_fit_params(
 
 def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
     """The persisted constants predict memory for any (context, slots)."""
-    model = make_model("pred", **{"measured": fit_params_block})
+    model = make_model("pred", **{"derived": fit_params_block})
     fp = model.vram.fit_params_static("unused")
     # model + compute + c*pool + p*D
     assert fp.vram_mib(ctx_per_slot=8192, parallel=4) == int(
@@ -308,7 +308,7 @@ def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
 
 
 def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
-    model = make_model("pf", **{"measured": None})
+    model = make_model("pf", **{"derived": None})
     monkeypatch.setattr(model.vram, "fit_params", lambda *a, **k: None)
     assert model.vram.fit_params_static("/bin/fit") is None
 
@@ -330,7 +330,7 @@ def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
 
 def test_fit_params_static_cache_type_mismatch_remeasures(
         make_model, fit_params_block):
-    model = make_model("s", **{"measured": fit_params_block})
+    model = make_model("s", **{"derived": fit_params_block})
     assert model.vram.fit_params_static("unused", cache_type="q8_0") is not None
     # A different cache type has no readable block and no binary: None.
     assert model.vram.fit_params_static("unused", cache_type="f16") is None
@@ -346,7 +346,7 @@ def _vision(make_model, tmp_path, stem, fit, **extra):
               if k in ("image_min_tokens", "image_max_tokens")}
     rest = {k: v for k, v in extra.items() if k not in tokens}
     block.update(tokens)
-    fm = {"measured": fit, "mmproj": block}
+    fm = {"derived": fit, "mmproj": block}
     fm.update(rest)
     return make_model(stem, **fm)
 
@@ -386,7 +386,7 @@ def test_calc_ctx_image_floor_no_mmproj_no_floor(make_model, tmp_path):
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server"}
-    model = make_model("i", **{"measured": fit, "image_max_tokens": 9440})
+    model = make_model("i", **{"derived": fit, "image_max_tokens": 9440})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
     assert ctx == 8192
 

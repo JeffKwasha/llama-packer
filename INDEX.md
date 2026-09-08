@@ -10,7 +10,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Modules
 
-- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, `image_min/max_tokens`, ...), companion resolution; file identity (`from_file`/`from_ref`/`Model[…]` registry, `GGUFModel`/`SafetensorsModel` subclasses, `WeightFinder`), `measured:` block persist/sync
+- [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, `image_min/max_tokens`, ...), companion resolution; file identity (`from_file`/`from_ref`/`Model[…]` registry, `GGUFModel`/`SafetensorsModel` subclasses, `WeightFinder`), `derived:` block persist/sync
 - [`llama_packer/profiles.py`](llama_packer/profiles.py) — `Profiles` value object: defaults, spare precedence, `allow_profiles` filtering, per-model variant grouping
 - [`llama_packer/progress.py`](llama_packer/progress.py) — optional `rich` progress bar (models completed/total); every method no-ops without `rich`/non-TTY/under pytest
 - [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + always-on `-text` variant, renamed auto-dropped main, matrix solve: squeeze + opportunistic s2t/image co-loads + tools demotion, bounded ctx) → `emit_config` (llama-swap entries with bare `<id>` = image-capable / `<id>-text` = text-only; exposes `entry_ids_by_stem`, `coload_stems`), `_filter_supported` (validation boundary incl. capability/companion cross-check), `write_yaml`

@@ -246,6 +246,24 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | `image_min_tokens` / `image_max_tokens` | Image input (mmproj) only, dynamic-resolution archs (Qwen-VL family): floor/cap on image tokens per image, emitted as `--image-min-tokens`/`--image-max-tokens`. Qwen math: 1 token ≈ 28×28 px (2.5-VL) / 32×32 px (3-VL); 1024 tokens ≈ 1 MP — good floor for art/artifact critique. Gemma/SigLIP is fixed ~256 tokens/image: keys are ignored there (warned). The cap also floors the solved context (parallel × max tokens must fit `-c`) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `ignore: true` | Skip this model entirely |
-| `measured:` | Auto-written by llama-packer — do not edit (fit-params VRAM numbers + `file:` header intrinsics) |
+| `derived:` | Auto-written by llama-packer — see the rules below (VRAM constants + `file:` header intrinsics) |
+
+**The `derived:` block (llama-packer's calculation cache):**
+
+1. **It is auto-generated.** llama-packer writes it from its own
+   measurements; nothing in it is operator input. Never hand-edit it —
+   a wrong value here silently mis-sizes the model everywhere. To
+   discard it, delete the block (or run `extras/clear-measured`) and
+   let llama-packer re-derive it.
+2. **It carries model requirements llama-packer calculated** — the
+   affine VRAM constants today (`model_mib`, `kv_per_token_mib`,
+   `slot_mib`, `compute_mib`, `source`, `cache_type`, `ts`) plus the
+   weight-file intrinsics under `file:`; other discoverable constants
+   may join later. Sidecars stay the place for *human* declarations
+   only.
+3. **The `ts:` stamp** dates the last evaluation; `source:` names the
+   measurement tier (`fit-estimate` = calibrated fast path,
+   `llama-server` = serve truth, `safetensors-estimate`/`vllm-estimate`
+   = analytic).
 
 See `SPEC.md` for the complete schema.
