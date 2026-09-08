@@ -73,7 +73,7 @@ def test_fit_params_logs_before_run(make_model, fit_params_block, monkeypatch, c
 
     def fake_run(cmd, **kw):
         return types.SimpleNamespace(
-            stdout="Vulkan 100 200 50\n", returncode=0)
+            stdout="Vulkan0 100 200 50\n", stderr="", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     with caplog.at_level(logging.INFO, logger="llama_packer.vram"):
@@ -85,7 +85,7 @@ def test_fit_params_cache_hit_is_silent(make_model, fit_params_block,
                                         monkeypatch, caplog):
     import subprocess
 
-    m = make_model("pc", **{"fit-params": fit_params_block})
+    m = make_model("pc", **{"measured": fit_params_block})
     budget = m.vram
     # Prime the in-memory cache via a first call backed by saved frontmatter.
     budget.fit_params_static("fit-bin")

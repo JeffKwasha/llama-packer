@@ -1017,6 +1017,11 @@ class Model:
             block = {}
         if extra:
             block.update(extra)
+            # Affine blocks supersede the pre-affine schema outright: stale
+            # keys would linger beside the new numbers forever otherwise.
+            if "kv_per_token_mib" in block:
+                block.pop("ctx_factor", None)
+                block.pop("parallel", None)
         # In-memory state first: callers (saved_for, measured_file_valid)
         # must see the values even when the file cannot be written.
         self.frontmatter[MEASURED_KEY] = copy.deepcopy(block)

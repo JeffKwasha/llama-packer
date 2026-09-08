@@ -199,12 +199,13 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
     embed = make_model("e", role="embeddings", context_length=32768)
     rerank = make_model("r", role="rerank", context_length=16384)
 
-    def fake_effective_static(fit_bin, cache_type="q8_0", parallel=1, **kw):
-        return (1000.0, 0.05, 50.0)
+    def fake_effective_static(fit_bin, cache_type="q8_0", **kw):
+        return (1000.0, 0.05, 0.0, 50.0)
 
-    def fake_fp(fit_bin, cache_type="q8_0", parallel=1, **kw):
-        return SimpleNamespace(model_mib=1000.0, ctx_factor=0.05,
-                               compute_mib=50.0)
+    def fake_fp(fit_bin, cache_type="q8_0", **kw):
+        return SimpleNamespace(model_mib=1000.0, kv_per_token_mib=0.05,
+                               slot_mib=0.0, compute_mib=50.0,
+                               source="fit-params")
 
     for m in (chat, embed, rerank):
         m.vram.effective_static = fake_effective_static

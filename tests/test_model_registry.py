@@ -189,8 +189,8 @@ def test_measured_file_sync_and_validity(tmp_path, caplog):
 
 
 def test_legacy_fit_params_block_still_read(make_model, fit_params_block):
-    m = make_model("lp", **{"fit-params": fit_params_block})
-    saved = m.vram.saved_for("q8_0", 1)
+    m = make_model("lp", **{"measured": fit_params_block})
+    saved = m.vram.saved_for("q8_0")
     assert saved is not None and saved.model_mib == 10000
 
 
@@ -219,8 +219,8 @@ def test_snapshot_listing_cached_by_mtime(tmp_path):
 
 def test_fit_params_round_trip_through_measured(make_model):
     m = make_model("rt", context_length=32768)
-    params = FitParams(1000, 0.5, 100, "fit-params", "q8_0", 1)
+    params = FitParams(1000, 0.5, 150.0, 100, "llama-server", "q8_0")
     m.vram._persist(params)
-    saved = m.vram.saved_for("q8_0", 1)
+    saved = m.vram.saved_for("q8_0")
     assert saved is not None and saved.model_mib == 1000
-    assert m.measured_block()["source"] == "fit-params"
+    assert m.measured_block()["source"] == "llama-server"

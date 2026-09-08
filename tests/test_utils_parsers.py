@@ -191,3 +191,48 @@ def test_hf_readme_kind_text_tag_returns_none(tmp_path):
     (snap / "README.md").write_text(
         "---\npipeline_tag: text-generation\n---\n\n# card\n")
     assert hf_readme_kind("org/text", str(tmp_path)) is None
+
+
+def test_make_fast_storage_predicate(tmp_path):
+    from llama_packer.utils import make_fast_storage_predicate
+
+    # a merged view (/ai) over two branches; mergerfs keeps directory
+    # structure identical across branches, so a merged path classifies by
+    # whether the same relative path exists under the fast branch
+    ai = tmp_path / "ai"
+    fast = tmp_path / "ssd_ai"
+    slow = tmp_path / "r1_ai"
+    for d in (ai, fast, slow):
+        d.mkdir()
+    # a file that exists under the fast branch at the same relative spot
+    (fast / "hub" / "blobs").mkdir(parents=True)
+    (fast / "hub" / "blobs" / "dirk.gguf").write_bytes(b"x")
+    # a symlink in the merged view pointing at the fast-branch blob
+    (ai / "hub").mkdir()
+    (ai / "hub" / "dirk-link.gguf").symlink_to(fast / "hub" / "blobs" / "dirk.gguf")
+    # a file only on the slow branch
+    (slow / "hub" / "blobs").mkdir(parents=True)
+    (slow / "hub" / "blobs" / "big.gguf").write_bytes(b"x")
+    (ai / "hub" / "big-link.gguf").symlink_to(slow / "hub" / "blobs" / "big.gguf")
+
+    def exists(path: str) -> bool:
+        return (tmp_path / path.lstrip("/")).exists()
+
+    def norm(p):
+        return str(p).replace(str(tmp_path) + "/", "/")
+
+    is_fast = make_fast_storage_predicate(str(fast), exists=exists)
+    # merged view + symlink: classifies by the blob's physical location
+    assert is_fast(str(ai / "hub" / "dirk-link.gguf"))
+    assert not is_fast(str(ai / "hub" / "big-link.gguf"))
+    # direct branch paths are trivially their own tier
+    assert is_fast(str(fast / "hub" / "blobs" / "dirk.gguf"))
+    assert not is_fast(str(slow / "hub" / "blobs" / "big.gguf"))
+    assert not is_fast(str(tmp_path / "ai" / "nothing.gguf"))
+
+    # None/empty roots: no tier knowledge
+    assert not make_fast_storage_predicate(None, exists=exists)(
+        norm(fast / "hub" / "blobs" / "dirk.gguf"))
+    # multiple roots
+    both = make_fast_storage_predicate([str(fast), str(slow)], exists=exists)
+    assert both(str(ai / "hub" / "big-link.gguf"))

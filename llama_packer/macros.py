@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import shlex
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import yaml
 
@@ -277,7 +277,7 @@ class Macros:
         self,
         profiles_cfg: dict | None,
         profiles: "Profiles | None" = None,
-        models_dirs: list[Path | str] | None = None,
+        models_dirs: Sequence[Path | str] | None = None,
         sub: Callable[[str], str] | None = None,
     ) -> None:
         self.profiles_cfg = profiles_cfg or {}

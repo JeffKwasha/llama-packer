@@ -16,7 +16,8 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 from pathlib import Path
 
 import yaml
@@ -844,6 +845,48 @@ def smart_resolve(path: str | os.PathLike) -> Path:
     return Path(result)
 
 
+def make_fast_storage_predicate(
+    fast_roots: str | list[str] | tuple[str, ...] | None,
+    exists: Callable[[str], bool] = os.path.exists,
+) -> Callable[[str], bool]:
+    """Predicate: is *path* stored on one of the fast-storage branches?
+
+    *fast_roots* name the physical branches behind a merged mount (e.g. the
+    SSD branch ``/mnt/@/ssd_ai`` of a mergerfs pool).  A merged view hides
+    which branch holds a file — stat(2) reports the merge's own device — so
+    the test is structural: the file's path *relative to its mount root*
+    must exist under the branch (mergerfs keeps the directory structure
+    identical across branches).  ``realpath`` is applied first, so
+    HF-hub snapshot symlinks classify by where the bytes (the blob) live.
+    Empty/None roots yield an always-False predicate: no tier knowledge,
+    behave as before.
+    """
+    if fast_roots is None:
+        roots: list[str] = []
+    elif isinstance(fast_roots, str):
+        roots = [fast_roots]
+    else:
+        roots = [str(r) for r in fast_roots]
+    branches = [os.path.realpath(r).rstrip("/") for r in roots if r]
+    if not branches:
+        return lambda path: False
+
+    def is_fast(path: str) -> bool:
+        real = os.path.realpath(path)
+        for branch in branches:
+            if real == branch or real.startswith(branch + "/"):
+                return True
+            try:
+                rel = os.path.relpath(real, mount_root(real))
+            except (ValueError, OSError):
+                continue
+            if exists(os.path.join(branch, rel)):
+                return True
+        return False
+
+    return is_fast
+
+
 def mount_root(path: str | os.PathLike) -> str:
     """Return the root directory of the filesystem that contains *path*.
 
@@ -1009,7 +1052,7 @@ def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str |
     prefix_to_var: dict[str, str] = {}
     var_to_value: dict[str, str] = {}
 
-    if hf_paths:
+    if hf_paths and hf_root:
         prefix_to_var[hf_root] = "HF_HOME"
         var_to_value["HF_HOME"] = hf_root
 

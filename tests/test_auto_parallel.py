@@ -33,7 +33,7 @@ def _scripted_by_parallel(model, by_parallel):
     The spare term proves ledger reserves actually reach the budget: every
     MB of spare costs 2 tokens of context in the fake.
     """
-    def fake(vram_total_mb, *, fit_bin=None, parallel=1, spare_mb=0,
+    def fake(vram_total_mb, *, server_bin=None, parallel=1, spare_mb=0,
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
              design_ctx=None, **kw):
         return max(0, by_parallel.get(parallel, 0) - spare_mb * 2)

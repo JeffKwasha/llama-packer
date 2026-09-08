@@ -13,6 +13,9 @@ dependencies = [
 # Recommended (not required) for vLLM-backend memory sizing. Without it,
 # vLLM-served models fall back to a local safetensors-header estimate.
 vllm = ["vllm-memory-estimator"]
+# Optional progress bar for long runs. Without it, progress methods no-op
+# and plain log lines are the only output.
+progress = ["rich"]
 
 [project.scripts]
 llama-packer = "llama_packer.__main__:main"

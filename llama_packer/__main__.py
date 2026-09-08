@@ -12,6 +12,7 @@ import shlex
 import shutil
 import sys
 import textwrap
+from typing import NoReturn
 from pathlib import Path
 
 import yaml
@@ -22,11 +23,11 @@ from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
 from llama_packer.utils import (
-    compute_env_prefixes, make_subst, _detect_drive_speed,
-    validate_dir_roles, NON_CHAT_ROLES,
+    compute_env_prefixes, make_subst, make_fast_storage_predicate,
+    _detect_drive_speed, validate_dir_roles, NON_CHAT_ROLES,
 )
 from llama_packer.consts import (
-    _MIN_AGENTIC_CTX, _RESERVE_SYSTEM, _RESERVE_VIDEO,
+    _MIN_AGENTIC_CTX, _MEMORY_MARGIN, _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
@@ -54,7 +55,7 @@ def setup_logging(verbosity: int = 0) -> None:
     )
 
 
-def fatal(msg: str, *args) -> None:
+def fatal(msg: str, *args) -> "NoReturn":
     """Log a CRITICAL complaint, then abort — for unrecoverable config errors."""
     logger.critical(msg, *args)
     sys.exit(1)
@@ -101,10 +102,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         """),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print config to stdout instead of writing")
-    parser.add_argument("--probe-parallel-scaling", action="store_true",
-                        help="Measure llama-fit-params VRAM at parallel 1/2/4/8 for one "
-                             "model per GGUF arch family and print the linearity table; "
-                             "writes nothing, then exits")
+    parser.add_argument("--probe-memory", nargs="*", metavar="ARCH",
+                        help="Measure serve-shaped llama-server VRAM over a "
+                             "(pool ctx x parallel) grid for one model per "
+                             "GGUF arch family (optionally restricted to the "
+                             "named families), least-squares fit the affine "
+                             "law and report the max residual; writes nothing, "
+                             "then exits")
     parser.add_argument("--output", default="config.yaml", help="Output path (default: config.yaml)")
     parser.add_argument("--llama-version", default="latest", dest="version",
                         help="llama-server version (default: latest)")
@@ -189,7 +193,7 @@ def write_agents_md(models_dir: Path) -> None:
         logger.warning("could not write AGENTS.md (%s), continuing", e)
 
 
-def _apply_env_subst(config: dict, sub, raw_paths: list[str]) -> dict:
+def _apply_env_subst(config: EmittedConfig, sub, raw_paths: list[str]) -> EmittedConfig:
     """Replace each raw emitted path in the generated cmds with its ${VAR} macro form."""
     subs = {raw: sub(raw) for raw in raw_paths}
     order = sorted(subs, key=len, reverse=True)
@@ -518,11 +522,18 @@ def main(argv: list[str] | None = None) -> None:
         fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
 
-    if args.probe_parallel_scaling:
-        from llama_packer.parallel_probe import run_probe
+    if args.probe_memory is not None:
+        from llama_packer.memory_probe import run_probe
+        llama_args = backend_args(profiles_cfg.get("llama_server"),
+                                  "llama_server")
+        is_fast = make_fast_storage_predicate(
+            (profiles_cfg.get("hardware") or {}).get("fast_storage"))
         print(run_probe(
-            models, fit_bin,
-            Profiles(profiles_cfg).default_cache_type))
+            models, fit_bin, llama_bin,
+            Profiles(profiles_cfg).default_cache_type,
+            only_archs=tuple(args.probe_memory) or None,
+            llama_args=llama_args,
+            is_fast=is_fast))
         return
 
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
@@ -543,7 +554,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Compute optimal ${env.*} prefixes from the raw paths actually emitted,
     # then substitute them into the binary path and post-process the config.
-    raw_paths = [llama_bin, fit_bin]
+    raw_paths = [llama_bin]
     if sd_bin:
         raw_paths.append(sd_bin)
     if whisper_bin:
@@ -626,6 +637,18 @@ def main(argv: list[str] | None = None) -> None:
 
     # Build config (progress bar appears only once the denominator is
     # known — total=len(models); without rich / non-TTY it is a no-op).
+    # Memory margin: inflate every measured term so the affine residual
+    # errs toward reserving more (profiles.yaml hardware.memory_margin).
+    margin = _MEMORY_MARGIN
+    raw_margin = (profiles_cfg.get("hardware") or {}).get("memory_margin")
+    if raw_margin is not None:
+        try:
+            margin = float(raw_margin)
+            if margin < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            fatal("profiles.yaml hardware.memory_margin: %r is not a "
+                  "non-negative number", raw_margin)
     progress = PackerProgress(enabled=sys.stderr.isatty())
     progress.start(len(models), "budgeting")
     try:
@@ -636,6 +659,7 @@ def main(argv: list[str] | None = None) -> None:
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
+            memory_margin=margin,
             progress_cb=lambda stem: progress.advance(stem),
         )
     except ValueError as e:

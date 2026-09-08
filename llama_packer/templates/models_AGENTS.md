@@ -246,6 +246,6 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | `image_min_tokens` / `image_max_tokens` | Image input (mmproj) only, dynamic-resolution archs (Qwen-VL family): floor/cap on image tokens per image, emitted as `--image-min-tokens`/`--image-max-tokens`. Qwen math: 1 token ≈ 28×28 px (2.5-VL) / 32×32 px (3-VL); 1024 tokens ≈ 1 MP — good floor for art/artifact critique. Gemma/SigLIP is fixed ~256 tokens/image: keys are ignored there (warned). The cap also floors the solved context (parallel × max tokens must fit `-c`) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `ignore: true` | Skip this model entirely |
-| `fit-params:` | Auto-written by llama-packer — do not edit |
+| `measured:` | Auto-written by llama-packer — do not edit (fit-params VRAM numbers + `file:` header intrinsics) |
 
 See `SPEC.md` for the complete schema.

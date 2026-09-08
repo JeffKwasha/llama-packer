@@ -90,6 +90,8 @@ profiles:
   # Distinct (parallel, cache_type, spare) combos get their own VRAM solve
   # and llama-swap entry; profile names within a group become setParamsByID
   # keys. `spare` reserves VRAM headroom (e.g. "512m", "6G").
+  # `parallel` is the slot count — and a pin: declaring it opts the model
+  # out of auto-parallel.
   # server:
   #   description: "Concurrency-tuned"
   #   parallel: 2
@@ -179,6 +181,15 @@ profiles:
 #   vram: 48G
 #   # baseline_mb: 512m        # extra reserve on top of fixed 2 GiB (default 0)
 #   # unified_system_mb: 8192  # system slice on unified hosts (default 8192)
+#   # memory_margin: 0.04      # fraction inflated against every measured VRAM
+#   #                          # term when solving (default 0.04: covers the
+#   #                          # allocator overhead llama.cpp's own buffers
+#   #                          # don't report, ~4% observed on Vulkan/radv)
+#   # fast_storage: /mnt/@/ssd_ai   # physical branch (or list) that holds
+#   #                          # SSD-resident models — reads ~6x faster than
+#   #                          # platter branches.  Family representatives and
+#   #                          # measurement prefer models resolved here;
+#   #                          # unset = no tier preference.
 
 # ── Override rules (optional) ────────────────────────────
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.

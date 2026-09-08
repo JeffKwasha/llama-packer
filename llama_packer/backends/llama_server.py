@@ -101,7 +101,11 @@ class LlamaServerBackend(BaseBackend):
         flags = [
             "--port", "${PORT}",
             "-m", str(model.gguf_path),
-            "-c", str(ctx_size),
+            # Per-slot context: the shared KV pool is sized to parallel*X,
+            # byte-identical to a -c pool of parallel*X tokens (validated
+            # against llama-fit-params).  ctx_size is what each slot serves
+            # and what metadata advertises.
+            "--kv-unified-per-slot", str(ctx_size),
             "--parallel", str(parallel),
             "--cache-type-k", cache_type,
             "--cache-type-v", cache_type,
