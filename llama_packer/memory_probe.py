@@ -173,29 +173,46 @@ def affine_report(
 ) -> dict | None:
     """Calibrate and validate one family representative.
 
-    Measures the fast estimate (fit-params pair + corrections — the thing
-    normal runs use, no server), then the serve truth (llama-server grid,
-    least-squares affine fit), and derives the per-arch correction row
-    ``truth − est`` that gets persisted for the family.  Returns None when
-    either side fails or fewer than four grid points measure; otherwise a
-    dict with the truth constants, the estimate, the correction row, the
-    per-point residuals of the truth fit, and the ``ok`` verdict.
+    Measures the fast estimate (fit-params trio — the thing normal runs
+    use, no server), then the serve truth (llama-server grid), and
+    derives the per-arch correction row ``truth − est`` that gets
+    persisted for the family.
+
+    Both sides derive ``(c, D)`` from their own KV/recurrent-state pool
+    lines with the same exact math — the ``(C, C/2)`` difference cancels
+    every fixed-size pool, the p difference isolates the per-slot cost —
+    so ``delta_c``/``delta_d`` stay ~0 unless the two tools genuinely
+    allocate differently (the gemma SWA ring does), and ``delta_fixed``
+    carries the real gap: fit-params' compute shaping vs the server's.
+    The law is validated on the truth pool lines (the grid's extra point
+    leaves a falsifying degree of freedom); the totals residual is
+    reported separately because serve compute is not affine in (C, p)
+    under batch flags.
     """
     est = model.vram._fit_params_serve(fit_bin, cache_type, llama_args)
-    points: list[tuple[int, int, int]] = []
+    bufs: dict[tuple[int, int], dict] = {}
     for ctx, parallel in (grid or _probe_grid(model.design_context)):
         buf = model.vram._run_measure_server(
             server_bin, cache_type, ctx, parallel, llama_args)
         if buf is not None:
-            points.append((ctx, parallel, round(sum(buf.values()))))
-    if len(points) < 4:
+            bufs[(ctx, parallel)] = buf
+    if len(bufs) < 4:
         return None
-    fit = _fit_affine(points)
-    if fit is None:
+    big = max(ctx for ctx, p in bufs if p == 1)
+    if (big, 2) not in bufs or (big // 2, 1) not in bufs:
         return None
-    fixed, c, d = fit
+
+    def pool(key: tuple[int, int]) -> float:
+        buf = bufs[key]
+        return buf["kv"] + buf["rs"]
+
+    c = 2.0 * (pool((big, 1)) - pool((big // 2, 1))) / big
+    d = pool((big, 2)) - pool((big, 1))
     if c <= 0:
         return None
+    fixed = bufs[(big, 1)]["weights"] + bufs[(big, 1)]["compute"] \
+        + max(0.0, bufs[(big, 1)]["output"])
+
     if est is None:
         est_row: dict | None = None
         corr = None
@@ -213,11 +230,16 @@ def affine_report(
                               corr)
     residuals: dict[str, float] = {}
     max_abs = 0.0
-    for ctx, parallel, total in points:
-        predicted = fixed + c * ctx + d * parallel
-        err = predicted - total
-        residuals[f"{ctx}/{parallel}"] = abs(err) / total
+    max_total_abs = 0.0
+    for key, buf in bufs.items():
+        ctx, parallel = key
+        err = pool(key) - (c * ctx + d * parallel)
+        residuals[f"{ctx}/{parallel}"] = abs(err) / pool(key)
         max_abs = max(max_abs, abs(err))
+        predicted_total = fixed + c * ctx + d * parallel
+        total = sum(buf.values())
+        max_total_abs = max(max_total_abs,
+                            abs(predicted_total - total) / total)
     max_residual = max(residuals.values(), default=0.0)
     return {
         "model": model,
@@ -226,10 +248,11 @@ def affine_report(
         "fixed_mib": round(fixed),
         "est": est_row,
         "corr": corr,
-        "grid": [(ctx, p) for ctx, p, _ in points],
+        "grid": sorted(bufs),
         "residuals": residuals,
         "max_residual": max_residual,
         "max_abs_mib": max_abs,
+        "max_total_residual": max_total_abs,
         "ok": max_residual <= tolerance or max_abs <= AFFINE_ABS_TOLERANCE_MIB,
     }
 
