@@ -415,7 +415,12 @@ class FitParams:
         )
 
     def to_dict(self) -> dict:
-        """Serialize to a frontmatter nested dict."""
+        """Serialize to a frontmatter nested dict.
+
+        ``ts`` stamps the measurement (ISO 8601): when an era's numbers
+        are ever quarantined again, stale blocks are identifiable by
+        inspection instead of by archaeology.
+        """
         return {
             "model_mib": self.model_mib,
             "kv_per_token_mib": self.kv_per_token_mib,
@@ -423,6 +428,7 @@ class FitParams:
             "compute_mib": self.compute_mib,
             "source": self.source,
             "cache_type": self.cache_type,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
 
     def vram_mib(self, ctx_per_slot: int, parallel: int = 1) -> int:

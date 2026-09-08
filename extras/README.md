@@ -11,6 +11,10 @@ llama-packer Python package.
   law `VRAM(C, p) = fixed + c·C + D·p`. Header-only (~0.6 s/run, no tensor
   data, no server, no meaningful VRAM use): safe on platter storage and
   beside a busy GPU. Run `./extras/fit-sweep --help` from the repo root.
+- [`clear-measured`](clear-measured) — purges the persisted `measured:`
+  blocks llama-packer writes into sidecars (they override the live
+  estimator and corrections cache until re-measured). Use whenever an
+  era's numbers are quarantined; `--before TS` purges by the `ts:` stamp.
 - [`llamaswap.ts`](llamaswap.ts) — opencode plugin: auto-discovers models
   from a running `llama-swap` server and injects them into opencode's
   provider config, plus `llamaswap_models` / `llamaswap_status` /
