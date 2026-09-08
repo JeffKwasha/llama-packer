@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""clear-measured — purge llama-packer's persisted ``measured:`` blocks.
+
+Every sidecar ``measured:`` block (and its legacy ``fit-params:`` key)
+is llama-packer's own calculation cache; it overrides the live
+estimator and the serve-corrections cache until re-measured.  When an
+era's numbers are quarantined (e.g. the 2026-09-07 contamination), the
+sidecar layer must be purged too — otherwise old numbers keep feeding
+every solve under the highest-trust ``source:`` label.  Blocks carry a
+``ts:`` stamp since 2026-09-08; blocks older than a quarantine can be
+selected by date.
+
+Usage (from the repo root):
+
+    ./extras/clear-measured [--before TS] [--dry-run] [--models-dir DIR] ...
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from llama_packer.discover import discover  # noqa: E402
+from llama_packer.model import MEASURED_KEY, _LEGACY_MEASURED_KEY  # noqa: E402
+from llama_packer.scope import ScopeStack  # noqa: E402
+
+
+def purge_frontmatter(md_path: Path, before: str | None) -> bool:
+    """Drop ``measured:``/legacy keys from one sidecar; True when purged.
+
+    Same ruamel round-trip as ``Model.persist_measured`` (comments and
+    formatting survive); *before* purges only blocks stamped earlier.
+    """
+    from ruamel.yaml import YAML
+
+    content = md_path.read_text(encoding="utf-8")
+    if not content.startswith("---"):
+        return False
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return False
+    yml = YAML()
+    yml.preserve_quotes = True
+    fm = yml.load(parts[1])
+    if fm is None:
+        return False
+    block = fm.get(MEASURED_KEY)
+    legacy = _LEGACY_MEASURED_KEY in fm
+    if not isinstance(block, dict) and not legacy:
+        return False
+    if before is not None and isinstance(block, dict):
+        ts = str(block.get("ts", ""))
+        if ts and ts >= before:
+            return False
+    if MEASURED_KEY in fm:
+        del fm[MEASURED_KEY]
+    if legacy:
+        del fm[_LEGACY_MEASURED_KEY]
+    import io
+    buf = io.StringIO()
+    yml.dump(fm, buf)
+    md_path.write_text("---\n" + buf.getvalue().rstrip("\n") + "\n---"
+                       + parts[2], encoding="utf-8")
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--before", metavar="TS",
+                    help="only purge blocks stamped before this ISO 8601 ts")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="list what would be purged, write nothing")
+    ap.add_argument("--model-dir", action="append", metavar="DIR",
+                    help="discovery root (default: profiles models_dirs)")
+    ap.add_argument("--profiles", default="profiles.yaml")
+    ap.add_argument("paths", nargs="*",
+                    help="explicit sidecar files (skip discovery)")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+
+    if args.paths:
+        sidecars = [Path(p) for p in args.paths]
+    else:
+        import yaml
+        cfg = {}
+        path = Path(args.profiles)
+        if path.is_file():
+            with open(path) as f:
+                cfg = yaml.safe_load(f) or {}
+        dirs = [Path(d) for d in (args.model_dir or cfg.get("models_dirs")
+                                  or ["models"])]
+        sidecars = [m.md_path for m in discover(
+            dirs, stack=ScopeStack(avail={"llama_bin": "llama-server"}),
+            generate_stubs=False, hf_home=cfg.get("hf_home"))]
+
+    purged = 0
+    for md in sidecars:
+        if md is None or not md.is_file():
+            continue
+        if args.dry_run:
+            block = None
+            import yaml as _y
+            head = md.read_text(encoding="utf-8").split("---", 2)
+            if len(head) > 2:
+                block = (_y.safe_load(head[1]) or {}).get(MEASURED_KEY)
+            if block is not None:
+                print(f"would purge {md} (source {block.get('source')})")
+            continue
+        if purge_frontmatter(md, args.before):
+            purged += 1
+            print(f"purged {md}")
+    print(f"clear-measured: {purged} sidecar(s) purged"
+          + (" (dry run)" if args.dry_run else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
