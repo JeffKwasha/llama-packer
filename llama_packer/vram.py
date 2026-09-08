@@ -65,6 +65,7 @@ from llama_packer.consts import (
     _WHISPER_COMPUTE_MB,
     _WEIGHT_CPU_MAP_TOLERANCE_MIB,
     _KOKORO_COMPUTE_MB,
+    ESTIMATE_ERROR_REASON,
 )
 from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
                                    SD_BACKENDS, VLLM_BACKENDS,
@@ -463,6 +464,9 @@ class VramBudget:
         self._effective_cache: dict[tuple, tuple[int, float, float, int]] = {}
         self._companion_cache: dict[tuple, tuple[int, float, float, int]] = {}
         self._logged: set[str] = set()
+        #: Set when no estimate source worked for this model — the planner
+        #: surfaces it as metadata.estimated/estimate_error on every entry.
+        self.unestimated_reason: str | None = None
 
     # ── saved fit-params from frontmatter ──
 
@@ -533,8 +537,11 @@ class VramBudget:
 
         logger.info("measuring VRAM: %s via llama-fit-params", label)
         try:
+            # errors="replace": fit-params logs can carry non-UTF-8 bytes
+            # (tokenizer dumps, control chars); strict decoding would raise
+            # UnicodeDecodeError inside subprocess itself.
             out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=60)
+                                 errors="replace", timeout=60)
         except subprocess.TimeoutExpired:
             logger.warning("fit-params timeout for %s", label)
             return None
@@ -542,7 +549,10 @@ class VramBudget:
             logger.warning("fit-params binary not found: %s", fit_bin)
             return None
         except Exception as e:
-            logger.warning("fit-params failed for %s: %s", label, e)
+            msg = f"fit-params failed for {label}: {e}"
+            if msg not in self._logged:
+                self._logged.add(msg)
+                logger.warning(msg)
             return None
 
         parsed = parse_fit_log(out.stdout + "\n" + out.stderr)
@@ -1153,18 +1163,17 @@ class VramBudget:
         )
 
         if static is None:
-            if self.model.backend in VLLM_BACKENDS:
-                # No memory estimate available (no estimator, no local
-                # safetensors): size to the declared context and let vLLM's
-                # own startup profiling bound the actual allocation.
-                return self._design_ctx()
-            # Fatal: no way to estimate VRAM for this model
-            raise RuntimeError(
-                f"VRAM measurement failed for {self.model.stem}; "
-                f"cannot estimate a safe context size. Ensure llama-server "
-                f"is available/built and the model format is supported "
-                f"(safetensors may be unsupported)."
-            )
+            # No estimate source worked (fit-params broken, no safetensors
+            # header, no vLLM estimator). Never crash the pack: size to the
+            # design context and flag the model unestimated — the planner
+            # serves it at its minimum useful context and matrix
+            # participants get a conservative largest-measured reserve.
+            if self.unestimated_reason is None:
+                self.unestimated_reason = ESTIMATE_ERROR_REASON
+            self._warn_once(
+                "VRAM measurement failed for %s; sizing to design context "
+                "%d (unverified — may OOM)", self.model.stem, design)
+            return design
 
         model_mib, kv_per_token, slot_mib, compute_mib = static
         remaining = available - model_mib - compute_mib

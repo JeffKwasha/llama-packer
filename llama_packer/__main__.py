@@ -664,6 +664,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     except ValueError as e:
         fatal("%s", e)
+    except RuntimeError as e:
+        # Planning must never traceback: a stuck point (unmeasurable model,
+        # broken binary) degrades to a clean fatal with the reason.
+        fatal("planning failed: %s", e)
     finally:
         progress.stop()
     # Prepare flag macros (placeholder domain) — auto on unless --no-macros

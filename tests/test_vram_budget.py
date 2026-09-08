@@ -242,6 +242,46 @@ def test_calc_ctx_cpu_resident_returns_design(make_model):
     assert ctx == 8192
 
 
+# ── unestimable fallback (no estimate source works) ──────────────────────
+
+
+def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
+    """No measurement source -> design ctx + unestimated flag, never raise."""
+    import logging
+
+    model = make_model("ue", context_length=32768)
+    model.vram.effective_static = lambda *a, **k: None
+    with caplog.at_level(logging.WARNING, logger="llama_packer.vram"):
+        ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    assert ctx == 32768
+    assert model.vram.unestimated_reason is not None
+    assert any("VRAM measurement failed" in r.message for r in caplog.records)
+    # The warning is deduped: a repeat solve logs it once.
+    model.vram.calc_ctx(32768, fit_bin="unused")
+    assert sum("VRAM measurement failed" in r.message
+               for r in caplog.records) == 1
+
+
+def test_fit_params_undecodable_output_returns_none(make_model, monkeypatch,
+                                                    caplog):
+    """fit-params logs can carry non-UTF-8 bytes; strict decoding must not
+    blow up inside subprocess (LFM2.5-VL regression: UnicodeDecodeError)."""
+    import logging
+    import subprocess
+
+    model = make_model("uf")
+    budget = model.vram
+
+    def fake_run(cmd, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xc4", 0, 1,
+                                 "invalid continuation byte")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with caplog.at_level(logging.WARNING, logger="llama_packer.vram"):
+        assert budget.fit_params("fit-bin", fit_ctx=1024) is None
+    assert any("fit-params failed" in r.message for r in caplog.records)
+
+
 def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
     # vLLM model with no estimator and no local safetensors: graceful fallback.
     model = make_model("f", backend="vllm", hf_repo="org/model",
