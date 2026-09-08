@@ -284,6 +284,24 @@ def save_serve_correction(
 _MEASURE_READY = "listening on http"
 
 
+def _proc_io_read(pid: int) -> int:
+    """Bytes the child read from storage (``/proc/<pid>/io``; own child).
+
+    The activity signal for the stall window: the multi-minute mmap load
+    of a platter model is *silent* in the log (nothing is printed
+    between "loading tensors" and completion), but its reads are
+    visible here.  Returns -1 when unreadable.
+    """
+    try:
+        with open(f"/proc/{pid}/io", "rb") as f:
+            for line in f:
+                if line.startswith(b"read_bytes:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return -1
+
+
 def _wait_ready(
     proc: subprocess.Popen,
     log_file,
@@ -294,20 +312,22 @@ def _wait_ready(
     """Poll the log for the ready marker.
 
     Returns ``"ready"``, or the failure shape: ``"exited"`` (the process
-    died first), ``"stall"`` (log size unchanged for *stall_s* while
-    alive — wedged I/O; abandoned at the stall window instead of burning
-    the full timeout) or ``"timeout"``.  Every buffer line precedes the
-    ready marker.
+    died first), ``"stall"`` (no progress — log size *and* storage reads
+    unchanged — for *stall_s* while alive; abandoned at the stall window
+    instead of burning the full timeout) or ``"timeout"``.  Every buffer
+    line precedes the ready marker.
     """
     deadline = time.monotonic() + timeout_s
-    last_size, last_progress = -1, time.monotonic()
+    last_size, last_io, last_progress = -1, -1, time.monotonic()
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return "exited"
         log_file.seek(0, os.SEEK_END)
         size = log_file.tell()
-        if size != last_size:
-            last_size, last_progress = size, time.monotonic()
+        io_read = _proc_io_read(proc.pid)
+        if size != last_size or io_read != last_io:
+            last_size, last_io = size, io_read
+            last_progress = time.monotonic()
         elif time.monotonic() - last_progress > stall_s:
             return "stall"
         log_file.seek(0)
