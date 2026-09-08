@@ -13,12 +13,12 @@ import pytest
 from llama_packer.memory_probe import (
     _fit_affine,
     _probe_grid,
-    affine_from_pair,
     affine_report,
     format_reports,
     pick_family_representatives,
     run_probe,
 )
+from llama_packer.vram import affine_from_pair
 
 
 def _fake(stem, tmp, arch="qwen3", size=100, suffix=".gguf",
