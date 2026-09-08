@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from llama_packer import gpu_state
 from llama_packer import utils
 from llama_packer import vllm_estimate
 from llama_packer.consts import (
@@ -51,11 +52,11 @@ from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DRAFT_COMPUTE_MB,
     _DRAFT_CTX_SAFETY,
+    _GPU_SPILL_TOLERANCE_MIB,
     _MIN_CTX_SIZE,
     _MMPROJ_COMPUTE_MB,
-    _MEASURE_CTX_CAP,
+    _MEASURE_STALL_S,
     _MEASURE_TIMEOUT_S,
-    _MTP_DRAFT_N_MAX,
     _MTP_SPEC_TYPE,
     _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
@@ -113,22 +114,56 @@ def parse_device_buffers(log_text: str) -> dict[str, float]:
     ``output`` (sums across every context the process created: the main
     context plus the MTP draft context when one is built).  Host-visible
     buffers (``Vulkan_Host``, ``CPU_Mapped``) are excluded: they live in
-    GTT/system RAM, not VRAM.
+    GTT/system RAM, not VRAM — see :func:`parse_spill_mib` for when that
+    exclusion makes a measurement invalid.
+    """
+    device, _ = _buffer_walk(log_text)
+    return device
+
+
+def parse_spill_mib(log_text: str) -> float:
+    """MiB of measurement buffers that landed outside device memory.
+
+    The per-run validity check: CPU-mapped weights (layers that never
+    made it to the device) plus host-visible KV/RS pools (the pool did
+    not fit beside whatever else holds VRAM).  Above the tolerance the
+    device-side sums undercount the truth — the 2026-09-07 Dirk GTT
+    spill — and the point must be rejected.  Host compute/output
+    staging is a normal Vulkan cost and is not counted.
+    """
+    _, spill = _buffer_walk(log_text)
+    return spill
+
+
+_COMP_BY_TOKEN = {"model": "weights", "KV": "kv", "RS": "rs",
+                  "compute": "compute", "output": "output"}
+
+
+def _buffer_walk(log_text: str) -> tuple[dict[str, float], float]:
+    """One pass over the buffer lines → (device sums, spill MiB).
+
+    Device sums: ``weights`` as the max per device across load passes,
+    every other component summed across contexts.  Spill: every
+    non-device-resident MiB that belongs on the GPU — CPU-mapped weight
+    lines and host-visible KV/RS lines.
     """
     weights: dict[str, float] = {}
     totals = {"kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
-    comp_by_token = {"model": "weights", "KV": "kv", "RS": "rs",
-                     "compute": "compute", "output": "output"}
+    spill = 0.0
     for m in _BUFFER_RE.finditer(log_text):
         dev, token, mib = m.group(1), m.group(2), float(m.group(3))
-        if not _is_device_buffer(dev):
-            continue
-        comp = comp_by_token[token]
-        if comp == "weights":
-            weights[dev] = max(weights.get(dev, 0.0), mib)
-        else:
-            totals[comp] += mib
-    return {"weights": sum(weights.values()), **totals}
+        comp = _COMP_BY_TOKEN[token]
+        if _is_device_buffer(dev):
+            if comp == "weights":
+                weights[dev] = max(weights.get(dev, 0.0), mib)
+            else:
+                totals[comp] += mib
+        elif comp == "weights":
+            if dev.startswith("CPU"):
+                spill += mib
+        elif comp in ("kv", "rs"):
+            spill += mib
+    return {"weights": sum(weights.values()), **totals}, spill
 
 
 def _free_port() -> int:
@@ -196,9 +231,7 @@ def _corrections_path() -> Path:
     geometry differences between estimate and serve), so they live in a
     machine-local cache, not in the repo.
     """
-    base = os.environ.get("LLAMA_PACKER_CACHE_DIR")
-    root = Path(base) if base else Path.home() / ".cache" / "llama-packer"
-    return root / "serve-corrections.json"
+    return gpu_state.cache_dir() / "serve-corrections.json"
 
 
 def get_serve_correction(
@@ -237,6 +270,39 @@ def save_serve_correction(
 
 # The llama-server readiness marker: every buffer line precedes it.
 _MEASURE_READY = "listening on http"
+
+
+def _wait_ready(
+    proc: subprocess.Popen,
+    log_file,
+    ready_token: bytes,
+    timeout_s: float,
+    stall_s: float,
+) -> str:
+    """Poll the log for the ready marker.
+
+    Returns ``"ready"``, or the failure shape: ``"exited"`` (the process
+    died first), ``"stall"`` (log size unchanged for *stall_s* while
+    alive — wedged I/O; abandoned at the stall window instead of burning
+    the full timeout) or ``"timeout"``.  Every buffer line precedes the
+    ready marker.
+    """
+    deadline = time.monotonic() + timeout_s
+    last_size, last_progress = -1, time.monotonic()
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return "exited"
+        log_file.seek(0, os.SEEK_END)
+        size = log_file.tell()
+        if size != last_size:
+            last_size, last_progress = size, time.monotonic()
+        elif time.monotonic() - last_progress > stall_s:
+            return "stall"
+        log_file.seek(0)
+        if ready_token in log_file.read():
+            return "ready"
+        time.sleep(0.5)
+    return "timeout"
 
 # Role batch flags repeated after the global args (later flags win in
 # llama.cpp), so the measurement sees the same compute the serve does.
@@ -490,8 +556,15 @@ class VramBudget:
         all layers on GPU, MTP draft, the profiles global args — flash
         attention and the role batch sizes — plus the embed/rerank batch
         override), because compute and recurrent-state allocations depend
-        on them.  The process is killed as soon as the server reports
-        ready; every buffer line precedes that point.
+        on them.
+
+        Guardrails (2026-09-07 contamination post-mortem): the pre-flight
+        refuses to measure beside a resident llama process; the child
+        runs in its own process group and dies on every exit path; a hung
+        load is abandoned at the stall window, not the full timeout; and
+        a run whose weights/KV/RS spilled to host-visible memory is
+        rejected (its device sums undercount the truth).  Every run is
+        journaled.
         """
         cache_key = ("serve", cache_type, ctx, parallel, llama_args)
         if cache_key in self._serve_cache:
@@ -499,6 +572,15 @@ class VramBudget:
 
         if self.model.gguf_path is None:
             return None
+        residents = gpu_state.llama_residents()
+        if residents:
+            self._warn_once(
+                "VRAM measurement refused for %s — llama processes "
+                "resident: %s", self.model.stem, "; ".join(residents[:3]))
+            gpu_state.journal({"mode": "serve", "model": self.model.stem,
+                               "outcome": "refused-residents"})
+            return None
+
         cmd = [
             str(server_bin), "-m", str(self.model.gguf_path),
             "-c", str(ctx), "--parallel", str(parallel),
@@ -512,44 +594,52 @@ class VramBudget:
 
         logger.info("measuring VRAM: %s via llama-server (ctx=%d, p=%d)",
                     self.model.stem, ctx, parallel)
+        started = time.monotonic()
+        proc: subprocess.Popen | None = None
+        outcome, spill, text = "launch-failed", 0.0, ""
+        buffers: dict[str, float] | None = None
         with tempfile.NamedTemporaryFile(
                 "w+b", suffix=".log", prefix="lp-measure-") as tf:
             try:
                 proc = subprocess.Popen(cmd, stdout=tf,
-                                        stderr=subprocess.STDOUT)
+                                        stderr=subprocess.STDOUT,
+                                        start_new_session=True)
             except (OSError, ValueError) as e:
                 self._warn_once("llama-server measurement: cannot launch %s: %s",
                                 server_bin, e)
-                return None
-            ready_token = _MEASURE_READY.encode("ascii", "ignore")
-            deadline = time.monotonic() + _MEASURE_TIMEOUT_S
-            ready = False
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.5)
-                tf.seek(0)
-                # bytes-level read: the server may have written half of a
-                # multi-byte sequence when we poll
-                if ready_token in tf.read():
-                    ready = True
-                    break
-            if proc.poll() is None:
-                proc.terminate()
+            else:
                 try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-            tf.seek(0)
-            text = tf.read().decode("utf-8", errors="replace") if ready else ""
-
-        if not ready:
-            self._warn_once("llama-server measurement failed for %s "
-                            "(ctx=%d, p=%d)", self.model.stem, ctx, parallel)
-            return None
-        buffers = parse_device_buffers(text)
-        self._serve_cache[cache_key] = buffers
+                    outcome = _wait_ready(
+                        proc, tf, _MEASURE_READY.encode("ascii", "ignore"),
+                        _MEASURE_TIMEOUT_S, _MEASURE_STALL_S)
+                    if outcome == "ready":
+                        tf.seek(0)
+                        text = tf.read().decode("utf-8", errors="replace")
+                finally:
+                    # Our child, our kill — on every exit path, always.
+                    if proc.poll() is None:
+                        gpu_state.kill_process_group(proc)
+                    else:
+                        proc.wait()
+        if outcome == "ready":
+            spill = parse_spill_mib(text)
+            if spill <= _GPU_SPILL_TOLERANCE_MIB:
+                buffers = parse_device_buffers(text)
+                self._serve_cache[cache_key] = buffers
+                outcome = "ok"
+            else:
+                outcome = "spill"
+        gpu_state.journal({
+            "mode": "serve", "model": self.model.stem, "ctx": ctx,
+            "parallel": parallel,
+            "pid": proc.pid if proc is not None else None,
+            "outcome": outcome, "spill_mib": round(spill, 1),
+            "dur_s": round(time.monotonic() - started, 1),
+        })
+        if buffers is None:
+            self._warn_once(
+                "llama-server measurement for %s (ctx=%d, p=%d) failed: %s",
+                self.model.stem, ctx, parallel, outcome)
         return buffers
 
     def _fit_params_serve(
@@ -590,7 +680,7 @@ class VramBudget:
         kv_per_token = r1["kv"] / design
         slot_mib = max(float(r2["context"] - r1["context"]), 0.0) \
             + rs_cell * (2.0 if mtp_on else 1.0)
-        compute_mib = max(r1["compute"], r2["compute"]) \
+        compute_mib = int(max(r1["compute"], r2["compute"])) \
             + int(round(rs_cell * (1.0 if mtp_on else 0.0)))
         params = FitParams(
             model_mib=int(r1["model"]),
@@ -600,7 +690,8 @@ class VramBudget:
             source="fit-estimate",
             cache_type=cache_type,
         )
-        corr = get_serve_correction(self.model.arch, cache_type, mtp_on)
+        corr = get_serve_correction(self.model.arch or "unknown", cache_type,
+                                    mtp_on)
         if corr is not None:
             params = FitParams(
                 model_mib=params.model_mib,
@@ -641,7 +732,7 @@ class VramBudget:
             model_mib=int(r1["model"]),
             kv_per_token_mib=kv_per_token,
             slot_mib=slot_mib,
-            compute_mib=max(r1["compute"], r2["compute"]),
+            compute_mib=int(max(r1["compute"], r2["compute"])),
             source="fit-params",
             cache_type=cache_type,
         )
