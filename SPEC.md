@@ -177,7 +177,7 @@ A single measurement cannot separate `c` from `D`, so the system measures a
 < 0.1% across dense/MoE/SWA families and q8_0/f16/bf16/q4_0) and replaces the
 former per-parallel sweeps.
 
-Values are persisted to the model's `.md` sidecar `measured:` block — **per
+Values are persisted to the model's `.md` sidecar `derived:` block — **per
 `cache_type`, parallel-independent by construction** (the `parallel` and
 legacy `ctx_factor` keys of the pre-affine schema are removed on rewrite).
 A `cache_type` change invalidates the block and re-measures: `c` would scale
@@ -556,7 +556,7 @@ vLLM has no `llama-fit-params` analog, so VRAM params are sourced differently bu
 through the same `FitParams` pipeline (`model_mib`, `kv_per_token_mib`,
 `slot_mib=0` — vLLM's paged KV pool is shared, `--max-num-seqs` does not
 change KV size — and `compute_mib`), and are
-persisted to the sidecar `measured:` block with `source:` `vllm-estimate` /
+persisted to the sidecar `derived:` block with `source:` `vllm-estimate` /
 `safetensors-estimate`. Sources, in order (`vram.py:_fit_params_vllm`):
 
 1. `vllm-memory-estimator` (optional dependency) on the `hf_repo` — reuses vLLM's own
@@ -1357,13 +1357,13 @@ weaknesses:
 ## Measured-Block Persistence
 
 Machine-written values live in the sidecar `.md` file under a single
-`measured` nested block — the only dynamically generated branch (a legacy
-`fit-params` block is still located, but its pre-affine numbers are
-stale: the block is re-measured and rewritten as `measured` with the
-affine schema on next persist):
+`derived` nested block — the only dynamically generated branch
+(llama-packer's own calculation cache: never hand-edit, delete to force
+re-evaluation; legacy `fit-params`/`measured` blocks are located but
+rewritten as `derived` on next persist):
 
 ```yaml
-measured:
+derived:
   model_mib: 4800
   kv_per_token_mib: 0.0312
   slot_mib: 12.5

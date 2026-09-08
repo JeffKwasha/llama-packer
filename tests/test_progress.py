@@ -85,7 +85,7 @@ def test_fit_params_cache_hit_is_silent(make_model, fit_params_block,
                                         monkeypatch, caplog):
     import subprocess
 
-    m = make_model("pc", **{"measured": fit_params_block})
+    m = make_model("pc", **{"derived": fit_params_block})
     budget = m.vram
     # Prime the in-memory cache via a first call backed by saved frontmatter.
     budget.fit_params_static("fit-bin")

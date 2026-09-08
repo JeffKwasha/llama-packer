@@ -29,7 +29,7 @@ def test_effective_static_folds_mmproj_and_mtp(tmp_path, make_model, fit_params_
     (tmp_path / "main-mmproj.gguf").write_bytes(b"x" * 3 * MIB)
     (tmp_path / "main.mtp.gguf").write_bytes(b"x" * 2 * MIB)
     m = make_model("main",
-                   **{"measured": dict(fit_params_block),
+                   **{"derived": dict(fit_params_block),
                       "mmproj": {"file": "main-mmproj.gguf"},
                       "speculative": "main.mtp.gguf"})
 
@@ -47,7 +47,7 @@ def test_effective_static_folds_mmproj_and_mtp(tmp_path, make_model, fit_params_
 def test_effective_static_mmproj_only_has_zero_kv_contribution(
         tmp_path, make_model, fit_params_block):
     (tmp_path / "solo-mmproj.gguf").write_bytes(b"x" * 3 * MIB)
-    m = make_model("solo", **{"measured": dict(fit_params_block),
+    m = make_model("solo", **{"derived": dict(fit_params_block),
                               "mmproj": {"file": "solo-mmproj.gguf"}})
     model_mib, kv_factor, slot_mib, compute_mib = m.vram.effective_static(
         fit_bin="unused", cache_type="q8_0")
@@ -62,7 +62,7 @@ def test_effective_static_vllm_skips_companions(tmp_path, make_model,
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x" * 3 * MIB)
     m = make_model("v", backend="vllm", hf_repo="org/model",
                    mmproj={"file": "v-mmproj.gguf"},
-                   **{"measured": dict(fit_params_block)})
+                   **{"derived": dict(fit_params_block)})
     assert m.vram.effective_static(fit_bin="unused") == (
         10000, 0.5, 150.0, 1000)
 
@@ -70,7 +70,7 @@ def test_effective_static_vllm_skips_companions(tmp_path, make_model,
 def test_effective_static_result_is_cached(tmp_path, make_model,
                                            fit_params_block, monkeypatch):
     (tmp_path / "c1-mmproj.gguf").write_bytes(b"x" * 2 * MIB)
-    m = make_model("c1", **{"measured": dict(fit_params_block),
+    m = make_model("c1", **{"derived": dict(fit_params_block),
                             "mmproj": {"file": "c1-mmproj.gguf"}})
 
     calls = {"n": 0}

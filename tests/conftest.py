@@ -34,7 +34,7 @@ def make_model(tmp_path):
 
 @pytest.fixture
 def fit_params_block():
-    """A valid serve-shaped measured block (cache_type q8_0)."""
+    """A valid serve-shaped derived block (cache_type q8_0)."""
     return {
         "model_mib": 10000,
         "kv_per_token_mib": 0.5,

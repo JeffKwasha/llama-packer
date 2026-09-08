@@ -26,7 +26,7 @@ def test_persist_preserves_comments_and_body(make_model, tmp_path):
     assert "keep this frontmatter comment" in content
     assert "# body heading" in content
     assert "Some markdown body." in content
-    assert "measured:" in content
+    assert "derived:" in content
     assert "fit-params:" not in content
     assert "model_mib: 1000" in content
 
@@ -51,6 +51,6 @@ def test_persist_migrates_legacy_fit_params_block(make_model, tmp_path):
     model.vram._persist(FitParams(2000, 0.25, 50, "fit-params", "q8_0", 1))
 
     content = md.read_text()
-    assert "measured:" in content
+    assert "derived:" in content
     assert "fit-params:" not in content
     assert "model_mib: 2000" in content

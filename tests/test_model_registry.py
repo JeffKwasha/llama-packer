@@ -172,7 +172,7 @@ def test_measured_file_sync_and_validity(tmp_path, caplog):
         m.sync_measured_file()
     assert m.measured_file_valid()
     content = md.read_text()
-    assert "measured:" in content
+    assert "derived:" in content
     assert "arch: qwen3" in content
 
     # second instance over the same files: no header re-read, still valid
@@ -189,7 +189,7 @@ def test_measured_file_sync_and_validity(tmp_path, caplog):
 
 
 def test_legacy_fit_params_block_still_read(make_model, fit_params_block):
-    m = make_model("lp", **{"measured": fit_params_block})
+    m = make_model("lp", **{"derived": fit_params_block})
     saved = m.vram.saved_for("q8_0")
     assert saved is not None and saved.model_mib == 10000
 
