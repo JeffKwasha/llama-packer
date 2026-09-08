@@ -7,6 +7,10 @@ llama-packer Python package.
   binaries into the repo root. Run `./extras/update --help` for options.
   **Run it from the repo root** (`./extras/update`) — the script detects
   that it is inside `extras/` and installs into the parent directory.
+- [`fit-sweep`](fit-sweep) — llama-fit-params VRAM data points for the affine
+  law `VRAM(C, p) = fixed + c·C + D·p`. Header-only (~0.6 s/run, no tensor
+  data, no server, no meaningful VRAM use): safe on platter storage and
+  beside a busy GPU. Run `./extras/fit-sweep --help` from the repo root.
 - [`llamaswap.ts`](llamaswap.ts) — opencode plugin: auto-discovers models
   from a running `llama-swap` server and injects them into opencode's
   provider config, plus `llamaswap_models` / `llamaswap_status` /

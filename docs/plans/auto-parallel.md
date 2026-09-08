@@ -212,6 +212,36 @@ unchanged), so no change there beyond using the solved `p`.
 
 ## Findings: the affine VRAM law (2026-09-07, SEAL record)
 
+> **2026-09-08 re-derivation.** The probe session that produced the table
+> below ran ~24 h and, for its final ~8 h, took readings beside a
+> measurement `llama-server` it had failed to kill (a constant offset an
+> affine fit absorbs with zero residual penalty — every poisoned run still
+> reported PASS). Post-mortem guardrails are now structural
+> (`llama_packer/gpu_state.py`: process-group kill on every exit path,
+> stall window, resident pre-flight, single-flight lock, run journal;
+> `parse_spill_mib` rejects points whose weights/KV/RS landed host-visible).
+> The correction rows derived during the incident were quarantined
+> (`~/.cache/llama-packer/serve-corrections.json.contaminated-20260907`).
+>
+> The constants themselves mostly survived re-derivation — `extras/fit-sweep`
+> (header-only llama-fit-params, exact pool-line math, zero tensor reads,
+> max_err 0.0000% on all 4-point grids, q8_0):
+>
+> | arch | witness | c (MiB/tok) | D_fit (MiB/slot) |
+> |------|---------|-------------|------------------|
+> | deepseek2 | GLM47-Flash | 0.027432 | 0.0 |
+> | gemma3 | gemma-3-12b | 0.033203 | 510.0 |
+> | gemma4 | gemma4-12B | 0.008301 | 510.0 |
+> | qwen35 | qwen38-27B-Dirk | 0.033203 | 149.6 |
+> | qwen35moe | qwen36-35B-Nail | 0.010376 | 62.8 |
+>
+> `c` matches the serve truth exactly; non-SWA `D` matches to < 0.5 MiB
+> (149.6 ≈ 150, 62.8 ≈ 63). Open for the serve-truth recalibration
+> (`--probe-memory`): the gemma family's fit-params SWA ring is 2× what
+> llama-server allocates (510 vs 255 — ring geometry differs between the
+> tools), and the fit-params compute shaping gap that the per-arch
+> `delta_fixed` corrections absorb.
+
 Measured with the `--probe-memory` probe across qwen3.8-27B (dense,
 arch `qwen35`), gemma-4-12B-QAT (dense+SWA+MTP, arch `gemma4`) and
 gemma-4-26B-A4B (MoE+SWA), at p ∈ {1,2,4,8}, C ∈ {64k,128k,256k},
