@@ -105,13 +105,16 @@ def main() -> int:
         if md is None or not md.is_file():
             continue
         if args.dry_run:
-            block = None
             import yaml as _y
             head = md.read_text(encoding="utf-8").split("---", 2)
-            if len(head) > 2:
-                block = (_y.safe_load(head[1]) or {}).get(MEASURED_KEY)
-            if block is not None:
+            fm = _y.safe_load(head[1]) if len(head) > 2 else None
+            fm = fm or {}
+            block = fm.get(MEASURED_KEY)
+            legacy = [k for k in _LEGACY_MEASURED_KEYS if k in fm]
+            if isinstance(block, dict):
                 print(f"would purge {md} (source {block.get('source')})")
+            elif legacy:
+                print(f"would purge {md} (legacy keys: {', '.join(legacy)})")
             continue
         if purge_frontmatter(md, args.before):
             purged += 1

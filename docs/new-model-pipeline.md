@@ -49,7 +49,9 @@ stat per model per run.
    **and** `shape` match. `shape` is the exact flag string the numbers were
    measured under (global args + the resolved `-ub`); a profiles or batch-key
    change re-measures instead of serving stale compute terms. `--remeasure`
-   skips this path for one run.
+   skips this path for one run. The trio pins `c` from the `(C, C/2)` pool
+   difference over the *actual* ctx delta, so any design context measures
+   exactly (sub-4k text designs are an error or a testcase — warned).
 2. **llama-fit-params trio** — three header-only runs (~0.6 s each) at the
    model's design context: `(C, p=1)`, `(C, p=2)`, `(C/2, p=1)`. The
    pool-line differences isolate `c` (per-token KV) and `D` (per-slot)

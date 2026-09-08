@@ -253,6 +253,10 @@ def test_format_reports_shows_verdicts(tmp_path):
 
 
 def test_run_probe_end_to_end(tmp_path, monkeypatch):
+    # The probe pre-flight reads live processes; this repo's normal state is
+    # a resident llama-swap, so the test stubs a clean GPU.
+    monkeypatch.setattr("llama_packer.gpu_state.llama_residents", lambda: [])
+
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
                                 llama_args):

@@ -1178,8 +1178,11 @@ class Planner:
             # Unestimable model: no measurement source worked. Serve at the
             # minimum useful context (type-based floor) — the matrix solve
             # carries it with no extra reserve — and mark every entry for
-            # client-facing metadata.
-            est_error = getattr(model.vram, "unestimated_reason", None)
+            # client-facing metadata.  The flag may sit on either budget:
+            # view_for() rebuilds VramBudget per view (mmproj models carry
+            # a separate companion-on budget that runs its own solves).
+            est_error = getattr(model.vram, "unestimated_reason", None) \
+                or getattr(view.vram, "unestimated_reason", None)
             # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
             # RAG entry's served context (the emit is what frees the VRAM).
             if view.role == "embeddings" and self.matrix_result:
@@ -1246,8 +1249,12 @@ class Planner:
                 if est_error is None:
                     # Discovery during this model's own solve: calc_ctx
                     # flagged the model unestimable (no measurement source
-                    # worked) — re-plan it at the type floor.
-                    est_error = getattr(model.vram, "unestimated_reason", None)
+                    # worked) — re-plan it at the type floor.  The flag may
+                    # sit on the *view's* budget: view_for() rebuilds
+                    # VramBudget per view, and the solve ran on `view`.
+                    est_error = getattr(model.vram, "unestimated_reason",
+                                        None) \
+                        or getattr(view.vram, "unestimated_reason", None)
                     if est_error is not None:
                         parallel = group_parallel
                         ctx_size = self._unestimated_ctx(view)

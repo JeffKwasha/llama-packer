@@ -19,10 +19,12 @@ Measurement source: real ``llama-server`` runs under the exact flags the
 server will run with (fit-params reports the KV pool only and misses the
 RS/draft/batch terms — the 2026-09-07 Dirk GTT spill).  The probe CLI
 (``llama-packer --probe-memory [ARCH...]``) measures one representative
-per GGUF arch family across p ∈ {1,2,4,8} and reports the derived
+per GGUF arch family on a small (C, p) grid (p ∈ {1,2}; the {1,2,4,8}
+sweep above was the one-off validation campaign) and reports the derived
 constants plus the max residual against the law — the check when a new
-architecture family shows up.  All functions are side-effect free (no
-persistence) and importable by other tools.
+architecture family shows up.  The correction rows it writes are the only
+persisted state (the pack-time estimate and the emitted config are
+untouched).
 """
 
 from __future__ import annotations

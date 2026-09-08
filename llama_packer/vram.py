@@ -54,7 +54,6 @@ from llama_packer import utils
 from llama_packer import vllm_estimate
 from llama_packer.consts import (
     _CTX_ROUND_TO,
-    _DEFAULT_CONTEXT_LENGTH,
     _DRAFT_COMPUTE_MB,
     _DRAFT_CTX_SAFETY,
     _KV_SPILL_TOLERANCE_MIB,
@@ -787,12 +786,16 @@ class VramBudget:
         no meaningful VRAM use) with the exact serve flags pin the affine
         constants from the KV/recurrent-state pool lines alone:
 
-            c = 2 * (pool(C) - pool(C/2)) / C     # ring/cells cancel
-            D = pool(C, p=2) - pool(C, p=1)       # per-slot fixed cost
+            c = (pool(C) - pool(C/2)) / (C - C/2)   # ring/cells cancel
+            D = pool(C, p=2) - pool(C, p=1)         # per-slot fixed cost
 
         where *pool* sums every KV pool and recurrent-state cache the
         ``-lv 5`` log reports (for SWA models that includes the
         fixed-size per-slot sliding ring, which the difference cancels).
+        The divisor is the *actual* ctx delta between the two runs, so
+        any design context works (the former ``max(C/2, 4096)`` floor
+        silently mis-derived ``c`` for designs below 8192 — and sub-4k
+        text designs are an error or a testcase anyway).
         The compute row is *not* part of the fit — under serve batch
         flags it is not affine in (C, p) (deepseek2: −64 MiB per ctx
         halving, −168 per extra slot) — so its max over the trio is the
@@ -806,14 +809,15 @@ class VramBudget:
         r2 = self.fit_params(fit_bin=fit_bin, fit_ctx=design,
                              cache_type=cache_type, parallel=2,
                              llama_args=llama_args)
+        r3_ctx = max(design // 2, 1)
         r3 = self.fit_params(fit_bin=fit_bin,
-                             fit_ctx=max(design // 2, _MIN_CTX_SIZE),
+                             fit_ctx=r3_ctx,
                              cache_type=cache_type, parallel=1,
                              llama_args=llama_args)
         if r1 is None or r2 is None or r3 is None \
-                or design <= 0 or r1["kv"] <= 0 or r3["kv"] <= 0:
+                or design - r3_ctx <= 0 or r1["kv"] <= 0 or r3["kv"] <= 0:
             return None
-        kv_per_token = 2.0 * (r1["kv"] - r3["kv"]) / design
+        kv_per_token = (r1["kv"] - r3["kv"]) / (design - r3_ctx)
         if kv_per_token <= 0:
             return None
         pool1 = r1["kv"] + r1["rs"]
@@ -1438,26 +1442,25 @@ def solve_matrix_ctx(
     best_ctx = 0
     for model, model_mib, kv_factor, slot_mib, compute_mib, parallel, \
             img_floor in chat_models:
+        if kv_factor <= 0:
+            # Unestimable rider (zero-cost placeholder): it rides whatever
+            # the measurable models afford and must not set the shared bar
+            # — its native max would inflate chat_ctx for everyone (and
+            # suppress tools demotion). The planner serves it at its type
+            # floor and flags the entry unverified.
+            continue
         chat_budget = remaining_for_chat - model_mib - compute_mib
         if chat_budget <= 0:
             continue
-        if kv_factor > 0:
-            ctx = int((chat_budget - slot_mib * parallel)
-                      / (kv_factor * parallel))
-            # The image token floor is raise-to-fit only when it was already
-            # affordable; a larger floor cannot buy VRAM it doesn't have.
-            if img_floor > ctx:
-                logger.warning(
-                    "matrix: %s image_max_tokens budget %d per slot exceeds "
-                    "the solved chat ctx %d; large images may not fit",
-                    model.stem, img_floor, ctx)
-        else:
-            ctx = model.gguf_context_length or _DEFAULT_CONTEXT_LENGTH
-            if img_floor > ctx:
-                logger.warning(
-                    "matrix: %s image_max_tokens budget %d per slot exceeds "
-                    "its context %d; large images may not fit",
-                    model.stem, img_floor, ctx)
+        ctx = int((chat_budget - slot_mib * parallel)
+                  / (kv_factor * parallel))
+        # The image token floor is raise-to-fit only when it was already
+        # affordable; a larger floor cannot buy VRAM it doesn't have.
+        if img_floor > ctx:
+            logger.warning(
+                "matrix: %s image_max_tokens budget %d per slot exceeds "
+                "the solved chat ctx %d; large images may not fit",
+                model.stem, img_floor, ctx)
         ctx = (ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)
         arch_max = model.design_context

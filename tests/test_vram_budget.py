@@ -491,6 +491,98 @@ def test_solve_matrix_ctx_exhausted_budget(make_model):
     assert ctx == _MIN_CTX_SIZE
 
 
+def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
+    """An unestimable rider (zero-cost placeholder, kv_factor 0) rides the
+    measurable models' solve — its native max must not inflate the shared
+    chat context (which would suppress tools demotion fleet-wide and serve
+    the unverified model at a context nothing bounded)."""
+    measurable = make_model("m", context_length=131072)
+    rider = make_model("rider", context_length=262144)
+    ctx = solve_matrix_ctx(
+        vram_total_mb=32768, spare_mb=0,
+        chat_models=[
+            (measurable, 8000, 0.2, 0.0, 500, 1, 0),
+            (rider, 0, 0.0, 0.0, 0, 1, 0),
+        ],
+        embed_params=None, rerank_params=None,
+    )
+    # rider excluded: budget = 30720 - 8500 = 22220 -> 111100 -> round to
+    # 106496 -> min(arch 131072); NOT the rider's native 262144.
+    assert ctx == 106496
+
+
+def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
+    rider = make_model("rider", context_length=262144)
+    ctx = solve_matrix_ctx(
+        vram_total_mb=32768, spare_mb=0,
+        chat_models=[(rider, 0, 0.0, 0.0, 0, 1, 0)],
+        embed_params=None, rerank_params=None,
+    )
+    # Nothing measurable bounds the solve -> the floor.
+    assert ctx == _MIN_CTX_SIZE
+
+
+# ── _measure_affine_trio: the (C, C/2) derivation ─────────────────────────
+
+
+def test_measure_affine_trio_small_design_exact(make_model):
+    """The pool difference divides by the ACTUAL ctx delta: designs below
+    8192 (the former r3 floor at 4096) previously mis-derived c by ~1.5x
+    and persisted it as a trusted fit-estimate block."""
+    model = make_model("t", context_length=6144)
+    pools = {6144: 400.0, 3072: 220.0}  # 180 MiB linear over 3072 tokens
+
+    def fake_fit_params(*, fit_bin="", fit_ctx=0, cache_type="q8_0",
+                        parallel=1, llama_args="", **kw):
+        return {"model": 1000, "kv": pools[fit_ctx], "rs": 0.0,
+                "compute": 100}
+
+    model.vram.fit_params = fake_fit_params
+    fp = model.vram._measure_affine_trio(6144, "q8_0", "", "fit-estimate",
+                                         "unused")
+    assert fp is not None
+    assert fp.kv_per_token_mib == pytest.approx(180 / 3072)
+    assert fp.model_mib == 1000 and fp.compute_mib == 100
+    assert fp.slot_mib == 0.0 and fp.source == "fit-estimate"
+
+
+def test_measure_affine_trio_sub4k_design_still_measures(make_model):
+    """Even a sub-4k design (an error or a testcase for text models) now
+    measures exactly instead of returning None — no per-run retry tax."""
+    model = make_model("t", context_length=4096)
+    pools = {4096: 300.0, 2048: 200.0}  # 100 MiB over 2048 tokens
+
+    def fake_fit_params(*, fit_bin="", fit_ctx=0, cache_type="q8_0",
+                        parallel=1, llama_args="", **kw):
+        return {"model": 900, "kv": pools[fit_ctx], "rs": 0.0,
+                "compute": 50}
+
+    model.vram.fit_params = fake_fit_params
+    fp = model.vram._measure_affine_trio(4096, "q8_0", "", "fit-estimate",
+                                         "unused")
+    assert fp is not None
+    assert fp.kv_per_token_mib == pytest.approx(100 / 2048)
+
+
+def test_design_context_sub4k_text_warns(make_model, caplog):
+    """A text model with a sub-4k context ceiling is almost certainly a
+    mislabeled/corrupt GGUF — one note, not a crash."""
+    import logging
+
+    m = make_model("tiny", context_length=2048)
+    with caplog.at_level(logging.WARNING):
+        assert m.design_context == 2048
+        assert m.design_context == 2048  # second read: no repeat
+    notes = [r for r in caplog.records if "sub-4k" in r.message]
+    assert len(notes) == 1
+    # embed/rerank models are legitimate at small contexts: no note
+    e = make_model("emb", role="embeddings", context_length=2048)
+    with caplog.at_level(logging.WARNING):
+        assert e.design_context == 2048
+    assert not [r for r in caplog.records if "sub-4k" in r.message
+                and "emb" in r.message]
+
+
 def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
     chat = make_model("chat", context_length=32768)
     chat_models = [(chat, 8000, 0.2, 0.0, 500, 1, 0)]
