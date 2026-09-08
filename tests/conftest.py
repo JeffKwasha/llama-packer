@@ -43,3 +43,11 @@ def fit_params_block():
         "source": "llama-server",
         "cache_type": "q8_0",
     }
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """Tests never touch the machine-local measurement artifacts
+    (corrections, lock, journal) — one test wrote a garbage correction
+    row into the live cache (2026-09-08, rep_stem "m")."""
+    monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))

@@ -147,16 +147,16 @@ def test_fit_affine_exact_and_overdetermined():
 def test_affine_report_exact_law_passes(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
+    C64 = 1 / 64  # exact MiB/token: every grid pool is an integer
+
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
                                 llama_args):
-            # fixed 1100 + c*C + p*D with c=0.01, D=150 (exact ints)
-            total = 1100 + round(0.01 * ctx) + 150 * parallel
-            return {"weights": total, "kv": 0.0, "rs": 0.0, "compute": 0.0,
-                    "output": 0.0}
-        def _fit_params_serve(self, *a, **k):
-            return SimpleNamespace(model_mib=900, compute_mib=100,
-                                   kv_per_token_mib=0.008, slot_mib=100.0)
+            # truth: fixed 1100 + c*C + p*D, with the ctx-scaling part in
+            # the KV pool line (where the derivation reads it)
+            return {"weights": 1100.0,
+                    "kv": float(ctx // 64 + 150 * parallel),
+                    "rs": 0.0, "compute": 0.0, "output": 0.0}
 
     m = _fake("m", tmp=tmp_path)
     m.design_context = 32000
@@ -165,20 +165,21 @@ def test_affine_report_exact_law_passes(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "llama_packer.memory_probe.save_serve_correction",
         lambda *a, **k: None)
-    # estimate is the truth minus a known correction: fit-params sees c=0.008,
-    # D=100, fixed=1000 -> correction closes to (0.01, 150, 1100)
+    # estimate is the truth minus a known correction: fit-params sees
+    # c=C64/2, D=100, fixed=1000 -> correction closes to (C64, 150, 1100)
     m.vram._fit_params_serve = lambda *a, **k: SimpleNamespace(
-        model_mib=900, compute_mib=100, kv_per_token_mib=0.008,
+        model_mib=900, compute_mib=100, kv_per_token_mib=C64 / 2,
         slot_mib=100.0)
     rep = affine_report(m, "/bin/fit", "/bin/llama-server", "q8_0")
     assert rep is not None
     assert rep["ok"] is True
     assert rep["slot_mib"] == pytest.approx(150.0, abs=1e-6)
-    assert abs(rep["kv_per_token_mib"] - 0.01) < 1e-9
+    assert rep["kv_per_token_mib"] == pytest.approx(C64, abs=1e-9)
     assert rep["fixed_mib"] == 1100
     assert len(rep["grid"]) == 5
     assert rep["max_residual"] <= 0.005
-    assert rep["corr"] == {"delta_fixed": 100, "delta_c": pytest.approx(0.002),
+    assert rep["corr"] == {"delta_fixed": 100,
+                           "delta_c": pytest.approx(C64 / 2),
                            "delta_d": pytest.approx(50.0),
                            "rep_stem": "m", "cache_type": "q8_0"}
 
@@ -189,15 +190,14 @@ def test_affine_report_nonlinear_fails(tmp_path):
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
                                 llama_args):
-            # one gross outlier point; the rest sits on an exact affine law
-            extra = 50000 if (ctx, parallel) == (32768, 2) else (
-                100 + 100 * (parallel - 1))
-            total = 1000 + round(0.01 * ctx) + extra
-            return {"weights": total, "kv": 0.0, "rs": 0.0, "compute": 0.0,
-                    "output": 0.0}
+            # one gross outlier point; the rest sits on an exact pool law
+            extra = 50000 if (ctx, parallel) == (32768, 2) else 0.0
+            return {"weights": 1000.0,
+                    "kv": float(ctx // 64 + 150 * parallel + extra),
+                    "rs": 0.0, "compute": 0.0, "output": 0.0}
         def _fit_params_serve(self, *a, **k):
             return SimpleNamespace(model_mib=900, compute_mib=100,
-                                   kv_per_token_mib=0.01, slot_mib=50.0)
+                                   kv_per_token_mib=1 / 64, slot_mib=150.0)
 
     m = _fake("m", tmp=tmp_path)
     m.design_context = 32768
@@ -255,13 +255,13 @@ def test_run_probe_end_to_end(tmp_path, monkeypatch):
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
                                 llama_args):
-            # exact law: fixed 1100 + c*C + p*D, c=0.01, D=100
-            total = 1100 + round(0.01 * ctx) + 100 * parallel
-            return {"weights": total, "kv": 0.0, "rs": 0.0, "compute": 0.0,
-                    "output": 0.0}
+            # exact law: fixed 1100 + c*C + p*D, c=1/64, D=100
+            return {"weights": 1100.0,
+                    "kv": float(ctx // 64 + 100 * parallel),
+                    "rs": 0.0, "compute": 0.0, "output": 0.0}
         def _fit_params_serve(self, *a, **k):
             return SimpleNamespace(model_mib=1000, compute_mib=100,
-                                   kv_per_token_mib=0.01, slot_mib=100.0)
+                                   kv_per_token_mib=1 / 64, slot_mib=100.0)
 
     a = _fake("qa", arch="qwen3", size=100, tmp=tmp_path)
     b = _fake("qb", arch="qwen3", size=400, tmp=tmp_path)
