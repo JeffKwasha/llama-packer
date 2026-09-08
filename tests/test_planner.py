@@ -105,6 +105,37 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     assert vision["name"].endswith("[vision 65k]")
 
 
+def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path):
+    """view_for() rebuilds VramBudget per view: a measurement failure
+    flagged on the companion-on view's budget must still surface as
+    estimate_error metadata — the re-check reads the solving budget."""
+    m = _vision_model(tmp_path, make_model, "ue")
+    _scripted_ctx(m, {True: 4096, False: 4096})
+    on = m.view_for(True)
+    on.vram.unestimated_reason = "VRAM measurement failed"
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=48 * 1024).plan()["ue"]
+    assert variants
+    assert all(v.estimate_error == "VRAM measurement failed"
+               for v in variants)
+
+
+def test_profiles_rag_parallel_pinned_to_one(make_model, profiles, caplog):
+    """Embed/rerank serve single-slot: a declared parallel is ignored with
+    a once-per-model note — resident parallelism must never shrink the
+    main chat context it serves."""
+    import logging
+
+    emb = make_model("emb", role="embeddings", parallel=8)
+    (key, _), = profiles.groups_for(emb, vram_total=48000).items()
+    assert key[0] == 1
+    assert any("single-slot" in r.message for r in caplog.records)
+    # chat keeps its declared parallel
+    chat = make_model("chat", parallel=8)
+    (ckey, _), = profiles.groups_for(chat, vram_total=48000).items()
+    assert ckey[0] == 8
+
+
 def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_path,
                                                    caplog):
     # Small design ctx: below min-context with AND without vision — dropping

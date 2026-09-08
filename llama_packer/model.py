@@ -17,12 +17,18 @@ from llama_packer import utils
 from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DIFFUSION_ARCH_RES,
+    _MIN_CTX_SIZE,
     _MTP_DRAFT_N_MAX,
 )
 from llama_packer.backends import DEFAULT_BACKEND
 
 if TYPE_CHECKING:
     from llama_packer.vram import VramBudget
+
+# Text models with a sub-4k context ceiling are almost certainly mislabeled
+# or corrupt GGUFs — one note per stem per process (design_context reads
+# constantly).
+_warned_sub4k: set[str] = set()
 
 logger = logging.getLogger(__name__)
 
@@ -215,8 +221,9 @@ class Model:
         def _claim(m: Model) -> None:
             if m in seen:
                 return
-            # One entry per weight file: the sidecar-bound claimant (which
-            # registers first) shadows its canonical file instance.
+            # One entry per weight file: the canonical file instance
+            # registers first (Model.__init__ runs from_file before
+            # _register) and shadows the later sidecar-bound claimant.
             if m.gguf_path is not None:
                 try:
                     ident = os.path.realpath(str(m.gguf_path))
@@ -823,14 +830,25 @@ class Model:
         """Architectural context limit (GGUF) > sidecar context_length > default.
 
         Single source of truth for a model's effective context ceiling, used by
-        the VRAM budget and matrix solver alike.
+        the VRAM budget and matrix solver alike.  A chat model whose ceiling
+        lands below 4096 is almost certainly a mislabeled or corrupt GGUF
+        (no real text model trains below 4k) — warned once per stem.
         """
         arch = self.gguf_context_length
         if arch is not None and arch > 0:
-            return arch
-        return int(self.frontmatter.get(
-            "context_length", _DEFAULT_CONTEXT_LENGTH
-        ))
+            ctx = arch
+        else:
+            ctx = int(self.frontmatter.get(
+                "context_length", _DEFAULT_CONTEXT_LENGTH
+            ))
+        if ctx < _MIN_CTX_SIZE and self.role == "chat" \
+                and self.stem not in _warned_sub4k:
+            _warned_sub4k.add(self.stem)
+            logger.warning(
+                "%s: text model with %d-token context ceiling — sub-4k "
+                "configurations are errors or testcases; verify the GGUF "
+                "(is this really a text in/out model?)", self.stem, ctx)
+        return ctx
 
     @property
     def gguf_context_length(self) -> int | None:

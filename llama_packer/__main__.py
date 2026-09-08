@@ -111,8 +111,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "(pool ctx x parallel) grid for one model per "
                              "GGUF arch family (optionally restricted to the "
                              "named families), least-squares fit the affine "
-                             "law and report the max residual; writes nothing, "
-                             "then exits")
+                             "law and report the max residual. Starts a real "
+                             "server (opt-in calibration, never a pack "
+                             "dependency); discovery may persist `file:` "
+                             "blocks to sidecars. Then exits")
     parser.add_argument("--output", default="config.yaml", help="Output path (default: config.yaml)")
     parser.add_argument("--llama-version", default="latest", dest="version",
                         help="llama-server version (default: latest)")

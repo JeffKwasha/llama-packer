@@ -122,15 +122,22 @@ class Profiles:
         entry's command (they render per entry and stamp the measurement
         shape).  When no profile matches, a single group derived from
         ``defaults`` is returned.
+
+        Embed/rerank always serve single-slot: their parallel is pinned to 1
+        (declared values are ignored with a note) — a resident's parallelism
+        must never buy context away from the main chat it serves.
         """
         try:
             from llama_packer.backends import get_backend
             role_defaults = get_backend(model.backend).default_batch_ubatch(model.role)
         except Exception:
             role_defaults = (2048, 512)
+        rag_role = model.role in ("embeddings", "rerank")
         groups: dict[tuple, list] = {}
         for pname, resolved in self.matched_for(model):
             parallel = model.parallel_for(resolved.get("parallel", 1))
+            if rag_role:
+                parallel = _rag_parallel(model, parallel)
             cache_type = model.cache_type_for(
                 str(resolved.get("cache_type", self.default_cache_type)))
             spare = self.spare_mb(resolved.get("spare"), spare_override, vram_total)
@@ -144,12 +151,36 @@ class Profiles:
             batch, ubatch = model.batch_ubatch_for(
                 None, self.llama_server_cfg, role_defaults)
             groups = {
-                (model.parallel_for(1), model.cache_type_for(self.default_cache_type),
+                (1 if rag_role else model.parallel_for(1),
+                 model.cache_type_for(self.default_cache_type),
                  self.global_spare_mb(spare_override, vram_total), batch, ubatch): [
                     ("default", dict(self.defaults)),
                 ],
             }
         return groups
+
+
+# Embed/rerank serve single-slot: their parallel is a chat knob, never a
+# resident one — a note once per model when a declaration is ignored.
+_rag_parallel_warned: set[str] = set()
+
+
+def _rag_parallel(model, declared: int) -> int:
+    """Pin an embeddings/rerank model to parallel 1.
+
+    Resident parallelism must never buy context away from the main chat it
+    serves ("main chat slightly better" beats "embed/rerank parallel > 1").
+    A declared parallel > 1 is ignored with a once-per-model note.
+    """
+    if declared == 1:
+        return 1
+    if model.stem not in _rag_parallel_warned:
+        _rag_parallel_warned.add(model.stem)
+        logger.warning(
+            "%s: embed/rerank serve single-slot — parallel %d ignored "
+            "(resident parallelism must not shrink the main chat context "
+            "it serves)", model.stem, declared)
+    return 1
 
 
 def _filter_profiles(profile_list: dict, allow_profiles) -> list[tuple[str, dict]]:

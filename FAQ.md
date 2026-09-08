@@ -91,3 +91,10 @@ shape, so a change re-measures automatically. Do **not** put `-b`/`-ub` in
 `llama_server.args` or sidecar `cli_args:` — the named keys render after
 them and win per flag, and `cli_args` values are invisible to the
 measurement (a warning points this out).
+
+## Can I run embed/rerank with `parallel: > 1`?
+
+No — by design. RAG residents always serve single-slot: a declared
+`parallel:` on an embeddings/rerank model is ignored with a once-per-model
+note. The main chat context those residents serve must never shrink by even
+4k to buy resident parallelism ("main chat slightly better" wins).
