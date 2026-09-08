@@ -85,3 +85,46 @@ def test_effective_static_result_is_cached(tmp_path, make_model,
     second = m.vram.effective_static(fit_bin="unused")
     assert first == second
     assert calls["n"] == 1  # second call served from _effective_cache
+
+
+# ── baked-in MTP header gate (2026-09-08 GLM-4.7-Flash UD incident) ───────
+
+def _mini_gguf(path, tensor_names):
+    """A parseable GGUF header with the given tensor names, no data."""
+    import struct
+    out = b"GGUF" + struct.pack("<I", 3)
+    out += struct.pack("<Q", len(tensor_names)) + struct.pack("<Q", 0)
+    for name in tensor_names:
+        nb = name.encode()
+        out += struct.pack("<Q", len(nb)) + nb
+        out += struct.pack("<I", 1) + struct.pack("<Q", 4096)
+        out += struct.pack("<I", 0) + struct.pack("<Q", 0)
+    path.write_bytes(out)
+
+
+def test_mtp_gate_blocks_stripped_gguf(tmp_path, make_model):
+    m = make_model("a", mtp=True)
+    _mini_gguf(m.gguf_path, ["blk.0.attn_q.weight"])
+    assert m._mtp_info() == (False, 0)  # declared, but no nextn → off
+
+
+def test_mtp_gate_keeps_real_nextn(tmp_path, make_model):
+    m = make_model("b", mtp=True, mtp_draft_n_max=6)
+    _mini_gguf(m.gguf_path, ["blk.0.attn_q.weight",
+                             "blk.1.nextn_eh_proj.weight"])
+    assert m._mtp_info() == (True, 6)
+
+
+def test_mtp_gate_undecidable_keeps_declared(tmp_path, make_model):
+    (tmp_path / "c.gguf").write_bytes(b"dummy")
+    m = make_model("c", mtp=True)
+    assert m._mtp_info() == (True, 2)  # unparseable header: declared intent
+
+
+def test_gguf_has_mtp_layers(tmp_path):
+    from llama_packer.utils import gguf_has_mtp_layers
+    _mini_gguf(tmp_path / "with.gguf", ["blk.1.nextn_eh_proj.weight"])
+    _mini_gguf(tmp_path / "without.gguf", ["blk.0.attn_q.weight"])
+    assert gguf_has_mtp_layers(tmp_path / "with.gguf") is True
+    assert gguf_has_mtp_layers(tmp_path / "without.gguf") is False
+    assert gguf_has_mtp_layers(tmp_path / "absent.gguf") is None

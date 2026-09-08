@@ -48,11 +48,16 @@ _MEASURE_CTX_CAP = 65536
 _MEASURE_TIMEOUT_S = 900
 _MEASURE_STALL_S = 120
 
-# Host-resident weights (CPU-mapped layers) or KV/RS (Vulkan_Host pool)
-# above this (MiB) reject a measurement point: the buffers did not fit
-# device memory (GPU busy or model too large), so the device-side sums
-# undercount the truth.  Legit host staging (compute/output) is ignored.
-_GPU_SPILL_TOLERANCE_MIB = 8.0
+# Host-resident KV/RS (Vulkan_Host pool) above this (MiB) rejects a
+# measurement point: the pool did not fit device memory (GPU busy or
+# model too large) — the 2026-09-07 Dirk GTT spill signature.
+_KV_SPILL_TOLERANCE_MIB = 8.0
+
+# CPU-mapped weights beyond this (MiB) reject a point too (layers that
+# never made it to the device), but llama.cpp structurally places some
+# tensors host-side on Vulkan even in healthy runs (~1 GiB observed), so
+# the tolerance must exceed that placement.
+_WEIGHT_CPU_MAP_TOLERANCE_MIB = 2048.0
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # MTP defaults

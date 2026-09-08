@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import re
 import subprocess
 import tempfile
@@ -52,7 +53,7 @@ from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DRAFT_COMPUTE_MB,
     _DRAFT_CTX_SAFETY,
-    _GPU_SPILL_TOLERANCE_MIB,
+    _KV_SPILL_TOLERANCE_MIB,
     _MIN_CTX_SIZE,
     _MMPROJ_COMPUTE_MB,
     _MEASURE_STALL_S,
@@ -62,6 +63,7 @@ from llama_packer.consts import (
     _RESERVE_VIDEO,
     _SD_COMPUTE_MB,
     _WHISPER_COMPUTE_MB,
+    _WEIGHT_CPU_MAP_TOLERANCE_MIB,
     _KOKORO_COMPUTE_MB,
 )
 from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
@@ -117,39 +119,42 @@ def parse_device_buffers(log_text: str) -> dict[str, float]:
     GTT/system RAM, not VRAM — see :func:`parse_spill_mib` for when that
     exclusion makes a measurement invalid.
     """
-    device, _ = _buffer_walk(log_text)
+    device, _, _ = _buffer_walk(log_text)
     return device
 
 
 def parse_spill_mib(log_text: str) -> float:
     """MiB of measurement buffers that landed outside device memory.
 
-    The per-run validity check: CPU-mapped weights (layers that never
-    made it to the device) plus host-visible KV/RS pools (the pool did
-    not fit beside whatever else holds VRAM).  Above the tolerance the
-    device-side sums undercount the truth — the 2026-09-07 Dirk GTT
-    spill — and the point must be rejected.  Host compute/output
-    staging is a normal Vulkan cost and is not counted.
+    The per-run validity check for *capacity* spills: host-visible
+    KV/RS pools (the pool did not fit beside whatever else holds VRAM —
+    the 2026-09-07 Dirk GTT spill) plus CPU-mapped weights beyond the
+    structural placement llama.cpp always uses on Vulkan (~1 GiB
+    observed in healthy runs).  Host compute/output staging is a normal
+    Vulkan cost and is not counted.
     """
-    _, spill = _buffer_walk(log_text)
-    return spill
+    _, host_kv_rs, cpu_weights = _buffer_walk(log_text)
+    return (host_kv_rs
+            + max(0.0, cpu_weights - _WEIGHT_CPU_MAP_TOLERANCE_MIB))
 
 
 _COMP_BY_TOKEN = {"model": "weights", "KV": "kv", "RS": "rs",
                   "compute": "compute", "output": "output"}
 
 
-def _buffer_walk(log_text: str) -> tuple[dict[str, float], float]:
-    """One pass over the buffer lines → (device sums, spill MiB).
+def _buffer_walk(log_text: str) -> tuple[dict[str, float], float, float]:
+    """One pass over the buffer lines → (device sums, host KV/RS, CPU weights).
 
     Device sums: ``weights`` as the max per device across load passes,
-    every other component summed across contexts.  Spill: every
-    non-device-resident MiB that belongs on the GPU — CPU-mapped weight
-    lines and host-visible KV/RS lines.
+    every other component summed across contexts.  Host KV/RS lines are
+    the capacity-spill signature; CPU-mapped weight lines are tracked
+    separately (structural placement up to a tolerance, offload failure
+    beyond it).
     """
     weights: dict[str, float] = {}
     totals = {"kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
-    spill = 0.0
+    host_kv_rs = 0.0
+    cpu_weights = 0.0
     for m in _BUFFER_RE.finditer(log_text):
         dev, token, mib = m.group(1), m.group(2), float(m.group(3))
         comp = _COMP_BY_TOKEN[token]
@@ -158,12 +163,11 @@ def _buffer_walk(log_text: str) -> tuple[dict[str, float], float]:
                 weights[dev] = max(weights.get(dev, 0.0), mib)
             else:
                 totals[comp] += mib
-        elif comp == "weights":
-            if dev.startswith("CPU"):
-                spill += mib
         elif comp in ("kv", "rs"):
-            spill += mib
-    return {"weights": sum(weights.values()), **totals}, spill
+            host_kv_rs += mib
+        elif comp == "weights" and dev.startswith("CPU"):
+            cpu_weights += mib
+    return {"weights": sum(weights.values()), **totals}, host_kv_rs, cpu_weights
 
 
 def _free_port() -> int:
@@ -599,6 +603,11 @@ class VramBudget:
         cmd += self._mtp_measure_flags()
         cmd += llama_args.split()
         cmd += _MEASURE_ROLE_BATCH.get(self.model.role, ())
+        # Line-buffered stdout even redirected to a file: the stall
+        # window reads log growth, and block buffering hides it during
+        # the multi-minute load (false stalls on platter models).
+        if shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL", "-eL"] + cmd
 
         logger.info("measuring VRAM: %s via llama-server (ctx=%d, p=%d)",
                     self.model.stem, ctx, parallel)
@@ -631,7 +640,7 @@ class VramBudget:
                         proc.wait()
         if outcome == "ready":
             spill = parse_spill_mib(text)
-            if spill <= _GPU_SPILL_TOLERANCE_MIB:
+            if spill <= _KV_SPILL_TOLERANCE_MIB:
                 buffers = parse_device_buffers(text)
                 self._serve_cache[cache_key] = buffers
                 outcome = "ok"
