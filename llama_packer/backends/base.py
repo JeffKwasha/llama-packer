@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 SETTING_KEYS = frozenset({
     "backend", "hf_repo", "chat_template", "chat_template_kwargs",
     "loras", "cli_args", "reasoning-format", "reasoning-preserve",
+    # First-class batch keys (llama-server renders them explicitly; other
+    # backends warn the declaration as unhandled).
+    "batch", "ubatch",
 })
 FRAMEWORK_CONSUMED = frozenset({"backend", "hf_repo"})
 METADATA_ONLY = frozenset({"chat_template_kwargs"})
@@ -88,6 +91,12 @@ class BaseBackend(ABC):
         """
         return True
 
+    def default_batch_ubatch(self, role: str) -> tuple[int, int]:
+        """``(batch, ubatch)`` defaults for *role* when nothing is
+        configured — the llama.cpp builtins.  llama-server overrides per
+        role (embed/rerank keep their tuned batch depth)."""
+        return (2048, 512)
+
     @abstractmethod
     def build_cmd(
         self,
@@ -97,8 +106,15 @@ class BaseBackend(ABC):
         cache_type: str,
         tvars: dict,
         include_mmproj: bool = True,
+        batch: int | None = None,
+        ubatch: int | None = None,
     ) -> tuple[str, dict]:
         """Compose the launch command.
+
+        ``batch``/``ubatch`` are the resolved first-class batch keys
+        (sidecar > profile > fleet > role); llama-server renders them
+        explicitly (and stamps ``ubatch`` into the VRAM measurement shape);
+        other backends ignore them.
 
         Returns ``(cmd, metadata_contributions)``.  ``metadata_contributions``
         is merged into the entry's ``metadata`` block by the writer.

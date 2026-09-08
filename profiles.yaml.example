@@ -106,12 +106,22 @@ profiles:
 # ── llama-server backend args (optional) ────────────────
 # Free-form flags appended to every llama-server command — fleet-wide
 # performance/tuning knobs (per-model sidecar `cli_args:` still wins per
-# flag).  Rendered BEFORE the built-in per-role flags, so embed/rerank role
-# flags (-b 4096 -ub 4096) win over conflicting values here: `-b 512`
-# therefore tunes chat models only, while non-conflicting flags (e.g.
-# --flash-attn) apply to all roles.  Flags don't feed the VRAM estimator.
+# flag).  Rendered BEFORE the named batch/ubatch flags, so those win over
+# conflicting values here: `-b 512` in args tunes nothing once named keys
+# are set (a warning points at the keys).  Non-conflicting flags (e.g.
+# --flash-attn) apply to all roles and ARE part of the VRAM measurement
+# shape — changing them re-measures every persisted `derived:` block.
+#
+# batch/ubatch are first-class planning keys with a resolution cascade:
+#   sidecar batch:/ubatch:  >  profile key  >  llama_server: here  >  role
+#   defaults (chat 2048/512, embed/rerank 4096/512 — llama.cpp builtins)
+# `ubatch` shapes the compute buffer (~6 MiB per -ub token on Vulkan, no
+# throughput cost measured) and stamps the VRAM measurement shape; `batch`
+# has no VRAM effect and is deliberately not part of the shape.
 # llama_server:
-#   args: "--flash-attn on -b 512 -ub 512"
+#   args: "--flash-attn on"
+#   # batch: 2048       # -b, logical batch — throughput only, no VRAM effect
+#   # ubatch: 512       # -ub, per-pass tokens — shapes the compute buffer
 
 # ── vLLM backend (optional) ────────────────────────────
 # Defaults for `backend: vllm` / `vllm-docker` via overrides.

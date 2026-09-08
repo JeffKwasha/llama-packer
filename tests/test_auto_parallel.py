@@ -209,6 +209,30 @@ def test_plan_floor_unreachable_falls_back(make_model):
     assert variants[0].ctx_size == 32768
 
 
+def test_plan_floor_unreachable_solves_once(make_model):
+    """The eager fallback and the p=1 loop iteration share one solve: an
+    unaffordable model is measured once, not twice (was: duplicate
+    calc_ctx calls, duplicate warnings)."""
+    m = make_model("ap", backend="llama-server", role="chat",
+                   min_context=999999)
+    del m.frontmatter["context_length"]
+    calls: list[int] = []
+
+    def fake(vram_total_mb, *, parallel=1, spare_mb=0, **kw):
+        calls.append(parallel)
+        return 32768
+
+    m.vram.calc_ctx = fake
+    for flag in (True, False):
+        view = m.view_for(flag)
+        if view is not m:
+            view.vram.calc_ctx = fake
+    variants = _planner(m).plan()["ap"]
+    assert variants[0].parallel == 1
+    assert variants[0].ctx_size == 32768
+    assert calls.count(1) == 1
+
+
 def test_plan_sidecar_parallel_pin_skips_solve(make_model):
     m = make_model("ap", backend="llama-server", role="chat", parallel=2)
     del m.frontmatter["context_length"]

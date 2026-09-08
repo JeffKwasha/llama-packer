@@ -102,6 +102,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         """),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print config to stdout instead of writing")
+    parser.add_argument("--remeasure", action="store_true",
+                        help="Ignore saved VRAM measurements (sidecar `derived:` "
+                             "blocks) and re-run the fast fit-params trio for "
+                             "every model — never a server, seconds per model")
     parser.add_argument("--probe-memory", nargs="*", metavar="ARCH",
                         help="Measure serve-shaped llama-server VRAM over a "
                              "(pool ctx x parallel) grid for one model per "
@@ -555,6 +559,13 @@ def main(argv: list[str] | None = None) -> None:
         fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
 
+    if args.remeasure:
+        for m in models:
+            m.vram.remeasure = True
+        logger.info("--remeasure: ignoring saved VRAM measurements "
+                    "(sidecar derived: blocks) — re-running the fit-params "
+                    "trio per model")
+
     if args.probe_memory is not None:
         from llama_packer.memory_probe import run_probe
         llama_args = backend_args(profiles_cfg.get("llama_server"),
@@ -566,7 +577,8 @@ def main(argv: list[str] | None = None) -> None:
             Profiles(profiles_cfg).default_cache_type,
             only_archs=tuple(args.probe_memory) or None,
             llama_args=llama_args,
-            is_fast=is_fast))
+            is_fast=is_fast,
+            profiles=Profiles(profiles_cfg)))
         return
 
     # Auto-calculated healthCheckTimeout: max(120, 1.2 * largest_model_mb / drive_speed_mb)
@@ -634,6 +646,13 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["sd_args"] = backend_args(sd_cfg, "sd")
     template_vars["whisper_args"] = backend_args(whisper_cfg, "whisper")
     template_vars["llama_args"] = backend_args(profiles_cfg.get("llama_server"), "llama_server")
+    # The named batch/ubatch keys render after the global args and win per
+    # flag: args -b/-ub would be silently shadowed — point at the keys.
+    _llama_args_toks = set(template_vars["llama_args"].split())
+    if "-b" in _llama_args_toks or "-ub" in _llama_args_toks:
+        logger.warning("llama_server.args carries -b/-ub — shadowed by the "
+                       "rendered batch/ubatch keys; move them to "
+                       "llama_server: batch:/ubatch:")
     # gpu_mem_util: explicit profiles.yaml value wins; otherwise derive the
     # fraction from the same reserve/spare budget llama.cpp uses, so vLLM's
     # --max-model-len and --gpu-memory-utilization describe one consistent pool.

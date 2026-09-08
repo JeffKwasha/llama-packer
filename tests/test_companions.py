@@ -21,6 +21,7 @@ def fit_params_block():
         # measure the MTP draft, so effective_static folds companions.
         "source": "safetensors-estimate",
         "cache_type": "q8_0",
+        "shape": "",
     }
 
 

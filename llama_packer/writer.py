@@ -243,6 +243,8 @@ def _build_entry(
     name_suffix: str = "",
     tools_demoted: bool = False,
     estimate_error: str | None = None,
+    batch: int | None = None,
+    ubatch: int | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -280,6 +282,7 @@ def _build_entry(
     cmd_str, backend_meta = backend.build_cmd(
         model, ctx_size, parallel, cache_type, template_vars,
         include_mmproj=include_mmproj,
+        batch=batch, ubatch=ubatch,
     )
     cmd_str = _strip_repeat_ws(cmd_str)
 
@@ -760,12 +763,47 @@ class Variant:
     profiles_group: list[tuple[str, dict]] = field(compare=False)
     ctx_size: int
     include_mmproj: bool
+    #: Resolved ``-b``/``-ub`` (sidecar > profile > fleet > role); rendered
+    #: explicitly on every llama-server command; ``ubatch`` also stamps the
+    #: VRAM measurement shape.
+    batch: int | None = None
+    ubatch: int | None = None
     vision_ctx: int | None = None
     coload: bool = False
     tools_demoted: bool = False
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
+
+
+def resolve_batch_ubatch(
+    profiles: Profiles, model: Model, profile: dict | None = None,
+) -> tuple[int, int]:
+    """Resolved ``(batch, ubatch)`` for *model* — sidecar keys > profile
+    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults
+    (the llama.cpp builtins).  One resolution site: the rendered command
+    and the VRAM measurement shape both consume these values, so the serve
+    and the estimate can never drift apart on batch flags."""
+    try:
+        backend = get_backend(model.backend)
+        role_defaults = backend.default_batch_ubatch(model.role)
+    except KeyError:
+        role_defaults = (2048, 512)
+    return model.batch_ubatch_for(
+        profile, profiles.llama_server_cfg if profiles else {}, role_defaults)
+
+
+def measurement_args(
+    profiles: Profiles, model: Model, global_args: str = "",
+    profile: dict | None = None,
+) -> str:
+    """The exact flag string VRAM constants are measured (and shape-stamped)
+    under: global args + the model's resolved ``-ub``.  ``batch`` is
+    excluded — measured to have no VRAM effect, so throughput tuning must
+    not invalidate estimates."""
+    _, ubatch = resolve_batch_ubatch(profiles, model, profile)
+    base = (global_args or "").strip()
+    return f"{base} -ub {ubatch}".strip()
 
 
 class Planner:
@@ -834,9 +872,12 @@ class Planner:
         include_mmproj: bool,
         design_ctx: int | None = None,
         context_length: int | None = None,
+        profile: dict | None = None,
     ) -> int:
         """VRAM-solved context clamped to the model's max trained context
-        (*context_length*) and the CLI ``--max-context`` cap."""
+        (*context_length*) and the CLI ``--max-context`` cap.  Measured
+        under the model's resolved ``-ub`` shape (:func:`measurement_args`);
+        *profile* adds the per-profile tier when the solve is group-scoped."""
         ctx = model.vram.calc_ctx(
             self.vram_total,
             fit_bin=self.fit_bin,
@@ -847,7 +888,8 @@ class Planner:
             cache_type=cache_type,
             design_ctx=design_ctx,
             memory_margin=self.memory_margin,
-            llama_args=self.llama_args,
+            llama_args=measurement_args(self.profiles, model,
+                                        self.llama_args, profile),
         )
         if context_length is not None:
             ctx = min(ctx, context_length)
@@ -918,6 +960,7 @@ class Planner:
         floor: int,
         pin_ctx: int | None,
         group_parallel: int,
+        profile: dict | None = None,
     ) -> tuple[int, int]:
         """Solve (parallel, ctx) for one unpinned chat variant.
 
@@ -932,11 +975,18 @@ class Planner:
         power = self.knobs.parallel_power
         pmax = self.knobs.auto_parallel_max
 
+        solved: dict[int, int] = {}
+
         def maxctx(p: int) -> int:
-            return self._bounded_ctx(
-                view, parallel=p, cache_type=cache_type,
-                spare_mb=spare_mb, include_mmproj=include_mmproj,
-                design_ctx=self.chat_ctx, context_length=cap_ctx)
+            # Memoized: the eager fallback and the loop share one solve per
+            # slot count, so an unaffordable p=1 warns once, not twice.
+            if p not in solved:
+                solved[p] = self._bounded_ctx(
+                    view, parallel=p, cache_type=cache_type,
+                    spare_mb=spare_mb, include_mmproj=include_mmproj,
+                    design_ctx=self.chat_ctx, context_length=cap_ctx,
+                    profile=profile)
+            return solved[p]
 
         fallback = (group_parallel,
                     min(maxctx(group_parallel), cap_ctx))
@@ -1081,7 +1131,7 @@ class Planner:
         try:
             quad = _static_params(
                 model, self.fit_bin, self.profiles.default_cache_type,
-                self.llama_args)
+                measurement_args(self.profiles, model, self.llama_args))
             if quad is None:
                 # Unestimable resident: charged 0 — the no-expansion rider
                 # policy (see _solve_matrix_context).
@@ -1147,7 +1197,7 @@ class Planner:
 
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
-            for (parallel, cache_type, spare_mb), group in groups.items():
+            for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
                 # Ledger charge: this pool's extra reserve (pools: overrides
                 # + co-residents) joins the spare for chat solves only — RAG
                 # and fixed-overhead roles ARE residents; charging them
@@ -1185,13 +1235,14 @@ class Planner:
                         view, cache_type=cache_type, spare_mb=spare_eff,
                         include_mmproj=include_mmproj, cap_ctx=cap_ctx,
                         floor=floor, pin_ctx=pin_ctx,
-                        group_parallel=parallel)
+                        group_parallel=parallel, profile=group[0][1])
                 else:
                     ctx_size = self._bounded_ctx(
                         view, parallel=parallel, cache_type=cache_type,
                         spare_mb=spare_eff, include_mmproj=include_mmproj,
                         design_ctx=self.chat_ctx,
-                        context_length=context_length)
+                        context_length=context_length,
+                        profile=group[0][1])
                 if est_error is None:
                     # Discovery during this model's own solve: calc_ctx
                     # flagged the model unestimable (no measurement source
@@ -1208,12 +1259,14 @@ class Planner:
                             on_view, parallel=parallel, cache_type=cache_type,
                             spare_mb=spare_eff, include_mmproj=True,
                             design_ctx=self.chat_ctx,
-                            context_length=context_length))
+                            context_length=context_length,
+                            profile=group[0][1]))
 
                 variants.append(Variant(
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                     profiles_group=group, ctx_size=ctx_size,
-                    include_mmproj=include_mmproj, vision_ctx=vision_ctx,
+                    include_mmproj=include_mmproj, batch=batch, ubatch=ubatch,
+                    vision_ctx=vision_ctx,
                     coload=is_coload, tools_demoted=tools_demoted,
                     estimate_error=est_error))
 
@@ -1229,11 +1282,13 @@ class Planner:
                             model, parallel=parallel, cache_type=cache_type,
                             spare_mb=spare_eff, include_mmproj=False,
                             design_ctx=self.chat_ctx,
-                            context_length=context_length))
+                            context_length=context_length,
+                            profile=group[0][1]))
                     variants.append(Variant(
                         parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                         profiles_group=group, ctx_size=text_ctx,
-                        include_mmproj=False, coload=is_coload,
+                        include_mmproj=False, batch=batch, ubatch=ubatch,
+                        coload=is_coload,
                         tools_demoted=tools_demoted,
                         estimate_error=est_error))
             plan[model.stem] = variants
@@ -1331,7 +1386,8 @@ def _solve_matrix_context(
             img_floor = on.image_max_tokens
         fp = on.vram.effective_static(fit_bin, cache_type=cache_type,
                                       include_mmproj=m.stem not in drop_stems,
-                                      llama_args=llama_args)
+                                      llama_args=measurement_args(profiles, m,
+                                                                  llama_args))
         if fp is not None:
             real_quads.append(fp)
         chat_meta.append((m, parallel, img_floor, fp))
@@ -1341,12 +1397,14 @@ def _solve_matrix_context(
     if not embed_model.on_cpu:
         embed_params = _static_params(embed_model, fit_bin,
                                       profiles.default_cache_type,
-                                      llama_args)
+                                      measurement_args(profiles, embed_model,
+                                                       llama_args))
     rerank_params = None
     if not rerank_model.on_cpu:
         rerank_params = _static_params(rerank_model, fit_bin,
                                        profiles.default_cache_type,
-                                       llama_args)
+                                       measurement_args(profiles, rerank_model,
+                                                        llama_args))
     for quad in (embed_params, rerank_params):
         if quad is not None:
             real_quads.append(quad)
@@ -1498,11 +1556,13 @@ def _coload_overhead(
     pinned = m.frontmatter.get("vram_mb") is not None
     cache_type = m.cache_type_for(profiles.default_cache_type)
     fp = m.vram.fit_params_static(fit_bin, cache_type=cache_type,
-                                  llama_args=llama_args)
+                                  llama_args=measurement_args(profiles, m,
+                                                              llama_args))
     measured = pinned or (fp is not None
                           and fp.source in ("llama-server", "vllm-estimate"))
     quad = m.vram.effective_static(fit_bin, cache_type=cache_type,
-                                   llama_args=llama_args)
+                                   llama_args=measurement_args(profiles, m,
+                                                               llama_args))
     if quad is None:
         return None
     model_mib, kv_factor, slot_mib, compute_mib = quad
@@ -1554,6 +1614,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 name_suffix=" [text]" if text_only else "",
                 tools_demoted=v.tools_demoted,
                 estimate_error=v.estimate_error,
+                batch=v.batch, ubatch=v.ubatch,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX
@@ -1577,6 +1638,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 name_suffix=f" [vision {n_k}k]",
                 tools_demoted=v.tools_demoted,
                 estimate_error=v.estimate_error,
+                batch=v.batch, ubatch=v.ubatch,
             )
             vision_id += f"-vision-{n_k}k"
             if vision_id in entries:

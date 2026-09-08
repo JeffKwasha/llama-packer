@@ -14,6 +14,7 @@ def make_block(**overrides) -> dict:
         "compute_mib": 1000,
         "source": "llama-server",
         "cache_type": "q8_0",
+        "shape": "",
     }
     base.update(overrides)
     return base
@@ -59,6 +60,46 @@ def test_to_dict_roundtrip():
     assert "parallel" not in d and "ctx_factor" not in d  # legacy keys gone
     fp2 = FitParams.from_dict(d, "q8_0")
     assert fp2 == fp
+
+
+def test_from_dict_shape_mismatch_returns_none():
+    # The compute term depends on batch/attention flags: a block measured
+    # under a different flag shape must not be reused.
+    assert FitParams.from_dict(make_block(shape="-ub 2048"), "q8_0",
+                               shape="") is None
+    assert FitParams.from_dict(make_block(shape=""), "q8_0",
+                               shape="--flash-attn on") is None
+
+
+def test_from_dict_shape_match_roundtrips():
+    fp = FitParams.from_dict(make_block(shape="--flash-attn on -b 4096"),
+                             "q8_0", shape="--flash-attn on -b 4096")
+    assert fp is not None
+    assert fp.shape == "--flash-attn on -b 4096"
+
+
+def test_from_dict_missing_shape_key_returns_none():
+    # Pre-shape blocks: the flags they measured under are unknown, so no
+    # current shape can vouch for their compute term. Always re-measure.
+    block = make_block()
+    del block["shape"]
+    assert FitParams.from_dict(block, "q8_0", shape="") is None
+
+
+def test_from_dict_shape_not_enforced_for_flag_free_sources():
+    # vllm/safetensors estimates are flag-independent: any stored shape is
+    # accepted (presence still required).
+    fp = FitParams.from_dict(make_block(source="vllm-estimate",
+                                        shape="whatever"), "q8_0",
+                             shape="")
+    assert fp is not None
+
+
+def test_to_dict_records_shape():
+    fp = FitParams(10000, 0.5, 0.0, 1000, "fit-estimate", "q8_0",
+                   shape="--flash-attn on")
+    assert FitParams.from_dict(fp.to_dict(), "q8_0",
+                               shape="--flash-attn on") == fp
 
 
 def test_vram_mib_affine_prediction():

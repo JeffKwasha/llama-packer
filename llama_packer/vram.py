@@ -25,10 +25,12 @@ compute, which is exactly the undercount that made Dirk spill 4.8 GB into
 GTT (2026-09-07; see docs/plans/auto-parallel.md).
 
 ``FitParams`` values persist in the sidecar ``derived:`` block — per
-``cache_type`` (blocks are never derived across cache types) — and are
-keyed by ``source``: blocks from the retired fit-params measurement are
-rejected on load and re-measured.  ``Model.persist_measured`` is the
-single writer.
+``cache_type`` and per measured flag **shape** (``derived: shape``: the
+effective serve args — profiles global args + role batch flags; the
+compute buffer depends on batch size and flash attention, so blocks are
+never reused across shapes; a flags change re-measures).  Blocks are keyed
+by ``source``: blocks from the retired fit-params measurement are rejected
+on load and re-measured.  ``Model.persist_measured`` is the single writer.
 """
 
 from __future__ import annotations
@@ -44,6 +46,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import yaml
 
 from llama_packer import gpu_state
 from llama_packer import utils
@@ -69,7 +73,7 @@ from llama_packer.consts import (
 )
 from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
                                    SD_BACKENDS, VLLM_BACKENDS,
-                                   WHISPER_BACKENDS)
+                                   WHISPER_BACKENDS, get_backend)
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -236,49 +240,100 @@ def parse_fit_log(log_text: str) -> dict[str, float] | None:
 
 # ── per-arch serve corrections (measured once by --probe-memory) ─────────
 
+_LEGACY_CORRECTIONS_NAME = "serve-corrections.json"
+_CORRECTIONS_NAME = "serve-corrections.yaml"
+_CORR_WARNED: set[str] = set()
+
 
 def _corrections_path() -> Path:
-    """Cache file holding the measured per-arch serve corrections.
+    """Durable machine-local corrections file beside ``profiles.yaml``.
 
     Corrections are hardware/backend-specific (allocator overhead, RS
-    geometry differences between estimate and serve), so they live in a
-    machine-local cache, not in the repo.
+    geometry differences between estimate and serve): machine-local, hence
+    gitignored — but durable and inspectable, unlike a cache directory.
+    ``LLAMA_PACKER_CORRECTIONS`` relocates the file (tests; multi-host
+    checkouts).  The retired ``~/.cache`` JSON stays readable as a
+    fallback so existing calibrations survive the move without a re-probe.
     """
-    return gpu_state.cache_dir() / "serve-corrections.json"
+    override = os.environ.get("LLAMA_PACKER_CORRECTIONS")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent / _CORRECTIONS_NAME
+
+
+def _load_corrections() -> dict:
+    """Parsed corrections table: the YAML file, else the legacy cache JSON.
+
+    Returns ``{}`` when neither exists.  A malformed YAML file is warned
+    about and treated as empty (the estimate then runs uncorrected).
+    """
+    path = _corrections_path()
+    for candidate, is_yaml in ((path, True),):
+        try:
+            with open(candidate) as f:
+                table = yaml.safe_load(f)
+            return table if isinstance(table, dict) else {}
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            logger.warning("serve corrections unreadable (%s): %s — "
+                           "estimates run uncorrected", candidate, e)
+            return {}
+    # Legacy fallback: the retired machine-local cache JSON.
+    legacy = gpu_state.cache_dir() / _LEGACY_CORRECTIONS_NAME
+    try:
+        with open(legacy) as f:
+            table = json.load(f)
+        return table if isinstance(table, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def get_serve_correction(
-    arch: str, cache_type: str, mtp_on: bool,
+    arch: str, cache_type: str, mtp_on: bool, shape: str = "",
 ) -> dict | None:
     """The measured ``(delta_fixed, delta_c, delta_d)`` row for an arch.
 
     Rows are written by ``--probe-memory`` (serve-shaped llama-server grid
     on the family representative minus the fast fit-params estimate) and
-    keyed by ``arch | cache_type | mtp``.  Returns None when uncalibrated.
+    keyed by ``arch | cache_type | mtp``; each row records the flag shape
+    the witness ran under.  A row measured under a *different* shape is
+    still applied — the deltas are mostly shape-independent allocator
+    bias — with a one-time per-arch note that a re-probe would refresh it.
+    Returns None when uncalibrated (the estimate runs uncorrected; that is
+    never an error).
     """
-    try:
-        with open(_corrections_path()) as f:
-            table = json.load(f)
-    except (OSError, ValueError):
+    table = _load_corrections()
+    row = table.get(f"{arch}|{cache_type}|{int(mtp_on)}")
+    if row is None or not isinstance(row, dict):
         return None
-    return table.get(f"{arch}|{cache_type}|{int(mtp_on)}")
+    row_shape = str(row.get("shape", ""))
+    if row_shape and shape and row_shape != shape:
+        key = f"{arch}|{cache_type}|{int(mtp_on)}"
+        if key not in _CORR_WARNED:
+            _CORR_WARNED.add(key)
+            logger.warning(
+                "serve correction for arch %r was measured under %r, now "
+                "estimating under %r — applying anyway (allocator-level "
+                "deltas); --probe-memory %s refreshes it",
+                arch, row_shape, shape, arch)
+    return row
 
 
 def save_serve_correction(
     arch: str, cache_type: str, mtp_on: bool, row: dict,
 ) -> None:
-    """Persist one correction row (merges into the existing table)."""
+    """Persist one correction row (merges into the YAML table)."""
     path = _corrections_path()
-    table: dict = {}
-    try:
-        with open(path) as f:
-            table = json.load(f)
-    except (OSError, ValueError):
-        table = {}
+    table = _load_corrections()
+    row = dict(row)
+    row.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     table[f"{arch}|{cache_type}|{int(mtp_on)}"] = row
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(table, f, indent=1, sort_keys=True)
+    try:
+        with open(path, "w") as f:
+            yaml.safe_dump(table, f, default_flow_style=False, sort_keys=True)
+    except OSError as e:
+        logger.warning("cannot write serve corrections %s: %s", path, e)
 
 
 # The llama-server readiness marker: every buffer line precedes it.
@@ -337,12 +392,12 @@ def _wait_ready(
         time.sleep(0.5)
     return "timeout"
 
-# Role batch flags repeated after the global args (later flags win in
-# llama.cpp), so the measurement sees the same compute the serve does.
-_MEASURE_ROLE_BATCH = {
-    "embeddings": ("-b", "4096", "-ub", "4096"),
-    "rerank": ("-b", "4096", "-ub", "4096"),
-}
+# Flag-shape sources: sources whose constants depend on the measurement
+# flag string (llama.cpp batch/attention flags).  The measured ``llama_args``
+# is stamped into every ``derived:`` block verbatim (`derived: shape`), so
+# the estimate and the serve can never drift apart on batch flags.
+# vllm/safetensors estimates are flag-independent.
+_SHAPE_SOURCES = frozenset({"llama-server", "fit-estimate", "fit-params"})
 
 
 @dataclass
@@ -364,9 +419,13 @@ class FitParams:
         compute_mib:       Compute/workspace buffers and any other constant
                            term (max over the p=1/p=2 measurement pair)
         source:            How values were obtained ("llama-server",
-                           "vllm-estimate", "safetensors-estimate")
+                            "vllm-estimate", "safetensors-estimate")
         cache_type:        KV cache quantization these values were measured
-                           with (blocks are never derived across types)
+                            with (blocks are never derived across types)
+        shape:             The effective serve-flag string the values were
+                            measured under (:func:`measure_args`) — the
+                            compute buffer depends on batch size and flash
+                            attention, so blocks are shape-bound
     """
 
     model_mib: int
@@ -375,16 +434,21 @@ class FitParams:
     compute_mib: int
     source: str
     cache_type: str
+    shape: str = ""
 
     @classmethod
-    def from_dict(cls, d: object, cache_type: str) -> FitParams | None:
+    def from_dict(cls, d: object, cache_type: str,
+                  shape: str = "") -> FitParams | None:
         """Validate and construct from a frontmatter dict.
 
         Returns None if the block is missing, incomplete, has non-numeric
-        values, if cache_type doesn't match the current request, or if the
+        values, if cache_type doesn't match the current request, if the
         block predates the serve-shaped measurement (``source`` "fit-params"
         or absent: those numbers undercount the RS cache, the MTP draft and
-        the batch-dependent compute, so they are re-measured).
+        the batch-dependent compute, so they are re-measured), or if the
+        block predates shape stamping or was measured under a different
+        flag shape (batch size / flash attention change the compute term —
+        stale numbers are re-measured).
         """
         if not isinstance(d, dict):
             return None
@@ -406,6 +470,12 @@ class FitParams:
         source = str(d.get("source", ""))
         if source not in _MEASURED_SOURCES:
             return None
+        if "shape" not in d:
+            # Pre-shape block: the flags it was measured under are unknown,
+            # so its compute term cannot be trusted for any current shape.
+            return None
+        if source in _SHAPE_SOURCES and str(d["shape"]) != str(shape):
+            return None
         return cls(
             model_mib=model_mib,
             kv_per_token_mib=kv_per_token_mib,
@@ -413,6 +483,7 @@ class FitParams:
             compute_mib=compute_mib,
             source=source,
             cache_type=saved_cache,
+            shape=str(d["shape"]),
         )
 
     def to_dict(self) -> dict:
@@ -420,7 +491,8 @@ class FitParams:
 
         ``ts`` stamps the measurement (ISO 8601): when an era's numbers
         are ever quarantined again, stale blocks are identifiable by
-        inspection instead of by archaeology.
+        inspection instead of by archaeology.  ``shape`` records the flag
+        string the values were measured under.
         """
         return {
             "model_mib": self.model_mib,
@@ -429,6 +501,7 @@ class FitParams:
             "compute_mib": self.compute_mib,
             "source": self.source,
             "cache_type": self.cache_type,
+            "shape": self.shape,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
 
@@ -460,30 +533,35 @@ class VramBudget:
         self.model = model
         self._cache: dict[tuple, dict[str, float]] = {}
         self._serve_cache: dict[tuple, dict[str, float]] = {}
-        self._static_cache: dict[str, FitParams] = {}
+        self._static_cache: dict[tuple[str, str], FitParams] = {}
         self._effective_cache: dict[tuple, tuple[int, float, float, int]] = {}
         self._companion_cache: dict[tuple, tuple[int, float, float, int]] = {}
         self._logged: set[str] = set()
+        #: CLI ``--remeasure``: ignore the saved block and re-run the trio
+        #: for every model (never a server; blocks re-persist with fresh
+        #: ts/shape).
+        self.remeasure: bool = False
         #: Set when no estimate source worked for this model — the planner
         #: surfaces it as metadata.estimated/estimate_error on every entry.
         self.unestimated_reason: str | None = None
 
     # ── saved fit-params from frontmatter ──
 
-    def saved_for(self, cache_type: str) -> FitParams | None:
+    def saved_for(self, cache_type: str, shape: str = "") -> FitParams | None:
         """Return the persisted measured block when it matches the *requested*
-        cache type.
+        cache type and flag shape.
 
-        Validating against the requested value (not the sidecar-declared
-        one) is what makes a cache-type change invalidate a stale block and
-        force a re-measurement instead of reusing mismatched numbers.  Any
-        legacy block (pre-affine: no ``slot_mib``) also fails validation and
-        is re-measured + rewritten.
+        Validating against the requested values (not the sidecar-declared
+        ones) is what makes a cache-type or serve-flags change invalidate a
+        stale block and force a re-measurement instead of reusing mismatched
+        numbers.  Any legacy block (pre-affine: no ``slot_mib``, or
+        pre-shape: no ``shape``) also fails validation and is re-measured +
+        rewritten.
         """
         raw = self.model.measured_block()
         if raw is None:
             return None
-        return FitParams.from_dict(raw, cache_type)
+        return FitParams.from_dict(raw, cache_type, shape)
 
     # ── raw fit-params binary call ──
 
@@ -614,7 +692,8 @@ class VramBudget:
         rejected (its device sums undercount the truth).  Every run is
         journaled.
         """
-        cache_key = ("serve", cache_type, ctx, parallel, llama_args)
+        shape = (llama_args or "").strip()
+        cache_key = ("serve", cache_type, ctx, parallel, shape)
         if cache_key in self._serve_cache:
             return self._serve_cache[cache_key]
 
@@ -637,8 +716,7 @@ class VramBudget:
             "--port", str(_free_port()), "-lv", "5",
         ]
         cmd += self._mtp_measure_flags()
-        cmd += llama_args.split()
-        cmd += _MEASURE_ROLE_BATCH.get(self.model.role, ())
+        cmd += shape.split()
         # Line-buffered stdout even redirected to a file: the stall
         # window reads log growth, and block buffering hides it during
         # the multi-minute load (false stalls on platter models).
@@ -748,6 +826,7 @@ class VramBudget:
             compute_mib=compute_mib,
             source=source,
             cache_type=cache_type,
+            shape=llama_args,
         )
 
     def _fit_params_serve(
@@ -771,8 +850,9 @@ class VramBudget:
         measurement they do.  Not persisted — persistence belongs to
         :meth:`fit_params_static`.
         """
+        shape = (llama_args or "").strip()
         params = self._measure_affine_trio(self._design_ctx(), cache_type,
-                                           llama_args, source="fit-estimate",
+                                           shape, source="fit-estimate",
                                            fit_bin=fit_bin)
         if params is None:
             return None
@@ -782,7 +862,7 @@ class VramBudget:
         # is folded in by effective_static instead).
         mtp_on = self.model.mtp is None and self.model._mtp_info()[0]
         corr = get_serve_correction(self.model.arch or "unknown", cache_type,
-                                    mtp_on)
+                                    mtp_on, shape)
         if corr is not None:
             # Corrections are measured at witness scale; clamp so a much
             # smaller model of the same arch can't go negative (from_dict
@@ -796,16 +876,23 @@ class VramBudget:
                                 + int(corr["delta_fixed"])),
                 source="fit-estimate",
                 cache_type=cache_type,
+                shape=shape,
             )
         else:
-            self._warn_once(
-                "%s: no serve correction measured for arch %r (mtp=%s) — "
-                "run --probe-memory to calibrate; the estimate may "
-                "undercount the draft and allocator overhead",
-                self.model.stem, self.model.arch, mtp_on)
+            # Uncorrected — never an error, so one note per arch, not per
+            # model.  Probes are opt-in calibration, not a requirement.
+            key = f"{self.model.arch}|{cache_type}|{int(mtp_on)}"
+            if key not in _CORR_WARNED:
+                _CORR_WARNED.add(key)
+                logger.warning(
+                    "estimate uncorrected for arch %r (mtp=%s) — ctx/fit "
+                    "may undercount draft and allocator terms; optional: "
+                    "--probe-memory %s calibrates",
+                    self.model.arch, mtp_on, self.model.arch)
         return params
 
-    def _fit_params_fast(self, cache_type: str, fit_bin: str) -> FitParams | None:
+    def _fit_params_fast(self, cache_type: str, fit_bin: str,
+                         llama_args: str = "") -> FitParams | None:
         """Transient fit-params trio — the uncalibrated approximation.
 
         Used only when the serve-shaped measurement is impossible (no
@@ -814,7 +901,8 @@ class VramBudget:
         run re-attempts the calibrated measurement.
         """
         return self._measure_affine_trio(self._design_ctx(), cache_type,
-                                         llama_args="", source="fit-params",
+                                         (llama_args or "").strip(),
+                                         source="fit-params",
                                          fit_bin=fit_bin)
 
     # ── static params (model_mib, kv_per_token_mib, slot_mib, compute_mib) ──
@@ -831,9 +919,16 @@ class VramBudget:
         estimate (never a server; normal runs pay ~1-2 s once per model)
         → plain fit-params pair (transient) → safetensors estimate.  New
         estimates are persisted to the sidecar so later runs pay nothing.
+        Every path runs under the model's measured flag shape (the
+        ``llama_args`` the caller composes: global args + the resolved
+        ``-ub``) — the in-memory cache and the persisted block are both
+        shape-bound, so a profiles/batch-key change re-measures instead of
+        reusing stale compute terms.  ``remeasure`` (CLI ``--remeasure``)
+        skips the saved-block path entirely.
         """
-        if cache_type in self._static_cache:
-            return self._static_cache[cache_type]
+        shape = (llama_args or "").strip()
+        if (cache_type, shape) in self._static_cache:
+            return self._static_cache[(cache_type, shape)]
 
         if self.model.backend in FIXED_OVERHEAD_BACKENDS \
                 or getattr(self.model, "on_cpu", False):
@@ -842,16 +937,17 @@ class VramBudget:
             # VRAM-bound.  Neither has meaningful FitParams.
             return None
 
-        # 1. Saved values from frontmatter (legacy fit-params blocks are
-        #    rejected by FitParams.from_dict and re-measured).  A valid
-        #    block living under a legacy key is rewritten under
-        #    ``derived:`` — the label is the documentation.
-        saved = self.saved_for(cache_type)
+        # 1. Saved values from frontmatter (legacy fit-params blocks and
+        #    wrong-shape blocks are rejected by FitParams.from_dict and
+        #    re-measured).  A valid block living under a legacy key is
+        #    rewritten under ``derived:`` — the label is the documentation.
+        #    ``--remeasure`` skips this path entirely.
+        saved = None if self.remeasure else self.saved_for(cache_type, shape)
         if saved is not None:
             from llama_packer.model import MEASURED_KEY
             if MEASURED_KEY not in self.model.frontmatter:
                 self._persist(saved)
-            self._static_cache[cache_type] = saved
+            self._static_cache[(cache_type, shape)] = saved
             return saved
 
         # 2. vLLM backends: estimate from the HF repo (vllm-memory-estimator)
@@ -859,7 +955,7 @@ class VramBudget:
         if self.model.backend in VLLM_BACKENDS:
             params = self._fit_params_vllm(cache_type)
             if params is not None:
-                self._static_cache[cache_type] = params
+                self._static_cache[(cache_type, shape)] = params
                 self._persist(params)
             return params
 
@@ -867,24 +963,24 @@ class VramBudget:
         #    normal runs never start a server.
         params = self._fit_params_serve(fit_bin, cache_type, llama_args)
         if params is not None:
-            self._static_cache[cache_type] = params
+            self._static_cache[(cache_type, shape)] = params
             self._persist(params)
             return params
 
         # 4. Plain fit-params pair as a transient fallback (no corrections;
         #    never persisted — the next run retries the calibrated path).
-        params = self._fit_params_fast(cache_type, fit_bin)
+        params = self._fit_params_fast(cache_type, fit_bin, llama_args)
         if params is not None:
             self._warn_once(
                 "%s: llama-server measurement unavailable; using the "
                 "fit-params approximation (not persisted)", self.model.stem)
-            self._static_cache[cache_type] = params
+            self._static_cache[(cache_type, shape)] = params
             return params
 
         # 5. Try safetensors estimation fallback
         params = self._estimate_safetensors(cache_type, self._design_ctx())
         if params is not None:
-            self._static_cache[cache_type] = params
+            self._static_cache[(cache_type, shape)] = params
             self._persist(params)
         return params
 
@@ -1178,7 +1274,13 @@ class VramBudget:
         model_mib, kv_per_token, slot_mib, compute_mib = static
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
-            logger.warning("model + compute exceeds available VRAM for %s", self.model.stem)
+            logger.warning(
+                "%s: weights + compute need %d MiB, only %d MiB budgeted "
+                "(VRAM %d - reserve %d - spare %d) — serving at minimum "
+                "context %d",
+                self.model.stem, int(model_mib + compute_mib),
+                int(available), vram_total_mb, reserve, spare_mb,
+                _MIN_CTX_SIZE)
             return _MIN_CTX_SIZE
 
         # Image token budget: image tokens are ordinary tokens inside the

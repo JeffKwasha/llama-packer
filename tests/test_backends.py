@@ -376,15 +376,60 @@ def test_llama_server_global_args_chat(make_model):
 
 
 def test_llama_server_global_args_role_flags_win(make_model):
-    # Global args render BEFORE the per-role flags, so embed/rerank keep
-    # their tuned -b/-ub 4096; non-conflicting flags still apply.
+    # Global args render BEFORE the per-role slot, and the resolved batch
+    # keys ride in that slot: named -b/-ub win over conflicting fleet args;
+    # non-conflicting flags still apply.
     tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
     cmd, _ = LlamaServerBackend().build_cmd(
-        make_model("e", role="embeddings"), 32768, 1, "q8_0", tv)
+        make_model("e", role="embeddings"), 32768, 1, "q8_0", tv,
+        batch=4096, ubatch=512)
     assert cmd.count("-b ") == 1 and cmd.count("-ub ") == 1
-    assert "-b 4096 -ub 4096" in cmd
+    assert "-b 4096 -ub 512" in cmd
     assert "-b 512" not in cmd
     assert "--flash-attn on" in cmd
+
+
+def test_llama_server_batch_ubatch_render_and_defaults(make_model):
+    # The resolved batch keys render explicitly in the per-role slot:
+    # they win over conflicting fleet args, lose to cli_args (warned).
+    be = LlamaServerBackend()
+    tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
+    cmd, _ = be.build_cmd(make_model("c"), 32768, 1, "q8_0", tv,
+                          batch=2048, ubatch=512)
+    assert "-b 2048 -ub 512" in cmd
+    assert "-b 512" not in cmd and "-ub 512" in cmd
+    assert "--flash-attn on" in cmd
+    # Role defaults: embed/rerank keep their tuned depth when nothing set.
+    assert be.default_batch_ubatch("embeddings") == (4096, 512)
+    assert be.default_batch_ubatch("rerank") == (4096, 512)
+    assert be.default_batch_ubatch("chat") == (2048, 512)
+    # cli_args -b/-ub warn once (shadowed + invisible to measurement).
+    cmd2, _ = be.build_cmd(make_model("w", cli_args="-b 4096"), 32768, 1,
+                           "q8_0", tv, batch=2048, ubatch=512)
+    assert "-b 4096 -ub 512" in cmd2  # named flags win per-flag
+
+
+def test_llama_server_batch_ubatch_resolution_cascade(make_model):
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import measurement_args, resolve_batch_ubatch
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"},
+                         "llama_server": {"args": "--flash-attn on",
+                                          "batch": 2048, "ubatch": 1024}})
+    m = make_model("c", role="chat")
+    # fleet tier wins over the role default
+    assert resolve_batch_ubatch(profiles, m) == (2048, 1024)
+    # sidecar tier wins over the fleet tier
+    m2 = make_model("c2", role="chat", batch=4096, ubatch=2048)
+    assert resolve_batch_ubatch(profiles, m2) == (4096, 2048)
+    # profile tier sits between sidecar and fleet
+    m3 = make_model("c3", role="chat")
+    assert resolve_batch_ubatch(profiles, m3, profile={"batch": 8192}) \
+        == (8192, 1024)
+    # measurement shape: global args + -ub only (batch has no VRAM effect)
+    assert measurement_args(profiles, m, "--flash-attn on") == \
+        "--flash-attn on -ub 1024"
+    assert measurement_args(profiles, m2, "--flash-attn on") == \
+        "--flash-attn on -ub 2048"
 
 
 def test_llama_server_global_args_per_model_cli_args_win(make_model):

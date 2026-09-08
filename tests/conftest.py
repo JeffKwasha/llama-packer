@@ -34,7 +34,8 @@ def make_model(tmp_path):
 
 @pytest.fixture
 def fit_params_block():
-    """A valid serve-shaped derived block (cache_type q8_0)."""
+    """A valid serve-shaped derived block (cache_type q8_0, empty shape:
+    measured with no extra flags)."""
     return {
         "model_mib": 10000,
         "kv_per_token_mib": 0.5,
@@ -42,6 +43,7 @@ def fit_params_block():
         "compute_mib": 1000,
         "source": "llama-server",
         "cache_type": "q8_0",
+        "shape": "",
     }
 
 
@@ -51,3 +53,5 @@ def _isolated_cache(tmp_path, monkeypatch):
     (corrections, lock, journal) — one test wrote a garbage correction
     row into the live cache (2026-09-08, rep_stem "m")."""
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LLAMA_PACKER_CORRECTIONS",
+                       str(tmp_path / "cache" / "serve-corrections.yaml"))

@@ -18,7 +18,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [`llama_packer/gpu_state.py`](llama_packer/gpu_state.py) — measurement-window guardrails: resident-llama pre-flight, process-group kill, single-flight `measurement_lock`, append-only run `journal`, cache dir
 - [`llama_packer/backends/`](llama_packer/backends/) — backend package: `base` (ABC + support matrix + `is_available`), `llama_server`, `vllm` (host + docker); `BACKENDS` registry, `infer_backend`, `VLLM_BACKENDS`, `get_backend`
 - [`llama_packer/overrides.py`](llama_packer/overrides.py) — pattern-scoped override rules (global profiles.yaml + directory-scoped `models.yaml`, inner scope wins) → backend/chat-template/lora/hf_repo/cli_args; format-based backend inference
-- [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` affine fit-params (`kv_per_token_mib` c, `slot_mib` D; per cache_type, parallel-independent; `vram_mb` pin for fixed-overhead backends), per-slot `calc_ctx` / `solve_matrix_ctx` (+`fixed_overhead_mb`, `memory_margin`)
+- [`llama_packer/vram.py`](llama_packer/vram.py) — `VramBudget` affine fit-params (`kv_per_token_mib` c, `slot_mib` D; per cache_type + measured flag `shape` (profiles args + role batch — a flags change re-measures), parallel-independent; `vram_mb` pin for fixed-overhead backends), per-slot `calc_ctx` / `solve_matrix_ctx` (+`fixed_overhead_mb`, `memory_margin`)
 - [`llama_packer/vllm_estimate.py`](llama_packer/vllm_estimate.py) — vLLM memory estimation via `vllm-memory-estimator` (+ safetensors fallback)
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
 - [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)
@@ -43,6 +43,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [FAQ.md](FAQ.md) — why HF-hub models don't show up and how to serve them (sidecar `model:`+`hf_repo:` vs symlinks)
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
+- [docs/new-model-pipeline.md](docs/new-model-pipeline.md) — what happens when a model is added: fit-params estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch keys; deleting `derived:` costs seconds, never a probe
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
 - [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
 - [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins)

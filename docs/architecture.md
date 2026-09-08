@@ -73,3 +73,11 @@ plain data — see `tests/test_planner.py`.
   variants, thread it through `groups_for`.
 - **New sidecar field**: add to `Model.FIELDS` only if the builder consumes
   it — everything else passes through to client metadata automatically.
+
+## Where to read more
+
+- [new-model-pipeline.md](new-model-pipeline.md) — the end-to-end walkthrough
+  for "a GGUF appeared": discovery → fit-params estimate → matrix solve →
+  auto-parallel → emit, including the measurement-shape contract, the
+  batch/ubatch keys, and what deleting a `derived:` block actually costs
+  (seconds of header-only work — never a server, never a probe).

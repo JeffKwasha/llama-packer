@@ -181,7 +181,8 @@ def test_affine_report_exact_law_passes(tmp_path, monkeypatch):
     assert rep["corr"] == {"delta_fixed": 100,
                            "delta_c": pytest.approx(C64 / 2),
                            "delta_d": pytest.approx(50.0),
-                           "rep_stem": "m", "cache_type": "q8_0"}
+                           "rep_stem": "m", "cache_type": "q8_0",
+                           "shape": ""}
 
 
 def test_affine_report_nonlinear_fails(tmp_path):
