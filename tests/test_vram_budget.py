@@ -9,10 +9,15 @@ solved, emitted value.
 
 from __future__ import annotations
 
+import json
+import os
+
 import pytest
 
+from llama_packer import vram
 from llama_packer.consts import _MIN_CTX_SIZE
-from llama_packer.vram import FitParams, parse_device_buffers, solve_matrix_ctx
+from llama_packer.vram import (FitParams, parse_device_buffers,
+                               parse_spill_mib, solve_matrix_ctx)
 
 
 # ── serve-shaped log parsing ──────────────────────────────────────────────
@@ -43,6 +48,120 @@ def test_parse_device_buffers_sums_device_only():
 def test_parse_device_buffers_empty_log():
     assert parse_device_buffers("garbage") == {
         "weights": 0.0, "kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
+
+
+# ── spill validity check (2026-09-07 post-mortem) ─────────────────────────
+
+def test_parse_spill_mib_counts_host_weights_and_kv():
+    """CPU-mapped weights and host KV = spill; host compute/output staging
+    is a normal Vulkan cost and is not spill."""
+    text = """\
+0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB
+0.24.044 I load_tensors:   CPU_Mapped model buffer size =   994.63 MiB
+0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  4352.00 MiB
+0.28.745 I llama_kv_cache: Vulkan_Host KV buffer size =  4352.00 MiB
+0.28.928 I sched_reserve: Vulkan_Host compute buffer size =  1104.34 MiB
+0.00.440 I llama_context: Vulkan_Host  output buffer size =     0.95 MiB
+"""
+    assert parse_spill_mib(text) == pytest.approx(994.63 + 4352.00)
+
+
+def test_parse_spill_mib_clean_log_is_zero():
+    text = """\
+0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB
+0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  8704.00 MiB
+0.28.928 I sched_reserve:    Vulkan0 compute buffer size =  1552.33 MiB
+0.28.928 I sched_reserve: Vulkan_Host compute buffer size =  1104.34 MiB
+0.00.440 I llama_context: Vulkan_Host  output buffer size =     0.95 MiB
+"""
+    assert parse_spill_mib(text) == 0.0
+
+
+# ── guarded serve measurement lifecycle ───────────────────────────────────
+
+def _stub_server(tmp_path, body: str) -> str:
+    path = tmp_path / "stub-measure-server.sh"
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return str(path)
+
+
+_OK_BODY = """\
+echo '0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB'
+echo '0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  8704.00 MiB'
+echo '0.28.928 I sched_reserve:    Vulkan0 compute buffer size =  1552.33 MiB'
+echo listening on http://127.0.0.1:1
+exec sleep 30
+"""
+
+
+@pytest.fixture
+def guard_env(tmp_path, monkeypatch):
+    """Clear pre-flight, tmp cache dir, fast stall window."""
+    monkeypatch.setattr(vram.gpu_state, "llama_residents", lambda: [])
+    monkeypatch.setattr(vram, "_MEASURE_STALL_S", 1)
+    monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
+    return tmp_path / "cache"
+
+
+def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
+    model = make_model("a")
+    buffers = model.vram._run_measure_server(
+        _stub_server(tmp_path, _OK_BODY), "q8_0", 8192, 1, "")
+    assert buffers is not None
+    assert buffers["kv"] == pytest.approx(8704.0)
+    entry = json.loads((guard_env / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "ok" and entry["pid"]
+    with pytest.raises(ProcessLookupError):
+        os.killpg(entry["pid"], 0)  # our child died with its measurement
+
+
+def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
+    body = ("echo '0.00 I llama_kv_cache: Vulkan_Host KV buffer size = "
+            "8704.00 MiB'\necho listening on http://127.0.0.1:1\nexec sleep 30\n")
+    model = make_model("a")
+    assert model.vram._run_measure_server(
+        _stub_server(tmp_path, body), "q8_0", 8192, 1, "") is None
+    entry = json.loads((guard_env / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "spill"
+
+
+def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
+                                                     monkeypatch):
+    monkeypatch.setattr(vram.gpu_state, "llama_residents",
+                        lambda: ["123 jk /x/llama-server -m y"])
+    monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
+    model = make_model("a")
+    # A nonexistent binary proves the refusal happened before any spawn.
+    assert model.vram._run_measure_server(
+        str(tmp_path / "never-spawned"), "q8_0", 8192, 1, "") is None
+    entry = json.loads((tmp_path / "cache" / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "refused-residents"
+
+
+def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
+                                                   guard_env):
+    model = make_model("a")
+    stub = _stub_server(tmp_path, "echo starting\nexec sleep 60\n")
+    buffers = model.vram._run_measure_server(stub, "q8_0", 8192, 1, "")
+    assert buffers is None  # well under _MEASURE_TIMEOUT_S
+    entry = json.loads((guard_env / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "stall"
+    with pytest.raises(ProcessLookupError):
+        os.killpg(entry["pid"], 0)
+
+
+def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
+    model = make_model("a")
+    stub = _stub_server(tmp_path, "exit 1\n")
+    assert model.vram._run_measure_server(stub, "q8_0", 8192, 1, "") is None
+    entry = json.loads((guard_env / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "exited"
 
 
 # ── calc_ctx ──────────────────────────────────────────────────────────────

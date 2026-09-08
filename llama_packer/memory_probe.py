@@ -31,9 +31,10 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from llama_packer import gpu_state
 from llama_packer.consts import _MEASURE_CTX_CAP, _MIN_CTX_SIZE
 from llama_packer.vram import (
-    affine_from_pair, get_serve_correction, save_serve_correction,
+    save_serve_correction,
 )
 
 if TYPE_CHECKING:
@@ -274,15 +275,25 @@ def run_probe(
 
     The only place llama-server is ever started — normal packer runs use
     the fast fit-params estimate plus the corrections this probe writes.
+    Refuses to start beside a resident llama process (measurement
+    validity is the whole point) and runs single-flight under the
+    measurement lock; every serve run is journaled by
+    ``VramBudget._run_measure_server``.
     """
-    reps = pick_family_representatives(models, only_archs, is_fast)
-    if not reps:
-        return "probe: no measurable GGUF families found"
-    logger.info("probe: %d families (%s)", len(reps), ", ".join(reps))
-    reports: list[dict | None] = []
-    for arch, model in reps.items():
-        logger.info("probe: %s (arch %s) grid %s", model.stem, arch,
-                    _probe_grid(model.design_context))
-        reports.append(affine_report(model, fit_bin, server_bin,
-                                     cache_type, llama_args))
-    return format_reports(reports)
+    residents = gpu_state.llama_residents()
+    if residents:
+        return ("probe: refusing to measure — llama processes resident:\n  "
+                + "\n  ".join(residents[:5]))
+    with gpu_state.measurement_lock("probe"):
+        reps = pick_family_representatives(models, only_archs, is_fast)
+        if not reps:
+            return "probe: no measurable GGUF families found"
+        logger.info("probe: %d families (%s)", len(reps), ", ".join(reps))
+        gpu_state.journal({"mode": "probe", "archs": ", ".join(reps)})
+        reports: list[dict | None] = []
+        for arch, model in reps.items():
+            logger.info("probe: %s (arch %s) grid %s", model.stem, arch,
+                        _probe_grid(model.design_context))
+            reports.append(affine_report(model, fit_bin, server_bin,
+                                         cache_type, llama_args))
+        return format_reports(reports)
