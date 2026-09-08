@@ -224,3 +224,11 @@ def test_fit_params_round_trip_through_measured(make_model):
     saved = m.vram.saved_for("q8_0")
     assert saved is not None and saved.model_mib == 1000
     assert m.measured_block()["source"] == "llama-server"
+
+
+def test_min_context_is_a_consumed_field(make_model):
+    # documented sidecar key: consumed by the builder, never leaked to
+    # clients as metadata
+    m = make_model("mc", min_context=65536)
+    assert m.frontmatter["min_context"] == 65536
+    assert "min_context" not in m.pass_through_metadata()

@@ -98,7 +98,12 @@ def kill_process_group(proc: subprocess.Popen) -> None:
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            try:
+                proc.wait(timeout=_KILL_GRACE_S)
+            except subprocess.TimeoutExpired:
+                logger.warning("kill_process_group: pid %s stuck in "
+                               "uninterruptible I/O; proceeding",
+                               proc.pid)
     try:
         os.kill(proc.pid, 0)
     except ProcessLookupError:

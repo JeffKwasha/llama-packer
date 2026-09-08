@@ -853,12 +853,19 @@ class Planner:
         sidecar_ctx = (view.frontmatter or {}).get("context_length")
         if sidecar_ctx is not None:
             try:
-                pins.append(int(sidecar_ctx))
-            except (TypeError, ValueError):
-                logger.warning("context_length=%r on %s is not an integer; "
-                               "ignoring pin", sidecar_ctx, view.stem)
+                pin = int(sidecar_ctx)
+                assert pin > 0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("context_length=%r on %s is not a positive "
+                               "integer; ignoring pin", sidecar_ctx, view.stem)
+            else:
+                pins.append(pin)
         if self.max_context is not None:
-            pins.append(self.max_context)
+            if self.max_context > 0:
+                pins.append(self.max_context)
+            else:
+                logger.warning("--max-context %d is not positive; ignoring",
+                               self.max_context)
         return min(pins) if pins else None
 
     def _auto_parallel(

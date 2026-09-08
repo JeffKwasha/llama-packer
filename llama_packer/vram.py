@@ -728,13 +728,9 @@ class VramBudget:
         kv_per_token = 2.0 * (r1["kv"] - r3["kv"]) / design
         if kv_per_token <= 0:
             return None
-        mtp_on, _ = self.model._mtp_info()
-        rs_cell = r1["rs"] / r1["rs_cells"] if r1["rs_cells"] else 0.0
         pool1 = r1["kv"] + r1["rs"]
-        slot_mib = max((r2["kv"] + r2["rs"]) - pool1, 0.0) \
-            + rs_cell * (2.0 if mtp_on else 1.0)
-        compute_mib = int(max(r1["compute"], r2["compute"], r3["compute"])) \
-            + int(round(rs_cell * (1.0 if mtp_on else 0.0)))
+        slot_mib = max((r2["kv"] + r2["rs"]) - pool1, 0.0)
+        compute_mib = int(max(r1["compute"], r2["compute"], r3["compute"]))
         return FitParams(
             model_mib=int(r1["model"]),
             kv_per_token_mib=kv_per_token,
@@ -770,15 +766,24 @@ class VramBudget:
                                            fit_bin=fit_bin)
         if params is None:
             return None
-        mtp_on, _ = self.model._mtp_info()
+        # The correction's mtp dimension means "a draft is baked into the
+        # main GGUF" — that is what the witness measured and what delta_d
+        # prices.  A separate draft companion does not qualify (its cost
+        # is folded in by effective_static instead).
+        mtp_on = self.model.mtp is None and self.model._mtp_info()[0]
         corr = get_serve_correction(self.model.arch or "unknown", cache_type,
                                     mtp_on)
         if corr is not None:
+            # Corrections are measured at witness scale; clamp so a much
+            # smaller model of the same arch can't go negative (from_dict
+            # would reject the block and re-measure on every run).
             params = FitParams(
                 model_mib=params.model_mib,
-                kv_per_token_mib=params.kv_per_token_mib + corr["delta_c"],
-                slot_mib=params.slot_mib + corr["delta_d"],
-                compute_mib=params.compute_mib + int(corr["delta_fixed"]),
+                kv_per_token_mib=max(1e-6, params.kv_per_token_mib
+                                     + corr["delta_c"]),
+                slot_mib=max(0.0, params.slot_mib + corr["delta_d"]),
+                compute_mib=max(0, params.compute_mib
+                                + int(corr["delta_fixed"])),
                 source="fit-estimate",
                 cache_type=cache_type,
             )

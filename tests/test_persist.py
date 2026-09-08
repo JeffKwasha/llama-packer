@@ -48,7 +48,7 @@ def test_persist_migrates_legacy_fit_params_block(make_model, tmp_path):
         "---\n"
     )
 
-    model.vram._persist(FitParams(2000, 0.25, 50, "fit-params", "q8_0", 1))
+    model.vram._persist(FitParams(2000, 0.25, 50, 100, "fit-estimate", "q8_0"))
 
     content = md.read_text()
     assert "derived:" in content
