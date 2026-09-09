@@ -20,6 +20,7 @@ from llama_packer.backends import (
 from llama_packer.backends.llama_server import LlamaServerBackend
 from llama_packer.backends.vllm import VllmDockerBackend, VllmHostBackend
 from llama_packer.profiles import Profiles
+from llama_packer.writer import MatrixKnobs
 
 
 def _tvars():
@@ -215,13 +216,14 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
     monkeypatch.setattr(writer, "solve_matrix_ctx",
                         lambda **kw: calls.append(dict(kw)) or 8192)
     profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    result = writer._solve_matrix_context([chat], embed, rerank, "unused",
-                                          48000, None, profiles)
+    result = writer._solve_matrix_context(
+        [chat], embed, rerank, "unused", 48000, None, profiles,
+        knobs=MatrixKnobs(embed_context=32768, rerank_context=16384))
     assert result is not None
-    assert calls[0]["embed_ctx"] == 32768   # declared, not hardcoded 8192
+    assert calls[0]["embed_ctx"] == 32768   # configured, not hardcoded 8192
     assert calls[0]["rerank_ctx"] == 16384
     # The fake solver returns 8192 (< tools_min_ctx) so the squeeze fires,
-    # but its gain is 0 (< ctx_gain_min) — declared contexts must survive.
+    # but its gain is 0 (< ctx_gain_min) — configured contexts must survive.
     assert (result.embed_ctx, result.rerank_ctx) == (32768, 16384)
     assert result.squeeze is False
 
