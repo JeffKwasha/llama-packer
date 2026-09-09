@@ -245,6 +245,11 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
 | `image_min_tokens` / `image_max_tokens` | Image input (mmproj) only, dynamic-resolution archs (Qwen-VL family): floor/cap on image tokens per image, emitted as `--image-min-tokens`/`--image-max-tokens`. Qwen math: 1 token ≈ 28×28 px (2.5-VL) / 32×32 px (3-VL); 1024 tokens ≈ 1 MP — good floor for art/artifact critique. Gemma/SigLIP is fixed ~256 tokens/image: keys are ignored there (warned). The cap also floors the solved context (parallel × max tokens must fit `-c`) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
+| `vllm_quantization` | vLLM `--quantization` *method* (e.g. `modelopt_mixed`) — not the metadata `quantization` field; absent = vLLM auto-detects from the checkpoint |
+| `moe_backend` | vLLM `--moe-backend` (e.g. `marlin`) |
+| `mamba: {...}` | Hybrid/Mamba recipe (see below) |
+| `tool_call_parser` | vLLM `--enable-auto-tool-choice --tool-call-parser <p>` (chat role) |
+| `reasoning_parser` | vLLM `--reasoning-parser <p>` (chat role) — distinct from llama.cpp's `reasoning-format` |
 | `ignore: true` | Skip this model entirely |
 | `derived:` | Auto-written by llama-packer — see the rules below (VRAM constants + `file:` header intrinsics) |
 
@@ -265,5 +270,23 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
    measurement tier (`fit-estimate` = calibrated fast path,
    `llama-server` = serve truth, `safetensors-estimate`/`vllm-estimate`
    = analytic).
+
+### vLLM recipe example
+
+Only for models served by the `vllm`/`vllm-docker` backends; every key is
+opt-in and emitted verbatim (absent = vLLM's own auto-detection):
+
+```yaml
+# vllm_quantization: modelopt_mixed   # --quantization (NVFP4 mixed checkpoints)
+# moe_backend: marlin                 # --moe-backend
+# tool_call_parser: qwen3_coder       # + --enable-auto-tool-choice
+# reasoning_parser: nemotron_v3       # --reasoning-parser
+# mamba:                              # hybrid / Mamba models:
+#   backend: flashinfer               #   --mamba-backend
+#   ssm_cache_dtype: float16          #   --mamba-ssm-cache-dtype
+#   stochastic_rounding: true         #   --enable-mamba-cache-stochastic-rounding
+#   philox_rounds: 5                  #   --mamba-cache-philox-rounds
+#   cache_mode: align                 #   --mamba-cache-mode
+```
 
 See `SPEC.md` for the complete schema.

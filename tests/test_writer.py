@@ -79,6 +79,23 @@ def test_vllm_docker_cmd(make_model):
     assert "--served-model-name ${MODEL_ID}" in cmd
 
 
+def test_vllm_docker_lifecycle_fields(make_model):
+    # Container backends get llama-swap's docker orchestration fields: cmdStop
+    # stops the container itself (a swap/unload would otherwise kill only the
+    # docker run client), unloadTimeout exceeds the stop grace, and the
+    # explicit proxy field (upstream: "the single most common configuration
+    # error" for containers).
+    _, entry = _entry(make_model, "d", backend="vllm-docker", hf_repo="org/model")
+    assert entry["cmdStop"] == "docker stop ${MODEL_ID}"
+    assert entry["unloadTimeout"] == 30
+    assert entry["proxy"] == "http://127.0.0.1:${PORT}"
+    # Managed (non-container, non-proxied) entries carry none of these.
+    _, llama_entry = _entry(make_model, "l")
+    assert "cmdStop" not in llama_entry
+    assert "unloadTimeout" not in llama_entry
+    assert "proxy" not in llama_entry
+
+
 def test_embeddings_role_flags(make_model):
     _, entry = _entry(make_model, "e", role="embeddings")
     assert "--embedding --embd-normalize 2" in entry["cmd"]

@@ -428,7 +428,9 @@ class Model:
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel", "min_context",
         "image_min_tokens", "image_max_tokens",
-
+        # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
+        "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
+        "reasoning_parser",
     })
 
     # Frontmatter keys a companion block may NOT set: identity, placement,
@@ -1259,6 +1261,53 @@ class Model:
         entry only. Returns None when not declared (uses the global default).
         """
         v = self.frontmatter.get("vllm_image")
+        return str(v) if v else None
+
+    # ── vLLM recipe keys (opt-in, verbatim; absent = let vLLM auto-detect) ──
+
+    @property
+    def vllm_quantization(self) -> str | None:
+        """vLLM ``--quantization`` value (sidecar ``vllm_quantization:``).
+
+        NOT the metadata ``quantization`` field (bits-per-weight) — this is
+        the weight-quant *method* vLLM loads with (e.g. ``modelopt_mixed``).
+        None lets vLLM auto-detect from the checkpoint config.
+        """
+        v = self.frontmatter.get("vllm_quantization")
+        return str(v) if v else None
+
+    @property
+    def moe_backend(self) -> str | None:
+        """vLLM ``--moe-backend`` value (``moe_backend:`` e.g. ``marlin``)."""
+        v = self.frontmatter.get("moe_backend")
+        return str(v) if v else None
+
+    @property
+    def mamba(self) -> dict | None:
+        """The ``mamba:`` recipe mapping (hybrid/Mamba models), or None.
+
+        Sub-keys render one flag each: ``backend`` → ``--mamba-backend``,
+        ``ssm_cache_dtype`` → ``--mamba-ssm-cache-dtype``, ``philox_rounds`` →
+        ``--mamba-cache-philox-rounds``, ``cache_mode`` → ``--mamba-cache-mode``,
+        ``stochastic_rounding: true`` → ``--enable-mamba-cache-stochastic-rounding``.
+        A non-mapping value is None here; the backend warns and skips it.
+        """
+        m = self.frontmatter.get("mamba")
+        return dict(m) if isinstance(m, dict) and m else None
+
+    @property
+    def tool_call_parser(self) -> str | None:
+        """vLLM ``--tool-call-parser`` (``tool_call_parser:``); also emits
+        ``--enable-auto-tool-choice``. Chat role only."""
+        v = self.frontmatter.get("tool_call_parser")
+        return str(v) if v else None
+
+    @property
+    def reasoning_parser(self) -> str | None:
+        """vLLM ``--reasoning-parser`` (``reasoning_parser:`` e.g.
+        ``nemotron_v3``).  Distinct from llama.cpp's ``reasoning-format``
+        (:attr:`reasoning_format`) — different server, different flag."""
+        v = self.frontmatter.get("reasoning_parser")
         return str(v) if v else None
 
     @property

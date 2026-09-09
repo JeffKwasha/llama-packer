@@ -1,8 +1,9 @@
 # vLLM / DGX Spark backend — design proposal
 
-**Status:** in progress — docker-vLLM scaffold implemented on `vllm-gb10`
-**Date:** 2026-08-15
-**Branch:** `vllm-gb10`
+**Status:** in progress — docker-vLLM scaffold implemented on `main`; recipe keys
++ container correctness on `gb10-support` (see `docs/plans/gb10-support-plan.md`)
+**Date:** 2026-08-15 (updated 2026-09-09)
+**Branch:** `gb10-support` (supersedes the stale `vllm-gb10` scaffold branch)
 **Primary backend:** llama-swap / llama.cpp (unchanged). vLLM is a second backend
 *inside llama-swap* for the DGX Spark, not a separate toolchain.
 
@@ -109,10 +110,31 @@ safetensors, so the GGUF fallback is a last resort.
 - **`hf_repo`-only models** — `Model.gguf_path` is optional for vLLM backends; a sidecar
   with only `hf_repo`/`hf_url` is valid.
 
+## Implemented 2026-09-09 (branch `gb10-support`)
+
+Per `docs/plans/gb10-support-plan.md`:
+
+- **Recipe keys (C1–C5)** — `vllm_quantization` (`--quantization`), `moe_backend`,
+  `mamba:` (five `--mamba-*` flags), `tool_call_parser`, `reasoning_parser`; opt-in,
+  verbatim, override-rule capable (`SETTING_KEYS` / `Model.FIELDS` / accessors).
+  Closes the Nemotron-3.5-Lightning ground-truth flag gap.
+- **Docker path mapping + mounts (C6)** — all path-shaped cmd values (model ref,
+  speculative draft, chat template) rewritten to container paths: under `vllm.hf_cache`
+  → `/root/.cache/huggingface/<rel>` (whole-root mount, symlink-safe), under a
+  `models_dir` → `/models…`, else `/extN` parent bind. Fixes the pre-existing
+  local-path `--model` host leak. `HF_HUB_OFFLINE=1` + `HF_HOME` on every docker entry
+  (no downloads; pre-stage the hub).
+- **Container lifecycle (C7)** — `cmdStop: docker stop ${MODEL_ID}` +
+  `unloadTimeout: 30` (llama-swap kb ttl-and-unloading), explicit
+  `proxy: http://127.0.0.1:${PORT}` (C9, writing-cmd).
+- **healthCheckTimeout (C8)** — vLLM floor at `model_size_mb / 100` (100 MB/s load
+  assumption; 300 s floor for repo-only models).
+
+Still open from the old list: MTP/spec translation beyond `speculative_config:` (the
+explicit JSON key covers dspark/MTP today).
+
 ## Planned (not yet implemented)
 
-- **MTP translation** — vLLM-mode `mtp`/`speculative` → `--num-speculative-tokens`;
-  warn-and-skip for unsupported architectures.
 - **tensor-parallel / multi-GPU** — emit `--tensor-parallel-size` and size the estimator
   accordingly (currently TP is fixed at 1).
 - **update design for matrix evict_costs** on vLLM entries (slow cold starts) and

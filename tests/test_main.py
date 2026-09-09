@@ -41,6 +41,17 @@ def test_health_check_vllm_backend_raises_floor(tmp_path):
     assert _health_check_timeout(models, _args()) == 300
 
 
+def test_health_check_vllm_size_floor(tmp_path):
+    # vLLM loads at an assumed 100 MB/s: floor = largest vLLM model size / 100.
+    # 60000 MiB -> 600 s (a ~60 GB NVFP4 model loads in ~10 min on DGX Spark);
+    # the 1.2 * size / drive_speed term (144 s here) must not undercut it.
+    models = [_model(tmp_path, 60000, backend="vllm")]
+    assert _health_check_timeout(models, _args()) == 600
+    # Non-vLLM models are unaffected by the vLLM size floor.
+    models = [_model(tmp_path, 60000)]
+    assert _health_check_timeout(models, _args()) == 144
+
+
 def test_health_check_explicit_speed_and_env(tmp_path, monkeypatch):
     models = [_model(tmp_path, 100000)]
     assert _health_check_timeout(models, _args(drive_speed=1000)) == 120

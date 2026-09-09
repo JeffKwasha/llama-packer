@@ -27,14 +27,24 @@ profiles:
 # ── vLLM backend ───────────────────────────────────────
 # Defaults for models whose override rules select the `vllm` / `vllm-docker`
 # backend. The image can be overridden per run via `llama-packer --vllm-image`,
-# the binary via `--vllm-server`.
+# the binary via `--vllm-server`. Per-model recipe keys (sidecar or override
+# rule): vllm_quantization (--quantization; NOT the metadata `quantization`),
+# moe_backend (--moe-backend), tool_call_parser (--enable-auto-tool-choice
+# --tool-call-parser), reasoning_parser (--reasoning-parser; distinct from
+# llama.cpp's reasoning-format), and mamba: (hybrid models — backend,
+# ssm_cache_dtype, stochastic_rounding, philox_rounds, cache_mode).
 vllm:
   image: vllm/vllm-openai:latest
   bin: vllm
   docker_args: "--runtime=nvidia --gpus all --shm-size=16g"
   container_port: 8000
   # gpu_mem_util: 0.9   # optional; when omitted it is derived from the same
-                        # reserve/spare VRAM budget llama.cpp uses
+  #                       reserve/spare VRAM budget llama.cpp uses
+  # hf_cache: /nas/humaii/config/models/.hf   # host HF hub root bind-mounted
+  #                       # into vllm-docker containers at
+  #                       # /root/.cache/huggingface (falls back to top-level
+  #                       # hf_home:).  Docker entries run with HF_HUB_OFFLINE=1
+  #                       # — models must be pre-staged here; nothing downloads.
 
 # ── whisper-server backend (optional, speech-to-text) ──
 # Opt-in via profiles.yaml `dirs: {s2t: s2t}`; each model needs an authored
