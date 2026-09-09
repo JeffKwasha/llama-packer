@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 
+from llama_packer.consts import _KV_CACHE_BYTES
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,6 +24,7 @@ def estimate_vllm(
     design_ctx: int,
     tensor_parallel_size: int = 1,
     max_active_seqs: int = 1,
+    cache_type: str = "f16",
 ) -> tuple[int, float, int] | None:
     """Estimate ``(model_mib, ctx_factor, compute_mib)`` for an HF model.
 
@@ -34,6 +37,11 @@ def estimate_vllm(
     ``ctx_factor`` is KV-cache per token so it matches the semantics of
     ``llama-fit-params`` (per-token KV, folded with ``parallel`` via
     ``max_active_seqs``).
+
+    The estimator prices KV at the model's native (auto) dtype — bf16/f16,
+    2 bytes/elem.  ``cache_type`` rescales it to the configured cache
+    precision (``q8_0`` → vLLM ``--kv-cache-dtype fp8`` = 1.0625 B/elem,
+    etc.) so the estimate matches what the emitted command will serve.
 
     Returns None when the estimator package is not installed or the estimate
     fails (caller then falls back to a local safetensors estimate).
@@ -77,5 +85,8 @@ def estimate_vllm(
     kv_cache_mib = est.kv_cache.nominal_gib * 1024
     if model_mib <= 0:
         return None
+    # The estimator assumes the native (auto) KV dtype (~2 B/elem); rescale
+    # to the configured cache precision so ctx_factor matches the emission.
+    kv_cache_mib *= _KV_CACHE_BYTES.get(cache_type, 2.0) / 2.0
     ctx_factor = kv_cache_mib / design_ctx if design_ctx > 0 else 0.0
     return model_mib, ctx_factor, compute_mib

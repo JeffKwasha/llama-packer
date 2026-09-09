@@ -36,6 +36,7 @@ from llama_packer.backends import (
     SETTING_KEYS,
     FRAMEWORK_CONSUMED,
     METADATA_ONLY,
+    VLLM_BACKENDS,
     get_backend,
 )
 
@@ -496,7 +497,13 @@ class MatrixKnobs:
     caps the slots and ``parallel_power`` is the score's slot exponent.
     Auto-parallel is on by default; ``matrix: auto_parallel: false``
     disables it fleet-wide and a sidecar/block ``parallel:`` pin opts a
-    single model out.
+    single model out.  ``vllm_auto_parallel_max`` is the cap for vLLM
+    backends: continuous batching makes a slot cost KV only (no per-slot
+    workspace), so vLLM tolerates far higher concurrency — and a sidecar
+    ``parallel: 0`` on a vLLM model means *uncapped* (emit no
+    ``--max-num-seqs``; vLLM admits elastically up to the pool, queueing
+    the rest).  On llama.cpp backends ``parallel: 0`` is invalid and falls
+    back to the fleet default with a warning.
     """
     min_chat_ctx: int = 65536
     tools_min_ctx: int = 131072
@@ -507,6 +514,7 @@ class MatrixKnobs:
     estimate_headroom: float = 1.25
     auto_parallel: bool = True
     auto_parallel_max: int = 8
+    vllm_auto_parallel_max: int = 16
     parallel_power: float = 0.75
 
     @classmethod
@@ -516,7 +524,8 @@ class MatrixKnobs:
         cfg = matrix_cfg or {}
         knobs: dict = {}
         for key in ("min_chat_ctx", "tools_min_ctx", "coload_min_ctx",
-                    "embed_context", "rerank_context", "ctx_gain_min"):
+                    "embed_context", "rerank_context", "ctx_gain_min",
+                    "auto_parallel_max", "vllm_auto_parallel_max"):
             v = cfg.get(key)
             if v is None:
                 continue
@@ -541,16 +550,6 @@ class MatrixKnobs:
         v = cfg.get("auto_parallel")
         if v is not None:
             knobs["auto_parallel"] = _parse_bool_knob("auto_parallel", v)
-        v = cfg.get("auto_parallel_max")
-        if v is not None:
-            try:
-                iv = int(v)
-                assert iv > 0
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("matrix: auto_parallel_max=%r is not a "
-                               "positive integer; using default", v)
-            else:
-                knobs["auto_parallel_max"] = iv
         v = cfg.get("parallel_power")
         if v is not None:
             try:
@@ -993,7 +992,11 @@ class Planner:
         parallel, max affordable ctx) when the floor is unreachable.
         """
         power = self.knobs.parallel_power
-        pmax = self.knobs.auto_parallel_max
+        # vLLM's continuous batching makes a slot cost KV only (no per-slot
+        # workspace), so concurrency is cheap — cap it higher there.
+        pmax = (self.knobs.vllm_auto_parallel_max
+                if view.backend in VLLM_BACKENDS
+                else self.knobs.auto_parallel_max)
 
         solved: dict[int, int] = {}
 
@@ -1241,7 +1244,24 @@ class Planner:
                     and "parallel" not in (view.frontmatter or {})
                     and not any("parallel" in resolved
                                 for _, resolved in group))
+                # parallel 0: uncapped vLLM serving (no --max-num-seqs; the
+                # shared pool admits elastically, queueing the rest).  The
+                # ctx solve stays single-seq — vLLM validates that one
+                # max-length sequence fits its pool at startup.  On
+                # llama.cpp backends 0 is invalid: warn, use the default.
+                uncapped = False
+                if parallel <= 0:
+                    if view.backend in VLLM_BACKENDS:
+                        uncapped = True
+                    else:
+                        logger.warning(
+                            "%s: parallel %d is invalid; using fleet "
+                            "default %d", view.stem, parallel,
+                            self.profiles.default_parallel)
+                        parallel = self.profiles.default_parallel
                 group_parallel = parallel
+                if uncapped:
+                    parallel = 1   # single-seq ctx solve; emission drops it
                 if est_error is not None:
                     ctx_size = self._unestimated_ctx(view)
                 elif auto:
@@ -1288,6 +1308,8 @@ class Planner:
                             design_ctx=self.chat_ctx,
                             context_length=context_length,
                             profile=group[0][1]))
+                if uncapped:
+                    parallel = 0   # emit uncapped: no --max-num-seqs
 
                 variants.append(Variant(
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
@@ -1408,6 +1430,16 @@ def _solve_matrix_context(
         on = m.view_for(m.stem not in drop_stems)
         cache_type = on.cache_type_for(profiles.default_cache_type)
         parallel = on.parallel_for(profiles.default_parallel)
+        if parallel <= 0:
+            # Uncapped vLLM: the shared solve is single-seq safe (its own
+            # emission solves ctx for one max-length sequence).  On
+            # llama.cpp backends 0 is invalid — warn, use the default.
+            if on.backend in VLLM_BACKENDS:
+                parallel = 1
+            else:
+                logger.warning("%s: parallel %d is invalid; using default",
+                               on.stem, profiles.default_parallel)
+                parallel = profiles.default_parallel
         img_floor = 0
         if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
                 and on.image_max_tokens):

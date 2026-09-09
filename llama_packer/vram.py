@@ -65,6 +65,7 @@ from llama_packer.consts import (
     _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
     _SD_COMPUTE_MB,
+    _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
     _WEIGHT_CPU_MAP_TOLERANCE_MIB,
     _KOKORO_COMPUTE_MB,
@@ -996,8 +997,10 @@ class VramBudget:
         Sources, in order:
         1. ``vllm-memory-estimator`` on the HF repo (accurate; reuses vLLM's
            own config/KV-cache logic) — requires ``hf_repo`` and the package.
-           vLLM's paged KV pool is shared, so there is no per-slot term
-           (``slot_mib=0``); ``--max-num-seqs`` does not change KV size.
+           vLLM's paged KV pool is shared, so there is no llama.cpp-style
+           per-slot recurrent term; the fixed ``_VLLM_PER_SEQ_MIB`` prices
+           CUDA-graph/scheduler growth per active sequence (the estimator's
+           own overhead is measured at one active sequence).
         2. local ``.safetensors`` header estimate (``utils.estimate_safetensors``).
 
         Returns None when neither is available (no estimator, no local file):
@@ -1008,14 +1011,14 @@ class VramBudget:
         if self.model.hf_repo:
             est = vllm_estimate.estimate_vllm(
                 self.model.hf_repo, design,
-                max_active_seqs=1,
+                max_active_seqs=1, cache_type=cache_type,
             )
             if est is not None:
                 model_mib, kv_per_token, compute_mib = est
                 return FitParams(
                     model_mib=model_mib,
                     kv_per_token_mib=kv_per_token,
-                    slot_mib=0.0,
+                    slot_mib=_VLLM_PER_SEQ_MIB,
                     compute_mib=compute_mib,
                     source="vllm-estimate",
                     cache_type=cache_type,
