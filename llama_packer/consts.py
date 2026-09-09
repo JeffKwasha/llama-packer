@@ -113,6 +113,11 @@ _SAFETENSORS_DTYPE_BYTES = {
     "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
     "F8": 1, "F6E4M3FN": 1, "F6E5M2": 1, "F4": 1,
     "F6E2M1FN": 0.5, "F3": 0.375, "F2": 0.25, "F1": 0.125,
+    # Real safetensors header dtype names (the safetensors spec, not torch
+    # enum spellings): fp8 and the sub-byte MX family.  FP8 checkpoints
+    # store ~1 B/elem — the same density as a Q8_0 GGUF.
+    "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1,
+    "F6_E2M3": 0.75, "F6_E3M2": 0.75, "F4_E2M1": 0.5, "F4_BNN": 0.125,
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -133,6 +138,13 @@ _MMPROJ_COMPUTE_MB = 150
 _DRAFT_COMPUTE_MB = 64
 _DRAFT_CTX_SAFETY = 1.6
 _SD_COMPUTE_MB = 512
+
+# vLLM per-sequence runtime growth (MiB): CUDA-graph capture and scheduler
+# workspace scale with the largest captured batch (``--max-num-seqs``).  The
+# memory-estimator prices its overhead at one active sequence, so the affine
+# fold carries the batch-dim growth through ``slot_mib``.  Conservative —
+# errs toward reserving more, like the other fixed heuristics here.
+_VLLM_PER_SEQ_MIB = 32.0
 _WHISPER_COMPUTE_MB = 100
 _KOKORO_COMPUTE_MB = 3072
 

@@ -273,6 +273,63 @@ def test_matrix_knobs_rag_caps():
     assert k.rag_cap("chat") == k.coload_min_ctx
 
 
+def test_matrix_knobs_vllm_auto_parallel():
+    k = MatrixKnobs.from_cfg({})
+    assert k.auto_parallel_max == 8
+    assert k.vllm_auto_parallel_max == 16
+    k = MatrixKnobs.from_cfg({"vllm_auto_parallel_max": 32})
+    assert k.vllm_auto_parallel_max == 32
+    k = MatrixKnobs.from_cfg({"vllm_auto_parallel_max": 0})
+    assert k.vllm_auto_parallel_max == 16
+
+
+def test_plan_vllm_uncapped_parallel_zero(make_model, profiles):
+    # sidecar parallel 0 on a vLLM model = uncapped: ctx solves single-seq
+    # (vLLM validates one max-length seq at startup), and the variant emits
+    # parallel 0 so --max-num-seqs is omitted.
+    m = make_model("uv", backend="vllm", parallel=0)
+    _fake_vram(m, (1000, 0.5, 100))
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024)
+    variants = planner.plan()["uv"]
+    assert variants[0].parallel == 0
+    assert variants[0].ctx_size == 32768
+
+
+def test_plan_llama_parallel_zero_warns_and_defaults(make_model, profiles,
+                                                     caplog):
+    # parallel 0 is a vLLM-only convention; on llama.cpp it's invalid and
+    # falls back to the fleet default with a warning.
+    m = make_model("m0", parallel=0)
+    _fake_vram(m, (1000, 0.5, 100))
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024)
+    variants = planner.plan()["m0"]
+    assert variants[0].parallel == 1
+    assert any("parallel 0 is invalid" in r.message for r in caplog.records)
+
+
+def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
+    # Same budget, same quads: the vLLM backend may use more slots than the
+    # llama.cpp cap — continuous batching makes a slot cost KV only.
+    # Pin-free profiles (no parallel in defaults) so auto-parallel runs;
+    # an explicit sidecar min_context (cascade row 1) sets the floor so the
+    # value function can actually reach both caps.
+    no_pin = Profiles({"defaults": {"cache_type": "q8_0"},
+                       "profiles": {"default": {}}})
+    vllm_m = make_model("av", backend="vllm", min_context=4096)
+    del vllm_m.frontmatter["context_length"]  # no pin: cap = design
+    _fake_vram(vllm_m, (1000, 0.5, 100))
+    planner = Planner([vllm_m], no_pin, fit_bin="unused",
+                      vram_total=48 * 1024, min_context=4096)
+    assert planner.plan()["av"][0].parallel == 16
+
+    llama_m = make_model("al", min_context=4096)
+    del llama_m.frontmatter["context_length"]
+    _fake_vram(llama_m, (1000, 0.5, 100))
+    planner = Planner([llama_m], no_pin, fit_bin="unused",
+                      vram_total=48 * 1024, min_context=4096)
+    assert planner.plan()["al"][0].parallel == 8
+
+
 def test_matrix_knobs_invalid_values_warn_and_default(caplog):
     with caplog.at_level(logging.WARNING):
         k = MatrixKnobs.from_cfg({"min_chat_ctx": -1, "coload_min_ctx": "big",

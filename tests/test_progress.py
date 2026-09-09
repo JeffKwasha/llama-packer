@@ -107,6 +107,36 @@ def test_estimator_forces_offline_and_restores(monkeypatch):
     assert "HF_HUB_OFFLINE" not in os.environ
 
 
+def test_estimate_vllm_kv_scales_with_cache_type(monkeypatch):
+    # The estimator prices KV at the native (auto) dtype ~2 B/elem; the
+    # cache_type decision (q8_0 -> --kv-cache-dtype fp8) must rescale it.
+    from llama_packer import vllm_estimate
+
+    class FakeOne:
+        nominal_gib = 10.0
+
+    class FakeKV:
+        nominal_gib = 1.0
+
+    class FakeEst:
+        parameters = FakeOne()
+        activations = FakeOne()
+        workspace = FakeOne()
+        vllm_overhead = FakeOne()
+        kv_cache = FakeKV()
+
+    fake_mod = types.ModuleType("memory_estimator")
+    fake_mod.EstimatorInputs = lambda **kw: types.SimpleNamespace(**kw)  # type: ignore[attr-defined]
+    fake_mod.estimate_from_inputs = lambda inputs: (None, FakeEst())  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "memory_estimator", fake_mod)
+
+    model_mib, ctx_factor, _ = vllm_estimate.estimate_vllm(
+        "org/repo", 4096, cache_type="q8_0")
+    assert model_mib == 10 * 1024
+    # 1 GiB bf16 KV -> 1.0625/2 = 0.53125 of it at fp8-equivalent bytes
+    assert ctx_factor == (1.0 * 1024 * 1.0625 / 2.0) / 4096
+
+
 def test_fit_params_logs_before_run(make_model, fit_params_block, monkeypatch, caplog):
     import subprocess
 

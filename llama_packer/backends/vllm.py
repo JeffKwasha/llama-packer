@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar
 
@@ -56,6 +57,37 @@ def _kv_cache_dtype_flags(cache_type: str) -> list[str]:
                    "(valid values: auto/fp8/nvfp4); serving at auto instead",
                    cache_type)
     return []
+
+
+# llama.cpp-only flags that must never reach a vLLM command line.  The
+# render layers (``vllm args``, sidecar ``cli_args``) and llama-swap dir
+# flag macros are backend-agnostic, so a llama-shaped flag can leak in;
+# strip it (flag and value) before the cmd ships.
+_LLAMA_ONLY_FLAGS = frozenset({
+    "-b", "-ub", "-c", "--ctx-size", "--ctx",
+    "--batch-size", "--ubatch-size", "-ngl", "--n-gpu-layers",
+    "--flash-attn", "--no-flash-attn", "-fa",
+    "--cache-type-k", "--cache-type-v", "--ctk", "--ctv",
+    "--kv-unified-per-slot", "--parallel",
+    "--mmproj", "--no-mmproj", "--embd-normalize", "--pooling",
+    "--lora", "--lora-scaled", "--reasoning-format", "--reasoning-budget",
+    "--spec-type", "--spec-draft-n-max", "--no-mmap", "--mlock",
+    "--threads", "-t", "--main-gpu", "--tensor-split",
+})
+
+
+def _strip_llama_only_flags(args: str) -> str:
+    """Drop llama.cpp-only flags (and their values) from a free-form layer.
+
+    Applied to the backend-agnostic render layers (``vllm args``, sidecar
+    ``cli_args``) — never to the builtin flag list, whose values (JSON
+    speculative configs, quoted templates) must round-trip untouched.
+    """
+    flags = utils._pair_flags(shlex.split(args))
+    return " ".join(
+        flag if not value else f"{flag} {shlex.quote(value)}"
+        for flag, value in flags.items()
+        if flag not in _LLAMA_ONLY_FLAGS)
 
 
 def _speculative_config(model: "Model") -> dict | None:
@@ -169,17 +201,25 @@ class VllmHostBackend(BaseBackend):
         cache_type: str = "q8_0",
         parallel: int = 1,
         map_path: Callable[[Path], str] | None = None,
+        batch: int | None = None,
     ) -> list[str]:
         flags = [
             "--model", self._model_ref(model),
             "--served-model-name", "${MODEL_ID}",
             "--host", "0.0.0.0", "--port", str(port),
             "--max-model-len", str(ctx_size),
-            # Aligned with llama-server's --parallel: same sidecar/profile
-            # key, same slot-count meaning on every backend.
-            "--max-num-seqs", str(parallel),
             "--gpu-memory-utilization", str(gpu_mem_util),
         ]
+        if parallel > 0:
+            # Aligned with llama-server's --parallel: same sidecar/profile
+            # key, same slot-count meaning on every backend.  parallel <= 0
+            # is uncapped: omit the admission limit entirely and let vLLM
+            # fill its paged KV pool elastically (it queues, never OOMs).
+            flags += ["--max-num-seqs", str(parallel)]
+        if batch:
+            # Chunked-prefill batch: tokens per scheduler step (the -b
+            # analog).  ubatch has no vLLM equivalent — handled internally.
+            flags += ["--max-num-batched-tokens", str(batch)]
         flags += _kv_cache_dtype_flags(cache_type)
         flags += self._ROLE_TASK.get(model.role, [])
         ct = model.resolved_chat_template
@@ -207,11 +247,13 @@ class VllmHostBackend(BaseBackend):
         gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
         vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
         flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util),
-                                  cache_type=cache_type, parallel=parallel)
+                                  cache_type=cache_type, parallel=parallel,
+                                  batch=batch)
         cmd = utils.render_command(
             [vllm_bin, "serve"], flags,
-            global_args=tvars.get("vllm_args") or "",
-            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
+            global_args=_strip_llama_only_flags(tvars.get("vllm_args") or ""),
+            cli_args=_strip_llama_only_flags(
+                (model.frontmatter.get("cli_args") or "").strip()),
         )
         return cmd, _spec_meta(model)
 
@@ -255,12 +297,14 @@ class VllmDockerBackend(VllmHostBackend):
         vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
         serve_flags = self._serve_flags(
             model, ctx_size, str(container_port), gpu_mem_util,
-            cache_type=cache_type, parallel=parallel, map_path=_map
+            cache_type=cache_type, parallel=parallel, map_path=_map,
+            batch=batch
         )
         serve = utils.render_command(
             [vllm_bin, "serve"], serve_flags,
-            global_args=tvars.get("vllm_args") or "",
-            cli_args=(model.frontmatter.get("cli_args") or "").strip(),
+            global_args=_strip_llama_only_flags(tvars.get("vllm_args") or ""),
+            cli_args=_strip_llama_only_flags(
+                (model.frontmatter.get("cli_args") or "").strip()),
         )
         bind = [
             f"-v {d}:{'/models' if i == 0 else f'/models{i + 1}'}"

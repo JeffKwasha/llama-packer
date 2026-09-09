@@ -236,3 +236,45 @@ def test_make_fast_storage_predicate(tmp_path):
     # multiple roots
     both = make_fast_storage_predicate([str(fast), str(slow)], exists=exists)
     assert both(str(ai / "hub" / "big-link.gguf"))
+
+
+# ── safetensors header estimate ──────────────────────────────────────────
+
+
+def _safetensors_file(tmp_path, dtype: str):
+    """Minimal safetensors file: one k_proj + one v_proj tensor header."""
+    import json
+    import struct
+
+    t = {"dtype": dtype, "shape": [512, 1024], "data_offsets": [0, 0]}
+    header = {
+        "model.layers.0.self_attn.k_proj.weight": t,
+        "model.layers.0.self_attn.v_proj.weight": dict(t),
+    }
+    header_bytes = json.dumps(header).encode()
+    p = tmp_path / "m.safetensors"
+    p.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\0" * 8)
+    return p
+
+
+def test_estimate_safetensors_fp8_dtype_names(tmp_path):
+    # FP8 checkpoints carry F8_E4M3 in the header (the safetensors spec
+    # spelling) — 1 B/elem, the same density as a Q8_0 GGUF.
+    from llama_packer.utils import estimate_safetensors
+
+    p = _safetensors_file(tmp_path, "F8_E4M3")
+    model_mib, kv_per_token = estimate_safetensors(str(p), "q8_0")
+    assert model_mib == 1  # 2 x 512x1024 @ 1 B = 1 MiB
+    assert kv_per_token == 2 * 512 * 1.0625 / (1024 * 1024)
+
+    p = _safetensors_file(tmp_path, "F8_E5M2")
+    model_mib, _ = estimate_safetensors(str(p), "q8_0")
+    assert model_mib == 1
+
+
+def test_estimate_safetensors_bf16_control(tmp_path):
+    from llama_packer.utils import estimate_safetensors
+
+    p = _safetensors_file(tmp_path, "BF16")
+    model_mib, _ = estimate_safetensors(str(p), "q8_0")
+    assert model_mib == 2  # 2 x 512x1024 @ 2 B = 2 MiB

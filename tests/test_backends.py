@@ -192,6 +192,32 @@ def test_vllm_parallel_maps_to_max_num_seqs(make_model):
     assert "--max-num-seqs 4" in docker_cmd
 
 
+def test_vllm_uncapped_omits_max_num_seqs(make_model):
+    # parallel 0 = uncapped: vLLM owns admission (elastic queueing), so the
+    # cap flag is omitted entirely.
+    m = make_model("v", hf_repo="org/model", parallel=0)
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 0, "q8_0", _tvars())
+    assert "--max-num-seqs" not in cmd
+    assert "--max-model-len 65536" in cmd
+
+
+def test_vllm_batch_flag_and_llama_only_strip(make_model):
+    # --max-num-batched-tokens renders from the batch key; llama.cpp-only
+    # flags leaking via sidecar cli_args are stripped with their values.
+    m = make_model("v", hf_repo="org/model",
+                   cli_args="--flash-attn on -b 2048 -ub 512 "
+                            "--reasoning-format deepseek")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 4, "q8_0", _tvars(),
+                                         batch=2048)
+    assert "--max-num-batched-tokens 2048" in cmd
+    assert "--max-num-seqs 4" in cmd
+    toks = cmd.split()
+    for gone in ("--flash-attn", "-b", "-ub", "--reasoning-format"):
+        assert gone not in toks
+    assert "deepseek" not in cmd
+    assert " 512" not in cmd
+
+
 def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
                                                           monkeypatch):
     from llama_packer import writer
