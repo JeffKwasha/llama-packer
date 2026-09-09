@@ -334,9 +334,12 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
 def _health_check_timeout(models, args) -> int:
     """Auto-calculated healthCheckTimeout when not set explicitly.
 
-    max(120, 1.2 * largest_model_mb / drive_speed_mb), raised to a 300s floor
-    when any model uses a vLLM backend (docker pull / HF download / model load
-    exceed the llama.cpp load path by minutes).
+    max(120, 1.2 * largest_model_mb / drive_speed_mb).  vLLM models get their
+    own floor at model_size_mb / 100 — a conservative 100 MB/s load-rate
+    assumption (docker pull, HF hub resolution and weight load exceed the
+    llama.cpp load path by minutes; a ~60 GB NVFP4 model loads in ~10 min on
+    DGX Spark).  Repo-only vLLM models (no measurable local file) keep the
+    300 s floor.
     """
     largest_mb = max(
         (m.gguf_path.stat().st_size // (1024 * 1024)
@@ -357,13 +360,21 @@ def _health_check_timeout(models, args) -> int:
         model_paths = [m.gguf_path for m in models if m.gguf_path and m.gguf_path.is_file()]
         drive_speed = _detect_drive_speed(model_paths)
     hct = max(120, int(1.2 * largest_mb / drive_speed))
+    # vLLM floor: assumed 100 MB/s load rate on the largest measurable model.
+    vllm_size_mb = max(
+        (m.gguf_path.stat().st_size // (1024 * 1024)
+         for m in models
+         if m.backend in VLLM_BACKENDS and m.gguf_path and m.gguf_path.is_file()),
+        default=0,
+    )
     if any(m.backend in VLLM_BACKENDS for m in models):
-        hct = max(hct, 300)
+        hct = max(hct, 300, vllm_size_mb // 100)
     # sd-server models also need generous timeout (diffusion weights load minutes)
     if any(m.backend in SD_BACKENDS for m in models):
         hct = max(hct, 300)
-    logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s)",
-                hct, largest_mb, drive_speed)
+    logger.info("healthCheckTimeout: %ds (largest=%dMB, drive=%dMB/s%s)",
+                hct, largest_mb, drive_speed,
+                f", vllm-largest={vllm_size_mb}MB" if vllm_size_mb else "")
     return hct
 
 
@@ -644,6 +655,12 @@ def main(argv: list[str] | None = None) -> None:
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
+    # Host HF hub root bind-mounted into vllm-docker containers
+    # (/root/.cache/huggingface).  HF_HUB_OFFLINE forbids downloads, so this
+    # must cover every repo-id model served via docker.  Falls back to the
+    # top-level `hf_home:`.
+    template_vars["hf_cache"] = str(vllm_cfg.get("hf_cache")
+                                    or profiles_cfg.get("hf_home") or "")
     template_vars["vllm_args"] = backend_args(vllm_cfg, "vllm")
     template_vars["sd_args"] = backend_args(sd_cfg, "sd")
     template_vars["whisper_args"] = backend_args(whisper_cfg, "whisper")

@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# In-container HF cache root (the images' default HOME cache).  The profiles
+# ``vllm.hf_cache`` host dir is bind-mounted here; HF_HUB_OFFLINE keeps every
+# lookup inside that mounted hub — llama-packer never downloads.
+_CONTAINER_HF_HOME = "/root/.cache/huggingface"
+
 # Our cache_type values that map onto vLLM's --kv-cache-dtype. vLLM supports
 # only auto (f16/bf16/f32) and fp8 KV caches; our q8_* precisions are ~8-bit
 # and map to "fp8" (e4m3). Sub-byte block quants have no vLLM equivalent.
@@ -90,6 +95,56 @@ def _strip_llama_only_flags(args: str) -> str:
         if flag not in _LLAMA_ONLY_FLAGS)
 
 
+# The ``mamba:`` recipe mapping (one sub-key → one flag; absent sub-keys emit
+# nothing).  Experimental vLLM flags: validate names/values against the served
+# image's `vllm serve --help` before relying on them — rename/remap here only.
+_MAMBA_FLAG_MAP: dict[str, tuple[str, type]] = {
+    "backend": ("--mamba-backend", str),
+    "ssm_cache_dtype": ("--mamba-ssm-cache-dtype", str),
+    "philox_rounds": ("--mamba-cache-philox-rounds", int),
+    "cache_mode": ("--mamba-cache-mode", str),
+    "stochastic_rounding": ("--enable-mamba-cache-stochastic-rounding", bool),
+}
+
+
+def _mamba_flags(model: "Model") -> list[str]:
+    """Render the ``mamba:`` recipe (hybrid/Mamba models) into vLLM flags."""
+    raw = model.frontmatter.get("mamba")
+    if raw is None or raw is False or raw == "":
+        return []
+    if not isinstance(raw, dict):
+        logger.warning("vllm: %s: mamba: must be a mapping of sub-keys "
+                       "(backend:, ssm_cache_dtype:, stochastic_rounding:, "
+                       "philox_rounds:, cache_mode:); got %r — ignoring",
+                       model.stem, raw)
+        return []
+    m = raw
+    flags: list[str] = []
+    for key, (flag, cast) in _MAMBA_FLAG_MAP.items():
+        v = m.get(key)
+        if v is None or v is False:
+            continue
+        if cast is bool:
+            if v is True:
+                flags.append(flag)
+            else:
+                logger.warning("vllm: %s: mamba.%s=%r is not boolean (ignored)",
+                               model.stem, key, v)
+        elif cast is int:
+            try:
+                flags += [flag, str(int(v))]
+            except (TypeError, ValueError):
+                logger.warning("vllm: %s: mamba.%s=%r is not an int (ignored)",
+                               model.stem, key, v)
+        else:
+            flags += [flag, str(v)]
+    for k in m:
+        if k not in _MAMBA_FLAG_MAP:
+            logger.warning("vllm: %s: unknown mamba sub-key %r (known: %s)",
+                           model.stem, k, ", ".join(sorted(_MAMBA_FLAG_MAP)))
+    return flags
+
+
 def _speculative_config(model: "Model") -> dict | None:
     """The ``--speculative-config`` JSON dict for *model*, or None.
 
@@ -134,17 +189,29 @@ def _spec_meta(model: "Model") -> dict:
     return meta
 
 
-def _map_paths_into(paths: list[Path], models_dirs) -> tuple[list[str], list[str]]:
+def _map_paths_into(paths: list[Path], models_dirs,
+                    hf_cache: str | None = None) -> tuple[list[str], list[str]]:
     """Map host paths for use inside the vLLM container.
 
-    Paths under any of ``models_dirs`` are rewritten under that dir's container
-    target (``/models``, ``/models2``, ...).  Other paths each get a dedicated
-    read-only bind mount (``-v <parent>:/extN``) and an ``/extN/<name>`` ref.
+    Resolution order per path (``Path.resolve()`` first, so symlinked layouts
+    map by their *real* location — an HF snapshot symlinked under ``~/models``
+    maps into the HF cache branch):
 
-    Returns ``(container_refs, docker_mount_flags)``.
+    1. under ``hf_cache`` (host HF hub root) → ``/root/.cache/huggingface/<rel>``;
+       the whole root is bind-mounted separately, so HF snapshot blob symlinks
+       (``file → ../../blobs/<hash>``) resolve
+    2. under any of ``models_dirs`` → that dir's container target (``/models``,
+       ``/models2``, ...)
+    3. else → dedicated read-only parent bind (``-v <parent>:/extN``) and an
+       ``/extN/<name>`` ref
+
+    Returns ``(container_refs, docker_mount_flags)``.  The hf_cache *mount* is
+    not part of the returned mounts — emit ``-v <hf_cache>:/root/.cache/huggingface``
+    once in build_cmd when hf_cache is configured.
     """
     if isinstance(models_dirs, (str, Path)):
         models_dirs = [str(models_dirs)]
+    hf_root = Path(hf_cache).resolve() if hf_cache else None
     roots = [
         (Path(d).resolve(), "/models" if i == 0 else f"/models{i + 1}")
         for i, d in enumerate(models_dirs) if d
@@ -155,14 +222,23 @@ def _map_paths_into(paths: list[Path], models_dirs) -> tuple[list[str], list[str
     for p in sorted(paths, key=str):
         rp = p.resolve()
         mapped = False
-        for root, target in roots:
+        if hf_root is not None:
             try:
-                rel = rp.relative_to(root)
+                rel = rp.relative_to(hf_root)
             except ValueError:
-                continue
-            refs.append(f"{target}/{rel}")
-            mapped = True
-            break
+                pass
+            else:
+                refs.append(f"{_CONTAINER_HF_HOME}/{rel}")
+                mapped = True
+        if not mapped:
+            for root, target in roots:
+                try:
+                    rel = rp.relative_to(root)
+                except ValueError:
+                    continue
+                refs.append(f"{target}/{rel}")
+                mapped = True
+                break
         if mapped:
             continue
         parent = rp.parent
@@ -178,7 +254,11 @@ class VllmHostBackend(BaseBackend):
     name = "vllm"
     formats = frozenset({".safetensors", "hf_repo"})
     roles = frozenset({"chat", "embeddings", "rerank"})
-    handles = frozenset({"cli_args", "chat_template", "hf_repo"})
+    handles = frozenset({
+        "cli_args", "chat_template", "hf_repo",
+        "vllm_quantization", "moe_backend", "mamba",
+        "tool_call_parser", "reasoning_parser",
+    })
 
     def is_available(self, avail: dict) -> bool:
         return bool(avail.get("vllm_bin"))
@@ -202,9 +282,11 @@ class VllmHostBackend(BaseBackend):
         parallel: int = 1,
         map_path: Callable[[Path], str] | None = None,
         batch: int | None = None,
+        model_ref: str | None = None,
+        spec_override: dict | None = None,
     ) -> list[str]:
         flags = [
-            "--model", self._model_ref(model),
+            "--model", model_ref or self._model_ref(model),
             "--served-model-name", "${MODEL_ID}",
             "--host", "0.0.0.0", "--port", str(port),
             "--max-model-len", str(ctx_size),
@@ -220,6 +302,15 @@ class VllmHostBackend(BaseBackend):
             # Chunked-prefill batch: tokens per scheduler step (the -b
             # analog).  ubatch has no vLLM equivalent — handled internally.
             flags += ["--max-num-batched-tokens", str(batch)]
+        # Model-config recipe keys: emitted only when declared (opt-in,
+        # verbatim — vLLM auto-detects most of this from the checkpoint).
+        vq = model.vllm_quantization
+        if vq:
+            flags += ["--quantization", vq]
+        mb = model.moe_backend
+        if mb:
+            flags += ["--moe-backend", mb]
+        flags += _mamba_flags(model)
         flags += _kv_cache_dtype_flags(cache_type)
         flags += self._ROLE_TASK.get(model.role, [])
         ct = model.resolved_chat_template
@@ -227,10 +318,21 @@ class VllmHostBackend(BaseBackend):
             ref = map_path(ct) if map_path else str(ct)
             flags += ["--chat-template", ref]
         if model.role == "chat":
-            # Speculative decoding is a generation-only feature.
-            spec = _speculative_config(model)
+            # Speculative decoding is a generation-only feature.  Docker passes
+            # its rewritten copy (container refs); host derives from frontmatter.
+            spec = spec_override if spec_override is not None \
+                else _speculative_config(model)
             if spec:
                 flags += ["--speculative-config", json.dumps(spec, separators=(",", ":"))]
+            # Generation features: tool calling and reasoning traces are
+            # parsed per model recipe.  Distinct from llama.cpp's
+            # --reasoning-format (Model.reasoning_format).
+            tcp = model.tool_call_parser
+            if tcp:
+                flags += ["--enable-auto-tool-choice", "--tool-call-parser", tcp]
+            rp = model.reasoning_parser
+            if rp:
+                flags += ["--reasoning-parser", rp]
         return flags
 
     def build_cmd(
@@ -260,6 +362,12 @@ class VllmHostBackend(BaseBackend):
 
 class VllmDockerBackend(VllmHostBackend):
     name = "vllm-docker"
+    # Container lifecycle (see BaseBackend): llama-swap stops the container
+    # itself on swap/unload — without cmdStop it can only kill the docker run
+    # client, leaving the container running with its VRAM held.  unloadTimeout
+    # must exceed the stop grace (docker stop is slow).
+    stop_cmd = "docker stop ${MODEL_ID}"
+    unload_timeout = 30
 
     def is_available(self, avail: dict) -> bool:
         return bool(avail.get("vllm_image"))
@@ -282,23 +390,62 @@ class VllmDockerBackend(VllmHostBackend):
         image = model.vllm_image or tvars.get("vllm_image", VLLM_DEFAULT_IMAGE)
         models_dirs = tvars.get("models_dirs") or [tvars.get("models_dir", "")]
         models_dirs = [d for d in models_dirs if d]
+        hf_cache = str(tvars.get("hf_cache") or "")
 
+        # Every path-shaped value inside cmd must be a container path.  Model
+        # refs that are repo ids stay verbatim (resolved offline through the
+        # mounted hub); the local file is mapped only when it IS the ref (a
+        # repo id makes the local file irrelevant — mapping it would add a
+        # pointless bind).
+        model_ref = model.hf_repo or None
+        if model_ref is None and model.gguf_path is not None:
+            model_ref = str(model.gguf_path)
+        spec = _speculative_config(model) if model.role == "chat" else None
+        if spec is not None:
+            spec = dict(spec)  # rewrite our copy — never mutate the frontmatter
         extra_paths: list[Path] = []
         ct = model.resolved_chat_template
         if ct is not None:
             extra_paths.append(ct)
+        if model.hf_repo is None and model.gguf_path is not None:
+            extra_paths.append(model.gguf_path)
+        spec_path_keys: list[str] = []
+        if spec:
+            for key in ("model", "draft_model"):
+                v = spec.get(key)
+                if isinstance(v, str) and v and Path(v).is_absolute() and Path(v).exists():
+                    extra_paths.append(Path(v))
+                    spec_path_keys.append(key)
 
-        refs, mounts = _map_paths_into(extra_paths, models_dirs)
-        container_ct_ref = refs[0] if (ct is not None and refs) else None
+        refs, ext_mounts = _map_paths_into(extra_paths, models_dirs, hf_cache or None)
+
+        def ref_for(path: Path) -> str:
+            """Container ref of the Nth mapped path (paths are sorted by str)."""
+            for p, ref in zip(sorted(extra_paths, key=str), refs):
+                if p == path:
+                    return ref
+            return str(path)
+
+        container_model_ref = None
+        if model_ref is not None:
+            container_model_ref = ref_for(Path(model_ref))
+        if model.hf_repo and not hf_cache:
+            logger.warning("vllm-docker: %s: hf_cache is not configured and the "
+                           "model ref is a repo id — with HF_HUB_OFFLINE=1 the "
+                           "entry cannot resolve (set profiles.yaml vllm.hf_cache)",
+                           model.stem)
+        if spec:
+            for key in spec_path_keys:
+                spec[key] = ref_for(Path(spec[key]))
 
         def _map(p: Path) -> str:
-            return container_ct_ref if (ct is not None and p == ct) else str(p)
+            return ref_for(p)
 
         vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
         serve_flags = self._serve_flags(
             model, ctx_size, str(container_port), gpu_mem_util,
             cache_type=cache_type, parallel=parallel, map_path=_map,
-            batch=batch
+            batch=batch, model_ref=container_model_ref, spec_override=spec,
         )
         serve = utils.render_command(
             [vllm_bin, "serve"], serve_flags,
@@ -315,7 +462,12 @@ class VllmDockerBackend(VllmHostBackend):
             docker_args,
             "--name ${MODEL_ID}",
             *bind,
-            *mounts,
+            # Shared HF hub: repo-id refs resolve from the mounted cache and
+            # HF_HUB_OFFLINE forbids downloads (llama-packer never fetches).
+            *( [f"-v {hf_cache}:{_CONTAINER_HF_HOME}"] if hf_cache else [] ),
+            f"-e HF_HOME={_CONTAINER_HF_HOME}",
+            "-e HF_HUB_OFFLINE=1",
+            *ext_mounts,
             f"-p ${{PORT}}:{container_port}",
             image,
         ]

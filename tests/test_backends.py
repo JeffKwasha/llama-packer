@@ -32,6 +32,7 @@ def _tvars():
         "container_port": 8000,
         "docker_args": "--runtime=nvidia --gpus all --shm-size=16g",
         "models_dir": "/models",
+        "hf_cache": "",
     }
 
 
@@ -698,6 +699,204 @@ def test_unsupported_reason_accepts_vllm_rerank(make_model):
     m.gguf_path = None
     m.frontmatter["hf_url"] = "https://huggingface.co/org/R3-rerank"
     assert infer_backend(m, {"vllm_image": "img"}) == "vllm-docker"
+
+
+# ── vLLM recipe keys (C1-C5) ─────────────────────────────────────────────
+
+def _safetensors_model(tmp_path, stem="st", **fm):
+    """A vLLM Model whose local file is a real .safetensors under tmp_path."""
+    from llama_packer.model import Model
+    f = tmp_path / f"{stem}.safetensors"
+    f.write_bytes(b"w")
+    model = Model(tmp_path / f"{stem}.md", {"name": stem, **fm})
+    model.gguf_path = f
+    return model
+
+
+def test_vllm_quantization_flag(make_model):
+    m = make_model("v", hf_repo="org/model", vllm_quantization="modelopt_mixed")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--quantization modelopt_mixed" in cmd
+    dcmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--quantization modelopt_mixed" in dcmd
+    # Absent -> not emitted: vLLM auto-detects from the checkpoint config.
+    m2 = make_model("v2", hf_repo="org/model")
+    cmd2, _ = VllmHostBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    assert "--quantization" not in cmd2
+
+
+def test_vllm_moe_backend_flag(make_model):
+    m = make_model("v", hf_repo="org/moe", moe_backend="marlin")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--moe-backend marlin" in cmd
+    m2 = make_model("v2", hf_repo="org/dense")
+    cmd2, _ = VllmHostBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    assert "--moe-backend" not in cmd2
+
+
+def test_vllm_mamba_flags(make_model, caplog):
+    full = {
+        "backend": "flashinfer",
+        "ssm_cache_dtype": "float16",
+        "stochastic_rounding": True,
+        "philox_rounds": 5,
+        "cache_mode": "align",
+    }
+    m = make_model("v", hf_repo="org/hybrid", mamba=full)
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    for flag in ("--mamba-backend flashinfer",
+                 "--mamba-ssm-cache-dtype float16",
+                 "--enable-mamba-cache-stochastic-rounding",
+                 "--mamba-cache-philox-rounds 5",
+                 "--mamba-cache-mode align"):
+        assert flag in cmd, flag
+    # Partial mapping -> only the set sub-keys emit.
+    m2 = make_model("v2", hf_repo="org/hybrid2", mamba={"backend": "triton"})
+    cmd2, _ = VllmHostBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    assert "--mamba-backend triton" in cmd2
+    assert "--mamba-ssm-cache-dtype" not in cmd2
+    # A bare boolean is malformed: warn + no flags.
+    m3 = make_model("v3", hf_repo="org/hybrid3", mamba=True)
+    with caplog.at_level(logging.WARNING):
+        cmd3, _ = VllmHostBackend().build_cmd(m3, 65536, 1, "q8_0", _tvars())
+    assert "--mamba" not in cmd3
+    assert any("must be a mapping" in r.message for r in caplog.records)
+    # Unknown sub-keys are warned, not silently dropped.
+    m4 = make_model("v4", hf_repo="org/hybrid4",
+                    mamba={"backend": "auto", "bakend": "oops"})
+    with caplog.at_level(logging.WARNING):
+        cmd4, _ = VllmHostBackend().build_cmd(m4, 65536, 1, "q8_0", _tvars())
+    assert "--mamba-backend auto" in cmd4
+    assert any("unknown mamba sub-key" in r.message for r in caplog.records)
+
+
+def test_vllm_tool_call_parser(make_model):
+    m = make_model("v", hf_repo="org/chat", tool_call_parser="qwen3_coder")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--enable-auto-tool-choice" in cmd
+    assert "--tool-call-parser qwen3_coder" in cmd
+    # Non-chat roles get no parser flags (generation-only feature).
+    e = make_model("e", hf_repo="org/embedder", role="embeddings",
+                   tool_call_parser="qwen3_coder")
+    ecmd, _ = VllmHostBackend().build_cmd(e, 8192, 1, "q8_0", _tvars())
+    assert "--tool-call-parser" not in ecmd
+
+
+def test_vllm_reasoning_parser(make_model):
+    # Distinct from llama.cpp's --reasoning-format (which _strip_llama_only_flags
+    # removes from vllm args): --reasoning-parser is a different string and stays.
+    m = make_model("v", hf_repo="org/chat", reasoning_parser="nemotron_v3")
+    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert "--reasoning-parser nemotron_v3" in cmd
+    assert "--reasoning-format" not in cmd
+    r = make_model("r", hf_repo="org/reranker", role="rerank",
+                   reasoning_parser="nemotron_v3")
+    rcmd, _ = VllmHostBackend().build_cmd(r, 8192, 1, "q8_0", _tvars())
+    assert "--reasoning-parser" not in rcmd
+
+
+# ── vLLM docker path mapping + mounts (C6) ───────────────────────────────
+
+def _hf_snapshot(tmp_path, repo_dir="models--org--draft", snap="d1"):
+    """Fake HF hub layout; returns (hf_root, snapshot_dir)."""
+    hf = tmp_path / "hf"
+    d = hf / "hub" / repo_dir / "snapshots" / snap
+    d.mkdir(parents=True)
+    (d / "draft.safetensors").write_bytes(b"x")
+    return hf, d
+
+
+def test_vllm_spec_draft_local_path_docker(make_model, tmp_path):
+    hf, snap = _hf_snapshot(tmp_path)
+    m = make_model("v", hf_repo="org/model",
+                   speculative_config={"method": "draft_model",
+                                       "model": str(snap),
+                                       "num_speculative_tokens": 3})
+    tv = {**_tvars(), "hf_cache": str(hf)}
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert f"-v {hf}:/root/.cache/huggingface" in cmd
+    ref = "/root/.cache/huggingface/hub/models--org--draft/snapshots/d1"
+    assert ref in cmd
+    import json as _json
+    # JSON is the trailing token of this cmd (no tool/reasoning parser set).
+    spec = _json.loads(cmd.split("--speculative-config ", 1)[1].strip())
+    assert spec.get("model") == ref
+    # Host backend keeps the raw host path.
+    hcmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert str(snap) in hcmd
+    assert "/root/.cache/huggingface" not in hcmd
+
+
+def test_vllm_spec_draft_models_dir_docker(make_model, tmp_path):
+    (tmp_path / "draft.safetensors").write_bytes(b"x")
+    m = make_model("v", hf_repo="org/model",
+                   speculative_config={"method": "draft_model",
+                                       "model": str(tmp_path / "draft.safetensors"),
+                                       "num_speculative_tokens": 3})
+    tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    # Under a models_dir the ref rides the existing /models bind — no extra mount.
+    assert '"model":"/models/draft.safetensors"' in cmd
+    assert "-v" in cmd  # the models_dir bind itself
+
+
+def test_vllm_spec_draft_elsewhere_docker(make_model, tmp_path):
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "draft.safetensors").write_bytes(b"x")
+    m = make_model("v", hf_repo="org/model",
+                   speculative_config={"method": "draft_model",
+                                       "model": str(other / "draft.safetensors")})
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert f"-v {other}:/ext0" in cmd
+    assert '"model":"/ext0/draft.safetensors"' in cmd
+
+
+def test_vllm_docker_model_ref_mapped(make_model, tmp_path):
+    # Local safetensors refs are container-path rewritten (the old host-path leak).
+    m = _safetensors_model(tmp_path)
+    tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert "--model /models/st.safetensors" in cmd
+    # Under the HF cache root -> /root/.cache/huggingface/<rel>.
+    hf, snap = _hf_snapshot(tmp_path)
+    m2 = _safetensors_model(tmp_path, stem="st2")
+    m2.gguf_path = snap / "draft.safetensors"
+    tv2 = {**_tvars(), "hf_cache": str(hf)}
+    cmd2, _ = VllmDockerBackend().build_cmd(m2, 65536, 1, "q8_0", tv2)
+    assert "--model /root/.cache/huggingface/hub/models--org--draft/snapshots/d1/draft.safetensors" in cmd2
+    # Host backend keeps the raw host path.
+    hcmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    assert f"--model {tmp_path / 'st.safetensors'}" in hcmd
+
+
+def test_vllm_docker_hf_mount_offline(make_model, caplog):
+    tv = {**_tvars(), "hf_cache": "/nas/hf"}
+    m = make_model("v", hf_repo="org/model")
+    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert "-v /nas/hf:/root/.cache/huggingface" in cmd
+    assert "-e HF_HOME=/root/.cache/huggingface" in cmd
+    assert "-e HF_HUB_OFFLINE=1" in cmd
+    # Empty hf_cache + repo-id ref -> no hub mount (the offline env vars stay
+    # — env is unconditional; the models_dir bind is unrelated); the pack-time
+    # warning names the fix.  The hub mount's source is exactly the configured
+    # hf_cache path, so its absence is the assertion.
+    m2 = make_model("v2", hf_repo="org/model")
+    with caplog.at_level(logging.WARNING):
+        cmd2, _ = VllmDockerBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    assert "-v /nas/hf:" not in cmd2
+    assert any("hf_cache is not configured" in r.message for r in caplog.records)
+
+
+def test_vllm_docker_local_file_no_hf_warning(make_model, tmp_path, caplog):
+    # A local-file model needs no hub; empty hf_cache must not warn.
+    m = _safetensors_model(tmp_path)
+    tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
+    with caplog.at_level(logging.WARNING):
+        cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    assert not any("hf_cache is not configured" in r.message
+                   for r in caplog.records)
+    assert "--model /models/st.safetensors" in cmd
 
 
 # ── whisper-server backend ────────────────────────────────────────────────

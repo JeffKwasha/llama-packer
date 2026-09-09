@@ -468,6 +468,18 @@ def _build_entry(
         entry["proxy"] = "http://127.0.0.1:${PORT}"
         entry["checkEndpoint"] = "/"
 
+    # Container lifecycle (llama-swap docker orchestration): cmdStop stops the
+    # container itself — without it a swap/unload kills only the `docker run`
+    # client process, leaving the container running with its VRAM held
+    # (llama-swap kb guides/model-runtime/ttl-and-unloading.md).  unloadTimeout
+    # must exceed the stop grace (docker stop is slow).  Container backends are
+    # also the documented case for the explicit proxy field ("the single most
+    # common configuration error" — kb guides/model-runtime/writing-cmd.md).
+    if backend.stop_cmd is not None:
+        entry["cmdStop"] = backend.stop_cmd
+        entry["unloadTimeout"] = backend.unload_timeout
+        entry["proxy"] = "http://127.0.0.1:${PORT}"
+
     return entry_id, entry
 
 

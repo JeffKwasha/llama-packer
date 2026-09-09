@@ -71,7 +71,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
 | `matrix` | Shared embed/rerank/chat VRAM budget solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
-| `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` | [vLLM Backend](#vllm-backend) |
+| `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
 | `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
@@ -418,6 +418,11 @@ error and the setting is ignored. An unknown `reasoning-format` value is
 likewise logged and dropped. (A `reasoning` capability in the sidecar is a
 descriptive signal; it never errors.)
 
+vLLM models use a different key for the same job: `reasoning_parser` →
+`--reasoning-parser` (e.g. `nemotron_v3`). The two keys are unrelated —
+different server, different flag — and llama.cpp's `--reasoning-format` is
+stripped from vLLM commands (see [vLLM Backend](#vllm-backend)).
+
 ### Per-request control (client side)
 
 Reasoning **effort** (`enable_thinking`, `reasoning_effort`,
@@ -555,6 +560,40 @@ overrides:
 - A model with only `hf_repo`/`hf_url` (no local file) is valid: `gguf_path` is optional for
   vLLM backends.
 
+### Model recipe keys (opt-in, verbatim)
+
+Every key is a serving choice: settable per-sidecar or by override rule, emitted only when
+declared (absent = vLLM auto-detects from the checkpoint — do not set a default). Precedence
+is the usual sidecar > override rule > fleet default.
+
+| Key | Flag(s) | Notes |
+|-----|---------|-------|
+| `vllm_quantization` | `--quantization <v>` | weight-quant *method* (e.g. `modelopt_mixed`). **Not** the metadata `quantization` field (bits-per-weight) — the separate key exists exactly to avoid that collision |
+| `moe_backend` | `--moe-backend <v>` | e.g. `marlin`, `cutlass`, `triton` |
+| `mamba` | five flags, one per sub-key | hybrid/Mamba models (see below) |
+| `tool_call_parser` | `--enable-auto-tool-choice --tool-call-parser <v>` | chat role only; orthogonal to the `tools` capability / matrix demotion (declare `capabilities: [tools]` in the sidecar to advertise it) |
+| `reasoning_parser` | `--reasoning-parser <v>` | chat role only; e.g. `nemotron_v3`, `deepseek_r1` |
+
+The `mamba:` mapping — each present sub-key emits exactly one flag:
+
+```yaml
+mamba:
+  backend: flashinfer            # -> --mamba-backend flashinfer
+  ssm_cache_dtype: float16       # -> --mamba-ssm-cache-dtype float16
+  stochastic_rounding: true      # -> --enable-mamba-cache-stochastic-rounding
+  philox_rounds: 5               # -> --mamba-cache-philox-rounds 5
+  cache_mode: align              # -> --mamba-cache-mode align
+```
+
+These are experimental, vLLM-version-specific flags — validate names/values against the
+served image's `vllm serve --help` (the sub-key→flag map lives in one place,
+`backends/vllm.py:_MAMBA_FLAG_MAP`).
+
+`reasoning_parser` is **not** llama.cpp's `reasoning-format` (`Model.reasoning_format`,
+emitted as `--reasoning-format`): different server, different flag, different values. The
+llama.cpp `--reasoning-format`/`--reasoning-budget` are stripped from vLLM commands; the
+`--reasoning-parser` string is unaffected.
+
 ### Memory estimation
 
 vLLM has no `llama-fit-params` analog, so VRAM params are sourced differently but flow
@@ -591,7 +630,54 @@ The binary (`vllm`) is resolved, highest to lowest:
 2. `vllm.bin` in `profiles.yaml`
 3. Built-in default (`vllm` on PATH)
 
-`profiles.yaml` `vllm:` also configures `docker_args` and `container_port` (`vllm-docker`).
+`profiles.yaml` `vllm:` also configures `docker_args`, `container_port` and `hf_cache`
+(`vllm-docker`).
+
+### Container (vllm-docker)
+
+llama-swap has no native container abstraction: a dockerized backend is a normal entry
+whose `cmd:` is `docker run --name ${MODEL_ID} … <image> <vllm serve flags>` — server
+flags are argv after the image, container env is `-e` inside `cmd` (an entry's `env:` list
+reaches only the docker client process). Two upstream-documented lifecycle fields are
+emitted with every vllm-docker entry:
+
+- `cmdStop: docker stop ${MODEL_ID}` — an unload (swap, manual, or TTL) stops the
+  *container*; without it llama-swap can only kill the `docker run` client, leaving the
+  container running with its VRAM held.
+- `unloadTimeout: 30` — must exceed the stop grace ("docker stop is slow").
+- `proxy: http://127.0.0.1:${PORT}` — upstream's container guidance ("the single most
+  common configuration error"). `checkEndpoint` keeps llama-swap's default `/health`
+  (correct for vLLM).
+
+References: llama-swap kb `guides/model-runtime/ttl-and-unloading.md` and
+`guides/model-runtime/writing-cmd.md`.
+
+**Mounts and path mapping.** Every path-shaped value inside `cmd` is rewritten to a valid
+in-container path. Model refs that are repo ids stay verbatim (resolved offline through
+the mounted hub); local files resolve in this order (after `Path.resolve()`, so symlinked
+layouts map by real location):
+
+1. Under `vllm.hf_cache` (host HF hub root; falls back to top-level `hf_home:`) →
+   `/root/.cache/huggingface/<rel>` — the whole root is bind-mounted, so HF snapshot blob
+   symlinks resolve. Applies to the model ref, `speculative_config` path values (`model`,
+   `draft_model`), and the chat template.
+2. Under any `models_dir` (e.g. `~/models`) → `/models`, `/models2`, … (already bound).
+3. Else → read-only parent bind (`-v <parent>:/extN`) and an `/extN/<name>` ref.
+
+Every vllm-docker entry also gets `-e HF_HOME=/root/.cache/huggingface` and
+`-e HF_HUB_OFFLINE=1`: **llama-packer never downloads**. A repo-id model that is not
+pre-staged in the mounted hub fails fast at startup — that is the cache-miss case, not a
+bug; llama-packer warns at pack time when `hf_cache` is unset for a repo-id model.
+
+`docker_args` (default `--runtime=nvidia --gpus all --shm-size=16g`) is the operator's
+flexibility point for container-runtime specifics: GPU device selection
+(`--gpus device=N` / `-e CUDA_VISIBLE_DEVICES=N`), `--ipc=host` vs `--shm-size`, and
+extra read-only binds (e.g. vLLM/flashinfer/triton JIT caches — without them every start
+pays compile cost, since container caches are ephemeral).
+
+The `healthCheckTimeout` budget assumes vLLM loads at 100 MB/s
+(`healthCheckTimeout >= largest_vllm_model_mb / 100`; 300 s floor for repo-only models) —
+a ~60 GB NVFP4 model gets ≥ 600 s.
 
 ### Limitations
 
@@ -602,6 +688,10 @@ The binary (`vllm`) is resolved, highest to lowest:
   loaded by vLLM (see [Speculative decoding under vLLM](#speculative-decoding-under-vllm)).
 - Runs one vLLM server per model per image/binary; multi-image or cluster/tensor-parallel
   provisioning is future work.
+- `HF_HUB_OFFLINE=1` forbids downloads in docker mode: models must be pre-staged in the
+  `hf_cache` hub (or served by local path under `models_dirs`).
+- vLLM recipe flags (`mamba:`, MoE/quant/parsers) are experimental and version-specific;
+  validate against the served image before relying on them.
 
 ## Image Backend (sd-server)
 
@@ -1327,6 +1417,11 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 | `hf_url` | str | HuggingFace model URL |
 | `hf_repo` | str | HF repo id for vLLM backends. Optional; parsed from `hf_url` when absent |
 | `vllm_image` | str | Per-model vLLM docker image. Overrides profiles.yaml `vllm.image` and `--vllm-image` for this entry |
+| `vllm_quantization` | str | vLLM `--quantization` method (e.g. `modelopt_mixed`). Not the metadata `quantization` field; absent = vLLM auto-detects. See [vLLM Backend](#vllm-backend) |
+| `moe_backend` | str | vLLM `--moe-backend` (e.g. `marlin`) |
+| `mamba` | dict | Hybrid/Mamba recipe → `--mamba-backend`, `--mamba-ssm-cache-dtype`, `--enable-mamba-cache-stochastic-rounding`, `--mamba-cache-philox-rounds`, `--mamba-cache-mode` (one flag per sub-key; absent sub-keys emit nothing) |
+| `tool_call_parser` | str | vLLM `--enable-auto-tool-choice --tool-call-parser <v>` (chat role); pair with `capabilities: [tools]` |
+| `reasoning_parser` | str | vLLM `--reasoning-parser <v>` (chat role). Distinct from llama.cpp's `reasoning-format` |
 
 ### Derived fields (computed, not authored)
 

@@ -1,6 +1,8 @@
 ## Documentation References
 - [llama-swap configuration docs](https://raw.githubusercontent.com/mostlygeek/llama-swap/refs/heads/main/docs/configuration.md)
 - [config.example.yaml](https://github.com/mostlygeek/llama-swap/blob/main/config.example.yaml) — includes a dockerized vLLM entry and matrix `evict_costs` for the vLLM backend
+- [TTL/unloading + docker cmdStop](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/model-runtime/ttl-and-unloading.md) — why emitted vllm-docker entries carry `cmdStop: docker stop ${MODEL_ID}` + `unloadTimeout: 30`
+- [Writing the `cmd`](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/model-runtime/writing-cmd.md) — macros (`${PORT}`/`${MODEL_ID}`), container `proxy:` guidance, `checkEndpoint` default `/health`
 - [SPEC.md](SPEC.md) — model metadata schema (capabilities, freethought, strengths/weaknesses, throughput), the llama-swap metadata channel, and the vLLM backend (`backend: vllm` / `backend: vllm-docker` via override rules)
 - [gguf_model_analysis.md](gguf_model_analysis.md)
 - [plans/vllm-gb10.md](plans/vllm-gb10.md) — vLLM / DGX Spark design and progress

@@ -144,6 +144,8 @@ Run `llama-packer --agents` to write an `AGENTS.md` sidecar guide into each mode
 
 Serve a model with vLLM instead of llama-server via an override rule in `profiles.yaml` (or a one-off `backend:` line in its sidecar): `backend: vllm` runs the host binary, `backend: vllm-docker` runs a container. Memory sizing, image/binary precedence, and budget details are in [SPEC.md → vLLM Backend](SPEC.md#vllm-backend).
 
+DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM detection falls back to the unified pool, and per-model recipe keys (`vllm_quantization`, `moe_backend`, `mamba:`, `tool_call_parser`, `reasoning_parser`) cover the Blackwell model recipes. Docker entries are self-contained: HF hub mounted read-only at `/root/.cache/huggingface` (offline — models must be pre-staged), `cmdStop`/`unloadTimeout` for container lifecycle, explicit `proxy`.
+
 ## See also
 
 - [SPEC.md](SPEC.md) — detailed configuration specification

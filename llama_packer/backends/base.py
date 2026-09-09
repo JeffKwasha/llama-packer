@@ -41,6 +41,9 @@ SETTING_KEYS = frozenset({
     # First-class batch keys (llama-server renders them explicitly; other
     # backends warn the declaration as unhandled).
     "batch", "ubatch",
+    # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
+    "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
+    "reasoning_parser",
 })
 FRAMEWORK_CONSUMED = frozenset({"backend", "hf_repo"})
 METADATA_ONLY = frozenset({"chat_template_kwargs"})
@@ -56,6 +59,14 @@ class BaseBackend(ABC):
     # True when the server is a proxied HTTP service (llama-swap needs the
     # `proxy:` + `checkEndpoint:` fields instead of managing inference).
     proxied: ClassVar[bool] = False
+    # Container lifecycle (llama-swap docker orchestration, docs/kb
+    # guides/model-runtime/ttl-and-unloading.md): `cmdStop` stops the container
+    # itself — without it llama-swap can only stop the `docker run` client
+    # process, leaving the container running and its VRAM held.  `unloadTimeout`
+    # must exceed the stop grace (docker stop is slow).  Only container backends
+    # set these; None keeps llama-server entries free of both fields.
+    stop_cmd: ClassVar[str | None] = None
+    unload_timeout: ClassVar[int | None] = None
 
     def unsupported_reason(self, model: "Model") -> str | None:
         """Return why this backend cannot serve *model*, or None if it can."""
