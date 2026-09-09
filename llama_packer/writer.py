@@ -485,8 +485,12 @@ class MatrixKnobs:
 
     Context tiers, smallest to largest: ``coload_min_ctx`` (emb/rnk squeeze
     floor) → ``min_chat_ctx`` (co-load decision floor) → ``tools_min_ctx``
-    (tools advertisement threshold).  ``ctx_gain_min`` gates the squeeze
-    adoption; ``estimate_headroom`` pads estimated co-load overheads.
+    (tools advertisement threshold).  ``embed_context`` / ``rerank_context``
+    are RAG caps — the maximum context those residents serve at (default
+    4096, capped by each model's design context); the served value is
+    ``min(rag_cap(role), design_context)`` everywhere, including for
+    unestimable RAG models.  ``ctx_gain_min`` gates the squeeze adoption;
+    ``estimate_headroom`` pads estimated co-load overheads.
     ``auto_parallel`` enables the value-function (ctx, slots) solve for
     unpinned chat models (see :func:`parallel_value`); ``auto_parallel_max``
     caps the slots and ``parallel_power`` is the score's slot exponent.
@@ -497,6 +501,8 @@ class MatrixKnobs:
     min_chat_ctx: int = 65536
     tools_min_ctx: int = 131072
     coload_min_ctx: int = 20480
+    embed_context: int = 4096
+    rerank_context: int = 4096
     ctx_gain_min: int = 4096
     estimate_headroom: float = 1.25
     auto_parallel: bool = True
@@ -510,7 +516,7 @@ class MatrixKnobs:
         cfg = matrix_cfg or {}
         knobs: dict = {}
         for key in ("min_chat_ctx", "tools_min_ctx", "coload_min_ctx",
-                    "ctx_gain_min"):
+                    "embed_context", "rerank_context", "ctx_gain_min"):
             v = cfg.get(key)
             if v is None:
                 continue
@@ -556,6 +562,19 @@ class MatrixKnobs:
             else:
                 knobs["parallel_power"] = fv
         return cls(**knobs)
+
+    def rag_cap(self, role: str) -> int:
+        """Configured context cap for a RAG role (embeddings | rerank).
+
+        The served RAG context is ``min(rag_cap(role), design_context)``
+        everywhere; unknown roles fall back to ``coload_min_ctx`` (legacy
+        behavior).
+        """
+        if role == "embeddings":
+            return self.embed_context
+        if role == "rerank":
+            return self.rerank_context
+        return self.coload_min_ctx
 
 
 def _parse_bool_knob(key: str, v: object) -> bool:
@@ -903,11 +922,12 @@ class Planner:
         Type-based floor: a matrix chat model follows the shared solved
         context like every chat (the solve charged exactly that for it);
         chat without a matrix gets the per-model floor cascade; embeddings
-        and rerank get the matrix's RAG minimum.  Capped by the trained
-        design context and ``--max-context``.
+        and rerank serve at their configured ``embed_context`` /
+        ``rerank_context`` (capped by the trained design context and
+        ``--max-context``).
         """
         if view.role in ("embeddings", "rerank"):
-            ctx = min(view.design_context, self.knobs.coload_min_ctx)
+            ctx = min(view.design_context, self.knobs.rag_cap(view.role))
         elif view.role == "chat" and self.chat_ctx is not None:
             ctx = self.chat_ctx
         else:
@@ -1341,7 +1361,8 @@ def _solve_matrix_context(
 
     Three passes, in order:
 
-    1. *Baseline*: embed/rerank at their design context → ``chat_ctx₀``.
+    1. *Baseline*: embed/rerank at their configured context (``rag_cap``
+       capped by design context) → ``chat_ctx₀``.
     2. *Squeeze* (§2b): when ``chat_ctx₀`` is below ``tools_min_ctx``, re-solve
        with embed/rerank contexts clamped to ``coload_min_ctx``; adopt only
        when the gain reaches ``ctx_gain_min``.
@@ -1453,18 +1474,16 @@ def _solve_matrix_context(
     if rerank_params is None and not rerank_model.on_cpu:
         rerank_params = _with_bound(None, rerank_model.stem)
 
-    # Reserve for embed/rerank at their own declared context (sidecar
-    # context_length > GGUF architectural max), not an arbitrary constant —
+    # Reserve for embed/rerank at their configured context (the
+    # ``embed_context`` / ``rerank_context`` knobs), capped by the model's
+    # declared context (sidecar context_length > GGUF architectural max) —
     # a 32k reranker costs ~4x the KV of an 8k one and must be budgeted as
-    # declared. An unestimable RAG resident serves at the matrix's minimum
-    # useful context instead: with no measurement its KV is unknown, so it
-    # must not multiply an unknown KV factor by its full design context.
-    embed_ctx = embed_model.design_context
-    rerank_ctx = rerank_model.design_context
-    if synthetic and embed_model.stem in synthetic:
-        embed_ctx = min(embed_ctx, knobs.coload_min_ctx)
-    if synthetic and rerank_model.stem in synthetic:
-        rerank_ctx = min(rerank_ctx, knobs.coload_min_ctx)
+    # declared.  Unestimable RAG residents ride free (zero-cost placeholder,
+    # like unestimable chat riders) and are served at the same configured
+    # context — the operator's contract, accepted unverified.
+    embed_ctx = min(knobs.rag_cap("embeddings"),
+                    embed_model.design_context)
+    rerank_ctx = min(knobs.rag_cap("rerank"), rerank_model.design_context)
 
     def _solve(embed_ctx_: int, rerank_ctx_: int,
                fixed_overhead_mb: int = 0) -> int:

@@ -257,21 +257,34 @@ def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
 def test_matrix_knobs_defaults_and_overrides():
     k = MatrixKnobs.from_cfg(None)
     assert (k.min_chat_ctx, k.tools_min_ctx, k.coload_min_ctx,
+            k.embed_context, k.rerank_context,
             k.ctx_gain_min, k.estimate_headroom) == (
-        65536, 131072, 20480, 4096, 1.25)
+        65536, 131072, 20480, 4096, 4096, 4096, 1.25)
     k = MatrixKnobs.from_cfg({"min_chat_ctx": 32000, "estimate_headroom": 1.5})
     assert k.min_chat_ctx == 32000
     assert k.estimate_headroom == 1.5
 
 
+def test_matrix_knobs_rag_caps():
+    k = MatrixKnobs.from_cfg({"embed_context": 8192, "rerank_context": 16384})
+    assert (k.embed_context, k.rerank_context) == (8192, 16384)
+    assert k.rag_cap("embeddings") == 8192
+    assert k.rag_cap("rerank") == 16384
+    assert k.rag_cap("chat") == k.coload_min_ctx
+
+
 def test_matrix_knobs_invalid_values_warn_and_default(caplog):
     with caplog.at_level(logging.WARNING):
         k = MatrixKnobs.from_cfg({"min_chat_ctx": -1, "coload_min_ctx": "big",
+                                  "embed_context": 0, "rerank_context": "4k",
                                   "estimate_headroom": 0.5})
     assert k.min_chat_ctx == 65536
     assert k.coload_min_ctx == 20480
+    assert (k.embed_context, k.rerank_context) == (4096, 4096)
     assert k.estimate_headroom == 1.25
     assert "min_chat_ctx" in caplog.text
+    assert "embed_context" in caplog.text
+    assert "rerank_context" in caplog.text
     assert "estimate_headroom" in caplog.text
 
 
@@ -308,8 +321,8 @@ def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
         fit_bin="unused", vram_total=48 * 1024, spare=None,
         profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
     assert result is not None
-    # available = 49152-2048 = 47104; emb+rnk at 8192 = 2*(600+819) = 2838
-    # baseline chat budget = 44266-8500 = 35766 -> capped 32768
+    # available = 49152-2048 = 47104; emb+rnk capped to 4096 = 2*1009 = 2018
+    # baseline chat budget = 45086-8500 = 36586 -> capped 32768
     assert result.chat_ctx == 32768
     # s2t (640 MB) fits; image (40000 MB) leaves a negative chat budget.
     assert result.coloads == (("s2t", 640),)
@@ -366,8 +379,8 @@ def test_solve_matrix_floor_blocks_all_coloads(profiles):
         fit_bin="unused", vram_total=48 * 1024, spare=None,
         profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=24576))
     assert result is not None
-    # chat_budget = 47104-2838-8500 = 35766 -> ctx 35766 -> capped 32768? No:
-    # factor 1.0 -> 35766 -> round 35840 -> capped 32768 >= floor -> s2t fits.
+    # chat_budget = 47104-2018-8500 = 36586 -> factor 1.0 -> round 32768,
+    # capped 32768 >= floor -> s2t fits.
     assert result.chat_ctx == 32768
     assert result.coloads == (("s2t", 640),)
 
@@ -402,10 +415,13 @@ def test_solve_matrix_squeeze_adopted(profiles):
     _fake_vram(chat, (4000, 1.0, 500))
     for m in (embed, rerank):
         _fake_vram(m, (500, 0.5, 100))
+    # High RAG caps so the baseline really serves 32768 and the squeeze
+    # (down to coload_min_ctx) has something to yield.
     result = _solve_matrix_context(
         [chat, embed, rerank], embed, rerank,
         fit_bin="unused", vram_total=64 * 1024, spare=None,
-        profiles=profiles)
+        profiles=profiles,
+        knobs=MatrixKnobs(embed_context=32768, rerank_context=32768))
     assert result is not None
     # baseline: rnk+emb at 32768 eat 33968; chat -> 22528. squeezed to 20480:
     # chat -> 32768. gain 10240 >= 4096 -> adopted.
@@ -464,7 +480,10 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
         m.vram.calc_ctx = fake_calc_ctx
 
     planner = Planner([chat, embed, rerank, s2t], profiles, fit_bin="unused",
-                      vram_total=64 * 1024, matrix_cfg={"min_chat_ctx": 8192},
+                      vram_total=64 * 1024,
+                      matrix_cfg={"min_chat_ctx": 8192,
+                                  "embed_context": 32768,
+                                  "rerank_context": 32768},
                       embed_model=embed, rerank_model=rerank)
     plan = planner.plan()
 
@@ -603,15 +622,16 @@ def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
                       vram_total=64 * 1024, matrix_cfg={"sets": {}},
                       embed_model=embed, rerank_model=rerank)
     plan = planner.plan()
-    # Riders are charged nothing extra (zero quads) and serve at the RAG
-    # minimum, not their design context.
+    # Riders are charged nothing extra (zero quads) and serve at the
+    # configured RAG cap (4096), not their design context.
     assert captured["embed_params"] == (0, 0.0, 0.0, 0)
     assert captured["rerank_params"] == (0, 0.0, 0.0, 0)
-    assert captured["embed_ctx"] == 20480
+    assert captured["embed_ctx"] == 4096
+    assert captured["rerank_ctx"] == 4096
     assert "e" in planner.synthetic_quads and "r" in planner.synthetic_quads
     for stem in ("e", "r"):
         v = plan[stem][0]
-        assert v.ctx_size == 20480
+        assert v.ctx_size == 4096
         assert v.estimate_error is not None
 
 
