@@ -33,8 +33,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # In-container HF cache root (the images' default HOME cache).  The profiles
-# ``vllm.hf_cache`` host dir is bind-mounted here; HF_HUB_OFFLINE keeps every
-# lookup inside that mounted hub — llama-packer never downloads.
+# ``vllm.hf_cache`` (host HF_HOME root — the dir containing ``hub/``) is
+# bind-mounted here; HF_HUB_OFFLINE keeps every lookup inside that mounted hub
+# — llama-packer never downloads.
 _CONTAINER_HF_HOME = "/root/.cache/huggingface"
 
 # Our cache_type values that map onto vLLM's --kv-cache-dtype. vLLM supports
@@ -197,7 +198,8 @@ def _map_paths_into(paths: list[Path], models_dirs,
     map by their *real* location — an HF snapshot symlinked under ``~/models``
     maps into the HF cache branch):
 
-    1. under ``hf_cache`` (host HF hub root) → ``/root/.cache/huggingface/<rel>``;
+    1. under ``hf_cache`` (host HF_HOME root — the dir containing ``hub/``) →
+       ``/root/.cache/huggingface/<rel>``;
        the whole root is bind-mounted separately, so HF snapshot blob symlinks
        (``file → ../../blobs/<hash>``) resolve
     2. under any of ``models_dirs`` → that dir's container target (``/models``,

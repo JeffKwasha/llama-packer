@@ -40,11 +40,12 @@ vllm:
   container_port: 8000
   # gpu_mem_util: 0.9   # optional; when omitted it is derived from the same
   #                       reserve/spare VRAM budget llama.cpp uses
-  # hf_cache: /nas/humaii/config/models/.hf   # host HF hub root bind-mounted
-  #                       # into vllm-docker containers at
-  #                       # /root/.cache/huggingface (falls back to top-level
-  #                       # hf_home:).  Docker entries run with HF_HUB_OFFLINE=1
-  #                       # — models must be pre-staged here; nothing downloads.
+  # hf_cache: /nas/humaii/config/models/.hf   # host HF_HOME root (the dir
+  #                       # containing hub/) bind-mounted into vllm-docker
+  #                       # containers at /root/.cache/huggingface (falls back
+  #                       # to top-level hf_home:).  Docker entries run with
+  #                       # HF_HUB_OFFLINE=1 — models must be pre-staged here;
+  #                       # nothing downloads.
 
 # ── whisper-server backend (optional, speech-to-text) ──
 # Opt-in via profiles.yaml `dirs: {s2t: s2t}`; each model needs an authored

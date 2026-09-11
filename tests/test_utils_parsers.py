@@ -58,7 +58,7 @@ def test_compute_env_prefixes_hf_grouping(tmp_path, monkeypatch):
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
 
     _p2v, v2v = compute_env_prefixes([str(gguf), str(ct)])
-    assert v2v["HF_HOME"] == hf_cache_root()
+    assert v2v["HF_HOME"] == str(hf_cache_root())
     assert v2v["MODELS_DIR"] == str(models)
     # The chat-template path must NOT widen MODELS_DIR up to tmp_path.
     assert v2v["MODELS_DIR"] == str(models)
@@ -78,6 +78,39 @@ def test_compute_env_prefixes_hf_home_override(tmp_path, monkeypatch):
     _p2v, v2v = compute_env_prefixes([str(gguf), str(ct)], hf_home=str(hf))
     assert v2v["HF_HOME"] == str(hf)
     assert v2v["MODELS_DIR"] == str(models)
+
+
+def test_hf_home_override_is_root_not_hub(tmp_path):
+    # hf_home / --hf-home name the HF_HOME root (the dir containing hub/);
+    # the hub is always <root>/hub.
+    from pathlib import Path
+    from llama_packer.utils import hf_cache_root, hf_hub_cache
+    root = tmp_path / "hf"
+    (root / "hub" / "models--org--repo").mkdir(parents=True)
+    assert hf_cache_root(str(root)) == root
+    assert isinstance(hf_cache_root(str(root)), Path)
+    assert hf_hub_cache(str(root)) == root / "hub"
+
+
+def test_hf_home_hub_dir_is_not_guessed(tmp_path, monkeypatch):
+    # The old code treated an override with no hub/ child as the hub itself.
+    # Per the HF_HOME invariant that is wrong: the override is the root, so
+    # the hub is <override>/hub and does not resolve.
+    from llama_packer.utils import hf_hub_cache, hf_snapshot_dir
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    hub = tmp_path / "hub"
+    (hub / "models--org--repo" / "snapshots" / "rev").mkdir(parents=True)
+    assert hf_hub_cache(str(hub)) == hub / "hub"
+    assert hf_snapshot_dir("org/repo", str(hub)) is None
+
+
+def test_hf_hub_cache_honours_huggingface_hub_cache(tmp_path, monkeypatch):
+    # $HUGGINGFACE_HUB_CACHE is HF's own *hub* variable (not a root).
+    from llama_packer.utils import hf_hub_cache
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "custom-hub"))
+    assert hf_hub_cache() == tmp_path / "custom-hub"
 
 
 # ── Model-kind classification (header-only) ───────────────────────────────

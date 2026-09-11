@@ -124,8 +124,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--models-dir", nargs="+", default=None,
                         help="Model directories (default: profiles.yaml models_dirs, "
                              "else ./models); pass multiple to scan several")
-    parser.add_argument("--hf-home", help="HF cache root for hub snapshot resolution and path grouping "
-                        "(overrides profiles.yaml hf_home / $HF_HOME / $HUGGINGFACE_HUB_CACHE)")
+    parser.add_argument("--hf-home", help="HF_HOME root (the dir containing hub/) for hub snapshot "
+                        "resolution and path grouping (overrides profiles.yaml hf_home / $HF_HOME)")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
     parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
     parser.add_argument("--agents", action="store_true",
@@ -655,7 +655,7 @@ def main(argv: list[str] | None = None) -> None:
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
-    # Host HF hub root bind-mounted into vllm-docker containers
+    # Host HF_HOME root bind-mounted into vllm-docker containers
     # (/root/.cache/huggingface).  HF_HUB_OFFLINE forbids downloads, so this
     # must cover every repo-id model served via docker.  Falls back to the
     # top-level `hf_home:`.
