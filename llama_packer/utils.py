@@ -985,36 +985,41 @@ def mount_root(path: str | os.PathLike) -> str:
     return cur
 
 
-def hf_cache_root(override: str | os.PathLike | None = None) -> str | None:
-    """Return the HF cache root, or None when it cannot be determined.
+def hf_cache_root(override: str | os.PathLike | None = None) -> Path | None:
+    """Return the HF_HOME root — the dir *containing* ``hub/`` — or None.
 
-    Resolution order: explicit *override* → ``HF_HOME`` → ``HUGGINGFACE_HUB_CACHE``
-    → ``~/.cache/huggingface`` (only when that directory exists).  Used to keep
-    HF-cache paths out of the models mount group so they don't widen
-    ``${MODELS_DIR}``.
+    ``--hf-home`` / profiles.yaml ``hf_home:`` / ``$HF_HOME`` all name this
+    root, **never** the hub itself: the root holds ``hub/`` (plus ``token``,
+    ``xet/`` …), while ``models--org--repo/`` lives one level down in
+    ``<root>/hub``.  ``$HUGGINGFACE_HUB_CACHE`` is HF's own *hub* variable (not
+    a root) and survives only as a last-resort source for path grouping.
+
+    Resolution order: explicit *override* → ``$HF_HOME`` →
+    ``$HUGGINGFACE_HUB_CACHE`` → ``~/.cache/huggingface`` (only when that
+    directory exists).  Used to keep HF-cache paths out of the models mount
+    group so they don't widen ``${MODELS_DIR}``.
     """
     root = override or os.environ.get("HF_HOME") or os.environ.get("HUGGINGFACE_HUB_CACHE")
     if root:
-        return os.path.abspath(os.fspath(root))
-    default = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-    return default if os.path.isdir(default) else None
+        return Path(os.path.abspath(os.fspath(root)))
+    default = Path.home() / ".cache" / "huggingface"
+    return default if default.is_dir() else None
 
 
 def hf_hub_cache(override: str | os.PathLike | None = None) -> Path | None:
     """Return the HF *hub* cache dir (the one holding ``models--org--repo/``).
 
-    Resolution order: explicit *override* (``--hf-home`` / profiles.yaml
-    ``hf_home:``, pointing at the HF_HOME-style root, or directly at the hub
-    dir) → ``$HF_HOME/hub`` → ``$HUGGINGFACE_HUB_CACHE`` →
+    The hub is always ``<HF_HOME-root>/hub``.  An explicit *override*
+    (``--hf-home`` / profiles.yaml ``hf_home:``) names the HF_HOME root and is
+    **never** interpreted as the hub itself — see :func:`hf_cache_root`.
+
+    Resolution order: explicit *override* → ``$HF_HOME`` →
+    ``$HUGGINGFACE_HUB_CACHE`` (already the hub dir) →
     ``~/.cache/huggingface/hub``.
     """
-    if override:
-        base = Path(override)
-        hub = base / "hub"
-        return hub if hub.is_dir() else base
-    home = os.environ.get("HF_HOME")
-    if home:
-        return Path(home) / "hub"
+    if override or os.environ.get("HF_HOME"):
+        root = hf_cache_root(override)
+        return (root / "hub") if root is not None else None
     env = os.environ.get("HUGGINGFACE_HUB_CACHE")
     if env:
         return Path(env)
@@ -1104,7 +1109,10 @@ def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str |
     is named ``LLAMA_DIR``; the HF group is ``HF_HOME``; remaining groups are
     ``MODELS_DIR``, ``MODELS_DIR_2``, ... in sorted mount order.
     """
-    hf_root = hf_cache_root(hf_home)
+    # Prefixes are string keys/values (macros are text), so convert the Path
+    # returned by hf_cache_root at this boundary.
+    hf_root_path = hf_cache_root(hf_home)
+    hf_root = str(hf_root_path) if hf_root_path is not None else None
 
     def _in_hf(p: str) -> bool:
         if not hf_root:
@@ -1123,7 +1131,7 @@ def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str |
     prefix_to_var: dict[str, str] = {}
     var_to_value: dict[str, str] = {}
 
-    if hf_paths and hf_root:
+    if hf_paths and hf_root is not None:
         prefix_to_var[hf_root] = "HF_HOME"
         var_to_value["HF_HOME"] = hf_root
 

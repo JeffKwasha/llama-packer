@@ -300,7 +300,8 @@ def _model_from_sidecar(md_path: Path, root: Path, role: str | None,
     # Never serve sidecars that live inside the HF hub cache hierarchy
     # (snapshots contain README.md plus any stray .md a user may have dropped).
     try:
-        hf_root = utils.hf_cache_root(hf_home)
+        hf_root_path = utils.hf_cache_root(hf_home)
+        hf_root = str(hf_root_path) if hf_root_path is not None else None
         if hf_root:
             # Resolve without following mount-skipping semantics - a plain
             # realpath/absolute check is sufficient to recognise HF tree.

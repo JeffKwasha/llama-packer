@@ -232,3 +232,32 @@ def test_infer_backend_respects_allowed_list(make_model):
     assert infer_backend(m, {"llama_bin": "/opt/ls"}, allowed=["llama-server"]) == "llama-server"
     # llama-server disabled -> nothing can serve a gguf
     assert infer_backend(m, {"llama_bin": "/opt/ls"}, allowed=["vllm"]) is None
+
+
+def test_vllm_recipe_keys_settable_by_override_rule(make_model):
+    # The vLLM recipe keys are *serving choices*: they must be settable by an
+    # override rule (not just a sidecar), and must not be rejected as unknown
+    # keys by compile_rule_list.  Regression for the "override-rule capable"
+    # claim in docs/plans/gb10-support-plan.md.
+    from llama_packer.backends.base import SETTING_KEYS
+    recipe_keys = {"vllm_quantization", "moe_backend", "mamba",
+                   "tool_call_parser", "reasoning_parser"}
+    assert recipe_keys <= SETTING_KEYS
+
+    profiles = {"overrides": [
+        {"when": {"base_model": "nemotron"},
+         "backend": "vllm-docker",
+         "vllm_quantization": "modelopt_mixed",
+         "moe_backend": "marlin",
+         "tool_call_parser": "qwen3_coder",
+         "reasoning_parser": "nemotron_v3",
+         "mamba": {"backend": "flashinfer", "stochastic_rounding": True}},
+    ]}
+    m = make_model("nemotron-3.5", base_model="nemotron")
+    _run([m], profiles)
+    assert m.backend == "vllm-docker"
+    assert m.vllm_quantization == "modelopt_mixed"
+    assert m.moe_backend == "marlin"
+    assert m.tool_call_parser == "qwen3_coder"
+    assert m.reasoning_parser == "nemotron_v3"
+    assert m.mamba == {"backend": "flashinfer", "stochastic_rounding": True}

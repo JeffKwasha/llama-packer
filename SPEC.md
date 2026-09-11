@@ -76,7 +76,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
-| `hf_home` | HF cache root for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
+| `hf_home` | HF_HOME root (the dir containing `hub/`) for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
 
 `profiles.yaml.example` provides a commented starter with one brief example per category — copy to `profiles.yaml` (gitignored) and uncomment what you need. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present.
 
@@ -657,7 +657,8 @@ in-container path. Model refs that are repo ids stay verbatim (resolved offline 
 the mounted hub); local files resolve in this order (after `Path.resolve()`, so symlinked
 layouts map by real location):
 
-1. Under `vllm.hf_cache` (host HF hub root; falls back to top-level `hf_home:`) →
+1. Under `vllm.hf_cache` (host HF_HOME root — the dir containing `hub/`; falls
+   back to top-level `hf_home:`) →
    `/root/.cache/huggingface/<rel>` — the whole root is bind-mounted, so HF snapshot blob
    symlinks resolve. Applies to the model ref, `speculative_config` path values (`model`,
    `draft_model`), and the chat template.
@@ -1293,9 +1294,11 @@ and `image`/`video` claimed at top level but absent from the block warns too
 — the companion-off variant would advertise it without the file, so move it
 into the block.
 
-The HF cache root is `--hf-home` > profiles.yaml `hf_home:` >
-`$HF_HOME`/`$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`. By default it
-points at your `/mnt/ai/huggingface`. With this, `hf download org/repo`
+The HF cache **root** (the dir *containing* `hub/`) is `--hf-home` >
+profiles.yaml `hf_home:` > `$HF_HOME` > `~/.cache/huggingface`. `--hf-home`,
+`hf_home:` and `$HF_HOME` always name this root — never `<root>/hub` itself.
+`$HUGGINGFACE_HUB_CACHE`, when set, names the hub directory directly. By default
+the root points at your `/mnt/ai/huggingface`. With this, `hf download org/repo`
 followed by a small `.md` sidecar is sufficient — no symlink step and no
 widening of `${MODELS_DIR}` (HF cache paths get their own `${HF_HOME}` macro).
 
@@ -1319,11 +1322,11 @@ the stub next to it.
 Generated commands are emitted with absolute paths, then rewritten to
 `${LLAMA_DIR}` / `${MODELS_DIR}` / `${MODELS_DIR_2}`… macros via
 `compute_env_prefixes` (grouped by mount, longest common directory per group).
-Paths under the Hugging Face cache root (`--hf-home` > profiles.yaml `hf_home:`
-> `$HF_HOME` > `$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`, the default
-`hf_home: /mnt/ai/huggingface` in your profiles.yaml) are pulled into their own
-`${HF_HOME}` macro so a chat template (or LoRA) living in the HF cache never
-widens `${MODELS_DIR}` up to a non-models directory.
+Paths under the Hugging Face cache **root** (the dir containing `hub/`:
+`--hf-home` > profiles.yaml `hf_home:` > `$HF_HOME` > `~/.cache/huggingface`, the
+default `hf_home: /mnt/ai/huggingface` in your profiles.yaml) are pulled into
+their own `${HF_HOME}` macro so a chat template (or LoRA) living in the HF cache
+never widens `${MODELS_DIR}` up to a non-models directory.
 
 
 ## Health-Check Timeout
@@ -1350,7 +1353,7 @@ reloads pick up moved/updated paths without a llama-swap restart.
 | Macro | Content |
 |-------|---------|
 | `LLAMA_DIR` | Group containing the llama-server binary |
-| `HF_HOME` | Paths under the HF cache root (`--hf-home` > `$HF_HOME` > `$HUGGINGFACE_HUB_CACHE` > `~/.cache/huggingface`) |
+| `HF_HOME` | Paths under the HF cache root — the dir containing `hub/` (`--hf-home` > `$HF_HOME` > `~/.cache/huggingface`; `$HUGGINGFACE_HUB_CACHE` is the hub, not the root) |
 | `MODELS_DIR` | First model mount group |
 | `MODELS_DIR_2` ... | Additional groups (sorted by mount path) |
 
