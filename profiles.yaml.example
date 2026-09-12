@@ -191,21 +191,36 @@ profiles:
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
 # ── Swap matrix (optional) ──────────────────────────────
-# Enables the llama-swap matrix router: every chat model shares a set with the
-# CPU-resident embed (emb) and rerank (rnk) models, so RAG models stay loaded
-# alongside whatever chat model is active. __CHAT_VARS__ is expanded to the
-# generated (c1 | c2 | ...) var expression at build time.
-# `emb` / `rnk` are fixed var names (hardcoded in _build_matrix_vars,
-# llama_packer/__main__.py:195 — not configurable) bound to the selected
-# embed/rerank models (CLI --embed / --rerank selectors, else smallest-VRAM
-# pick). Reference them literally in `sets:` expressions.
+# Enables the llama-swap matrix router: every chat model shares a set with
+# co-resident models, so they stay loaded alongside whatever chat model is
+# active. __CHAT_VARS__ expands to the generated (c1 | c2 | ...) var
+# expression at build time.
+#
+# `categories:` names each co-resident class and maps it to a model role:
+#   emb / rnk — the RAG pair (default). They drive the shared chat-context
+#               solve and are reserved first.
+#   any other name (e.g. tts / stt) — a fixed-overhead resident reserved
+#               alongside chat and RAG while the chat context stays at/above
+#               the co-load floor. Category names are the var names used in
+#               `sets:`.
+# tts and stt are separate categories because switching between them forces a
+# resident reload; an OR in a set is a runtime choice, not a co-load. Model
+# selection is by role, with an optional `selector:` substring (CLI --embed /
+# --rerank still select the RAG pair).
 #
 # matrix:
+#   categories:
+#     emb:  {role: embeddings}
+#     rnk:  {role: rerank}
+#     # tts: {role: t2s}
+#     # stt: {role: s2t}
 #   evict_costs:
 #     emb: 100
 #     rnk: 100
+#     # tts: 50      # brief-use TTS: evict before chat context
 #   sets:
 #     rag: "__CHAT_VARS__ & emb & rnk"
+#     # voice: "__CHAT_VARS__ & (tts | stt)"
 #   auto_parallel: false        # on by default: value-function (ctx, slots)
 #                               # solve for unpinned chat; false disables it
 #                               # fleet-wide (a sidecar parallel: pin opts one

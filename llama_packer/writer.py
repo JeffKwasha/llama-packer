@@ -858,6 +858,7 @@ class Planner:
         matrix_cfg: dict | None = None,
         embed_model: Model | None = None,
         rerank_model: Model | None = None,
+        fixed_categories: list[tuple[str, Model]] | None = None,
         baseline_mb: int = 0,
         min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
@@ -876,6 +877,9 @@ class Planner:
         self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
         self.embed_model = embed_model
         self.rerank_model = rerank_model
+        # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
+        # fixed-overhead residents reserved alongside chat and RAG.
+        self.fixed_categories = fixed_categories or []
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.min_context_explicit = min_context_explicit
@@ -1107,6 +1111,7 @@ class Planner:
             baseline_mb=self.baseline_mb, drop_stems=drop_stems,
             knobs=self.knobs, memory_margin=self.memory_margin,
             llama_args=self.llama_args, synthetic=synthetic,
+            fixed_categories=self.fixed_categories,
         )
         self.synthetic_quads = synthetic
         # Flag the synthesized models so plan() serves them at their
@@ -1384,6 +1389,7 @@ def _solve_matrix_context(
     memory_margin: float = _MEMORY_MARGIN,
     llama_args: str = "",
     synthetic: dict[str, tuple[int, float, float, int]] | None = None,
+    fixed_categories: list[tuple[str, Model]] | None = None,
 ) -> MatrixSolve | None:
     """Solve the shared VRAM budget for chat context plus co-loads.
 
@@ -1420,6 +1426,7 @@ def _solve_matrix_context(
     spare_mb = parse_spare_mb(spare, vram_total)
 
     drop_stems = drop_stems or set()
+    fixed_categories = fixed_categories or []
 
     # Get static params for chat models (companion VRAM folded in).
     # The drop decision (mmproj skipped to reach the min useful context) is
@@ -1580,9 +1587,44 @@ def _solve_matrix_context(
         else knobs.min_chat_ctx
     coloads: list[tuple[str, int]] = []
     if chat_ctx >= floor:
+        declared_stems = {m.stem for _, m in fixed_categories}
+        used = 0
+
+        def _reserve(oh: int, stem: str, declared: bool) -> int | None:
+            """Reserve *oh* MB if chat stays at/above the floor; else None."""
+            nonlocal used
+            ctx = _solve(embed_ctx, rerank_ctx, fixed_overhead_mb=used + oh)
+            if ctx < floor:
+                return None
+            used += oh
+            if not declared:
+                coloads.append((stem, oh))
+            return ctx
+
+        # 3a. Declared categories (explicit operator intent, e.g. tts/stt)
+        #     are reserved first; one that does not fit is reported and left
+        #     unreserved.
+        for name, m in fixed_categories:
+            oh = _coload_overhead(m, fit_bin, profiles, knobs, llama_args)
+            if oh is None:
+                logger.warning("matrix: category %r (%s) skipped: cannot size it",
+                               name, m.stem)
+                continue
+            ctx = _reserve(oh, m.stem, declared=True)
+            if ctx is None:
+                logger.warning(
+                    "matrix: category %r (%s) does not fit below the chat "
+                    "floor %d; not reserved", name, m.stem, floor)
+            else:
+                logger.info(
+                    "matrix: category %r (%s) reserved (%d MB, chat_ctx=%d)",
+                    name, m.stem, oh, ctx)
+
+        # 3b. Opportunistic co-loads: s2t/image models that are *not* already
+        #     a declared category, smallest fixed overhead first.
         overheads: list[tuple[int, str, Model]] = []
         for m in chat_models:
-            if m.role not in ("s2t", "image"):
+            if m.role not in ("s2t", "image") or m.stem in declared_stems:
                 continue
             oh = _coload_overhead(m, fit_bin, profiles, knobs,
                                   llama_args)
@@ -1591,18 +1633,15 @@ def _solve_matrix_context(
                                m.stem)
                 continue
             overheads.append((oh, m.stem, m))
-        used = 0
         for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
-            ctx = _solve(embed_ctx, rerank_ctx, fixed_overhead_mb=used + oh)
-            if ctx >= floor:
-                used += oh
-                coloads.append((stem, oh))
+            ctx = _reserve(oh, stem, declared=False)
+            if ctx is None:
+                logger.warning(
+                    "matrix: co-load %s skipped: would drop chat ctx below "
+                    "the floor %d", stem, floor)
+            else:
                 logger.info("matrix: co-load %s included (%d MB, chat_ctx=%d)",
                             stem, oh, ctx)
-            else:
-                logger.warning(
-                    "matrix: co-load %s skipped: would drop chat ctx to %d "
-                    "(floor %d)", stem, ctx, floor)
     return MatrixSolve(
         chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
         coloads=tuple(coloads), squeeze=squeeze,
@@ -1764,6 +1803,7 @@ def build_config(
     matrix_cfg: dict | None = None,
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
+    fixed_categories: list[tuple[str, Model]] | None = None,
     baseline_mb: int = 0,
     min_context: int = _MIN_AGENTIC_CTX,
     min_context_explicit: bool = False,
@@ -1786,6 +1826,9 @@ def build_config(
         matrix_cfg: Matrix configuration for embed/rerank context solving
         embed_model: Embedding model (if matrix configured)
         rerank_model: Reranking model (if matrix configured)
+        fixed_categories: Declared matrix categories beyond the RAG pair
+            (name, model), e.g. tts/stt — reserved as fixed-overhead
+            residents alongside chat and RAG (matrix categories).
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
@@ -1809,7 +1852,8 @@ def build_config(
         supported, profiles, fit_bin, vram_total,
         spare=spare, max_context=max_context,
         matrix_cfg=matrix_cfg, embed_model=embed_model,
-        rerank_model=rerank_model, baseline_mb=baseline_mb,
+        rerank_model=rerank_model, fixed_categories=fixed_categories,
+        baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
         memory_margin=memory_margin,
         llama_args=template_vars.get("llama_args", ""),

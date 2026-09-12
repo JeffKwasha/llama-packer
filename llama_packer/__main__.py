@@ -250,14 +250,19 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
 def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     """Resolve the swap-matrix configuration before build_config.
 
-    Returns (matrix_cfg, embed_model, rerank_model). Without a ``matrix:``
-    section the matrix is disabled — make that state visible when the fleet
-    actually has RAG models, otherwise a silently missing co-loading setup
-    looks exactly like a bug (it has, repeatedly).
+    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
+
+    ``categories`` maps each declared category name → its selected model
+    (defaults: ``emb``/``rnk`` bound to the embeddings/rerank models).  The
+    RAG pair still drives the shared chat-context solve; every *other*
+    category (e.g. ``tts``/``stt``) is returned in ``fixed`` as a
+    fixed-overhead resident reserved alongside chat and RAG.
+
+    Without a ``matrix:`` section the matrix is disabled — make that state
+    visible when the fleet actually has RAG models, otherwise a silently
+    missing co-loading setup looks exactly like a bug (it has, repeatedly).
     """
     matrix_cfg = profiles_cfg.get("matrix")
-    embed_model = None
-    rerank_model = None
     if not matrix_cfg:
         emb = _select_model(models, "embeddings", args.embed, logger)
         rnk = _select_model(models, "rerank", args.rerank, logger)
@@ -266,18 +271,54 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
                 "matrix: disabled — profiles.yaml has no matrix: section; "
                 "RAG co-loading off (emb: %s, rnk: %s)",
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
-        return None, None, None
+        return None, None, None, {}, ()
     embed_model = _select_model(models, "embeddings", args.embed, logger)
     rerank_model = _select_model(models, "rerank", args.rerank, logger)
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
-        return None, None, None
+        return None, None, None, {}, ()
     if rerank_model is None:
         logger.warning("no rerank model found; skipping matrix")
-        return None, None, None
+        return None, None, None, {}, ()
+
+    # Declared categories (defaults bind the RAG pair).  Category names are
+    # the matrix var names; roles may repeat (e.g. tts/stt on t2s/s2t).
+    cat_specs = matrix_cfg.get("categories") or {
+        "emb": {"role": "embeddings"}, "rnk": {"role": "rerank"}}
+    categories: dict[str, "Model"] = {}
+    for name, spec in cat_specs.items():
+        spec = spec if isinstance(spec, dict) else {}
+        role = str(spec.get("role") or "")
+        selector = spec.get("selector")
+        if not role:
+            logger.warning("matrix: category %r has no role; omitted", name)
+            continue
+        model = _select_model(models, role, selector, logger)
+        if model is None:
+            logger.warning("matrix: category %r: no %s model%s; omitted",
+                           name, role,
+                           f" matching {selector!r}" if selector else "")
+            continue
+        categories[str(name)] = model
+    # Back-compat: the canonical RAG names always resolve.
+    categories.setdefault("emb", embed_model)
+    categories.setdefault("rnk", rerank_model)
+
+    known = set(categories)
+    for key in (matrix_cfg.get("evict_costs") or {}):
+        if key not in known:
+            logger.warning("matrix: evict_costs key %r is not a declared "
+                           "category %s; llama-swap will ignore it",
+                           key, sorted(known))
+
+    fixed = [(n, m) for n, m in categories.items()
+             if m is not embed_model and m is not rerank_model]
     logger.info("matrix embed: %s", embed_model.stem)
     logger.info("matrix rerank: %s", rerank_model.stem)
-    return matrix_cfg, embed_model, rerank_model
+    if fixed:
+        logger.info("matrix categories: %s",
+                    ", ".join(f"{n}={m.stem}" for n, m in fixed))
+    return matrix_cfg, embed_model, rerank_model, categories, fixed
 
 
 # Var-name prefix per co-load role, used in set expressions
@@ -285,7 +326,7 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
 _COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
 
 
-def _build_matrix_vars(models: list, embed_model, rerank_model,
+def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
                        coload_stems: list[str],
                        entry_ids_by_stem: dict[str, list[str]], logger) -> tuple[dict, list[str]]:
     """Auto-collect matrix vars: chat entries + selected embed/rerank + co-loads.
@@ -309,10 +350,18 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
         for eid in entry_ids_by_stem.get(m.stem, []):
             chat_idx += 1
             vars_[f"c{chat_idx}"] = eid
+    # Declared categories contribute one var each (emb, rnk, tts, stt, …);
+    # the category names are what `sets:` expressions reference.
+    for name, model in (categories or {}).items():
+        if name in vars_:
+            logger.warning("matrix: category var %r collides with an existing "
+                           "var; skipped", name)
+            continue
+        vars_[name] = model.template_id
     if embed_model is not None:
-        vars_["emb"] = embed_model.template_id
+        vars_.setdefault("emb", embed_model.template_id)
     if rerank_model is not None:
-        vars_["rnk"] = rerank_model.template_id
+        vars_.setdefault("rnk", rerank_model.template_id)
     by_stem = {m.stem: m for m in models}
     coload_vars: list[str] = []
     for stem in coload_stems:
@@ -326,8 +375,8 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
             name = f"{prefix}{n}"
         vars_[name] = m.template_id
         coload_vars.append(name)
-    logger.info("matrix vars: %d chat + emb + rnk + %d coload",
-                chat_idx, len(coload_vars))
+    logger.info("matrix vars: %d chat + %d category + %d coload",
+                chat_idx, len(categories or {}), len(coload_vars))
     return vars_, coload_vars
 
 
@@ -703,8 +752,8 @@ def main(argv: list[str] | None = None) -> None:
                     template_vars["gpu_mem_util"])
 
     # Detect matrix configuration before build_config
-    matrix_cfg, embed_model, rerank_model = _detect_matrix(
-        profiles_cfg, models, args, logger)
+    (matrix_cfg, embed_model, rerank_model, matrix_categories,
+     matrix_fixed) = _detect_matrix(profiles_cfg, models, args, logger)
 
     # Build config (progress bar appears only once the denominator is
     # known — total=len(models); without rich / non-TTY it is a no-op).
@@ -727,6 +776,7 @@ def main(argv: list[str] | None = None) -> None:
             models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
             spare=args.spare, max_context=max_ctx,
             matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
+            fixed_categories=matrix_fixed,
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
@@ -780,8 +830,8 @@ def main(argv: list[str] | None = None) -> None:
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
         vars_, coload_vars = _build_matrix_vars(
-            models, embed_model, rerank_model, config.coload_stems,
-            config.entry_ids_by_stem, logger)
+            models, embed_model, rerank_model, matrix_categories,
+            config.coload_stems, config.entry_ids_by_stem, logger)
         chat_var_names = [k for k in vars_ if re.fullmatch(r"c\d+", k)]
         # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
         chat_expr = "(" + " | ".join(chat_var_names) + ")"

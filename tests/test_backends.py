@@ -254,6 +254,40 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
     assert result.squeeze is False
 
 
+def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
+    # A declared non-RAG category (e.g. tts) is reserved as fixed overhead:
+    # the solver sees fixed_overhead_mb > 0 for it.
+    from llama_packer import writer
+
+    chat = make_model("chat", context_length=32768)
+    embed = make_model("e", role="embeddings", context_length=32768)
+    rerank = make_model("r", role="rerank", context_length=16384)
+    tts = make_model("t", role="t2s", context_length=4096)
+
+    def fake_fp(fit_bin, cache_type="q8_0", **kw):
+        return SimpleNamespace(model_mib=1000.0, kv_per_token_mib=0.0,
+                               slot_mib=0.0, compute_mib=50.0,
+                               source="fit-params")
+
+    for m in (chat, embed, rerank, tts):
+        m.vram.effective_static = lambda *a, **k: (1000.0, 0.0, 0.0, 50.0)
+        m.vram.fit_params_static = fake_fp
+
+    calls: list[dict] = []
+    monkeypatch.setattr(writer, "solve_matrix_ctx",
+                        lambda **kw: calls.append(dict(kw)) or 100000)
+    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
+    result = writer._solve_matrix_context(
+        [chat], embed, rerank, "unused", 100000, None, profiles,
+        knobs=MatrixKnobs(embed_context=32768, rerank_context=16384),
+        fixed_categories=[("tts", tts)])
+    assert result is not None
+    assert any(c.get("fixed_overhead_mb", 0) > 0 for c in calls)
+    # Declared categories are not opportunistic co-loads.
+    assert result.coloads == ()
+
+
+
 def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
     tpl = tmp_path / "qwen.jinja"
     tpl.write_text("x")
