@@ -3,13 +3,13 @@
 ## Why don't my HF hub models (`$HF_HOME/hub`) show up?
 
 The packer never scans the HF cache. Discovery walks `models_dirs` only
-(e.g. `/mnt/ai/models`); the hub cache is a *resolution source*, not a scan
+(e.g. `~/models`); the hub cache is a *resolution source*, not a scan
 target. A model is served when a sidecar in a served directory names it.
 
 **Sidecar reference (recommended, no symlinks):**
 
 ```yaml
-# /mnt/ai/models/chat/Ornith-1.5-9B.md
+# <models_dir>/chat/Ornith-1.5-9B.md
 ---
 name: Ornith 1.5 9B
 parameters: 9B

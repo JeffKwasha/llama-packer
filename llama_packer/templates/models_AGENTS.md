@@ -214,7 +214,7 @@ Convention: brand + major version; minor only when it changed the architecture
 `image`, `s2t`, `t2s`. It is inferred from the directory (table above) or from
 `type:` containing `embedding`/`rerank`/`image`; set `role:` to override.
 `image`/`s2t`/`t2s` backends are opt-in via profiles.yaml (`dirs:` +
-`backends:`). See SPEC.md for the full map.
+`backends:`). See the `llama-packer` project's `SPEC.md` for the full map.
 
 ## HuggingFace resolution
 
@@ -227,7 +227,7 @@ at a differently-named file.
 
 Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 `context_length`, and sampling params — live in a directory `models.yaml` and
-`profiles.yaml`, not in the sidecar. See SPEC.md.
+`profiles.yaml`, not in the sidecar. See the project `SPEC.md`.
 
 ## Other fields
 
@@ -258,7 +258,7 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 1. **It is auto-generated.** llama-packer writes it from its own
    measurements; nothing in it is operator input. Never hand-edit it —
    a wrong value here silently mis-sizes the model everywhere. To
-   discard it, delete the block (or run `extras/clear-measured`) and
+   discard it, delete the block (or run the project's `extras/clear-measured`) and
    let llama-packer re-derive it.
 2. **It carries model requirements llama-packer calculated** — the
    affine VRAM constants today (`model_mib`, `kv_per_token_mib`,
@@ -289,4 +289,4 @@ opt-in and emitted verbatim (absent = vLLM's own auto-detection):
 #   cache_mode: align                 #   --mamba-cache-mode
 ```
 
-See `SPEC.md` for the complete schema.
+See the `llama-packer` project's `SPEC.md` for the complete schema.
