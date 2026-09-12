@@ -146,6 +146,10 @@ _SD_COMPUTE_MB = 512
 # errs toward reserving more, like the other fixed heuristics here.
 _VLLM_PER_SEQ_MIB = 32.0
 _WHISPER_COMPUTE_MB = 100
+# audio.cpp: weights + a session/vocoder/diffusion buffer.  Family-dependent
+# (ASR/VAD ~512 … diffusion TTS ~3072); operators pin the exact figure with
+# the sidecar `vram_mb:` key when a family drifts from this default.
+_AUDIO_CPP_COMPUTE_MB = 1024
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # Diffusion architecture regex patterns

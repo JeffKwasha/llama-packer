@@ -460,13 +460,13 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # Proxied backends (sd-server, whisper-server) are proxied HTTP services,
-    # not llama-swap managed inference — expose the standard proxy fields so
-    # llama-swap can health-check and route.  checkEndpoint "/" avoids the
-    # /health pitfall (Discussion #866: sd-server returns 200 on / only).
+    # Proxied backends (sd-server, whisper-server, audio-cpp) are proxied HTTP
+    # services, not llama-swap managed inference — expose the standard proxy
+    # fields so llama-swap can health-check and route.  Each backend names its
+    # own health path (sd-server answers "/"; audio.cpp exposes /health).
     if backend.proxied:
         entry["proxy"] = "http://127.0.0.1:${PORT}"
-        entry["checkEndpoint"] = "/"
+        entry["checkEndpoint"] = getattr(backend, "check_endpoint", "/")
 
     # Container lifecycle (llama-swap docker orchestration): cmdStop stops the
     # container itself — without it a swap/unload kills only the `docker run`

@@ -974,4 +974,73 @@ def test_infer_backend_whisper(make_model):
 
 def test_fixed_overhead_backends_include_whisper():
     from llama_packer.backends import FIXED_OVERHEAD_BACKENDS
-    assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server"}
+    assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server", "audio-cpp"}
+
+
+# ── audio-cpp backend (audio.cpp TTS/ASR) ─────────────────────────────────
+
+def test_audio_cpp_registered():
+    b = get_backend("audio-cpp")
+    assert b.formats == {".gguf", ".safetensors", "hf_repo"}
+    assert b.roles == {"t2s", "s2t"}
+    assert b.proxied is True
+    assert b.check_endpoint == "/health"
+    assert b.stop_cmd is None  # host launch: no container lifecycle
+
+
+def test_audio_cpp_requires_binary():
+    b = get_backend("audio-cpp")
+    assert not b.is_available({})
+    assert b.is_available({"audio_cpp_bin": "/opt/audiocpp_server"})
+
+
+def test_audio_cpp_cmd_shape(make_model):
+    m = make_model("chatterbox", role="t2s", audio_cpp={
+        "family": "chatterbox", "task": "tts",
+        "options": {"temperature": 0.8, "top_p": 0.8}})
+    cmd, meta = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "/opt/audiocpp_server",
+        "audio_cpp_backend": "cuda",
+        "audio_cpp_voice_dir": "/opt/voices",
+    })
+    assert cmd.startswith(
+        "sh -c 'cat > /tmp/audiocpp-chatterbox-${PORT}.json <<JSON")
+    assert cmd.endswith(
+        "exec /opt/audiocpp_server --config "
+        "/tmp/audiocpp-chatterbox-${PORT}.json'")
+    assert '"port":${PORT}' in cmd            # unquoted -> JSON number
+    assert '"family":"chatterbox"' in cmd
+    assert '"task":"tts"' in cmd
+    assert '"backend":"cuda"' in cmd
+    assert '"voice_dir":"/opt/voices"' in cmd
+    assert '"default_request_options":{"temperature":0.8,"top_p":0.8}' in cmd
+    assert str(m.gguf_path) in cmd
+    assert meta == {}
+
+
+def test_audio_cpp_task_defaults_by_role(make_model):
+    tts = make_model("t", role="t2s")
+    cmd, _ = get_backend("audio-cpp").build_cmd(tts, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"task":"tts"' in cmd
+    asr = make_model("a", role="s2t")
+    cmd, _ = get_backend("audio-cpp").build_cmd(asr, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"task":"asr"' in cmd
+
+
+def test_infer_backend_audio_cpp_vs_whisper(make_model):
+    from llama_packer.backends import infer_backend
+    # audio t2s GGUF -> audio-cpp
+    a = make_model("a", role="t2s")
+    assert infer_backend(a, {"audio_cpp_bin": "x"}) == "audio-cpp"
+    # whisper .bin (s2t) stays on whisper-server — audio.cpp has no whisper
+    # family and cannot load GGML .bin models.
+    w = make_model("w", role="s2t")
+    w.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
+    assert (infer_backend(w, {"whisper_bin": "y", "audio_cpp_bin": "x"})
+            == "whisper-server")
+    # audio s2t GGUF -> audio-cpp
+    g = make_model("g", role="s2t")
+    assert (infer_backend(g, {"audio_cpp_bin": "x", "whisper_bin": "y"})
+            == "audio-cpp")

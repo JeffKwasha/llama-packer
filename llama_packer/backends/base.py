@@ -70,6 +70,9 @@ class BaseBackend(ABC):
     # True when the server is a proxied HTTP service (llama-swap needs the
     # `proxy:` + `checkEndpoint:` fields instead of managing inference).
     proxied: bool = False
+    # Health path llama-swap polls for a proxied server.  "/" suits sd-server;
+    # audio.cpp exposes /health; whisper-server accepts "/".
+    check_endpoint: str = "/"
     # Container lifecycle (llama-swap docker orchestration, docs/kb
     # guides/model-runtime/ttl-and-unloading.md): `cmdStop` stops the container
     # itself — without it llama-swap can only stop the `docker run` client

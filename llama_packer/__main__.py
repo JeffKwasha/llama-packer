@@ -35,6 +35,8 @@ from llama_packer.writer import build_config, write_yaml, EmittedConfig
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
+from llama_packer.backends.audio_cpp import (AUDIO_CPP_DEFAULT_BIN,
+                                             AUDIO_CPP_SERVER_KNOBS)
 
 
 
@@ -162,6 +164,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
     parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
                         "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
+    parser.add_argument("--audio-cpp-server", help="audiocpp_server binary for `audio-cpp` backend "
+                        "(overrides profiles.yaml audio_cpp.bin / $AUDIOCPP_BIN_DIR / audiocpp_server on PATH)")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
     return parser.parse_args(argv[1:] if argv else None)
@@ -530,6 +534,25 @@ def main(argv: list[str] | None = None) -> None:
             cand = cand / "whisper-server"
         whisper_bin = str(cand)
 
+    # audio-cpp (audio.cpp) resource configuration (CLI > profiles.yaml
+    # `audio_cpp:` section > $AUDIOCPP_BIN_DIR > audiocpp_server on PATH).
+    # `backend:` (auto|cuda|vulkan|cpu) selects the engine runtime; auto
+    # follows the detected GPU vendor (NVIDIA→cuda, AMD→vulkan, else cpu).
+    audio_cpp_cfg = profiles_cfg.get("audio_cpp") or {}
+    audio_cpp_bin_raw = (args.audio_cpp_server or audio_cpp_cfg.get("bin")
+                         or os.environ.get("AUDIOCPP_BIN_DIR")
+                         or shutil.which("audiocpp_server"))
+    audio_cpp_bin = None
+    if audio_cpp_bin_raw:
+        cand = Path(str(audio_cpp_bin_raw))
+        if cand.is_dir():  # AUDIOCPP_BIN_DIR may be a directory
+            cand = cand / "audiocpp_server"
+        audio_cpp_bin = str(cand)
+    audio_cpp_backend = str(audio_cpp_cfg.get("backend") or "auto").lower()
+    if audio_cpp_backend in ("", "auto"):
+        audio_cpp_backend = {"nvidia": "cuda", "amd": "vulkan"}.get(
+            detect_gpu_vendor(), "cpu")
+
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
     # pushed/popped around its level.  Defaults, rules, companion resolution
@@ -541,6 +564,7 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
             "whisper_bin": whisper_bin or "",
+            "audio_cpp_bin": audio_cpp_bin or "",
             # Container runtimes: probed once so container transports are only
             # inferred when their runtime is actually on PATH.
             "docker": bool(shutil.which("docker")),
@@ -631,6 +655,12 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["vllm_bin"] = vllm_bin
     template_vars.setdefault("sd_bin", "sd-server")
     template_vars.setdefault("whisper_bin", "whisper-server")
+    template_vars["audio_cpp_bin"] = audio_cpp_bin or AUDIO_CPP_DEFAULT_BIN
+    template_vars["audio_cpp_backend"] = audio_cpp_backend
+    for _knob in AUDIO_CPP_SERVER_KNOBS:
+        _value = audio_cpp_cfg.get(_knob)
+        if _value not in (None, ""):
+            template_vars[f"audio_cpp_{_knob}"] = str(_value)
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     # GPU vendor for container device flags (docker --runtime/--gpus vs

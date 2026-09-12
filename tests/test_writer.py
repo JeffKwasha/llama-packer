@@ -389,3 +389,20 @@ def test_t2s_role_is_text_in_audio_out(make_model):
     caps = _entry_of(model)["capabilities"]
     assert caps["in"] == ["text"]
     assert caps["out"] == ["audio"]
+
+
+def test_audio_cpp_entry_proxy_and_health(make_model):
+    # audio.cpp is a proxied HTTP service: llama-swap needs proxy + its own
+    # health path (/health), unlike sd-server/whisper-server which answer "/".
+    model = make_model("a", role="t2s", backend="audio-cpp")
+    _, entry = _build_entry(
+        model, parallel=1, cache_type="q8_0",
+        profiles_group=[("default", {})], profiles_defaults={},
+        template_vars={"audio_cpp_bin": "/opt/audiocpp_server"},
+        context_length=0, ctx_size=0,
+    )
+    assert entry["proxy"] == "http://127.0.0.1:${PORT}"
+    assert entry["checkEndpoint"] == "/health"
+    assert entry["capabilities"]["in"] == ["text"]
+    assert entry["capabilities"]["out"] == ["audio"]
+    assert entry["cmd"].startswith("sh -c ")

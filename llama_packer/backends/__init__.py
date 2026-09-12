@@ -25,6 +25,7 @@ from llama_packer.backends.base import (
     SETTING_KEYS,
     BaseBackend,
 )
+from llama_packer.backends.audio_cpp import AudioCppBackend
 from llama_packer.backends.llama_server import LlamaServerBackend
 from llama_packer.backends.sd_server import SdServerBackend
 from llama_packer.backends.transport import (
@@ -45,6 +46,7 @@ ENGINES: tuple[type[BaseBackend], ...] = (
     VllmBackend,
     SdServerBackend,
     WhisperServerBackend,
+    AudioCppBackend,
 )
 
 #: Transport instances by name.  Container runtimes share one implementation;
@@ -74,6 +76,7 @@ class BoundBackend(BaseBackend):
         self.roles = engine.roles
         self.handles = engine.handles
         self.proxied = engine.proxied
+        self.check_endpoint = engine.check_endpoint
         self.stop_cmd = transport.stop_cmd
         self.unload_timeout = transport.unload_timeout
 
@@ -117,10 +120,11 @@ def _names_for(engine_cls: type[BaseBackend]) -> frozenset[str]:
 VLLM_BACKENDS = _names_for(VllmBackend)
 SD_BACKENDS = _names_for(SdServerBackend)
 WHISPER_BACKENDS = _names_for(WhisperServerBackend)
+AUDIO_CPP_BACKENDS = _names_for(AudioCppBackend)
 
 # Backends with fixed VRAM overhead (weights + buffer, no per-token KV factor):
 # excluded from the shared chat matrix solve.
-FIXED_OVERHEAD_BACKENDS = SD_BACKENDS | WHISPER_BACKENDS
+FIXED_OVERHEAD_BACKENDS = SD_BACKENDS | WHISPER_BACKENDS | AUDIO_CPP_BACKENDS
 
 # Fallback backend when nothing is declared and inference cannot run
 # (e.g. a bare Model constructed outside the normal pipeline).
@@ -191,6 +195,7 @@ __all__ = [
     "VLLM_BACKENDS",
     "SD_BACKENDS",
     "WHISPER_BACKENDS",
+    "AUDIO_CPP_BACKENDS",
     "FIXED_OVERHEAD_BACKENDS",
     "DEFAULT_BACKEND",
     "SETTING_KEYS",

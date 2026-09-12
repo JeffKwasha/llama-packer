@@ -68,11 +68,12 @@ from llama_packer.consts import (
     _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
     _WEIGHT_CPU_MAP_TOLERANCE_MIB,
+    _AUDIO_CPP_COMPUTE_MB,
     ESTIMATE_ERROR_REASON,
 )
-from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, SD_BACKENDS,
-                                   VLLM_BACKENDS, WHISPER_BACKENDS,
-                                   get_backend)
+from llama_packer.backends import (AUDIO_CPP_BACKENDS, FIXED_OVERHEAD_BACKENDS,
+                                   SD_BACKENDS, VLLM_BACKENDS,
+                                   WHISPER_BACKENDS, get_backend)
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -87,7 +88,8 @@ _FIT_PARAMS_REQUIRED = frozenset(
 
 # Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
-                     **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS}}
+                     **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
+                     **{n: _AUDIO_CPP_COMPUTE_MB for n in AUDIO_CPP_BACKENDS}}
 
 # Persisted blocks acceptable without re-measurement.  The retired plain
 # fit-params measurement (KV-pool only, no corrections) is deliberately
