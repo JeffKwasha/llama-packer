@@ -106,16 +106,6 @@ class BaseBackend(ABC):
             logger.warning("backend %s cannot handle setting %r (ignored)",
                            self.name, key)
 
-    def is_available(self, avail: dict) -> bool:
-        """True when this engine can launch under its bound transport.
-
-        ``avail`` maps resource names to their configured values (e.g.
-        ``llama_bin``, ``vllm_image``, ``docker``).  Backends declare their
-        requirements via ``host_requires`` / ``container_requires`` so a
-        format is only auto-assigned to a pair that can actually run.
-        """
-        return self.supports(avail, self.transport)
-
     def supports(self, avail: dict, transport: Transport) -> bool:
         """Whether this engine can launch under *transport* with *avail*."""
         required = (self.container_requires if transport.container

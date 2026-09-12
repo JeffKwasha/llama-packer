@@ -249,7 +249,7 @@ class VllmBackend(BaseBackend):
         spec_override: dict | None = None,
     ) -> list[str]:
         flags = [
-            "--model", model_ref or self._model_ref(model),
+            "--model", model_ref,
             "--served-model-name", "${MODEL_ID}",
             "--host", "0.0.0.0", "--port", str(port),
             "--max-model-len", str(ctx_size),
@@ -299,9 +299,6 @@ class VllmBackend(BaseBackend):
                 flags += ["--reasoning-parser", rp]
         return flags
 
-    def _model_ref(self, model: "Model") -> str:
-        return model.hf_repo or str(model.gguf_path)
-
     def build_cmd(
         self,
         model: "Model",
@@ -321,6 +318,8 @@ class VllmBackend(BaseBackend):
 
         model_ref = model.hf_repo or (
             str(model.gguf_path) if model.gguf_path is not None else None)
+        # Invariant: vLLM only serves models with a repo id or a local file.
+        assert model_ref is not None
         spec = _speculative_config(model) if model.role == "chat" else None
         if spec is not None:
             spec = dict(spec)  # rewrite our copy — never mutate the frontmatter

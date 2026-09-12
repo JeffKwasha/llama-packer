@@ -98,13 +98,6 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
                     logger.warning("sidecar %s: diffusion arch %r but no architecture: set (e.g. architecture: wan/hunyuan-video/flux) for backend routing",
                                    model.stem, arch)
 
-        # s2t/t2s/image must not be served as chat via llama-server
-        if model.role in ("s2t", "t2s", "image") and backend.name == "llama-server":
-            logger.error("skipping %s: role %r must not use backend %r (use %s)",
-                         model.stem, model.role, backend.name,
-                         {"s2t":"whisper-server","t2s":"audio-cpp","image":"sd-server"}[model.role])
-            continue
-
         # Capability / companion cross-check: a companion file is not a
         # capability — what it enables must be declared where it is served.
         caps_l = [str(c).lower() for c in model.capabilities]
