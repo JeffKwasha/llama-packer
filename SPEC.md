@@ -1297,10 +1297,10 @@ into the block.
 The HF cache **root** (the dir *containing* `hub/`) is `--hf-home` >
 profiles.yaml `hf_home:` > `$HF_HOME` > `~/.cache/huggingface`. `--hf-home`,
 `hf_home:` and `$HF_HOME` always name this root — never `<root>/hub` itself.
-`$HUGGINGFACE_HUB_CACHE`, when set, names the hub directory directly. By default
-the root points at your `/mnt/ai/huggingface`. With this, `hf download org/repo`
-followed by a small `.md` sidecar is sufficient — no symlink step and no
-widening of `${MODELS_DIR}` (HF cache paths get their own `${HF_HOME}` macro).
+`$HUGGINGFACE_HUB_CACHE`, when set, names the hub directory directly. Point
+`hf_home:` at that root; then `hf download org/repo` followed by a small `.md`
+sidecar is sufficient — no symlink step and no widening of `${MODELS_DIR}` (HF
+cache paths get their own `${HF_HOME}` macro).
 
 **Stub sidecars.** A model file without any sidecar gets an **empty** one
 written next to it — just frontmatter delimiters and a title, nothing more.
@@ -1323,8 +1323,7 @@ Generated commands are emitted with absolute paths, then rewritten to
 `${LLAMA_DIR}` / `${MODELS_DIR}` / `${MODELS_DIR_2}`… macros via
 `compute_env_prefixes` (grouped by mount, longest common directory per group).
 Paths under the Hugging Face cache **root** (the dir containing `hub/`:
-`--hf-home` > profiles.yaml `hf_home:` > `$HF_HOME` > `~/.cache/huggingface`, the
-default `hf_home: /mnt/ai/huggingface` in your profiles.yaml) are pulled into
+`--hf-home` > profiles.yaml `hf_home:` > `$HF_HOME` > `~/.cache/huggingface`) are pulled into
 their own `${HF_HOME}` macro so a chat template (or LoRA) living in the HF cache
 never widens `${MODELS_DIR}` up to a non-models directory.
 

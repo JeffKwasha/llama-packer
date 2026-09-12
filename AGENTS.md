@@ -1,19 +1,5 @@
 # AGENTS.md
 
-Rules for agents working in this repo.
-
-## Environments
-- Do NOT create a `.venv`. Use the existing environment at `/var/uv/env/bin14`.
-- Do NOT make changes to that environment. If any change seems needed, ask the user first.
-- Run tests with: `PYTHONDONTWRITEBYTECODE=1 /var/uv/env/bin14/bin/python -m pytest -q -p no:cacheprovider`
-
-## Filesystem
-- Never run recursive searches (`find`, `grep`, `glob`, `rg`, ...) on `/home`, `/`, or `/mnt` — they hang forever. Use direct paths and non-recursive `ls`.
-- Symlinks are used everywhere, including symlinks to symlinks to symlinks. Resolve before assuming a path is real or dead.
-
-## Tooling
-- Node.js is evil. Stay away from it.
-
 ## Measurement runs (probe-memory, fit-sweep, any llama-server load)
 Two legal modes, nothing else:
 
@@ -31,12 +17,9 @@ Two legal modes, nothing else:
    just failed; diagnose the single failing point first.
 
 Forbidden patterns (all observed 2026-09-08):
-- launching a multi-arch × multi-point batch as the FIRST live test of
-  unproven code;
-- `sleep 290; tail; sleep 290; tail` — blind, decision-free polling;
-- rerunning a full batch instead of reproducing one failed point.
+- avoid running commands that will take more than 4 minutes to complete
+- when one step of a multi-step action fails, it's best to skip the prior steps.
+- if you have to run a slow command, consider running it in a subagent and doing something else in the meantime.
 
-Drives: a measurement load reads 6-20 GB from platter; keep strictly
-one heavy reader, and keep total batch wall time announced to the user
-before starting. The run journal (~/.cache/llama-packer/measure-journal.jsonl)
-records per-point duration — read its dur_s trend to catch drift early.
+Platter drives read at 100MB/second - estimate time to complete before firing off a command
+loading a 22GB model from a platter will almost always take more than 4 minutes.

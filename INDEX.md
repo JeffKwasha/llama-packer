@@ -52,7 +52,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 ## Data dirs
 
 - `models/` — GGUF + `.md` sidecars (`chat/` `vision/` `doc/` `embed/` `rerank/` by use-case; `img/` etc. ignored; optional per-directory `models.yaml`; see SPEC.md "Model Discovery"); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
-- `/mnt/ai/models` — canonical model root (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); configured via profiles.yaml `models_dirs:` + `dirs:` / `hf_home:`
+- configured model roots (`models_dirs:`) — same layout (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); `dirs:` maps directories to roles, `hf_home:` sets the HF cache root
 - `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
 - [`extras/update`](extras/update) — llama.cpp + llama-swap updater (installs into repo root)

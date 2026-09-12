@@ -147,7 +147,7 @@ export INSTALL_ROOT
 # llama.cpp build directory: path containing llama-server and llama-fit-params.
 # If set, overrides the auto-detected llama-b#### directories.
 # Leave empty to use the llama-b*/ dirs under INSTALL_ROOT (created by extras/update).
-# Example: "/opt/llama/cpp/build" or "/mnt/ai/llama-builds"
+# Example: "/opt/llama/cpp/build" or "~/llama-builds"
 export LLAMA_BIN_DIR="${LLAMA_BIN_DIR:-}"
 
 # Models directory: root containing GGUF models and .md sidecars.
@@ -404,7 +404,7 @@ main "$@"
 2. **Make it executable**: `chmod +x install_llama_packer.sh`
 3. **Customize** the env vars at the top (or override them on the command line):
    ```bash
-   INSTALL_ROOT=/opt/llama-packer MODELS_DIR=/mnt/ai/models ./install_llama_packer.sh
+   INSTALL_ROOT=/opt/llama-packer MODELS_DIR=~/models ./install_llama_packer.sh
    ```
 4. **Run**: `./install_llama_packer.sh`
 
