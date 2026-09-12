@@ -69,9 +69,9 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Shared embed/rerank/chat VRAM budget solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
+| `matrix` | Configurable co-resident `categories` + shared chat/RAG VRAM solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
-| `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
+| `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
 | `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
@@ -269,7 +269,7 @@ All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat 
 
 ## Matrix Context Solving
 
-When `profiles.yaml` defines a `matrix` section with `embed` and `rerank` models, the system solves a shared VRAM budget equation across all model types:
+When `profiles.yaml` defines a `matrix` section, the system solves a shared VRAM budget equation across all model types. The co-resident classes are declared by `categories:` — defaulting to the RAG pair `emb`/`rnk`, with additional fixed-overhead categories (e.g. `tts`/`stt`) allowed:
 
 ```
 reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
@@ -279,7 +279,32 @@ chat_ctx solves Σ(chat_weight + chat_factor × chat_ctx) = available - embed - 
 
 The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (at their declared contexts). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models. Smaller chat models are never raised above their own design context — they are only clamped down to it. Unestimable chat participants ("riders", zero-cost placeholders) ride the measurable models' solve: they never set the shared bar (their native max would inflate `chat_ctx` for everyone and suppress tools demotion) and are flagged `estimated: false`.
 
-Embed/rerank models are auto-selected as the smallest model of each type, or matched by `--embed`/`--rerank` CLI selectors. **They always serve single-slot**: a declared `parallel:` on an embeddings/rerank model is ignored with a note — resident parallelism must never buy context away from the main chat it serves.
+Embed/rerank models are auto-selected as the smallest model of each role, or matched by `--embed`/`--rerank` CLI selectors (declared categories select by their `role:`). **They always serve single-slot**: a declared `parallel:` on an embeddings/rerank model is ignored with a note — resident parallelism must never buy context away from the main chat it serves.
+
+### Categories
+
+`matrix.categories:` maps a category **name** (the var name referenced by `sets:`) to the role that selects its model:
+
+```yaml
+matrix:
+  categories:
+    emb: {role: embeddings}
+    rnk: {role: rerank}
+    tts: {role: t2s}      # optional fixed-overhead resident
+    stt: {role: s2t}
+  evict_costs: {emb: 100, rnk: 100, tts: 50, stt: 50}
+  sets:
+    rag:   "__CHAT_VARS__ & emb & rnk"
+    voice: "__CHAT_VARS__ & (tts | stt)"
+```
+
+- Defaults to `{emb: {role: embeddings}, rnk: {role: rerank}}`, so existing configs are unchanged.
+- `emb`/`rnk` drive the shared chat-context solve below. Every **other** declared category is a **fixed-overhead resident**: reserved alongside chat and RAG, smallest-first, while chat stays at or above the co-load floor.
+- A category that cannot be sized is skipped with a warning; one that does not fit the floor is **not reserved** (its var is still emitted, so a `sets:` branch referencing it may over-subscribe — the warning is the signal).
+- `evict_costs:` keys must be declared category names; an unknown key is warned about and left to llama-swap (which ignores it).
+- Model selection is by role, with the same smallest-VRAM / `--embed`/`--rerank` selector logic used for the RAG pair.
+
+`tts` and `stt` are separate categories because switching between them forces a resident reload; `(tts | stt)` in a set is a runtime choice, not a co-load. Additional audio roles (`vc`, `vad`, `music`, `separation`) are recorded in [docs/plans/audio-roles.md](docs/plans/audio-roles.md).
 
 ### Knobs (matrix section keys)
 
@@ -302,14 +327,14 @@ When the baseline solve puts chat below `tools_min_ctx`, the solver re-solves wi
 
 ### Opportunistic co-loads
 
-After the squeeze pass, enabled `s2t` and `image` models (not `t2s` — containerized, separate pool; not `embeddings`/`rerank` — unconditional residents) are included smallest-fixed-overhead-first while the chat solve stays at or above the floor:
+After the squeeze pass, enabled `s2t` and `image` models that are **not already declared categories** (and not `embeddings`/`rerank` — unconditional residents) are included smallest-fixed-overhead-first while the chat solve stays at or above the floor. Declared non-RAG categories (e.g. `tts`/`stt`) are reserved *first*, before this opportunistic pass:
 
 - floor = `tools_min_ctx` when a chat model declares `tools` and the baseline still keeps it; otherwise `min_chat_ctx`.
 - A candidate that would drop chat below the floor is skipped with a warning naming model and MB; it does not block smaller candidates later in the list.
 - Fixed overhead = weights + fixed compute (zero KV terms for these backends). An operator-pinned `vram_mb` sidecar field is authoritative (`source: config`); otherwise the file-size + per-backend-buffer estimate applies, padded by `estimate_headroom` when no measurement exists. CPU-resident candidates cost 0.
 - Shared process overhead is counted once per process, not per model — a multi-model entry (e.g. a speech server hosting ASR + VAD + diarization) is budgeted as Σ(weights + per-model activations) + one shared constant; pin the entry with `vram_mb` to encode the sum directly.
 
-Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision), and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
+Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision) in addition to one var per declared category, and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
 
 ### tools demotion
 
@@ -673,7 +698,8 @@ Every vLLM container entry also gets `-e HF_HOME=/root/.cache/huggingface` and
 pre-staged in the mounted hub fails fast at startup — that is the cache-miss case, not a
 bug; llama-packer warns at pack time when `hf_cache` is unset for a repo-id model.
 
-`docker_args` (default `--runtime=nvidia --gpus all --shm-size=16g`) is the operator's
+`container_args` (default: vendor-detected device flags + `--shm-size=16g`;
+legacy keys `docker_args`/`podman_args`) is the operator's
 flexibility point for container-runtime specifics: GPU device selection
 (`--gpus device=N` / `-e CUDA_VISIBLE_DEVICES=N`), `--ipc=host` vs `--shm-size`, and
 extra read-only binds (e.g. vLLM/flashinfer/triton JIT caches — without them every start

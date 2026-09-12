@@ -31,7 +31,9 @@ main()                                        (__main__.py — thin orchestratio
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx |
 | `emit_config` | `writer.py` | Pure rendering: plans → entry dicts. Zero VRAM contact, zero I/O |
 | `_filter_supported` | `writer.py` | **The** validation boundary: backend format/role compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
-| Backends | `backends/` | Registry + ABC; each renders a resolved `Model` into a `cmd`. Selection: sidecar/override `backend:` > format inference gated by configured resources |
+| Backends (engines) | `backends/`, `backends/base.py` | The serving engines (llama.cpp, vLLM, sd.cpp, whisper.cpp, audio.cpp): roles/formats, argv construction (`build_cmd`), and the resource requirements needed to launch them (`host_requires`/`container_requires`). Each renders a resolved `Model` into a `cmd` |
+| Transports | `backends/transport.py` | How an engine's process is launched: `host`, or a container runtime (`docker`, `podman`). Owns host→container path translation, mounts, container env, GPU device flags and lifecycle (`stop_cmd`/`unload_timeout`). One `ContainerTransport(runtime)` serves both docker and podman |
+| Registry binding | `backends/__init__.py` | Materialises one `BoundBackend` per valid (engine, transport) pair; engines declare which transports they support. Names: bare engine for host, `<engine>-<transport>` otherwise. Inference order: engines in declaration order, transports host > podman > docker; a container pair is only inferred when its runtime is on `PATH`. Selection: sidecar/override `backend:` > format/role inference gated by configured resources |
 | `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `calc_ctx`, matrix solver primitives |
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
@@ -46,6 +48,7 @@ main()                                        (__main__.py — thin orchestratio
 | Validation happens exactly once, before budgeting | `build_config` composes filter → plan → emit in that order |
 | Plans are values; rendering is pure | `Planner.plan()` returns `dict[stem, list[Variant]]`; `emit_config` has no side effects |
 | Precedence rules exist in one place | raw `defaults:`/`profiles:` dicts are only read through `Profiles` |
+| Backends are (engine × transport) bindings, not per-combination classes | `BoundBackend` over `ENGINES` × `TRANSPORTS` (`backends/__init__.py`); container mechanics live only in `transport.py` |
 
 The plan/emit split is deliberate: planning depends only on models'
 `VramBudget` interfaces (injectable/fakeable), emission is deterministic over
@@ -65,10 +68,15 @@ plain data — see `tests/test_planner.py`.
 
 ## Extension points
 
-- **Add a backend**: create `backends/<name>.py` with a `BaseBackend` subclass,
-  register it in `BACKENDS` (`backends/__init__.py`). Registration order is the
-  inference preference order; declare `formats`, roles, and `is_available`
-  resource gating. Nothing else changes.
+- **Add an engine**: create `backends/<name>.py` with a `BaseBackend` subclass
+  and add it to `ENGINES` (`backends/__init__.py`). Declare `formats`, `roles`,
+  `transports` (which of `host`/`podman`/`docker` it runs under), and
+  `host_requires`/`container_requires` (the `avail` keys needed to launch).
+  Registration order is the inference preference order; the transport seam
+  means one engine class serves every supported transport. Nothing else changes.
+- **Add a transport**: implement a `Transport` in `backends/transport.py` and
+  register it in `TRANSPORTS`; engines opt in via `transports`. Container
+  runtimes share one implementation parameterised by the runtime binary.
 - **New profiles.yaml key**: read it through `Profiles`; if it affects
   variants, thread it through `groups_for`.
 - **New sidecar field**: add to `Model.FIELDS` only if the builder consumes
@@ -76,6 +84,8 @@ plain data — see `tests/test_planner.py`.
 
 ## Where to read more
 
+- [backends/](backends/) — one doc per engine: roles/formats, command shape, config keys, VRAM
+- [transports/](transports/) — host / docker / podman: launch wrapping, path translation, lifecycle
 - [new-model-pipeline.md](new-model-pipeline.md) — the end-to-end walkthrough
   for "a GGUF appeared": discovery → fit-params estimate → matrix solve →
   auto-parallel → emit, including the measurement-shape contract, the

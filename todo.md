@@ -1,16 +1,19 @@
 # todo.md — Plan for B + C
 
-Status: **working plan, as it stands 2026-09-11** (no design decisions frozen
-yet). Repo `main` @ `705d8ad`, 417 tests green.
+Status: **historical planning snapshot** — the plan as it stood before
+implementation; landed on branch `dry_backend` (2026-09-12). See
+[Completion status](#completion-status) at the bottom for what shipped, what
+was deferred, and what our decisions superseded.
 
 - **B** = backend/transport delineation (engine vs transport seam).
 - **C** = configurable matrix categories, to express
   `(CHAT) + ((EMB+RERANK) | (TTS&/or STT))`.
-- **Forcing function** = `audio.cpp` (`audiocpp_server`). Its brief is
-  [`docs/plans/audio-cpp.md`](docs/plans/audio-cpp.md) — another AI is researching it.
+- **Forcing function** = `audio.cpp` (`audiocpp_server`); engine doc now at
+  [`docs/backends/audio-cpp.md`](docs/backends/audio-cpp.md).
 
-Companion docs: [`docs/plans/matrix-categories.md`](docs/plans/matrix-categories.md)
-(C proposal, recorded 2026-08-24, "not scheduled"),
+Companion docs: [`docs/backends/`](docs/backends/),
+[`docs/transports/`](docs/transports/),
+[`docs/plans/matrix-categories.md`](docs/plans/matrix-categories.md) (implemented),
 [`docs/plans/opportunistic-coload.md`](docs/plans/opportunistic-coload.md),
 [`docs/architecture.md`](docs/architecture.md).
 
@@ -209,3 +212,32 @@ roles can't participate at all.
 2. C: exact `matrix.categories` YAML shape (ratify `matrix-categories.md`).
 3. Audio category granularity (`tts`/`stt` vs `audio`).
 4. Whether B and C land as separate PRs (recommended) or one.
+
+---
+
+## Completion status (2026-09-12)
+
+**B — done.** Engine and transport are independent axes (`backends/transport.py`,
+`BoundBackend`): `vllm`/`vllm-podman`/`vllm-docker` are one engine × three
+transports; engines declare `transports`; preference host > podman > docker,
+runtime-gated. `docs/architecture.md` updated (components, invariant, extension
+points).
+
+**C — done (approach (a)).** `matrix.categories` (default `emb`/`rnk`),
+per-category vars, `evict_costs` validation; non-RAG categories are
+fixed-overhead residents reserved first. `tts`/`stt` separate. Documented in
+`SPEC.md` + README.
+
+**audio-cpp — done (host).** First engine on the seam; roles `t2s`+`s2t`;
+replaces kokoro-podman (removed) and complements whisper-server (no model
+overlap).
+
+**Superseded / deferred / out of scope:**
+- Full `solve_matrix_ctx` → `category_params` generalization — **not done by
+  decision** (approach (a) chosen over (b)).
+- Missing-category / "voice-only" fleets — **not done**; `emb`+`rnk` are still
+  required to enable the matrix.
+- `+`/`|` grammar vs llama-swap `settings.matrix` — **unverified**.
+- audio-cpp **podman transport** — **future, if ever**.
+- audio.cpp **source build** — **out of scope** for llama-packer.
+- audio roles `vc`/`vad`/`music`/`sep` — parked in `docs/plans/audio-roles.md`.

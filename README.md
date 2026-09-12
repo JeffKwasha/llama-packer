@@ -128,11 +128,11 @@ Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](p
 |---|---|
 | `defaults` / `profiles` | `temperature`, `top_p`, `cache_type`, `parallel`, `spare` (+ `base * N` expressions, `description` docs-only) |
 | `models_dirs` / `dirs` / `hf_home` | discovery roots & dir→role map (`it2t: chat`) |
-| `backends` / `vllm` | enable list (`llama-server`, `vllm-docker`), `image`/`bin`/`docker_args` |
+| `backends` / `vllm` | enable list (`llama-server`, `vllm-podman`, `vllm-docker`), `image`/`bin`/`container_args` (legacy `docker_args`) |
 | `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
-| `matrix` | shared `emb`/`rnk` co-loading sets via `__CHAT_VARS__` |
+| `matrix` | co-resident `categories` (default `emb`/`rnk`; e.g. add `tts`/`stt`), sets via `__CHAT_VARS__` |
 
 Profiles overlay `defaults` and emit `filters.setParamsByID`; sidecar `modes:` / `allow_profiles:` replace or filter them per-model. See [SPEC → profiles.yaml](SPEC.md#profilesyaml) for the full table.
 
@@ -170,4 +170,4 @@ DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM dete
 - Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
 - Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as `role: t2s` / `role: s2t` with `dirs: {t2s: t2s, s2t: s2t}` and `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
-- Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)
+- Configurable matrix categories — **available**: declare co-resident classes beyond `emb`/`rnk` (e.g. `tts`/`stt`) and reference them in `sets:`; see [SPEC → Matrix Context Solving](SPEC.md#matrix-context-solving)

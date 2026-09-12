@@ -3,7 +3,7 @@
 Text-to-speech (`t2s`) and speech-to-text (`s2t`) via the native ggml
 [audio.cpp](https://github.com/0xShug0/audio.cpp) engine (`audiocpp_server`).
 
-- **Engine:** audio.cpp · **Transports:** host (`audio-cpp`); podman later.
+- **Engine:** audio.cpp · **Transports:** host (`audio-cpp`); a container transport is future/optional.
 - **Roles:** `t2s`, `s2t`.
 - **Formats:** `.gguf`, `.safetensors`, `hf_repo`.
 - **Proxied:** yes — `proxy` + `checkEndpoint: /health`.
@@ -120,17 +120,22 @@ alongside chat and RAG while the chat context stays at/above the co-load floor.
 
 ## Build / install
 
-API-level notes (not yet wired into `extras/update`):
+**llama-packer does not build audio.cpp** — obtaining the binary is out of
+scope, as with the other engines (`extras/update` only downloads llama.cpp and
+llama-swap). Point the backend at an `audiocpp_server` you built or obtained;
+resolution is `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
+`$AUDIOCPP_BIN_DIR` > `audiocpp_server` on `PATH`.
 
-- **Source:** GCC 13+, CMake. `-DENGINE_ENABLE_CUDA=ON` (NVIDIA),
-  `-DENGINE_ENABLE_VULKAN=ON` (portable AMD), CPU always on; build the
-  `audiocpp_server` target.
-- **NVIDIA/Spark:** CUDA, pin `CUDAToolkit_ROOT` + `CMAKE_CUDA_COMPILER`.
-- **AMD/RDNA4:** the documented portable path is **Vulkan**; HIP/ROCm is
-  experimental.
+- **Source build (operator-managed):** upstream `docs/build/linux.md` — GCC 13+,
+  CMake; `-DENGINE_ENABLE_CUDA=ON` (NVIDIA), `-DENGINE_ENABLE_VULKAN=ON`
+  (portable AMD path), CPU always on. On GB10, pin `CUDAToolkit_ROOT` +
+  `CMAKE_CUDA_COMPILER` to avoid a mixed-toolkit build.
 - **Prebuilt:** the llama-swap unified image (`unified-cuda13`, `unified-cuda`,
-  `unified-vulkan`) builds audio.cpp from source; no stable standalone
-  `audiocpp_server` tarball was found.
+  `unified-vulkan`) bundles it; no stable standalone `audiocpp_server` tarball
+  was found.
+
+A container transport (podman/docker) may be added later; it is not part of the
+current host-only support.
 
 ## vs whisper.cpp
 
