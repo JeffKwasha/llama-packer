@@ -382,17 +382,10 @@ def test_chat_models_still_have_no_proxy_fields(make_model):
     assert "checkEndpoint" not in entry
 
 
-# ── t2s (kokoro-podman) role ─────────────────────────────────────────────
+# ── t2s role capabilities (serving backend: audio-cpp) ───────────────────
 
 def test_t2s_role_is_text_in_audio_out(make_model):
     model = make_model("k", role="t2s")
     caps = _entry_of(model)["capabilities"]
     assert caps["in"] == ["text"]
     assert caps["out"] == ["audio"]
-
-
-def test_t2s_entry_gets_proxy_fields(make_model):
-    model = make_model("k", role="t2s", backend="kokoro-podman")
-    entry = _entry_of(model)
-    assert entry["proxy"] == "http://127.0.0.1:${PORT}"
-    assert entry["checkEndpoint"] == "/"

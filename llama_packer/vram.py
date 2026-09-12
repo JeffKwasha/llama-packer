@@ -68,12 +68,11 @@ from llama_packer.consts import (
     _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
     _WEIGHT_CPU_MAP_TOLERANCE_MIB,
-    _KOKORO_COMPUTE_MB,
     ESTIMATE_ERROR_REASON,
 )
-from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
-                                   SD_BACKENDS, VLLM_BACKENDS,
-                                   WHISPER_BACKENDS, get_backend)
+from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, SD_BACKENDS,
+                                   VLLM_BACKENDS, WHISPER_BACKENDS,
+                                   get_backend)
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -88,8 +87,7 @@ _FIT_PARAMS_REQUIRED = frozenset(
 
 # Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
-                     **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
-                     **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
+                     **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS}}
 
 # Persisted blocks acceptable without re-measurement.  The retired plain
 # fit-params measurement (KV-pool only, no corrections) is deliberately
@@ -1140,9 +1138,9 @@ class VramBudget:
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
-        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t,
-        # kokoro-podman t2s): VRAM = weights (file size, 0 when baked into the
-        # image) + a fixed runtime buffer, no KV terms.  These are excluded
+        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t):
+        # VRAM = weights (file size, 0 when baked into a container image) + a
+        # fixed runtime buffer, no KV terms.  These are excluded
         # from the shared chat matrix, so precise factors are irrelevant;
         # calc_ctx returns design_ctx when kv_per_token_mib==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:

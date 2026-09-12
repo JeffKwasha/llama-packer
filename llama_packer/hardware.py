@@ -224,7 +224,7 @@ def detect_gpu_vendor() -> str:
 
     Same probes as :func:`detect_gpu_env_var` (amd-smi / rocminfo, then
     nvidia-smi) but returning a vendor label — used to pick container
-    default images and device pass-through flags (kokoro-podman).
+    default images and device pass-through flags.
     """
     try:
         out = subprocess.run(

@@ -102,7 +102,7 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
         if model.role in ("s2t", "t2s", "image") and backend.name == "llama-server":
             logger.error("skipping %s: role %r must not use backend %r (use %s)",
                          model.stem, model.role, backend.name,
-                         {"s2t":"whisper-server","t2s":"kokoro-podman","image":"sd-server"}[model.role])
+                         {"s2t":"whisper-server","t2s":"audio-cpp","image":"sd-server"}[model.role])
             continue
 
         # Capability / companion cross-check: a companion file is not a

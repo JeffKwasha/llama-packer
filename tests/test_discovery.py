@@ -374,37 +374,4 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
                    for r in caplog.records)
 
 
-# ── t2s (kokoro) discovery ────────────────────────────────────────────────
-
-def test_t2s_optin_hf_repo_only_sidecar(tmp_path, caplog):
-    # Kokoro weights are baked into the container image: a t2s sidecar needs
-    # no local model file at all — hf_repo alone identifies it.
-    from llama_packer.backends import infer_backend
-    root = tmp_path / "models"
-    (root / "t2s").mkdir(parents=True)
-    (root / "t2s" / "kokoro-v1.md").write_text(
-        "---\nname: kokoro-v1\nhf_repo: hexgrad/Kokoro-82M\n---\n")
-
-    with caplog.at_level(logging.ERROR):
-        models = Model.from_dir(root, generate_stubs=False,
-                                dir_roles={"t2s": "t2s"})
-    assert len(models) == 1
-    m = models[0]
-    assert m.role == "t2s"
-    # Backend inference needs the configured image (from_dir passes no avail,
-    # so availability gating happens at pack time, not discovery time).
-    assert infer_backend(m, {"kokoro_image": "img"}) == "kokoro-podman"
-
-
-def test_t2s_onnx_sidecar_stem_resolves(tmp_path):
-    # A locally downloaded .onnx copy resolves by same-stem convention.
-    root = tmp_path / "models"
-    (root / "t2s").mkdir(parents=True)
-    (root / "t2s" / "kokoro-v1.onnx").write_bytes(b"x")
-    (root / "t2s" / "kokoro-v1.md").write_text(_sidecar("Kokoro v1"))
-
-    models = Model.from_dir(root, generate_stubs=False,
-                            dir_roles={"t2s": "t2s"})
-    assert len(models) == 1
-    assert models[0].gguf_path is not None
-    assert models[0].gguf_path.name == "kokoro-v1.onnx"
+# ── audio (t2s) discovery is exercised by the audio-cpp backend tests ─────

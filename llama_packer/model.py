@@ -466,8 +466,8 @@ class Model:
         # where a file lives, not a file itself. Most sidecars resolve to a
         # concrete file (same-stem, explicit model:, or single non-mmproj file
         # in the snapshot). hf_repo-only (no local file) is allowed for
-        # backends that serve directly from a repo id (vLLM safetensors,
-        # kokoro-podman which is image-baked). Every other case needs a file.
+        # backends that serve directly from a repo id (vLLM safetensors).
+        # Every other case needs a file.
         self.gguf_path = self._resolve_gguf_path()
         if not self.gguf_path and self.hf_repo is None:
             tried_local = ", ".join(
@@ -703,7 +703,7 @@ class Model:
             return None
 
         # 2. Convention: same stem, .gguf / .safetensors / whisper GGML .bin /
-        # kokoro ONNX (.bin and .onnx resolve only for their audio roles —
+        # .onnx (the .bin and .onnx forms resolve only for their audio roles —
         # discovery requires the s2t/t2s directory)
         for ext in (".gguf", ".safetensors", ".bin", ".onnx"):
             hit = Model.from_ref(f"{self.stem}{ext}", anchors=[parent],
