@@ -13,11 +13,9 @@ set -euo pipefail
 #   ./extras/update --swap-only v252  # Specific llama-swap version
 #   ./extras/update --skip-swap # Skip llama-swap update
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Binaries install into the repo root; when this script runs from extras/,
-# target the parent directory.
-INSTALL_DIR="$SCRIPT_DIR"
-[[ "$(basename "$SCRIPT_DIR")" == "extras" ]] && INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Binaries install into the current working directory, not the script's
+# location — run this from wherever you want llama-b*/ and llama-swap to live.
+INSTALL_DIR="$PWD"
 RELEASES_URL="https://api.github.com/repos/ggml-org/llama.cpp/releases"
 LLAMA_SWAP_RELEASES_URL="https://api.github.com/repos/mostlygeek/llama-swap/releases"
 KEEP_VERSIONS=3  # Keep current + N-1 previous versions
@@ -75,7 +73,7 @@ usage() {
 Usage: $(basename "$0") [version|vulkan|rocm] [options]
 
 Download and install llama.cpp and llama-swap prebuilt binaries.
-Run this from the repo root; it installs into the repo root.
+Install location is the current working directory.
 
 Arguments:
   version       Specific llama.cpp version tag (e.g., b8913, b8902)
@@ -87,7 +85,8 @@ Options:
   --cpp-only         Only update llama.cpp (skip llama-swap)
   --skip-swap        Skip llama-swap update
   --swap-version TAG Specific llama-swap version (e.g., v252)
-  --arch ARCH        Override arch for llama-swap (linux_amd64, linux_arm64, x86_64, aarch64)
+  --arch ARCH        Override the detected CPU architecture for both
+                     downloads (x64/amd64/linux_amd64 or arm64/aarch64/linux_arm64)
   -h, --help         Show this help
 
 Examples:
@@ -195,7 +194,7 @@ cleanup_old_versions() {
 get_llama_swap_arch() {
     if [ -n "$OVERRIDE_ARCH" ]; then
         case "$OVERRIDE_ARCH" in
-            linux_amd64|x86_64|amd64) echo "linux_amd64" ;;
+            linux_amd64|x86_64|amd64|x64) echo "linux_amd64" ;;
             linux_arm64|aarch64|arm64) echo "linux_arm64" ;;
             *) echo "$OVERRIDE_ARCH" ;;
         esac
@@ -205,6 +204,26 @@ get_llama_swap_arch() {
         x86_64|amd64) echo "linux_amd64" ;;
         aarch64|arm64) echo "linux_arm64" ;;
         *) echo "linux_amd64" ;;
+    esac
+}
+
+# llama.cpp release assets use x64 / arm64 / s390x (e.g. llama-b<int>-bin-ubuntu-vulkan-arm64.tar.gz).
+# Note: the Linux ROCm builds upstream ships are x64-only.
+get_llama_cpp_arch() {
+    if [ -n "$OVERRIDE_ARCH" ]; then
+        case "$OVERRIDE_ARCH" in
+            linux_amd64|x86_64|amd64|x64) echo "x64" ;;
+            linux_arm64|aarch64|arm64) echo "arm64" ;;
+            s390x) echo "s390x" ;;
+            *) echo "$OVERRIDE_ARCH" ;;
+        esac
+        return
+    fi
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        s390x) echo "s390x" ;;
+        *) echo "x64" ;;
     esac
 }
 
@@ -546,6 +565,7 @@ fi
 # Main: llama.cpp
 if ! $SWAP_ONLY; then
     HIGHEST_INSTALLED=$(get_highest_installed)
+    CPP_ARCH=$(get_llama_cpp_arch)
 
     case "$VERSION" in
         *vulkan)
@@ -554,9 +574,9 @@ if ! $SWAP_ONLY; then
                 echo "Already have version b$HIGHEST_INSTALLED, which is newer than $TAG"
             else
                 ASSETS=$(get_assets "$TAG")
-                URL=$(find_asset "$ASSETS" "ubuntu-vulkan-x64")
+                URL=$(find_asset "$ASSETS" "ubuntu-vulkan-${CPP_ARCH}")
                 if [ -z "$URL" ]; then
-                    echo "Error: Could not find Vulkan asset for $TAG" >&2
+                    echo "Error: Could not find Vulkan ($CPP_ARCH) asset for $TAG" >&2
                     exit 1
                 fi
                 if download_and_extract "$URL" "$TAG"; then
@@ -569,6 +589,10 @@ if ! $SWAP_ONLY; then
             if is_newer "$HIGHEST_INSTALLED" "${TAG#b}"; then
                 echo "Already have version b$HIGHEST_INSTALLED, which is newer than $TAG"
             else
+                if [ "$CPP_ARCH" != "x64" ]; then
+                    echo "Error: ROCm builds are Linux x64 only (detected $CPP_ARCH)" >&2
+                    exit 1
+                fi
                 ASSETS=$(get_assets "$TAG")
                 URL=$(find_asset "$ASSETS" "ubuntu-rocm-[^-]*-x64")
                 if [ -z "$URL" ]; then
@@ -586,9 +610,9 @@ if ! $SWAP_ONLY; then
                 echo "Already have version b$HIGHEST_INSTALLED, which is newer than $TAG"
             else
                 ASSETS=$(get_assets "$TAG")
-                URL=$(find_asset "$ASSETS" "ubuntu-vulkan-x64")
+                URL=$(find_asset "$ASSETS" "ubuntu-vulkan-${CPP_ARCH}")
                 if [ -z "$URL" ]; then
-                    echo "Error: Could not find Vulkan asset for $TAG" >&2
+                    echo "Error: Could not find Vulkan ($CPP_ARCH) asset for $TAG" >&2
                     exit 1
                 fi
                 if download_and_extract "$URL" "$TAG"; then
@@ -603,12 +627,14 @@ if ! $SWAP_ONLY; then
                 echo "Error: Version $VERSION not found" >&2
                 exit 1
             fi
-            URL=$(find_asset "$ASSETS" "ubuntu-vulkan-x64")
+            URL=$(find_asset "$ASSETS" "ubuntu-vulkan-${CPP_ARCH}")
             if [ -z "$URL" ]; then
-                # Try ROCm
-                URL=$(find_asset "$ASSETS" "ubuntu-rocm-[^-]*-x64")
+                # Try ROCm (x64 only upstream)
+                if [ "$CPP_ARCH" = "x64" ]; then
+                    URL=$(find_asset "$ASSETS" "ubuntu-rocm-[^-]*-x64")
+                fi
                 if [ -z "$URL" ]; then
-                    echo "Error: Could not find Linux asset for $VERSION" >&2
+                    echo "Error: Could not find Linux ($CPP_ARCH) asset for $VERSION" >&2
                     exit 1
                 fi
             fi
