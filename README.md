@@ -81,7 +81,7 @@ UI badges from these), driven by `role:` plus declared capabilities:
 | `embeddings` | `embed/` | text → vectors | llama-server / vLLM | `/v1/embeddings` |
 | `rerank` | `rerank/` | query+docs → scores | llama-server / vLLM | `/v1/rerank` |
 | `s2t` | `s2t/` (opt-in) | audio → text | whisper-server | `/v1/audio/transcriptions` |
-| `t2s` | `t2s/` (opt-in) | text → audio | kokoro-podman | `/v1/audio/speech` |
+| `t2s` | `t2s/` (opt-in) | text → audio | audio-cpp | `/v1/audio/speech` |
 | `image` | `img/` (opt-in) | text+image → image (or video if video capability / video-arch) | sd-server | `/sdapi/v1/txt2img` |
 
 On a **chat** model, `capabilities: [image]` adds image *input* (`vision`
@@ -142,7 +142,7 @@ Run `llama-packer --agents` to write an `AGENTS.md` sidecar guide into each mode
 
 ### vLLM backend
 
-Serve a model with vLLM instead of llama-server via an override rule in `profiles.yaml` (or a one-off `backend:` line in its sidecar): `backend: vllm` runs the host binary, `backend: vllm-docker` runs a container. Memory sizing, image/binary precedence, and budget details are in [SPEC.md → vLLM Backend](SPEC.md#vllm-backend).
+Serve a model with vLLM instead of llama-server via an override rule in `profiles.yaml` (or a one-off `backend:` line in its sidecar): `backend: vllm` runs the host binary, `backend: vllm-podman` / `backend: vllm-docker` run a container. Memory sizing, image/binary precedence, and budget details are in [docs/backends/vllm.md](docs/backends/vllm.md).
 
 DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM detection falls back to the unified pool, and per-model recipe keys (`vllm_quantization`, `moe_backend`, `mamba:`, `tool_call_parser`, `reasoning_parser`) cover the Blackwell model recipes. Docker entries are self-contained: HF_HOME root mounted read-only at `/root/.cache/huggingface` (offline — models must be pre-staged), `cmdStop`/`unloadTimeout` for container lifecycle, explicit `proxy`.
 
@@ -166,8 +166,8 @@ DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM dete
 - Support multi-image/tensor-parallel vLLM provisioning
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
-- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [SPEC.md](SPEC.md#image-backend-sd-server) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
-- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [SPEC.md → Audio Backend](SPEC.md#audio-backend-whisper-server)
-- Text-to-speech via `kokoro-podman` (Kokoro-82M in rootless podman, NVIDIA + AMD/ROCm) — **available** as `role: t2s` with `dirs: {t2s: t2s}` and `backends: [kokoro-podman]` (opt-in; weights baked into the image — an `hf_repo`-only sidecar suffices; fixed ~3 GiB VRAM); see [SPEC.md → Audio Backend (kokoro-podman)](SPEC.md#audio-backend-kokoro-podman)
+- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [docs/backends/sd-server.md](docs/backends/sd-server.md) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
+- Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as `role: t2s` / `role: s2t` with `dirs: {t2s: t2s, s2t: s2t}` and `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
 - Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)

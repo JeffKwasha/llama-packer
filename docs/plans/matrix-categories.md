@@ -1,7 +1,11 @@
 # Plan: Configurable matrix categories
 
-Status: **proposal — not scheduled**. Recorded 2026-08-24.
-Related: `docs/plans/comfyui-sd.md`, `SPEC.md` Matrix Context Solving, `llama_packer/{__main__,writer,vram}.py`.
+Status: **implemented** (approach (a): declared non-RAG categories are
+fixed-overhead residents). `matrix.categories` + `evict_costs` validation +
+category vars shipped 2026-09-12; the remaining "fully general N-category
+solved-context" idea is future work. Recorded 2026-08-24.
+Related: `docs/plans/comfyui-sd.md`, `docs/plans/audio-roles.md`, `SPEC.md`
+Matrix Context Solving, `llama_packer/{__main__,writer,vram}.py`.
 
 ## Current state
 

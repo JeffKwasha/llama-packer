@@ -527,10 +527,11 @@ modes:
 ## vLLM Backend
 
 A model can be served with vLLM instead of llama-server by an override
-rule (see below) that sets `backend: vllm` (host binary) or `backend: vllm-docker`
-(container). The emitted entry runs `vllm serve`, published to llama-swap's `${PORT}`
-host macro. Everything else works identically: aliases/modes (`filters.setParamsByID`),
-`metadata`, capabilities, matrix routing.
+rule (see below) that sets `backend: vllm` (host binary), `backend: vllm-podman`
+or `backend: vllm-docker` (container). The emitted entry runs `vllm serve`,
+published to llama-swap's `${PORT}` host macro. Everything else works
+identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
+matrix routing.
 
 All three roles are supported, mapped onto vLLM's pooling interface:
 
@@ -547,7 +548,7 @@ LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`
 # profiles.yaml
 overrides:
   - when: {base_model: 'qwen3\\.30b'}
-    backend: vllm            # or vllm-docker
+    backend: vllm            # or vllm-podman / vllm-docker
     hf_repo: Qwen/Qwen3-30B-A3B-Instruct
 ```
 
@@ -617,7 +618,7 @@ architectural max) and vLLM's own startup profiling bounds the actual allocation
 
 ### Image / binary precedence
 
-The container image (`vllm-docker`) is resolved, highest to lowest:
+The container image (`vllm-podman`/`vllm-docker`) is resolved, highest to lowest:
 
 1. Per-model `vllm_image:` frontmatter
 2. `--vllm-image` CLI flag
@@ -630,18 +631,20 @@ The binary (`vllm`) is resolved, highest to lowest:
 2. `vllm.bin` in `profiles.yaml`
 3. Built-in default (`vllm` on PATH)
 
-`profiles.yaml` `vllm:` also configures `docker_args`, `container_port` and `hf_cache`
-(`vllm-docker`).
+`profiles.yaml` `vllm:` also configures `container_args` (legacy `docker_args` /
+`podman_args`), `container_port`, `container_vendor` and `hf_cache` for the
+container pairs.
 
-### Container (vllm-docker)
+### Container (vllm-podman / vllm-docker)
 
-llama-swap has no native container abstraction: a dockerized backend is a normal entry
-whose `cmd:` is `docker run --name ${MODEL_ID} … <image> <vllm serve flags>` — server
+llama-swap has no native container abstraction: a containerized backend is a normal entry
+whose `cmd:` is `<runtime> run --name ${MODEL_ID} … <image> <vllm serve flags>` — server
 flags are argv after the image, container env is `-e` inside `cmd` (an entry's `env:` list
-reaches only the docker client process). Two upstream-documented lifecycle fields are
-emitted with every vllm-docker entry:
+reaches only the container client process). docker and podman share one implementation
+(see [docs/transports/](docs/transports/)); two upstream-documented lifecycle fields are
+emitted with every container entry:
 
-- `cmdStop: docker stop ${MODEL_ID}` — an unload (swap, manual, or TTL) stops the
+- `cmdStop: <runtime> stop ${MODEL_ID}` — an unload (swap, manual, or TTL) stops the
   *container*; without it llama-swap can only kill the `docker run` client, leaving the
   container running with its VRAM held.
 - `unloadTimeout: 30` — must exceed the stop grace ("docker stop is slow").
@@ -665,7 +668,7 @@ layouts map by real location):
 2. Under any `models_dir` (e.g. `~/models`) → `/models`, `/models2`, … (already bound).
 3. Else → read-only parent bind (`-v <parent>:/extN`) and an `/extN/<name>` ref.
 
-Every vllm-docker entry also gets `-e HF_HOME=/root/.cache/huggingface` and
+Every vLLM container entry also gets `-e HF_HOME=/root/.cache/huggingface` and
 `-e HF_HUB_OFFLINE=1`: **llama-packer never downloads**. A repo-id model that is not
 pre-staged in the mounted hub fails fast at startup — that is the cache-miss case, not a
 bug; llama-packer warns at pack time when `hf_cache` is unset for a repo-id model.
@@ -812,76 +815,23 @@ the smallest ones join the shared resident set while chat keeps its floor.
 The emitted `--parallel` maps the sidecar/profile slot count to concurrent
 transcription workers.
 
-## Audio Backend (kokoro-podman)
+## Audio Backend (audio-cpp)
 
-A model with `role: t2s` (opt-in: a `t2s/` directory plus `dirs: {t2s: t2s}` in
-`profiles.yaml`) is served with **kokoro-podman** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
-text-to-speech via [remsky/Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI)
-in **rootless podman** (OpenAI-compatible `POST /v1/audio/speech`,
-`GET /v1/audio/voices`, health on `/`, container port 8880).
+A model with `role: t2s` (text-to-speech) or `role: s2t` (ASR) is served
+through the native **audio.cpp** engine (`audiocpp_server`). The full contract
+— roles, sidecar keys (`audio_cpp: {family, task, options, voice, voice_ref}`),
+profiles.yaml keys (`audio_cpp: {bin, backend, device, …}`), the emitted
+`sh -c` heredoc, classification, VRAM and matrix categories — lives in
+[docs/backends/audio-cpp.md](docs/backends/audio-cpp.md).
 
 ```yaml
 # profiles.yaml
-dirs: {t2s: t2s}
-backends: [llama-server, kokoro-podman]
+dirs: {t2s: t2s, s2t: s2t}
+backends: [llama-server, audio-cpp]
 ```
 
-```yaml
-# sidecar: t2s/kokoro-v1.md — weights and ~50 voicepacks are baked into the
-# image, so hf_repo alone identifies the model; no local file required.
----
-name: kokoro-v1
-hf_repo: hexgrad/Kokoro-82M
-description: "Kokoro-82M text-to-speech"
----
-```
-
-Emitted entry (NVIDIA example):
-
-```yaml
-kokoro-v1:
-  cmd: podman run --init --rm --name ${MODEL_ID} -p ${PORT}:8880 --device nvidia.com/gpu=all ghcr.io/remsky/kokoro-fastapi-gpu:latest
-  proxy: http://127.0.0.1:${PORT}
-  checkEndpoint: /
-  capabilities: {in: [text], out: [audio]}
-```
-
-### Vendor selection
-
-The GPU vendor picks both the default image tag and device pass-through flags:
-
-| vendor | default image | podman flags |
-|--------|--------------|--------------|
-| nvidia | `ghcr.io/remsky/kokoro-fastapi-gpu:latest` | `--device nvidia.com/gpu=all` |
-| amd | `ghcr.io/remsky/kokoro-fastapi-rocm:latest` | `--device /dev/kfd --device /dev/dri --group-add video --group-add render` |
-| cpu | `ghcr.io/remsky/kokoro-fastapi-cpu:latest` | *(none)* |
-
-Detection probes `amd-smi`/`rocminfo` then `nvidia-smi`. Precedence for the
-image: CLI `--kokoro-image` > profiles.yaml `t2s.image:` > vendor default.
-`t2s.vendor:` (`auto|nvidia|amd|cpu`) overrides detection for tag *and* flags;
-`t2s.podman_args:` replaces the auto flags entirely; `t2s.container_port`
-overrides 8880; `t2s.voices_dir:` bind-mounts a persistent voicepack directory
-(read-write — the server loads `.pt` packs per request and saves combined
-voices back). Pin to an upstream release tag rather than `:latest` for
-stability (`gpu:-cu128` for RTX 50-series / Blackwell).
-
-### Voices
-
-No per-model configuration: voices live server-side in the image (~50 packs),
-selected per request via the JSON body (`"voice": "af_heart"`, weighted mixes
-like `"af_bella(2)+af_sky(1)"`) and listed at `/v1/audio/voices`.
-
-### Capabilities and VRAM
-
-`role: t2s` emits `capabilities: {in: [text], out: [audio]}` (Speech badge).
-VRAM is fixed overhead: weights are baked into the image so `model_mib` is 0
-unless a local file resolves, plus a conservative 3072 MiB runtime buffer (the
-PyTorch/CUDA floor is ~2.4 GiB, peaks near 4 GiB under load — upstream
-`/dev/unload` benchmarks). The entry is excluded from the shared chat matrix
-solve. A local `.onnx` copy may resolve by same-stem sidecar convention inside
-the `t2s/` dir.
-
-
+GGML whisper `.bin` models remain on `whisper-server` (see the section above) —
+audio.cpp has no whisper family and cannot load them.
 
 ## Override Rules
 
@@ -1024,14 +974,16 @@ exactly like one in a sidecar (same merge rule, same validation).
 
 **Backend inference.** When neither the sidecar nor any rule declares a
 `backend`, one is inferred from the model's file format (`backends.infer_backend`):
-the registry walks backends in **registration order** — `llama-server`,
-`vllm-docker`, `vllm` — and picks the first whose registered formats cover the
-model AND whose required resources are configured (llama-server binary, vLLM
-image / binary). For this purpose **a locally resolved model file's extension
+the registry walks backends in **registration order** — `llama-server`, `vllm`,
+`vllm-podman`, `vllm-docker`, `sd-server`, `whisper-server`, `audio-cpp` — and
+picks the first whose registered formats cover the model AND whose required
+resources are configured (llama-server binary, vLLM image / binary, container
+runtime on `PATH`). For this purpose **a locally resolved model file's extension
 wins over `hf_repo`**: an HF repo id only drives selection when the model has
-no local file. Today that means `.gguf` → `llama-server` and safetensors /
-`hf_repo` → `vllm-docker` (falling back to host `vllm` when only the binary is
-configured). A format no available backend covers logs an error and the
+no local file. Today that means `.gguf` → `llama-server`; safetensors /
+`hf_repo` → the vLLM pairs (host first, then podman/docker); `.bin` under
+`s2t/` → `whisper-server`; audio GGUFs under `t2s/`/`s2t/` → `audio-cpp`. A
+format no available backend covers logs an error and the
 model's entries are skipped; so does a rule or sidecar naming an unregistered
 `backend`.
 
@@ -1059,33 +1011,36 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | Backend | Model formats | Roles |
 |---------|--------------|-------|
 | `llama-server` | `.gguf` | chat, embeddings, rerank |
-| `vllm` | safetensors, `hf_repo` | chat |
-| `vllm-docker` | safetensors, `hf_repo` | chat |
+| `vllm` / `vllm-podman` / `vllm-docker` | safetensors, `hf_repo` | chat, embeddings, rerank |
 | `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | image |
 | `whisper-server` | `.bin` (s2t dir only) | s2t |
-| `kokoro-podman` | `.onnx`, `hf_repo` | t2s |
+| `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | t2s, s2t |
 
 ## Backend Selection
 
 profiles.yaml's ordered `backends:` list both **enables** and **prioritizes**
 backends; when absent, every registered backend is usable in registration
-order (`llama-server`, `vllm-docker`, `vllm`, `sd-server`):
+order: engines in declaration order (`llama-server`, `vllm`, `sd-server`,
+`whisper-server`, `audio-cpp`) and, within an engine, transports in
+`host` > `podman` > `docker` order:
 
 ```yaml
 # profiles.yaml
 backends:
   - llama-server    # tried first for everything it can serve
-  - vllm-docker     # enabled, second preference
+  - vllm            # vLLM host binary
+  - vllm-podman     # container pair
   - sd-server       # image generation (opt-in; needs dirs: img: image)
-  # vllm            # absent = disabled, even with resources configured
+  # vllm-docker     # absent = disabled, even with resources configured
 ```
 
-Inference walks this list (availability still filters: an entry without its
-binary/image configured is skipped) and picks the first backend whose formats
-and roles cover the model. An explicit sidecar/override `backend:` pin to a
-disabled name is an error that skips that model — pinning bypasses *inference*,
-never policy. Registration order: `llama-server`, `vllm-docker`, `vllm`,
-`sd-server`, `whisper-server`, `kokoro-podman`.
+Inference walks this list (availability still filters: a pair without its
+binary/image configured, or without its container runtime on `PATH`, is
+skipped) and picks the first backend whose formats and roles cover the model.
+An explicit sidecar/override `backend:` pin to a disabled name is an error that
+skips that model — pinning bypasses *inference*, never policy. Registration
+order: `llama-server`, `vllm`, `vllm-podman`, `vllm-docker`, `sd-server`,
+`whisper-server`, `audio-cpp`.
 
 ## Global backend args
 
@@ -1106,8 +1061,8 @@ sd:
 ```
 
 The same *intent* maps to different flags per engine, so each backend owns its
-own `args` (kokoro is a containerized service — `t2s.podman_args` plays that
-role). Values must be a string of flags (a non-string value aborts the run)
+own `args` (audio.cpp is a config-file service — its knobs live under
+`audio_cpp:`). Values must be a string of flags (a non-string value aborts the run)
 and are validated with shlex at build time (bad quoting aborts the run);
 they don't feed the VRAM estimator — they're operator responsibility, like
 sidecar `cli_args`.
@@ -1207,7 +1162,7 @@ pushed, its models are built, then children are visited:
 | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
 | `rerank` | `rerank` | Reranker models |
 | `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
-| `t2s` | `t2s` | Text-to-speech (kokoro via podman; opt-in via `dirs: {t2s: t2s}`) |
+| `t2s` | `t2s` | Text-to-speech (audio.cpp via audio-cpp; opt-in via `dirs: {t2s: t2s}`) |
 | `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
 
   Files at the root itself default to `chat`; files under any other

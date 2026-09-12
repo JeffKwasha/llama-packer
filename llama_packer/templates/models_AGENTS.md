@@ -26,8 +26,8 @@ matches the model file next to it. The directory sets the role:
 | `embed/` | embeddings | nested dirs keep the role |
 | `rerank/` | rerank | |
 | `img/` | image | sd-server; opt-in via profiles.yaml `dirs:` |
-| `s2t/` | s2t | whisper-server; opt-in; `.bin` needs an authored sidecar |
-| `t2s/` | t2s | kokoro-podman; opt-in; sidecar only needs `hf_repo: hexgrad/Kokoro-82M` |
+| `s2t/` | s2t | whisper.cpp `.bin` (whisper-server) or audio.cpp GGUFs (audio-cpp); opt-in; `.bin` needs an authored sidecar |
+| `t2s/` | t2s | audio-cpp; opt-in; sidecar declares `audio_cpp: {family, task}` |
 | (any) `<name>.safetensors` | by dir or `role:` | vLLM |
 | (any) `<name>.md` | — | sidecar for the model file above |
 
@@ -123,9 +123,14 @@ hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one 
 # speculative: model.mtp.gguf  # only if the snapshot actually contains *mtp*.gguf
 # mtp: true                  # only when MTP heads are baked into the main GGUF
 # --- serving ---
-role: chat                   # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server) | t2s (kokoro-podman)
+role: chat                   # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server / audio-cpp) | t2s (audio-cpp)
 # cli_args: "--vae ae.safetensors --lora my.safetensors"  # extra backend flags (unstructured)
 # vram_mb: 1280              # fixed-overhead backends (s2t/image/t2s): pin total process VRAM
+# audio_cpp:                 # role t2s/s2t only (audio.cpp engine)
+#   family: chatterbox       # audio.cpp family (identity + routing)
+#   task: tts                # tts | clon | asr | vad | align | music | sep | …
+#   options: {temperature: 0.8, top_p: 0.8}   # family request options
+#   voice: jk                # voice-library name, or voice_ref: voices/jk.wav
 # image_min_tokens: 1024     # image input: min image tokens/image (dynamic-res archs, e.g. Qwen-VL; needs mmproj)
 # image_max_tokens: 4096     # image input: cap image tokens/image (bounds KV cost; unset = model default, can be huge)
 # --- agent metadata (optional; passed through) ---
