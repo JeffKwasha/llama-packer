@@ -314,9 +314,9 @@ class Macros:
                     continue
                 if not isinstance(mval, str):
                     logger.warning(
-                        "macros: macro %r value must be a string (got %T), ignored",
+                        "macros: macro %r value must be a string (got %s), ignored",
                         mname,
-                        type(mval),
+                        type(mval).__name__,
                     )
                     continue
                 try:

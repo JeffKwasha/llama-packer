@@ -131,3 +131,30 @@ def test_container_wrap_shape():
     assert "-e HF_HUB_OFFLINE=1" in cmd
     assert "-p ${PORT}:8000" in cmd
     assert cmd.endswith(" img:1 vllm serve --port 8000")
+
+
+# ── backend-name validation contract ──────────────────────────────────────
+
+def test_validate_backend_names_accepts_registered_pairs():
+    from llama_packer.backends import validate_backend_names
+
+    assert validate_backend_names([]) is None
+    assert validate_backend_names(
+        ["llama-server", "vllm", "vllm-podman", "vllm-docker",
+         "sd-server", "whisper-server", "audio-cpp"]) is None
+
+
+def test_validate_backend_names_reports_unknown_name():
+    from llama_packer.backends import validate_backend_names
+
+    err = validate_backend_names(["llama-server", "bogus"])
+    assert err is not None
+    assert "bogus" in err
+
+
+def test_validate_backend_names_rejects_removed_kokoro():
+    from llama_packer.backends import validate_backend_names
+
+    err = validate_backend_names(["kokoro-podman"])
+    assert err is not None and "kokoro-podman" in err
+

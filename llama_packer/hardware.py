@@ -334,14 +334,14 @@ class GpuProfile:
         # only when other non-model processes occupy VRAM.
         baseline_mb = 0
         explicit_baseline = False
-        if yaml_hw.get("baseline_mb"):
-            baseline_mb = utils.parse_mem_mb(str(yaml_hw["baseline_mb"]))
-            explicit_baseline = True
-            logger.info("vram baseline: %d MiB (from profiles.yaml hardware.baseline_mb)", baseline_mb)
-        elif baseline is not None:
+        if baseline is not None:
             baseline_mb = utils.parse_mem_mb(str(baseline))
             explicit_baseline = True
             logger.info("vram baseline: %d MiB (from --baseline)", baseline_mb)
+        elif yaml_hw.get("baseline_mb"):
+            baseline_mb = utils.parse_mem_mb(str(yaml_hw["baseline_mb"]))
+            explicit_baseline = True
+            logger.info("vram baseline: %d MiB (from profiles.yaml hardware.baseline_mb)", baseline_mb)
 
         # Fold the fixed reserve into the unified system reservation so the
         # knob reads as the total system cost: reserve = _RESERVE_SYSTEM +

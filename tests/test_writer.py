@@ -406,3 +406,44 @@ def test_audio_cpp_entry_proxy_and_health(make_model):
     assert entry["capabilities"]["in"] == ["text"]
     assert entry["capabilities"]["out"] == ["audio"]
     assert entry["cmd"].startswith("sh -c ")
+
+
+# ── config serialization contract ─────────────────────────────────────────
+
+def test_emitted_config_plain_is_a_plain_dict():
+    from llama_packer.writer import EmittedConfig
+
+    ec = EmittedConfig({"models": {"m": {"cmd": "x"}}},
+                       entry_ids_by_stem={"m": ["m"]}, coload_stems=["e"])
+    plain = ec.plain()
+    assert type(plain) is dict
+    assert plain == {"models": {"m": {"cmd": "x"}}}
+    # Build-time metadata is not part of the serialized document.
+    assert ec.entry_ids_by_stem == {"m": ["m"]}
+
+
+def test_write_yaml_round_trips_without_python_tags(tmp_path):
+    import yaml
+
+    from llama_packer.writer import EmittedConfig, write_yaml
+
+    ec = EmittedConfig({"models": {"m": {"cmd": "x"}},
+                        "macros": {"A": "--a 1"}},
+                       entry_ids_by_stem={"m": ["m"]})
+    out = tmp_path / "config.yaml"
+    write_yaml(ec, out)
+    text = out.read_text()
+    assert yaml.safe_load(text) == ec.plain()
+    assert "python/object" not in text
+
+
+def test_write_yaml_accepts_plain_dict(tmp_path):
+    import yaml
+
+    from llama_packer.writer import write_yaml
+
+    cfg = {"models": {}, "macros": {}}
+    out = tmp_path / "config.yaml"
+    write_yaml(cfg, out)
+    assert yaml.safe_load(out.read_text()) == cfg
+
