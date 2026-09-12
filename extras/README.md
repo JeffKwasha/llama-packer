@@ -4,9 +4,10 @@ Helper scripts that live next to this repo but aren't part of the
 llama-packer Python package.
 
 - [`update`](update) — downloads/installs prebuilt `llama.cpp` + `llama-swap`
-  binaries into the repo root. Run `./extras/update --help` for options.
-  **Run it from the repo root** (`./extras/update`) — the script detects
-  that it is inside `extras/` and installs into the parent directory.
+  binaries into the **current working directory**. Run `./extras/update --help`
+  for options. The CPU architecture is auto-detected for both downloads
+  (llama.cpp `x64`/`arm64`; llama-swap `linux_amd64`/`linux_arm64`); `--arch`
+  overrides it. Run it from wherever you want the binaries installed.
 - [`fit-sweep`](fit-sweep) — llama-fit-params VRAM data points for the affine
   law `VRAM(C, p) = fixed + c·C + D·p`. Header-only (~0.6 s/run, no tensor
   data, no server, no meaningful VRAM use): safe on platter storage and
