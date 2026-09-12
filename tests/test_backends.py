@@ -18,7 +18,6 @@ from llama_packer.backends import (
     get_backend,
 )
 from llama_packer.backends.llama_server import LlamaServerBackend
-from llama_packer.backends.vllm import VllmDockerBackend, VllmHostBackend
 from llama_packer.profiles import Profiles
 from llama_packer.writer import MatrixKnobs
 
@@ -70,7 +69,7 @@ def test_llama_server_rejects_safetensors(make_model):
 
 
 def test_vllm_requires_safetensors_or_hf_repo(make_model):
-    b = VllmHostBackend()
+    b = get_backend("vllm")
     # local .gguf only -> unsupported by vllm
     assert b.unsupported_reason(make_model("m")) is not None
     # hf_repo -> supported
@@ -78,7 +77,7 @@ def test_vllm_requires_safetensors_or_hf_repo(make_model):
 
 
 def test_vllm_rejects_embeddings_role(make_model):
-    b = VllmHostBackend()
+    b = get_backend("vllm")
     assert b.unsupported_reason(make_model("e", role="embeddings")) is not None
 
 
@@ -102,7 +101,7 @@ def test_llama_server_cmd_has_mmap_layers_and_cache(make_model):
 
 def test_vllm_host_cmd(make_model):
     m = make_model("v", hf_repo="org/model")
-    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert cmd.startswith("vllm serve")
     assert "--model org/model" in cmd
     assert "--max-model-len 65536" in cmd
@@ -111,7 +110,7 @@ def test_vllm_host_cmd(make_model):
 
 def test_vllm_baked_in_mtp_emits_speculative_config(make_model):
     m = make_model("v", hf_repo="org/model", mtp=True)
-    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert '--speculative-config {"method":"mtp","num_speculative_tokens":2}' in cmd
     # Same default depth as the llama-server path — one config, one meaning.
     assert meta == {"mtp_enabled": True, "mtp_draft_max": 2}
@@ -119,7 +118,7 @@ def test_vllm_baked_in_mtp_emits_speculative_config(make_model):
 
 def test_vllm_mtp_depth_override(make_model):
     m = make_model("v", hf_repo="org/model", mtp=True, **{"mtp_draft_n_max": 3})
-    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert '"num_speculative_tokens":3' in cmd
     assert meta["mtp_draft_max"] == 3
 
@@ -129,7 +128,7 @@ def test_vllm_explicit_speculative_config_wins(make_model):
            "num_speculative_tokens": 4}
     m = make_model("v", hf_repo="org/model", mtp=True,
                    **{"speculative_config": cfg})
-    cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--speculative-config" in cmd
     # JSON emitted verbatim (key order preserved), not the derived mtp config
     assert '"method":"eagle3"' in cmd and '"num_speculative_tokens":4' in cmd
@@ -141,7 +140,7 @@ def test_vllm_gguf_speculative_companion_warned_and_skipped(make_model, caplog):
     m = make_model("v", hf_repo="org/model", speculative="v.mtp.gguf",
                    backend="vllm")
     with caplog.at_level(logging.WARNING):
-        cmd, meta = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+        cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--speculative-config" not in cmd
     assert meta == {"mtp_enabled": False}
     assert any("cannot be loaded by vLLM" in r.message for r in caplog.records)
@@ -149,7 +148,7 @@ def test_vllm_gguf_speculative_companion_warned_and_skipped(make_model, caplog):
 
 def test_vllm_docker_mtp_flag(make_model):
     m = make_model("v", hf_repo="org/model", mtp=True)
-    cmd, meta = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--speculative-config" in cmd
     assert meta["mtp_enabled"] is True
 
@@ -157,17 +156,17 @@ def test_vllm_docker_mtp_flag(make_model):
 def test_vllm_cache_type_maps_to_kv_cache_dtype(make_model):
     # q8_* -> fp8 (single configuration: same precision decision both backends)
     m = make_model("v", hf_repo="org/model")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--kv-cache-dtype fp8" in cmd
     # f16/bf16/f32 -> vLLM auto; no flag
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "f16", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "f16", _tvars())
     assert "--kv-cache-dtype" not in cmd
 
 
 def test_vllm_sub_byte_cache_type_warned_and_skipped(make_model, caplog):
     m = make_model("v", hf_repo="org/model")
     with caplog.at_level(logging.WARNING):
-        cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q4_0", _tvars())
+        cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q4_0", _tvars())
     assert "--kv-cache-dtype" not in cmd
     assert any("no --kv-cache-dtype equivalent" in r.message
                for r in caplog.records)
@@ -181,15 +180,15 @@ def test_vllm_nvfp4_flag_emitted_and_sized(make_model):
     from llama_packer.consts import _KV_CACHE_BYTES
     assert _KV_CACHE_BYTES["nvfp4"] == pytest.approx(0.5625)
     m = make_model("v", hf_repo="org/model")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "nvfp4", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "nvfp4", _tvars())
     assert "--kv-cache-dtype nvfp4" in cmd
 
 
 def test_vllm_parallel_maps_to_max_num_seqs(make_model):
     m = make_model("v", hf_repo="org/model")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 4, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 4, "q8_0", _tvars())
     assert "--max-num-seqs 4" in cmd
-    docker_cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 4, "q8_0", _tvars())
+    docker_cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 4, "q8_0", _tvars())
     assert "--max-num-seqs 4" in docker_cmd
 
 
@@ -197,7 +196,7 @@ def test_vllm_uncapped_omits_max_num_seqs(make_model):
     # parallel 0 = uncapped: vLLM owns admission (elastic queueing), so the
     # cap flag is omitted entirely.
     m = make_model("v", hf_repo="org/model", parallel=0)
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 0, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 0, "q8_0", _tvars())
     assert "--max-num-seqs" not in cmd
     assert "--max-model-len 65536" in cmd
 
@@ -208,7 +207,7 @@ def test_vllm_batch_flag_and_llama_only_strip(make_model):
     m = make_model("v", hf_repo="org/model",
                    cli_args="--flash-attn on -b 2048 -ub 512 "
                             "--reasoning-format deepseek")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 4, "q8_0", _tvars(),
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 4, "q8_0", _tvars(),
                                          batch=2048)
     assert "--max-num-batched-tokens 2048" in cmd
     assert "--max-num-seqs 4" in cmd
@@ -260,7 +259,7 @@ def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
     tpl.write_text("x")
     m = make_model("v", hf_repo="org/model")
     m._resolved_chat_template = tpl.resolve()
-    cmd, meta = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert cmd.startswith("docker run")
     assert "--chat-template" in cmd
     assert "/models" in cmd  # models_dir bind mount
@@ -268,7 +267,7 @@ def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
 
 def test_warn_unhandled(caplog):
     import logging
-    b = VllmHostBackend()
+    b = get_backend("vllm")
     with caplog.at_level(logging.WARNING):
         b.warn_unhandled({"loras", "cli_args", "chat_template"})
     # vllm handles cli_args/chat_template/hf_repo, not loras -> warning
@@ -280,7 +279,7 @@ def test_setting_keys_partition():
     # and from what a backend would render.
     assert FRAMEWORK_CONSUMED == {"backend", "hf_repo"}
     assert METADATA_ONLY == {"chat_template_kwargs"}
-    assert VLLM_BACKENDS == {"vllm", "vllm-docker"}
+    assert VLLM_BACKENDS == {"vllm", "vllm-podman", "vllm-docker"}
     assert "backend" in SETTING_KEYS and "chat_template" in SETTING_KEYS
 
 
@@ -326,14 +325,16 @@ def test_infer_backend_gguf_prefers_llama_server(make_model):
     assert infer_backend(make_model("g"), {"llama_bin": "/opt/llama-server"}) == "llama-server"
 
 
-def test_infer_backend_safetensors_prefers_docker_then_host(make_model):
+def test_infer_backend_safetensors_prefers_host_then_container(make_model):
     from llama_packer.backends import infer_backend
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = Path("/models/s.safetensors")
-    # both available -> docker wins (registration preference order)
-    assert infer_backend(m, {"vllm_image": "img", "vllm_bin": "vllm"}) == "vllm-docker"
-    # only host binary available
-    assert infer_backend(m, {"vllm_bin": "vllm"}) == "vllm"
+    # Transport preference is host > podman > docker: the host binary wins
+    # when present, then the containers in that order.
+    assert infer_backend(m, {"vllm_image": "img", "vllm_bin": "vllm"}) == "vllm"
+    assert infer_backend(m, {"vllm_image": "img"}) == "vllm-podman"
+    # A probed-absent runtime is skipped (podman: False -> docker next).
+    assert infer_backend(m, {"vllm_image": "img", "podman": False}) == "vllm-docker"
     # neither configured -> no backend
     assert infer_backend(m, {}) is None
 
@@ -342,12 +343,12 @@ def test_infer_backend_hf_repo_only(make_model):
     from llama_packer.backends import infer_backend
     m = make_model("h", hf_repo="org/model")
     m.gguf_path = None  # no local file
-    assert infer_backend(m, {"vllm_image": "img"}) == "vllm-docker"
+    assert infer_backend(m, {"vllm_image": "img"}) == "vllm-podman"
 
 
 def test_docker_cmd_uses_per_model_image(make_model):
     m = make_model("d", hf_repo="org/model", vllm_image="custom/img:v2")
-    cmd, _ = VllmDockerBackend().build_cmd(m, 8192, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 8192, 1, "q8_0", _tvars())
     assert "custom/img:v2" in cmd
     assert "vllm/vllm-openai:latest" not in cmd
 
@@ -358,8 +359,35 @@ def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
     tvars = {**_tvars(), "models_dir": str(tmp_path)}
     m = make_model("d", hf_repo="org/model")
     m._resolved_chat_template = tpl.resolve()
-    cmd, _ = VllmDockerBackend().build_cmd(m, 8192, 1, "q8_0", tvars)
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 8192, 1, "q8_0", tvars)
     assert "--chat-template /models/qwen.jinja" in cmd
+
+
+# ── vllm podman pair (one engine, container transport) ────────────────────
+
+def test_vllm_podman_pair_cmd(make_model):
+    b = get_backend("vllm-podman")
+    assert b.roles == {"chat", "embeddings", "rerank"}
+    assert b.stop_cmd == "podman stop ${MODEL_ID}"
+    assert b.unload_timeout == 30
+    m = make_model("p", hf_repo="org/model")
+    tv = {**_tvars(), "container_vendor": "nvidia"}
+    cmd, _ = b.build_cmd(m, 65536, 1, "q8_0", tv)
+    assert cmd.startswith("podman run --init --rm")
+    assert "--device nvidia.com/gpu=all" in cmd
+    assert "-p ${PORT}:8000" in cmd
+    assert "vllm serve" in cmd and "--port 8000" in cmd
+    # No --served-model-name duplication: the engine command rides after the
+    # container image, exactly once.
+    assert cmd.count("vllm serve") == 1
+
+
+def test_vllm_container_runtime_gating(make_model):
+    b = get_backend("vllm-podman")
+    assert b.is_available({"vllm_image": "img"})          # not probed -> ok
+    assert b.is_available({"vllm_image": "img", "podman": True})
+    assert not b.is_available({"vllm_image": "img", "podman": False})
+    assert not b.is_available({"podman": True})            # no image
 
 
 # ── reasoning flags + duplicate-free command composition ───────────────────
@@ -480,16 +508,16 @@ def test_llama_server_global_args_absent_no_leak(make_model):
 def test_vllm_global_args_host_and_docker(make_model):
     tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
     m = make_model("v", hf_repo="org/model")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", tv)
     assert "--max-num-batched-tokens 512" in cmd
-    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
     assert "--max-num-batched-tokens 512" in cmd
 
 
 def test_vllm_global_args_per_model_cli_args_win(make_model):
     tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
     m = make_model("v", hf_repo="org/model", cli_args="--max-num-batched-tokens 1024")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", tv)
     assert cmd.count("--max-num-batched-tokens") == 1
     assert "--max-num-batched-tokens 1024" in cmd
 
@@ -631,7 +659,7 @@ def test_vllm_warns_on_reasoning_format(make_model, caplog):
     import logging
     m = make_model("v", hf_repo="org/model", **{"reasoning-format": "deepseek"})
     with caplog.at_level(logging.WARNING):
-        VllmHostBackend().warn_unhandled(
+        get_backend("vllm").warn_unhandled(
             {k for k in SETTING_KEYS if k in m.frontmatter} - FRAMEWORK_CONSUMED - METADATA_ONLY
         )
     assert any("reasoning-format" in r.message for r in caplog.records)
@@ -662,7 +690,7 @@ def test_apply_overrides_pinned_backend_disabled(make_model):
 
 
 def test_vllm_role_task_flags(make_model):
-    host = VllmHostBackend()
+    host = get_backend("vllm")
     rerank = make_model("r", hf_repo="org/reranker", role="rerank")
     cmd, _ = host.build_cmd(rerank, 8192, 1, "q8_0", _tvars())
     assert "--task score" in cmd
@@ -676,19 +704,19 @@ def test_vllm_role_task_flags(make_model):
 
 def test_vllm_docker_rerank_task_flag(make_model):
     m = make_model("dr", hf_repo="org/reranker", role="rerank")
-    cmd, _ = VllmDockerBackend().build_cmd(m, 8192, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 8192, 1, "q8_0", _tvars())
     assert "--task score" in cmd
 
 
 def test_vllm_speculative_suppressed_off_chat(make_model):
     # mtp: true must not leak --speculative-config into a pooling model's cmd.
     r = make_model("mr", hf_repo="org/reranker", role="rerank", mtp=True)
-    cmd, meta = VllmHostBackend().build_cmd(r, 8192, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm").build_cmd(r, 8192, 1, "q8_0", _tvars())
     assert "--speculative-config" not in cmd
     assert meta["mtp_enabled"] is False
     # ...but chat models keep it.
     c = make_model("mc", hf_repo="org/chat", mtp=True)
-    cmd, meta = VllmHostBackend().build_cmd(c, 8192, 1, "q8_0", _tvars())
+    cmd, meta = get_backend("vllm").build_cmd(c, 8192, 1, "q8_0", _tvars())
     assert "--speculative-config" in cmd
     assert meta["mtp_enabled"] is True
 
@@ -698,7 +726,7 @@ def test_unsupported_reason_accepts_vllm_rerank(make_model):
     m = make_model("r3", role="rerank")
     m.gguf_path = None
     m.frontmatter["hf_url"] = "https://huggingface.co/org/R3-rerank"
-    assert infer_backend(m, {"vllm_image": "img"}) == "vllm-docker"
+    assert infer_backend(m, {"vllm_image": "img"}) == "vllm-podman"
 
 
 # ── vLLM recipe keys (C1-C5) ─────────────────────────────────────────────
@@ -715,22 +743,22 @@ def _safetensors_model(tmp_path, stem="st", **fm):
 
 def test_vllm_quantization_flag(make_model):
     m = make_model("v", hf_repo="org/model", vllm_quantization="modelopt_mixed")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--quantization modelopt_mixed" in cmd
-    dcmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    dcmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--quantization modelopt_mixed" in dcmd
     # Absent -> not emitted: vLLM auto-detects from the checkpoint config.
     m2 = make_model("v2", hf_repo="org/model")
-    cmd2, _ = VllmHostBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    cmd2, _ = get_backend("vllm").build_cmd(m2, 65536, 1, "q8_0", _tvars())
     assert "--quantization" not in cmd2
 
 
 def test_vllm_moe_backend_flag(make_model):
     m = make_model("v", hf_repo="org/moe", moe_backend="marlin")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--moe-backend marlin" in cmd
     m2 = make_model("v2", hf_repo="org/dense")
-    cmd2, _ = VllmHostBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    cmd2, _ = get_backend("vllm").build_cmd(m2, 65536, 1, "q8_0", _tvars())
     assert "--moe-backend" not in cmd2
 
 
@@ -743,7 +771,7 @@ def test_vllm_mamba_flags(make_model, caplog):
         "cache_mode": "align",
     }
     m = make_model("v", hf_repo="org/hybrid", mamba=full)
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     for flag in ("--mamba-backend flashinfer",
                  "--mamba-ssm-cache-dtype float16",
                  "--enable-mamba-cache-stochastic-rounding",
@@ -752,33 +780,33 @@ def test_vllm_mamba_flags(make_model, caplog):
         assert flag in cmd, flag
     # Partial mapping -> only the set sub-keys emit.
     m2 = make_model("v2", hf_repo="org/hybrid2", mamba={"backend": "triton"})
-    cmd2, _ = VllmHostBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+    cmd2, _ = get_backend("vllm").build_cmd(m2, 65536, 1, "q8_0", _tvars())
     assert "--mamba-backend triton" in cmd2
     assert "--mamba-ssm-cache-dtype" not in cmd2
     # A bare boolean is malformed: warn + no flags.
     m3 = make_model("v3", hf_repo="org/hybrid3", mamba=True)
     with caplog.at_level(logging.WARNING):
-        cmd3, _ = VllmHostBackend().build_cmd(m3, 65536, 1, "q8_0", _tvars())
+        cmd3, _ = get_backend("vllm").build_cmd(m3, 65536, 1, "q8_0", _tvars())
     assert "--mamba" not in cmd3
     assert any("must be a mapping" in r.message for r in caplog.records)
     # Unknown sub-keys are warned, not silently dropped.
     m4 = make_model("v4", hf_repo="org/hybrid4",
                     mamba={"backend": "auto", "bakend": "oops"})
     with caplog.at_level(logging.WARNING):
-        cmd4, _ = VllmHostBackend().build_cmd(m4, 65536, 1, "q8_0", _tvars())
+        cmd4, _ = get_backend("vllm").build_cmd(m4, 65536, 1, "q8_0", _tvars())
     assert "--mamba-backend auto" in cmd4
     assert any("unknown mamba sub-key" in r.message for r in caplog.records)
 
 
 def test_vllm_tool_call_parser(make_model):
     m = make_model("v", hf_repo="org/chat", tool_call_parser="qwen3_coder")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--enable-auto-tool-choice" in cmd
     assert "--tool-call-parser qwen3_coder" in cmd
     # Non-chat roles get no parser flags (generation-only feature).
     e = make_model("e", hf_repo="org/embedder", role="embeddings",
                    tool_call_parser="qwen3_coder")
-    ecmd, _ = VllmHostBackend().build_cmd(e, 8192, 1, "q8_0", _tvars())
+    ecmd, _ = get_backend("vllm").build_cmd(e, 8192, 1, "q8_0", _tvars())
     assert "--tool-call-parser" not in ecmd
 
 
@@ -786,12 +814,12 @@ def test_vllm_reasoning_parser(make_model):
     # Distinct from llama.cpp's --reasoning-format (which _strip_llama_only_flags
     # removes from vllm args): --reasoning-parser is a different string and stays.
     m = make_model("v", hf_repo="org/chat", reasoning_parser="nemotron_v3")
-    cmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--reasoning-parser nemotron_v3" in cmd
     assert "--reasoning-format" not in cmd
     r = make_model("r", hf_repo="org/reranker", role="rerank",
                    reasoning_parser="nemotron_v3")
-    rcmd, _ = VllmHostBackend().build_cmd(r, 8192, 1, "q8_0", _tvars())
+    rcmd, _ = get_backend("vllm").build_cmd(r, 8192, 1, "q8_0", _tvars())
     assert "--reasoning-parser" not in rcmd
 
 
@@ -813,7 +841,7 @@ def test_vllm_spec_draft_local_path_docker(make_model, tmp_path):
                                        "model": str(snap),
                                        "num_speculative_tokens": 3})
     tv = {**_tvars(), "hf_cache": str(hf)}
-    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
     assert f"-v {hf}:/root/.cache/huggingface" in cmd
     ref = "/root/.cache/huggingface/hub/models--org--draft/snapshots/d1"
     assert ref in cmd
@@ -822,7 +850,7 @@ def test_vllm_spec_draft_local_path_docker(make_model, tmp_path):
     spec = _json.loads(cmd.split("--speculative-config ", 1)[1].strip())
     assert spec.get("model") == ref
     # Host backend keeps the raw host path.
-    hcmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    hcmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert str(snap) in hcmd
     assert "/root/.cache/huggingface" not in hcmd
 
@@ -834,7 +862,7 @@ def test_vllm_spec_draft_models_dir_docker(make_model, tmp_path):
                                        "model": str(tmp_path / "draft.safetensors"),
                                        "num_speculative_tokens": 3})
     tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
-    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
     # Under a models_dir the ref rides the existing /models bind — no extra mount.
     assert '"model":"/models/draft.safetensors"' in cmd
     assert "-v" in cmd  # the models_dir bind itself
@@ -847,7 +875,7 @@ def test_vllm_spec_draft_elsewhere_docker(make_model, tmp_path):
     m = make_model("v", hf_repo="org/model",
                    speculative_config={"method": "draft_model",
                                        "model": str(other / "draft.safetensors")})
-    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert f"-v {other}:/ext0" in cmd
     assert '"model":"/ext0/draft.safetensors"' in cmd
 
@@ -856,24 +884,24 @@ def test_vllm_docker_model_ref_mapped(make_model, tmp_path):
     # Local safetensors refs are container-path rewritten (the old host-path leak).
     m = _safetensors_model(tmp_path)
     tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
-    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
     assert "--model /models/st.safetensors" in cmd
     # Under the HF cache root -> /root/.cache/huggingface/<rel>.
     hf, snap = _hf_snapshot(tmp_path)
     m2 = _safetensors_model(tmp_path, stem="st2")
     m2.gguf_path = snap / "draft.safetensors"
     tv2 = {**_tvars(), "hf_cache": str(hf)}
-    cmd2, _ = VllmDockerBackend().build_cmd(m2, 65536, 1, "q8_0", tv2)
+    cmd2, _ = get_backend("vllm-docker").build_cmd(m2, 65536, 1, "q8_0", tv2)
     assert "--model /root/.cache/huggingface/hub/models--org--draft/snapshots/d1/draft.safetensors" in cmd2
     # Host backend keeps the raw host path.
-    hcmd, _ = VllmHostBackend().build_cmd(m, 65536, 1, "q8_0", _tvars())
+    hcmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert f"--model {tmp_path / 'st.safetensors'}" in hcmd
 
 
 def test_vllm_docker_hf_mount_offline(make_model, caplog):
     tv = {**_tvars(), "hf_cache": "/nas/hf"}
     m = make_model("v", hf_repo="org/model")
-    cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+    cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
     assert "-v /nas/hf:/root/.cache/huggingface" in cmd
     assert "-e HF_HOME=/root/.cache/huggingface" in cmd
     assert "-e HF_HUB_OFFLINE=1" in cmd
@@ -883,7 +911,7 @@ def test_vllm_docker_hf_mount_offline(make_model, caplog):
     # hf_cache path, so its absence is the assertion.
     m2 = make_model("v2", hf_repo="org/model")
     with caplog.at_level(logging.WARNING):
-        cmd2, _ = VllmDockerBackend().build_cmd(m2, 65536, 1, "q8_0", _tvars())
+        cmd2, _ = get_backend("vllm-docker").build_cmd(m2, 65536, 1, "q8_0", _tvars())
     assert "-v /nas/hf:" not in cmd2
     assert any("hf_cache is not configured" in r.message for r in caplog.records)
 
@@ -893,7 +921,7 @@ def test_vllm_docker_local_file_no_hf_warning(make_model, tmp_path, caplog):
     m = _safetensors_model(tmp_path)
     tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
     with caplog.at_level(logging.WARNING):
-        cmd, _ = VllmDockerBackend().build_cmd(m, 65536, 1, "q8_0", tv)
+        cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
     assert not any("hf_cache is not configured" in r.message
                    for r in caplog.records)
     assert "--model /models/st.safetensors" in cmd

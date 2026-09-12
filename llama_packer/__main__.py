@@ -18,7 +18,7 @@ from pathlib import Path
 import yaml
 
 from llama_packer import Model, __version__, find_bin_dir
-from llama_packer.hardware import GpuProfile
+from llama_packer.hardware import GpuProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
@@ -541,6 +541,10 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
             "whisper_bin": whisper_bin or "",
+            # Container runtimes: probed once so container transports are only
+            # inferred when their runtime is actually on PATH.
+            "docker": bool(shutil.which("docker")),
+            "podman": bool(shutil.which("podman")),
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
@@ -629,6 +633,10 @@ def main(argv: list[str] | None = None) -> None:
     template_vars.setdefault("whisper_bin", "whisper-server")
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
+    # GPU vendor for container device flags (docker --runtime/--gpus vs
+    # podman --device); overridable per run via profiles.yaml.
+    template_vars["container_vendor"] = str(
+        vllm_cfg.get("container_vendor") or detect_gpu_vendor())
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
     # Host HF_HOME root bind-mounted into vllm-docker containers
     # (/root/.cache/huggingface).  HF_HUB_OFFLINE forbids downloads, so this

@@ -21,9 +21,7 @@ class SdServerBackend(BaseBackend):
     roles = frozenset({"image"})
     handles = frozenset({"cli_args"})
     proxied = True
-
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("sd_bin"))
+    host_requires = frozenset({"sd_bin"})
 
     def build_cmd(
         self,

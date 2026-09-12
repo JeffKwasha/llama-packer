@@ -32,6 +32,7 @@ class LlamaServerBackend(BaseBackend):
         "reasoning-format", "reasoning-preserve",
         "batch", "ubatch",
     })
+    host_requires = frozenset({"llama_bin"})
 
     # Per-role server-mode flags, appended after the shared core arguments.
     # The batch half moved to first-class ``batch:``/``ubatch:`` planning
@@ -56,9 +57,6 @@ class LlamaServerBackend(BaseBackend):
 
     def default_batch_ubatch(self, role: str) -> tuple[int, int]:
         return self._ROLE_BATCH.get(role, (2048, 512))
-
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("llama_bin"))
 
     def _mtp_args(self, model: "Model") -> tuple[list[str], dict]:
         """Speculative-decoding flags plus metadata contributions."""
