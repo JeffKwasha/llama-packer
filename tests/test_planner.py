@@ -20,11 +20,14 @@ def profiles():
                      "profiles": {"default": {}, "big": {"temperature": 0.9}}})
 
 
-def _scripted_ctx(model, by_mmproj):
+def _scripted_ctx(model, by_mmproj, quad=(100, 0.01, 10, 100)):
     """Replace calc_ctx with a fake keyed on include_mmproj.
 
     Companion-on variants carry their own VRAM budget (bound to the serving
     view), so the fake is installed on the base budget and every view.
+    The affine quad is faked the same way: the planner reports per-variant
+    memory tags from effective_static, which must never reach a subprocess
+    in hermetic tests.
     """
     def fake(vram_total_mb, *, server_bin=None, parallel=1, spare_mb=0,
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
@@ -35,6 +38,15 @@ def _scripted_ctx(model, by_mmproj):
         view = model.view_for(flag)
         if view is not model:
             view.vram.calc_ctx = fake
+
+    def fake_static(fit_bin, cache_type="q8_0", design_ctx=None,
+                    include_mmproj=True, llama_args="", allow_cpu=False):
+        return quad
+    model.vram.effective_static = fake_static
+    for flag in (True, False):
+        view = model.view_for(flag)
+        if view is not model:
+            view.vram.effective_static = fake_static
 
 
 def _vision_model(tmp_path, make_model, name):

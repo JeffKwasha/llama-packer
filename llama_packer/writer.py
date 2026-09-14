@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,6 +58,64 @@ def _model_can_reason(model: Model) -> bool:
 def _strip_repeat_ws(text: str) -> str:
     """Collapse runs of whitespace to single spaces (templates with | blocks)."""
     return " ".join(text.split())
+
+
+def _fmt_mib(mib: float) -> str:
+    """Human memory size: ``X.XGB`` at/above 1 GiB, integer ``MB`` below.
+
+    Small values stay truthful (``RAM 64MB``, never ``0.0GB``) so a tiny
+    host residue is distinguishable from a missing number.
+    """
+    if mib >= 1024:
+        return f"{mib / 1024:.1f}GB"
+    return f"{int(round(mib))}MB"
+
+
+def format_mem_tag(
+    vram_mib: float | None,
+    ram_mib: float,
+    *,
+    spill_mib: float | None = None,
+    ssd_mib: float | None = None,
+) -> str:
+    """Memory-allocation tag appended to emitted entry descriptions.
+
+    A verbatim report of the decided TOTAL allocation attributable to the
+    entry (weights + companions + context at the served ``(ctx, slots)``)
+    — never capped, never re-solved: an impossible-looking ``VRAM 73.0GB``
+    on a 32 GB card is printed as decided.  ``vram_mib=None`` is a
+    CPU-resident serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
+    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (disk-resident weights)
+    are reserved grammar for a future allocator that decides a split —
+    today's allocator never splits, so callers leave them None.
+    """
+    if vram_mib is None:
+        tag = f"RAM {_fmt_mib(ram_mib)}"
+    else:
+        vram_part = f"VRAM {_fmt_mib(vram_mib)}"
+        if spill_mib is not None:
+            vram_part += f" + {_fmt_mib(spill_mib)}"
+        tag = f"{vram_part} RAM {_fmt_mib(ram_mib)}"
+    if ssd_mib is not None:
+        tag += f" SSD {_fmt_mib(ssd_mib)}"
+    return f"[{tag}]"
+
+
+# A previously emitted memory tag at the end of a description (stripped
+# before appending a fresh one, so copying a generated description back
+# into a sidecar never stacks tags on re-pack).
+_MEM_TAG_RE = re.compile(r"\s*\[(?:VRAM|RAM)\b[^\]]*\]\s*$")
+
+
+def _with_mem_tag(description: str | None, tag: str | None) -> str | None:
+    """Description with a fresh memory tag appended (idempotent).
+
+    Returns None only when there is neither a description nor a tag.
+    """
+    if tag is None:
+        return description
+    base = _MEM_TAG_RE.sub("", description or "").rstrip()
+    return f"{base} {tag}" if base else tag
 
 
 def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> list[Model]:
@@ -239,6 +298,8 @@ def _build_entry(
     estimate_error: str | None = None,
     batch: int | None = None,
     ubatch: int | None = None,
+    mem_vram_mib: float | None = None,
+    mem_ram_mib: float | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -253,9 +314,14 @@ def _build_entry(
 
     The first step resolves the serving view: with a companion block, the
     companion-on variant serves the block merged over the frontmatter while
-    the companion-off variant serves the base frontmatter (strip-by-recompute
+    the     companion-off variant serves the base frontmatter (strip-by-recompute
     — purpose is emergent from the block, never hardcoded).  Pass the base
     model here, not a view: views return themselves from ``view_for``.
+
+    ``mem_vram_mib``/``mem_ram_mib`` are the decided TOTAL allocation for
+    this serving (reported verbatim as a trailing description tag via
+    :func:`format_mem_tag`; ``None``/``None`` or a non-None
+    ``estimate_error`` emits no tag).
     """
     model = model.view_for(include_mmproj)
     base_id = model.template_id
@@ -416,8 +482,11 @@ def _build_entry(
         entry["filters"] = {"setParamsByID": set_params}
     if model.name:
         entry["name"] = model.name + name_suffix
-    if model.description:
-        entry["description"] = model.description
+    mem_tag = None
+    if estimate_error is None and mem_ram_mib is not None:
+        mem_tag = format_mem_tag(mem_vram_mib, mem_ram_mib)
+    if model.description or mem_tag is not None:
+        entry["description"] = _with_mem_tag(model.description, mem_tag)
     # The VRAM-served -c limit (vs. capabilities.context = max trained).
     metadata["ctx_size"] = ctx_size
     # Client-facing estimate health: when no VRAM estimate source worked,
@@ -797,6 +866,17 @@ class Variant:
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
+    #: Decided TOTAL memory attributable to this serving (weights +
+    #: companions + context at the served ctx/slots), in MiB — the numbers
+    #: the emitted description tag reports verbatim.  ``mem_vram_mib=None``
+    #: is a CPU-resident serving (RAM-only tag).  Both None when undecided
+    #: (no estimate) — then no tag is emitted.
+    mem_vram_mib: float | None = None
+    mem_ram_mib: float | None = None
+    #: Same pair for the best-effort vision companion entry (served at
+    #: ``vision_ctx`` with the projection); None when no vision entry.
+    mem_vision_vram_mib: float | None = None
+    mem_vision_ram_mib: float | None = None
 
 
 def resolve_batch_ubatch(
@@ -1180,6 +1260,50 @@ class Planner:
                            model.stem, e)
             return 0
 
+    def _variant_memory(
+        self,
+        view,
+        *,
+        cache_type: str,
+        include_mmproj: bool,
+        ctx_size: int,
+        parallel: int,
+        profile: dict | None,
+    ) -> tuple[float | None, float | None]:
+        """Decided TOTAL memory (MiB) attributable to one serving variant.
+
+        ``(vram_mib, ram_mib)`` evaluated from the combined affine quad at
+        the variant's served ``(ctx_size, parallel)`` — weights + folded
+        companions + context — exactly what the emitted description tag
+        reports verbatim (no capping, no re-solving).  CPU-resident
+        servings return ``(None, ram_mib)`` (host-RAM constants via
+        ``allow_cpu`` — never used for VRAM sizing).  ``(None, None)``
+        when undecidable (no estimate source worked).  ``parallel <= 0``
+        (uncapped vLLM) is priced single-seq, matching its ctx solve.
+        """
+        quad = view.vram.effective_static(
+            self.fit_bin, cache_type=cache_type,
+            include_mmproj=include_mmproj,
+            llama_args=measurement_args(self.profiles, view,
+                                        self.llama_args, profile),
+            allow_cpu=True,
+        )
+        if quad is None:
+            return (None, None)
+        model_mib, kv_factor, slot_mib, compute_mib = quad
+        p = parallel if parallel > 0 else 1
+        total = (model_mib + compute_mib
+                 + kv_factor * ctx_size * p + slot_mib * p)
+        if view.on_cpu:
+            return (None, float(total))
+        files_mb = view.size_mb
+        if include_mmproj and view.mmproj is not None \
+                and view.mmproj.gguf_path is not None:
+            files_mb += view.mmproj.size_mb
+        if view.mtp is not None and view.mtp.gguf_path is not None:
+            files_mb += view.mtp.size_mb
+        return (float(total), max(0.0, float(files_mb - model_mib)))
+
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
@@ -1321,13 +1445,30 @@ class Planner:
                 if uncapped:
                     parallel = 0   # emit uncapped: no --max-num-seqs
 
+                if est_error is not None:
+                    mem: tuple[float | None, float | None] = (None, None)
+                    vmem: tuple[float | None, float | None] = (None, None)
+                else:
+                    mem = self._variant_memory(
+                        view, cache_type=cache_type,
+                        include_mmproj=include_mmproj, ctx_size=ctx_size,
+                        parallel=parallel, profile=group[0][1])
+                    vmem = self._variant_memory(
+                        on_view, cache_type=cache_type,
+                        include_mmproj=True, ctx_size=vision_ctx,
+                        parallel=parallel, profile=group[0][1]) \
+                        if vision_ctx is not None else (None, None)
+
                 variants.append(Variant(
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                     profiles_group=group, ctx_size=ctx_size,
                     include_mmproj=include_mmproj, batch=batch, ubatch=ubatch,
                     vision_ctx=vision_ctx,
                     coload=is_coload, tools_demoted=tools_demoted,
-                    estimate_error=est_error))
+                    estimate_error=est_error,
+                    mem_vram_mib=mem[0], mem_ram_mib=mem[1],
+                    mem_vision_vram_mib=vmem[0],
+                    mem_vision_ram_mib=vmem[1]))
 
                 # On-demand text-only variant: when the main entry keeps its
                 # mmproj, also plan a no-vision entry (``<id>-text``) so
@@ -1343,13 +1484,20 @@ class Planner:
                             design_ctx=self.chat_ctx,
                             context_length=context_length,
                             profile=group[0][1]))
+                    tmem: tuple[float | None, float | None] = \
+                        (None, None) if est_error is not None else \
+                        self._variant_memory(
+                            model, cache_type=cache_type,
+                            include_mmproj=False, ctx_size=text_ctx,
+                            parallel=parallel, profile=group[0][1])
                     variants.append(Variant(
                         parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                         profiles_group=group, ctx_size=text_ctx,
                         include_mmproj=False, batch=batch, ubatch=ubatch,
                         coload=is_coload,
                         tools_demoted=tools_demoted,
-                        estimate_error=est_error))
+                        estimate_error=est_error,
+                        mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))
             plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
@@ -1717,6 +1865,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 tools_demoted=v.tools_demoted,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
+                mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX
@@ -1741,6 +1890,8 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 tools_demoted=v.tools_demoted,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
+                mem_vram_mib=v.mem_vision_vram_mib,
+                mem_ram_mib=v.mem_vision_ram_mib,
             )
             vision_id += f"-vision-{n_k}k"
             if vision_id in entries:

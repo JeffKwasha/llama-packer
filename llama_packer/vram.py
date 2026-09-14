@@ -917,6 +917,7 @@ class VramBudget:
         fit_bin: str,
         cache_type: str = "q8_0",
         llama_args: str = "",
+        allow_cpu: bool = False,
     ) -> FitParams | None:
         """Get affine VRAM constants for this model at *cache_type*.
 
@@ -929,17 +930,22 @@ class VramBudget:
         ``-ub``) — the in-memory cache and the persisted block are both
         shape-bound, so a profiles/batch-key change re-measures instead of
         reusing stale compute terms.  ``remeasure`` (CLI ``--remeasure``)
-        skips the saved-block path entirely.
+        skips the saved-block path entirely.  ``allow_cpu`` measures
+        CPU-resident models too (their constants describe host RAM, used
+        for the emitted memory tag — never for VRAM sizing); without it
+        CPU-resident models return None as before.
         """
         shape = (llama_args or "").strip()
         if (cache_type, shape) in self._static_cache:
             return self._static_cache[(cache_type, shape)]
 
-        if self.model.backend in FIXED_OVERHEAD_BACKENDS \
-                or getattr(self.model, "on_cpu", False):
+        if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Fixed-overhead backends are sized from file size + a fixed
             # buffer (effective_static); CPU-resident models are not
             # VRAM-bound.  Neither has meaningful FitParams.
+            return None
+        if getattr(self.model, "on_cpu", False) and not allow_cpu:
+            # CPU-resident models are not VRAM-bound (see allow_cpu).
             return None
 
         # 1. Saved values from frontmatter (legacy fit-params blocks and
@@ -1126,6 +1132,7 @@ class VramBudget:
         design_ctx: int | None = None,
         include_mmproj: bool = True,
         llama_args: str = "",
+        allow_cpu: bool = False,
     ) -> tuple[int, float, float, int] | None:
         """Combined affine VRAM constants for main model plus its companions.
 
@@ -1134,7 +1141,9 @@ class VramBudget:
         numbers, so downstream context math sees a single budget.  The MTP
         draft is folded only when the main block did *not* come from the
         serve-shaped measurement — those blocks are measured with the
-        draft running and already carry it.
+        draft running and already carry it.  ``allow_cpu`` is passed
+        through to :meth:`fit_params_static` (host-RAM constants for the
+        emitted memory tag on CPU-resident models).
         """
         cache_key = ("effective", cache_type, include_mmproj, llama_args)
         if cache_key in self._effective_cache:
@@ -1171,7 +1180,8 @@ class VramBudget:
             return params
 
         main = self.fit_params_static(fit_bin, cache_type=cache_type,
-                                      llama_args=llama_args)
+                                       llama_args=llama_args,
+                                       allow_cpu=allow_cpu)
         if main is None:
             return None
 
