@@ -8,6 +8,7 @@ general-purpose functions with simple input→output semantics.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import functools
 import json
 import logging
@@ -31,6 +32,7 @@ from llama_packer.consts import (
     _UNKNOWN_READ_MBPS,
     _DEFAULT_DIR_ROLES,
     _DIFFUSION_ARCH_RES,
+    _WEIGHT_SUFFIXES,
 )
 
 logger = logging.getLogger(__name__)
@@ -1027,6 +1029,28 @@ def hf_hub_cache(override: str | os.PathLike | None = None) -> Path | None:
     return default if default.is_dir() else None
 
 
+def snapshot_weight_paths(snap: Path) -> list[str]:
+    """Snapshot-relative weight paths at any depth, sorted.
+
+    The single recursive snapshot listing in the codebase: one ``rglob``
+    filtered to :data:`_WEIGHT_SUFFIXES`, returned as posix relative paths
+    (``model.gguf``, ``Subdir/model.gguf``). Callers cache per snapshot mtime.
+    """
+    try:
+        files = [p for p in snap.rglob("*") if p.is_file()]
+    except OSError:
+        return []
+    rels = []
+    for p in files:
+        if p.suffix.lower() not in _WEIGHT_SUFFIXES:
+            continue
+        try:
+            rels.append(p.relative_to(snap).as_posix())
+        except ValueError:
+            continue
+    return sorted(rels)
+
+
 def hf_snapshot_dir(repo_id: str, hf_home: str | os.PathLike | None = None) -> Path | None:
     """Locate the local HF hub snapshot directory for ``repo_id``.
 
@@ -1064,24 +1088,48 @@ def hf_snapshot_file(repo_id: str, filename: str,
     Lets a sidecar reference a hub-downloaded GGUF (``hf_repo: org/repo`` +
     ``model: file.gguf``) without symlinking it into a models dir — readable
     snapshot filenames, no blob hashes, and it keeps working when sidecars
-    move.  ``filename`` may be a glob pattern (``mmproj*.gguf``): an exact
-    file wins; otherwise a single glob match resolves and an ambiguous match
-    warns and fails.  Returns None when unresolved.
+    move.  ``filename`` may be a snapshot-relative path into a subdirectory
+    (``Subdir/model.gguf``), a bare basename matched at any depth (a single
+    hit wins; several warn and fail), or a glob pattern (an exact file wins;
+    otherwise a single glob match resolves and an ambiguous match warns and
+    fails).  Returns None when unresolved.
     """
     snap = hf_snapshot_dir(repo_id, hf_home)
     if snap is None:
         return None
-    candidate = snap / filename
-    if candidate.is_file():
-        return candidate
-    if any(ch in filename for ch in "*?["):
-        matches = sorted(snap.glob(filename))
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
+    if "/" not in filename and not any(ch in filename for ch in "*?["):
+        # Bare basename: always resolve through the index, so a basename
+        # present at several depths warns instead of silently winning.
+        hits = [r for r in snapshot_weight_paths(snap)
+                if Path(r).name == filename]
+        if len(hits) == 1:
+            return snap / hits[0]
+        if len(hits) > 1:
             logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
-                           filename, repo_id, len(matches),
-                           ", ".join(m.name for m in matches))
+                           filename, repo_id, len(hits),
+                           ", ".join(hits))
+        return None
+    candidate = snap / filename
+    try:
+        if candidate.is_file():
+            return candidate
+    except OSError:
+        return None
+    rels = snapshot_weight_paths(snap)
+    if any(ch in filename for ch in "*?["):
+        matches = sorted({r for r in rels
+                          if fnmatch.fnmatchcase(Path(r).name, filename)
+                          or fnmatch.fnmatchcase(r, filename)})
+    else:
+        # Explicit relative path that is not an exact file — no basename
+        # fallback (a name with a separator names one place, not many).
+        return None
+    if len(matches) == 1:
+        return snap / matches[0]
+    if len(matches) > 1:
+        logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
+                       filename, repo_id, len(matches),
+                       ", ".join(matches))
     return None
 
 

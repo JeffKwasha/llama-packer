@@ -102,7 +102,8 @@ serves (identity falls back to the stem). For an HF-cache GGUF: `parameters`
 from the size in the filename (`31B`), `quantization` is the exact suffix after
 the last `-` (`...i1-Q4_K_M.gguf` → `Q4_K_M`), `context_length` is the GGUF
 header value (`262144` for gemma4 — matches `ls` filename and `README.md`),
-`model:` is the snapshot filename, `hf_repo:`/`hf_url:` is the repo id.
+`model:` is the snapshot filename (or a `Subdir/file` relative path when the
+file sits in a snapshot subdirectory), `hf_repo:`/`hf_url:` is the repo id.
 
 ```yaml
 ---
@@ -114,7 +115,7 @@ quantization: Q4_K_M         # exact suffix from snapshot filename: Q4_K_M, Q6_K
 context_length: 262144       # architectural max (from GGUF header; gemma4 = 262144)
 description: "one-line summary."
 # --- file & huggingface ---
-model: model.gguf            # snapshot filename when the file lives in the HF cache (with hf_repo:)
+model: model.gguf            # snapshot filename (or Subdir/file path) when the file lives in the HF cache (with hf_repo:)
 hf_repo: org/model           # HF cache repo id — required with model: for cache files
 hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one line
 # mmproj:                       # only if the snapshot actually contains *mmproj*.gguf
@@ -224,9 +225,11 @@ Convention: brand + major version; minor only when it changed the architecture
 ## HuggingFace resolution
 
 For a hub-cached model, set `model:` to the exact snapshot filename (get it
-with `ls <snapshot>/`) and `hf_repo: org/repo` (or `hf_url:`). No symlink is
-needed. If the sidecar can't share the model's stem, `model:` is how you point
-at a differently-named file.
+with `ls <snapshot>/`) — or a `Subdir/file` relative path when the file sits
+in a snapshot subdirectory — and `hf_repo: org/repo` (or `hf_url:`). No
+symlink is needed. If the sidecar can't share the model's stem, `model:` is
+how you point at a differently-named file. A bare basename matching files at
+several depths warns and fails; disambiguate with the relative path.
 
 ## Fleet-level overrides
 
@@ -238,7 +241,7 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 
 | Key | Meaning |
 |-----|---------|
-| `model: <file>` | Model file when stem differs; with `hf_repo:` it names the snapshot file |
+| `model: <file>` | Model file when stem differs; with `hf_repo:` it names the snapshot file (or a `Subdir/file` relative path) |
 | `mmproj: {file: …}` | Companion block: `file:` locates the projector/draft file; other keys form a conditional overlay served only while the file is served (see Companions) |
 | `device: N` / `device: cpu` | Pin to GPU N or run on CPU |
 | `concurrency: N` | Per-model concurrency limit |

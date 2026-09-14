@@ -133,7 +133,9 @@ def _hf_tree(tmp_path, repo="org/repo", rev="abc123", files=("model.gguf",), wit
     snap = hub / f"models--{repo.replace('/', '--')}" / "snapshots" / rev
     snap.mkdir(parents=True)
     for f in files:
-        (snap / f).write_bytes(b"x")
+        p = snap / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
     if with_ref:
         refs = hub / f"models--{repo.replace('/', '--')}" / "refs"
         refs.mkdir(parents=True)
@@ -375,3 +377,89 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
 
 
 # ── audio (t2s) discovery is exercised by the audio-cpp backend tests ─────
+
+
+# ── snapshot subdirectories ─────────────────────────────────────────────
+# Weight files nested below the snapshot top level resolve via explicit
+# relative paths, unique bare basenames, and single-model auto-detect.
+
+
+def test_hf_snapshot_file_subdir_exact_and_bare(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Sub/model.gguf", "README.md"))
+    hit = hf_snapshot_file("org/repo", "Sub/model.gguf", hf_home)
+    assert hit is not None and hit.parent.name == "Sub"
+    # Bare basename finds the single nested hit (config files never match).
+    bare = hf_snapshot_file("org/repo", "model.gguf", hf_home)
+    assert bare is not None and bare == hit
+
+
+def test_hf_snapshot_file_bare_ambiguous_across_depths_warns(tmp_path, caplog):
+    hf_home = _hf_tree(tmp_path, files=("model.gguf", "Sub/model.gguf"))
+    with caplog.at_level(logging.WARNING):
+        assert hf_snapshot_file("org/repo", "model.gguf", hf_home) is None
+    assert any("ambiguous" in r.message for r in caplog.records)
+    # The explicit relative path still resolves.
+    hit = hf_snapshot_file("org/repo", "Sub/model.gguf", hf_home)
+    assert hit is not None and hit.parent.name == "Sub"
+
+
+def test_hf_snapshot_file_nested_glob(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("A/x-mmproj-F16.gguf", "B/y.gguf"))
+    hit = hf_snapshot_file("org/repo", "*mmproj*.gguf", hf_home)
+    assert hit is not None and hit.parent.name == "A"
+    hit = hf_snapshot_file("org/repo", "B/*.gguf", hf_home)
+    assert hit is not None and hit.name == "y.gguf"
+
+
+def test_model_resolves_subdir_model_from_hf_cache(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf",))
+    md_path = tmp_path / "kokoro.md"
+    fm = {"name": "kokoro", "model": "Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf",
+          "hf_repo": "org/repo"}
+    m = Model(md_path, fm, hf_home=hf_home)
+    assert m.gguf_path is not None
+    assert m.gguf_path.name == "kokoro-82m-q8_0.gguf"
+
+
+def test_model_resolves_unique_nested_bare_name(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Sub/only.gguf",))
+    md_path = tmp_path / "only.md"
+    m = Model(md_path, {"name": "only", "model": "only.gguf",
+                        "hf_repo": "org/repo"}, hf_home=hf_home)
+    assert m.gguf_path is not None and m.gguf_path.parent.name == "Sub"
+
+
+def test_model_ambiguous_bare_name_across_depths_raises(tmp_path):
+    import pytest
+    hf_home = _hf_tree(tmp_path, files=("model.safetensors",
+                                        "speech_tokenizer/model.safetensors"))
+    md_path = tmp_path / "q.md"
+    with pytest.raises(ValueError, match="not found"):
+        Model(md_path, {"name": "q", "model": "model.safetensors",
+                        "hf_repo": "org/repo"}, hf_home=hf_home)
+
+
+def test_snapshot_auto_detect_single_nested_model(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Sub/only.gguf",))
+    md_path = tmp_path / "auto.md"
+    m = Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
+              hf_home=hf_home)
+    assert m.gguf_path is not None and m.gguf_path.parent.name == "Sub"
+
+
+def test_snapshot_auto_detect_prefers_top_level(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("model.safetensors",
+                                        "speech_tokenizer/model.safetensors"))
+    md_path = tmp_path / "auto.md"
+    m = Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
+              hf_home=hf_home)
+    assert m.gguf_path is not None and m.gguf_path.parent.name == "abc123"
+
+
+def test_snapshot_auto_detect_several_nested_models_errors(tmp_path):
+    import pytest
+    hf_home = _hf_tree(tmp_path, files=("A/a.gguf", "B/b.gguf"))
+    md_path = tmp_path / "auto.md"
+    with pytest.raises(ValueError, match="several models"):
+        Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
+              hf_home=hf_home)

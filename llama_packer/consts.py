@@ -187,3 +187,12 @@ _DEFAULT_DIR_ROLES = {
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 _NON_CHAT_ROLES = frozenset({"embeddings", "rerank", "image", "s2t", "t2s"})
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Weight-file suffixes
+# The only files that can be models. Snapshot listings and companion
+# scans filter to these so config/asset subdirs (tokenizer/,
+# 1_Pooling/, speech_tokenizer/ config) never match.
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+_WEIGHT_SUFFIXES = frozenset({".gguf", ".safetensors", ".bin", ".onnx"})

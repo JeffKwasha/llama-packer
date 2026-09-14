@@ -19,6 +19,7 @@ from llama_packer.consts import (
     _DIFFUSION_ARCH_RES,
     _MIN_CTX_SIZE,
     _MTP_DRAFT_N_MAX,
+    _WEIGHT_SUFFIXES,
 )
 from llama_packer.backends import DEFAULT_BACKEND
 
@@ -74,7 +75,11 @@ class WeightFinder:
         return utils.hf_snapshot_dir(repo, hf_home)
 
     def snapshot_files(self, repo: str, hf_home=None) -> tuple[Path | None, list[str]]:
-        """(snapshot dir, sorted file names), listing cached by dir mtime."""
+        """(snapshot dir, sorted snapshot-relative weight paths), cached by dir mtime.
+
+        Relative paths span any depth (``model.gguf``,
+        ``Subdir/model.gguf``); see :func:`utils.snapshot_weight_paths`.
+        """
         snap = self.snapshot(repo, hf_home)
         if snap is None:
             return None, []
@@ -86,29 +91,50 @@ class WeightFinder:
         if hit is not None and hit[0] == mtime:
             return snap, hit[1]
         try:
-            names = sorted(p.name for p in snap.iterdir() if p.is_file())
+            rels = utils.snapshot_weight_paths(snap)
         except OSError:
             return snap, []
-        self._snap_files[str(snap)] = (mtime, names)
-        return snap, names
+        self._snap_files[str(snap)] = (mtime, rels)
+        return snap, rels
 
     def snapshot_exact(self, repo: str, name: str, hf_home=None) -> Path | None:
-        """Exact *name* inside the repo snapshot, or None."""
-        snap, names = self.snapshot_files(repo, hf_home)
-        if snap is None or name not in names:
+        """Exact *name* inside the repo snapshot, or None.
+
+        *name* may be a snapshot-relative path (``Subdir/model.gguf``) or a
+        bare basename matched at any depth (a single hit wins; several warn
+        and fail — ambiguity never resolves silently).
+        """
+        snap, rels = self.snapshot_files(repo, hf_home)
+        if snap is None:
             return None
-        candidate = snap / name
-        try:
-            return candidate if candidate.is_file() else None
-        except OSError:
-            return None
+        if "/" in name:
+            # Explicit relative path names one place, not many.
+            candidate = snap / name
+            try:
+                return candidate if candidate.is_file() else None
+            except OSError:
+                return None
+        hits = [r for r in rels if Path(r).name == name]
+        if len(hits) == 1:
+            return snap / hits[0]
+        if len(hits) > 1:
+            logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
+                           name, repo, len(hits), ", ".join(hits))
+        return None
 
     def match_snapshot(self, repo: str, pattern: str, hf_home=None) -> list[Path]:
-        """Snapshot files matching glob *pattern* (sorted)."""
-        snap, names = self.snapshot_files(repo, hf_home)
+        """Snapshot files matching glob *pattern* (sorted).
+
+        Matched against basenames at any depth (plus the relative path, so
+        ``Subdir/*.gguf`` works); a single hit wins upstream, several warn
+        and fail there.
+        """
+        snap, rels = self.snapshot_files(repo, hf_home)
         if snap is None:
             return []
-        return [snap / n for n in names if fnmatch.fnmatchcase(n, pattern)]
+        return [snap / r for r in rels
+                if fnmatch.fnmatchcase(Path(r).name, pattern)
+                or fnmatch.fnmatchcase(r, pattern)]
 
 
 _DEFAULT_FINDER: WeightFinder | None = None
@@ -712,19 +738,22 @@ class Model:
                 return hit.gguf_path
 
         # 3. No local file – try hf_repo snapshot auto (exactly one non-mmproj
-        # model → use it, several → error, none → give up for __init__ error)
+        # model → use it, several → error, none → give up for __init__ error).
+        # Top level wins: subdirectories only count when the snapshot top
+        # level holds no weight file.
         if self.hf_repo:
-            snap, names = self._finder.snapshot_files(
+            snap, rels = self._finder.snapshot_files(
                 self.hf_repo, self._hf_home)
             if snap is not None:
                 # Collect non-mmproj candidates (mmproj/mtp are companions, not
-                # main models). Also skip .msgpack etc – only real weight files.
-                candidates = [
-                    n for n in names
-                    if Path(n).suffix.lower() in
-                    {".gguf", ".safetensors", ".bin", ".onnx"}
-                    and "mmproj" not in Path(n).stem.lower()
-                ]
+                # main models).
+                def _is_candidate(r: str) -> bool:
+                    p = Path(r)
+                    return (p.suffix.lower() in _WEIGHT_SUFFIXES
+                            and "mmproj" not in p.stem.lower())
+                top = [r for r in rels if "/" not in r and _is_candidate(r)]
+                sub = [r for r in rels if "/" in r and _is_candidate(r)]
+                candidates = top if top else sub
                 if len(candidates) == 1:
                     hit = Model.from_file(snap / candidates[0])
                     if hit is not None:
@@ -735,7 +764,8 @@ class Model:
                         f"sidecar {self.label} (hf_repo {self.hf_repo!r}): "
                         f"several models in snapshot {snap}: {names_s} – "
                         f"set `model: <filename>` in the sidecar to choose one "
-                        f"(exact file in the snapshot, e.g. `ls {snap}`)"
+                        f"(exact file in the snapshot, or a `Subdir/file` "
+                        f"relative path, e.g. `ls {snap}`)"
                     )
                 # zero candidates – fall through to __init__ error (no file)
 
