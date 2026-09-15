@@ -46,6 +46,9 @@ SETTING_KEYS = frozenset({
     # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
     "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
     "reasoning_parser",
+    # audio-cpp engine block (rendered into server.json by audio-cpp;
+    # other backends warn it as unhandled)
+    "audio_cpp",
 })
 FRAMEWORK_CONSUMED = frozenset({"backend", "hf_repo"})
 METADATA_ONLY = frozenset({"chat_template_kwargs"})

@@ -315,6 +315,18 @@ def test_setting_keys_partition():
     assert METADATA_ONLY == {"chat_template_kwargs"}
     assert VLLM_BACKENDS == {"vllm", "vllm-podman", "vllm-docker"}
     assert "backend" in SETTING_KEYS and "chat_template" in SETTING_KEYS
+    assert "audio_cpp" in SETTING_KEYS
+
+
+def test_audio_cpp_handles_its_block(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        get_backend("audio-cpp").warn_unhandled({"audio_cpp"})
+    assert not [r for r in caplog.records if "audio_cpp" in r.message]
+    # ... but a backend that ignores it warns (misrouted sidecar signal)
+    with caplog.at_level(logging.WARNING):
+        get_backend("llama-server").warn_unhandled({"audio_cpp"})
+    assert any("audio_cpp" in r.message for r in caplog.records)
 
 
 def test_basebackend_is_abstract():
@@ -1038,11 +1050,14 @@ def test_audio_cpp_cmd_shape(make_model):
         "audio_cpp_voice_dir": "/opt/voices",
     })
     assert cmd.startswith(
-        "sh -c 'cat > /tmp/audiocpp-chatterbox-${PORT}.json <<JSON")
+        "sh -c 'mkdir -p /tmp/llama-swap && cat > "
+        "/tmp/llama-swap/audiocpp-chatterbox-${PORT}.json <<JSON")
     assert cmd.endswith(
         "exec /opt/audiocpp_server --config "
-        "/tmp/audiocpp-chatterbox-${PORT}.json'")
+        "/tmp/llama-swap/audiocpp-chatterbox-${PORT}.json'")
     assert '"port":${PORT}' in cmd            # unquoted -> JSON number
+    assert "\n" in cmd                            # heredoc newlines are load-bearing
+    assert "\nJSON\n" in cmd                      # heredoc terminator on its own line
     assert '"family":"chatterbox"' in cmd
     assert '"task":"tts"' in cmd
     assert '"backend":"cuda"' in cmd

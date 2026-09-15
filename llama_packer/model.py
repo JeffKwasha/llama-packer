@@ -457,6 +457,10 @@ class Model:
         # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
         "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
         "reasoning_parser",
+        # Fixed-overhead VRAM pin (consumed by vram.py / writer.py)
+        "vram_mb",
+        # audio-cpp engine block (consumed by AudioCppBackend.build_cmd)
+        "audio_cpp",
     })
 
     # Frontmatter keys a companion block may NOT set: identity, placement,

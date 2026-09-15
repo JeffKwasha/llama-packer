@@ -406,6 +406,7 @@ def test_audio_cpp_entry_proxy_and_health(make_model):
     assert entry["capabilities"]["in"] == ["text"]
     assert entry["capabilities"]["out"] == ["audio"]
     assert entry["cmd"].startswith("sh -c ")
+    assert "\n" in entry["cmd"]  # heredoc newlines survive emit (_strip_repeat_ws)
 
 
 # ── config serialization contract ─────────────────────────────────────────
@@ -446,4 +447,22 @@ def test_write_yaml_accepts_plain_dict(tmp_path):
     out = tmp_path / "config.yaml"
     write_yaml(cfg, out)
     assert yaml.safe_load(out.read_text()) == cfg
+
+
+def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
+    # Regression: multi-line cmd (audio-cpp heredoc) must round-trip with
+    # newlines intact — PyYAML's default folded style collapses them.
+    import yaml
+
+    from llama_packer.backends import get_backend
+    from llama_packer.writer import write_yaml
+
+    model = make_model("chatterbox", role="t2s", backend="audio-cpp")
+    cmd, _ = get_backend("audio-cpp").build_cmd(
+        model, 0, 1, "q8_0", {"audio_cpp_bin": "/opt/audiocpp_server"})
+    assert "\n" in cmd
+    out = tmp_path / "config.yaml"
+    write_yaml({"models": {"m": {"cmd": cmd}}}, out)
+    text = out.read_text()
+    assert yaml.safe_load(text)["models"]["m"]["cmd"] == cmd
 

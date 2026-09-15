@@ -56,8 +56,12 @@ def _model_can_reason(model: Model) -> bool:
 
 
 def _strip_repeat_ws(text: str) -> str:
-    """Collapse runs of whitespace to single spaces (templates with | blocks)."""
-    return " ".join(text.split())
+    """Collapse runs of whitespace to single spaces (templates with | blocks).
+
+    Newlines are preserved: multi-line values (e.g. audio-cpp's heredoc
+    ``cmd``) depend on them.
+    """
+    return "\n".join(" ".join(line.split()) for line in text.split("\n"))
 
 
 def _fmt_mib(mib: float) -> str:
@@ -2006,8 +2010,34 @@ def build_config(
     return emit_config(supported, planner.plan(), profiles, template_vars)
 
 
+class _LiteralDumper(yaml.Dumper):
+    """YAML dumper that keeps newlines intact via literal blocks.
+
+    PyYAML's default renders multi-line strings as folded (single-quoted)
+    scalars, which collapse load-bearing newlines (e.g. audio-cpp's
+    heredoc ``cmd``) into spaces.  Forcing ``|`` style on strings that
+    contain a newline makes the round-trip exact.  Scoped to this subclass
+    so no global ``yaml.add_representer`` side effects leak elsewhere.
+    """
+
+
+def _literal_str_representer(dumper, data):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_LiteralDumper.add_representer(str, _literal_str_representer)
+
+
+def dump_yaml(payload: dict) -> str:
+    """Serialize *payload* to a YAML string, preserving embedded newlines."""
+    return yaml.dump(payload, default_flow_style=False, sort_keys=False,
+                     allow_unicode=True, Dumper=_LiteralDumper)
+
+
 def write_yaml(config: dict, path: Path | str) -> None:
     """Write config to YAML file."""
     payload = config.plain() if isinstance(config, EmittedConfig) else config
     with open(path, "w") as f:
-        yaml.dump(payload, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        f.write(dump_yaml(payload))

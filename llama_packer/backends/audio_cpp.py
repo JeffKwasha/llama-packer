@@ -3,7 +3,7 @@
 
 Runs the native ggml ``audiocpp_server`` (0xShug0/audio.cpp) as a proxied HTTP
 service, exactly like ``sd-server``/``whisper-server``: llama-swap owns the
-entry, writes a ``server.json`` and execs the binary.  One entry per sidecar
+entry, writes a ``server.json`` under ``/tmp/llama-swap/`` and execs the binary.  One entry per sidecar
 model (1:1) keeps llama-packer's "one entry = one process with a fixed command
 line" invariant; audio.cpp's multi-model LRU is a shared-server deployment we
 do not emit.
@@ -52,7 +52,7 @@ class AudioCppBackend(BaseBackend):
     name = "audio-cpp"
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
     roles = frozenset({"t2s", "s2t"})
-    handles = frozenset()
+    handles = frozenset({"audio_cpp"})
     # Host first; a container transport is a later deployment (the engine
     # would reuse transport.py unchanged).
     transports = frozenset({"host"})
@@ -120,9 +120,9 @@ class AudioCppBackend(BaseBackend):
         payload = json.dumps(server, separators=(",", ":"))
         payload = payload.replace(f'"{_PORT_SENTINEL}"', "${PORT}")
 
-        config_path = f"/tmp/audiocpp-{utils.slugify(model.stem)}-${{PORT}}.json"
+        config_path = f"/tmp/llama-swap/audiocpp-{utils.slugify(model.stem)}-${{PORT}}.json"
         cmd = (
-            f"sh -c 'cat > {config_path} <<JSON\n"
+            f"sh -c 'mkdir -p /tmp/llama-swap && cat > {config_path} <<JSON\n"
             f"{payload}\n"
             f"JSON\n"
             f"exec {binary} --config {config_path}'"

@@ -31,7 +31,7 @@ from llama_packer.consts import (
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
-from llama_packer.writer import build_config, write_yaml, EmittedConfig
+from llama_packer.writer import build_config, write_yaml, dump_yaml, EmittedConfig
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -864,7 +864,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.dry_run:
         payload = config.plain() if isinstance(config, EmittedConfig) else config
-        sys.stdout.write(yaml.dump(payload, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        sys.stdout.write(dump_yaml(payload))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
     else:

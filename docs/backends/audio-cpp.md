@@ -66,15 +66,20 @@ One `audiocpp_server` process per sidecar (1:1) — llama-packer's
 "chatterbox-tts":
   capabilities: { in: [text], out: [audio] }
   checkEndpoint: /health
-  cmd: >
-    sh -c 'cat > /tmp/audiocpp-chatterbox-${PORT}.json <<JSON
+  cmd: |
+    sh -c 'mkdir -p /tmp/llama-swap && cat > /tmp/llama-swap/audiocpp-chatterbox-${PORT}.json <<JSON
     {"host":"127.0.0.1","port":${PORT},"backend":"cuda","device":0,"threads":1,
      "models":[{"id":"chatterbox","family":"chatterbox","path":"…","task":"tts","mode":"offline",
                 "default_request_options":{"temperature":0.8,"top_p":0.8}}]}
     JSON
-    exec /opt/audiocpp_server --config /tmp/audiocpp-chatterbox-${PORT}.json'
+    exec /opt/audiocpp_server --config /tmp/llama-swap/audiocpp-chatterbox-${PORT}.json'
   proxy: "http://127.0.0.1:${PORT}"
 ```
+
+The heredoc newlines are load-bearing: the writer emits multi-line `cmd`
+values as YAML literal blocks (`|`), never folded, so the round-trip is
+exact. The per-port `server.json` is rewritten on every model load under
+`/tmp/llama-swap/` (flat; `mkdir -p` in the `cmd` creates it).
 
 The server's own multi-model LRU (`max_loaded_models`, `/v1/tasks/unload_models`)
 is available for a shared-server deployment, but is **not** the default: the

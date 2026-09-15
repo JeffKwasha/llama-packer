@@ -232,3 +232,17 @@ def test_min_context_is_a_consumed_field(make_model):
     m = make_model("mc", min_context=65536)
     assert m.frontmatter["min_context"] == 65536
     assert "min_context" not in m.pass_through_metadata()
+
+
+def test_audio_keys_are_consumed_fields(make_model, caplog):
+    # documented sidecar keys (models_AGENTS.md): vram_mb pins fixed-overhead
+    # VRAM (vram.py/writer.py), audio_cpp drives AudioCppBackend.build_cmd.
+    # Neither may warn nor leak to clients as metadata.
+    import logging
+    m = make_model("a", vram_mb=4096,
+                   audio_cpp={"family": "qwen3_asr", "task": "asr"})
+    with caplog.at_level(logging.WARNING):
+        meta = m.pass_through_metadata()
+    assert "vram_mb" not in meta
+    assert "audio_cpp" not in meta
+    assert not [r for r in caplog.records if "unhandled frontmatter" in r.message]
