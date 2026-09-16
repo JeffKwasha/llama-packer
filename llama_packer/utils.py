@@ -1051,12 +1051,175 @@ def snapshot_weight_paths(snap: Path) -> list[str]:
     return sorted(rels)
 
 
-def hf_snapshot_dir(repo_id: str, hf_home: str | os.PathLike | None = None) -> Path | None:
+def _top_level(rels: list[str]) -> list[str]:
+    """Snapshot-relative paths at the snapshot root (no subdirectory)."""
+    return [r for r in rels if "/" not in r]
+
+
+def match_snapshot_paths(snap: Path, rels: list[str], filename: str,
+                         top_only: bool = False) -> list[str]:
+    """Candidate snapshot-relative paths for *filename* (sorted).
+
+    The single matching core for every hub file lookup (weights and
+    non-weights alike — callers choose the listing). *filename* may be an
+    explicit snapshot-relative path (names one place — returned iff it is a
+    file), a bare basename matched at any depth, or a glob (an exact hit
+    wins, else all basename-or-relative-path matches). With
+    ``top_only=True`` only snapshot-root files are considered. Returns
+    candidates; callers decide ambiguity via :func:`single_snapshot_hit`.
+    """
+    candidates = _top_level(rels) if top_only else list(rels)
+    if "/" in filename and not any(ch in filename for ch in "*?["):
+        # Explicit relative path names one place, not many.
+        try:
+            if (snap / filename).is_file():
+                return [filename]
+        except OSError:
+            pass
+        return []
+    if not any(ch in filename for ch in "*?["):
+        return [r for r in candidates if Path(r).name == filename]
+    exact = [r for r in candidates
+             if r == filename or Path(r).name == filename]
+    if exact:
+        return exact
+    return sorted({r for r in candidates
+                   if fnmatch.fnmatchcase(Path(r).name, filename)
+                   or fnmatch.fnmatchcase(r, filename)})
+
+
+def single_snapshot_hit(snap: Path, hits: list[str], repo_id: str,
+                        filename: str) -> Path | None:
+    """The single winner from :func:`match_snapshot_paths`, or None.
+
+    One hit resolves; several warn and fail — ambiguity never resolves
+    silently. Zero hits is plain None (the caller owns the not-found
+    message, which knows the local dirs that were also tried).
+    """
+    if len(hits) == 1:
+        return snap / hits[0]
+    if len(hits) > 1:
+        logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
+                       filename, repo_id, len(hits), ", ".join(hits))
+    return None
+
+
+def describe_ref(ref, repo_default: str | None = None) -> str:
+    """Human-readable form of a file ref for log/error messages.
+
+    Hub refs render as ``repo:file (hf download repo)`` so the fix is in
+    the message; anything else renders as the string itself (mappings
+    without a usable repo render as ``repr``).
+    """
+    if isinstance(ref, dict):
+        repo = ref.get("hf_repo") or repo_default
+        name = ref.get("file")
+        if repo and isinstance(name, str) and name:
+            return f"{repo}:{name} (hf download {repo})"
+        return repr(ref)
+    return str(ref)
+
+
+def snapshot_all_paths(snap: Path) -> list[str]:
+    """Snapshot-relative file paths at any depth, sorted.
+
+    Unlike :func:`snapshot_weight_paths` (weights only), this lists *every*
+    file — chat templates (``.jinja``), LoRAs, docs — so non-weight file refs
+    (``chat_template:``, ``loras:``) can resolve inside the hub cache with
+    the same snapshot-selection semantics as weights. Returned as posix
+    relative paths (``chat_template.jinja``, ``archive/v22/foo.jinja``).
+    """
+    try:
+        files = [p for p in snap.rglob("*") if p.is_file()]
+    except OSError:
+        return []
+    rels = []
+    for p in files:
+        try:
+            rels.append(p.relative_to(snap).as_posix())
+        except ValueError:
+            continue
+    return sorted(rels)
+
+
+# ── File-ref pick semantics ─────────────────────────────────────────────
+#
+# Any config key that names a file accepts either a bare string (local path,
+# ``hub:org/repo:file``, or glob — per-callsite) or a mapping:
+#
+#     {file: chat_template.jinja}                             ≡ "chat_template.jinja"
+#     {hf_repo: org/repo, file: chat_template.jinja}          (hub file)
+#     {hf_repo: org/repo, file: chat_template.jinja, pick: "newest,top"}
+#
+# ``pick`` is a comma/space-separated token string (or list) on two axes:
+# snapshot selection (``main`` = default legacy: refs/main → sole snapshot →
+# newest-with-warning; ``newest`` / ``oldest`` = by snapshot mtime, no
+# warning — explicit choice) and in-snapshot scoping (``top`` = only consider
+# files at the snapshot root, ignoring subdirectory copies). Ambiguity still
+# fails loud (warn + unresolved) — ``pick`` only narrows the candidate set,
+# it never silently takes the first of several.
+
+PICK_SNAPSHOT_MODES = frozenset({"main", "newest", "oldest"})
+PICK_FILE_SCOPES = frozenset({"top"})
+_KNOWN_PICK_TOKENS = PICK_SNAPSHOT_MODES | PICK_FILE_SCOPES
+
+
+def parse_pick(pick) -> tuple[str, bool]:
+    """Parse a file-ref ``pick`` value into ``(snapshot_mode, top_only)``.
+
+    Accepts None (→ ``("main", False)``), a token string (``"newest,top"``),
+    or a list of tokens. Unknown tokens log a warning and are ignored.
+    """
+    if pick is None:
+        return "main", False
+    if isinstance(pick, str):
+        tokens = [t.strip().lower() for t in pick.replace(",", " ").split()]
+    elif isinstance(pick, (list, tuple)):
+        tokens = [str(t).strip().lower() for t in pick]
+    else:
+        logger.warning("hf: ignoring malformed pick %r (expected token string)", pick)
+        return "main", False
+    mode = "main"
+    top_only = False
+    for t in tokens:
+        if not t:
+            continue
+        if t in PICK_SNAPSHOT_MODES:
+            mode = t
+        elif t == "top":
+            top_only = True
+        else:
+            logger.warning("hf: ignoring unknown pick token %r (known: %s)",
+                           t, ", ".join(sorted(_KNOWN_PICK_TOKENS)))
+    return mode, top_only
+
+
+def parse_hub_ref(ref: str) -> tuple[str, str] | None:
+    """Split a ``hub:<org>/<repo>:<file>`` string into ``(repo, file)``.
+
+    Returns None when *ref* is not a well-formed ``hub:`` ref (warning on
+    malformed ones, silence otherwise so plain paths pass through).
+    """
+    if not isinstance(ref, str) or not ref.startswith("hub:"):
+        return None
+    rest = ref[len("hub:"):]
+    repo, _, name = rest.rpartition(":")
+    if not repo or not name:
+        logger.warning("hf: malformed %r (expected hub:org/repo:file)", ref)
+        return None
+    return repo, name
+
+
+def hf_snapshot_dir(repo_id: str, hf_home: str | os.PathLike | None = None,
+                    *, mode: str | None = None) -> Path | None:
     """Locate the local HF hub snapshot directory for ``repo_id``.
 
-    Revision selection: ``refs/main`` when present, else the sole snapshot
-    dir, else the newest by mtime (with a warning).  Returns None when the
-    repo is not in the hub cache.
+    Revision selection (``mode`` from :func:`parse_pick`, default ``"main"``):
+    ``refs/main`` when present, else the sole snapshot dir, else the newest
+    by mtime (with a warning). ``mode="newest"`` / ``"oldest"`` select by
+    snapshot mtime directly, ignoring ``refs/main`` and warning nothing —
+    the caller asked explicitly. Returns None when the repo is not in the
+    hub cache.
     """
     hub = hf_hub_cache(hf_home)
     if hub is None:
@@ -1065,72 +1228,24 @@ def hf_snapshot_dir(repo_id: str, hf_home: str | os.PathLike | None = None) -> P
     snaps = repo_dir / "snapshots"
     if not snaps.is_dir():
         return None
+    dirs = [d for d in snaps.iterdir() if d.is_dir()]
+    if not dirs:
+        return None
+    if mode in ("newest", "oldest"):
+        dirs.sort(key=lambda d: d.stat().st_mtime)
+        return dirs[-1] if mode == "newest" else dirs[0]
     ref = repo_dir / "refs" / "main"
     if ref.is_file():
         rev = ref.read_text(encoding="utf-8").strip()
         if rev and (snaps / rev).is_dir():
             return snaps / rev
-    dirs = [d for d in snaps.iterdir() if d.is_dir()]
-    if not dirs:
-        return None
+    if len(dirs) == 1:
+        return dirs[0]
     dirs.sort(key=lambda d: d.stat().st_mtime)
     snap = dirs[-1]
-    if len(dirs) > 1:
-        logger.warning("hf: %s has %d snapshots and no refs/main; using newest (%s)",
-                       repo_id, len(dirs), snap.name)
+    logger.warning("hf: %s has %d snapshots and no refs/main; using newest (%s)",
+                   repo_id, len(dirs), snap.name)
     return snap
-
-
-def hf_snapshot_file(repo_id: str, filename: str,
-                     hf_home: str | os.PathLike | None = None) -> Path | None:
-    """Resolve ``filename`` inside the local HF hub snapshot of ``repo_id``.
-
-    Lets a sidecar reference a hub-downloaded GGUF (``hf_repo: org/repo`` +
-    ``model: file.gguf``) without symlinking it into a models dir — readable
-    snapshot filenames, no blob hashes, and it keeps working when sidecars
-    move.  ``filename`` may be a snapshot-relative path into a subdirectory
-    (``Subdir/model.gguf``), a bare basename matched at any depth (a single
-    hit wins; several warn and fail), or a glob pattern (an exact file wins;
-    otherwise a single glob match resolves and an ambiguous match warns and
-    fails).  Returns None when unresolved.
-    """
-    snap = hf_snapshot_dir(repo_id, hf_home)
-    if snap is None:
-        return None
-    if "/" not in filename and not any(ch in filename for ch in "*?["):
-        # Bare basename: always resolve through the index, so a basename
-        # present at several depths warns instead of silently winning.
-        hits = [r for r in snapshot_weight_paths(snap)
-                if Path(r).name == filename]
-        if len(hits) == 1:
-            return snap / hits[0]
-        if len(hits) > 1:
-            logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
-                           filename, repo_id, len(hits),
-                           ", ".join(hits))
-        return None
-    candidate = snap / filename
-    try:
-        if candidate.is_file():
-            return candidate
-    except OSError:
-        return None
-    rels = snapshot_weight_paths(snap)
-    if any(ch in filename for ch in "*?["):
-        matches = sorted({r for r in rels
-                          if fnmatch.fnmatchcase(Path(r).name, filename)
-                          or fnmatch.fnmatchcase(r, filename)})
-    else:
-        # Explicit relative path that is not an exact file — no basename
-        # fallback (a name with a separator names one place, not many).
-        return None
-    if len(matches) == 1:
-        return snap / matches[0]
-    if len(matches) > 1:
-        logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
-                       filename, repo_id, len(matches),
-                       ", ".join(matches))
-    return None
 
 
 def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str | os.PathLike | None = None,

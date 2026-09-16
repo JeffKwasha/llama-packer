@@ -1,243 +1,176 @@
-# todo.md — Plan for B + C
+# todo.md — audio.cpp plan (2026-09-16, rev 2)
 
-Status: **historical planning snapshot** — the plan as it stood before
-implementation; landed on branch `dry_backend` (2026-09-12). See
-[Completion status](#completion-status) at the bottom for what shipped, what
-was deferred, and what our decisions superseded.
+**Goal:** ship STT + TTS on audio.cpp — kokoro + chatterbox included — using the
+**existing 1:1 emission** (one `audiocpp_server` per sidecar, one model per
+`server.json`). Per decision 2026-09-16: it is OK that each capability is its
+own entry in llama-swap's model list, and OK that switching models reloads
+audio.cpp completely (llama-swap stop/start). No shared-server grouping, no
+in-process LRU reliance; `max_loaded_models`/`idle_unload_ms` are not emitted
+in 1:1 mode.
 
-- **B** = backend/transport delineation (engine vs transport seam).
-- **C** = configurable matrix categories, to express
-  `(CHAT) + ((EMB+RERANK) | (TTS&/or STT))`.
-- **Forcing function** = `audio.cpp` (`audiocpp_server`); engine doc now at
-  [`docs/backends/audio-cpp.md`](docs/backends/audio-cpp.md).
+**Branch:** audio 1:1 support lives on `dry_backend` (currently checked out,
+with uncommitted modifications). Commit/stash that work first; then a small
+follow-up branch (or direct commits on `dry_backend`) carries the deltas below.
 
-Companion docs: [`docs/backends/`](docs/backends/),
-[`docs/transports/`](docs/transports/),
-[`docs/plans/matrix-categories.md`](docs/plans/matrix-categories.md) (implemented),
-[`docs/plans/opportunistic-coload.md`](docs/plans/opportunistic-coload.md),
-[`docs/architecture.md`](docs/architecture.md).
+**Box facts (2026-09-16, verified):** binary is **audio.cpp 0.8.0**
+(`/mnt/pool/data/tools/audiocpp`, git 4af1432, prebuilt ubuntu-x64-vulkan →
+backends **cpu + vulkan only**); GPU = AMD Radeon AI Pro R9700 (RADV GFX1201,
+RDNA4) via Vulkan; ROCm present but binary has no HIP build. Pre-built GGUF
+packages already downloaded via HF repo `audio-cpp/audio.cpp-gguf` snapshot
+`1b13cd58`: Chatterbox-GGUF, Chatterbox-Turbo-GGUF, Kokoro-82M-GGUF,
+Parakeet-TDT-0.6B-v3-GGUF, Nemotron-3.5-ASR-Streaming-0.6B-GGUF,
+Canary-180M-Flash-GGUF.
 
----
+**Upstream source of truth (read 2026-09-16, verified):**
+`app/server/README.md` (config keys: `host/port/backend/device/threads/
+lazy_load/max_loaded_models/idle_unload_ms/min_free_memory_mb/busy_timeout_ms/
+voice_dir/max_request_body_bytes`; per-model: `id/family/path/task/mode/
+load_options/session_options/default_request_options/default_voice_preset/
+voice_presets/lazy/busy_timeout_ms/model_spec_override`;
+endpoints `/health`, `/v1/models`, `/v1/audio/speech`,
+`/v1/audio/transcriptions[/details|/live]`, `/v1/audio/alignments`,
+`/v1/tasks/run`, `/v1/tasks/unload_models`), `docs/gguf.md` (standalone GGUFs
+embed package spec + all sidecars → **no companion files needed**;
+`model_spec_override` is the escape hatch for tensor-only/legacy GGUFs;
+`path` may be a directory → resolves `model.gguf`), `docs/build/HIP.md`
+(`hip`/`rocm` CLI alias; server JSON accepts `"backend": "hip"` — not usable on
+this vulkan-only binary).
 
-## Where the code is right now (facts, not proposals)
+## 0. Bring-up: make audio.cpp work at all (DONE/in progress)
 
-**Backends are flat registry entries** (`llama_packer/backends/__init__.py:34`):
-`BACKENDS = {llama-server, vllm, vllm-docker, sd-server, whisper-server,
-kokoro-podman}`. Each is a `BaseBackend` (`backends/base.py`) that renders one
-resolved `Model` into a `cmd`. The **engine** (what computes) and the
-**transport** (host process / docker / podman) are conflated in the name:
+- **Root cause of "empty UI":** `models/<X>-GGUF/` are symlinks into the HF
+  snapshot, whose GGUFs are symlinks to extensionless blobs → engine resolves
+  the path, sees no `.gguf` extension → `unsupported tensor source format`
+  (reproduced on 0.8.0 CLI; same as `extras/hardlink-audio.py` docstring).
+- **Fix (runs as the cache owner; claude cannot write it):** convert snapshot
+  GGUF symlinks → hard links (same mergerfs branch as blob, zero duplication,
+  `hf cache rm` still frees):
+  ```bash
+  snap=/mnt/ai/huggingface/hub/models--audio-cpp--audio.cpp-gguf/snapshots/1b13cd58245c74e3ff4ca06925766c5ef7991bd4
+  for f in "$snap"/*-GGUF/*.gguf; do
+    [ -L "$f" ] || continue
+    t=$(readlink -f "$f"); ln "$t" "$f.tmp" && mv -T "$f.tmp" "$f"
+  done
+  ```
+- Then smoke-test CLI, smallest first (<4 min each): kokoro (`task tts`),
+  chatterbox (`task clon` — loader registers `clon`+`vc`, not `tts`),
+  chatterbox_turbo (`task tts`), parakeet (`task asr`), nemotron (`task asr`).
+  `--backend vulkan` (R9700), `--out` to a claude-writable dir.
+- Then server: hand-written `server.json` with the same 4-6 models, run
+  `audiocpp_server --config`, `curl /health` (returns configured-model count),
+  `/v1/models`, `POST /v1/audio/speech`, `POST /v1/audio/transcriptions` with a
+  local wav (multipart). This is the config llama-packer must reproduce.
 
-| Registry name | Engine | Transport |
-|---|---|---|
-| `llama-server` | llama.cpp | host |
-| `vllm` | vLLM | host |
-| `vllm-docker` | vLLM | docker |
-| `sd-server` | stable-diffusion.cpp | host |
-| `whisper-server` | whisper.cpp | host |
-| `kokoro-podman` | Kokoro | podman |
+**§0 results (2026-09-16, all verified on the R9700 / RADV Vulkan):**
+- Hardlink fix applied by jk — all 6 snapshot GGUFs are link-count-2 real files.
+- **Gotcha:** the engine extracts embedded sidecars to `/tmp/audiocpp-gguf/`
+  (hardcoded name, honors `$TMPDIR`). A dir owned by another user wedges the
+  run (`Permission denied [/tmp/audiocpp-gguf/<hash>]`) — on this box run with
+  `TMPDIR` set, or remove the stale `/tmp/audiocpp-gguf` (owned by `hermes`).
+- CLI: kokoro `tts` ✅, chatterbox_turbo `tts` ✅, chatterbox `clon` ✅
+  (requires `--voice-ref`), parakeet `asr` ✅, nemotron `asr` ✅ (word
+  timestamps + clean transcript). Chatterbox base has **no `tts` task** —
+  confirmed.
+- Server (`/tmp/claude/audio/server.json`: `lazy_load: true`, 3 models):
+  `/health` ok → `/v1/audio/speech` (kokoro) 6.9 s incl. lazy load, 24 kHz PCM
+  → `/v1/audio/transcriptions` (parakeet, multipart) round-trips the TTS
+  output, RTF 0.0145 after load. Working config shape confirmed.
 
-Transport-specific logic already exists but scattered: `vllm.py` carries the
-path mapping/mounts/env (`_CONTAINER_HF_HOME`, `_map_paths_into`), lifecycle
-(`stop_cmd`, `unload_timeout`), and proxy emission; `kokoro.py` carries podman
-vendor/device flags. `BaseBackend` already has ClassVars `proxied`, `stop_cmd`,
-`unload_timeout` — a partial seam.
+## 1. Backend selection (`vulkan/cpu` now; `cuda/hip/metal` accepted)
 
-**The matrix is hardcoded to three roles** (`llama_packer/__main__.py`):
-`_detect_matrix` (`:250`), `_select_model` (`:225`), `_build_matrix_vars`
-(`:288`, emits synthetic `c1..cN` + `emb` + `rnk` + opportunistic co-loads),
-`_expand_matrix_sets` (`:381`, `__CHAT_VARS__` / `__COLOAD_VARS__`). Solving
-lives in `writer.Planner._solve_matrix` / `_solve_matrix_context` →
-`vram.solve_matrix_ctx`. Non-chat roles (`utils.SERVED_ROLES` = chat, embeddings,
-rerank, image, s2t, t2s; `NON_CHAT_ROLES` = the last five) are excluded from the
-chat solve; `FIXED_OVERHEAD_BACKENDS` = sd ∪ whisper ∪ kokoro get a fixed budget
-(`vram.py:938`).
+- `llama_packer/backends/audio_cpp.py:42` — `_AUDIO_CPP_BACKENDS` already
+  `{cuda, vulkan, cpu, metal}`; add `hip` (accept `rocm` alias → normalize);
+  reject `best` (CLI-only value, not a server-JSON value).
+- `llama_packer/__main__.py:600-603` — `auto` map (NVIDIA→cuda, AMD→vulkan,
+  else cpu) is correct for this box (AMD R9700 → vulkan). Add
+  `--audio-cpp-backend` CLI override; precedence **sidecar > CLI >
+  profiles.yaml `audio_cpp.backend` > auto** (reverses today's tvars-first
+  behavior — needs a test).
+- Binary-capability gate: probe the binary's backend set (e.g. `--list-devices`
+  output or version banner) and warn when an emitted backend isn't in it
+  (0.8.0 prebuilt = cpu,vulkan; cuda/hip emission would fail at load).
 
-**Consequence:** adding an audio engine multiplies both axes at once (a new
-engine × host/podman), and audio can't join the matrix (it's a fixed-overhead
-sidecar, not a declarable category).
+## 2. Sidecar schema fixes (existing 1:1 path)
 
----
+Current gaps in `build_cmd` (`audio_cpp.py:64-130`):
 
-## B — engine / transport delineation
+- `voice`/`voice_ref` are declared in docs (`audio-cpp.md:42-43`) but **never
+  emitted**. Upstream config-side keys are per-model `default_voice_preset`
+  (`{voice_ref, reference_text}`) and `voice_presets`, plus server-level
+  `voice_dir`. Map: sidecar `voice_ref` → `default_voice_preset`; `voice` →
+  preset name. **`voice_dir` relative paths resolve against the config file's
+  dir (`/tmp/llama-swap/`) — absolutize.**
+- Add `load_options` / `session_options` freeform pass-throughs (PocketTTS
+  needs `load_options: {language}`; chatterbox/kokoro don't for preset-voice
+  TTS).
+- `family` required, warn+skip if unknown to the loader list; per-family
+  default task (`kokoro_tts→tts`, `chatterbox→clon`, `chatterbox_turbo→tts`,
+  `qwen3_asr/parakeet_tdt/nemotron_asr→asr`).
+- `mode` default `offline` (audio_cpp.py:99) — fine; note streaming is
+  buffered SSE, not live capture, for these families.
+- Add `model_spec_override` pass-through (top-level or per-model) for
+  tensor-only/legacy GGUFs; standalone GGUFs from `audio.cpp-gguf` embed spec +
+  sidecars, so no `companions:`/`files:` sidecar key — that plan item is
+  dropped.
 
-### Goal
-One **engine** definition reusable across **transports**, so `audio-cpp` (and
-future engines) don't add a flat registry entry per transport, and so
-docker/podman path-mapping/lifecycle logic has a single home.
+## 3. Model sourcing (simplified)
 
-### Proposed seam
-Split responsibilities:
+- `hf_repo: audio-cpp/audio.cpp-gguf` + `model: <snapshot-file>` — resolution
+  via `model.py:_resolve_gguf_path` (model.py:823) exists.
+- Keep `extras/hardlink-audio.py` as the documented pre-pack step (symlink→
+  extensionless blob rejection); optionally wire it into `discover.py` behind
+  a flag. It must also handle the "GGUF dir is itself an HF-snapshot symlink"
+  layout seen today (snapshot dir containing the *-GGUF dirs).
+- Directory `path` is valid upstream (resolves `model.gguf`); prefer
+  single-file snapshot GGUF for llama-packer.
 
-- **Engine** (what computes): roles/formats/capabilities; argv builder
-  (`serve_flags`); binary/availability + version; VRAM class (measured vs
-  fixed-overhead); the set of path-valued refs it emits (model, draft, template).
-- **Transport** (how it runs): wrap argv in host/docker/podman; mounts +
-  host→container path mapping; container env; lifecycle (`cmdStop`,
-  `unloadTimeout`); `proxy` / `checkEndpoint`; port publication.
+## 4. VRAM + health (unchanged, verified)
 
-Registry resolves a name → `(engine, transport)`; keep the existing names as
-aliases so nothing else changes:
+- `vram.py:92`, `_AUDIO_CPP_COMPUTE_MB=1024` (`consts.py:152`); measured
+  reality: kokoro ≈ 190 MB file → ~1.1 GB VRAM, chatterbox q8 2.1 GB file →
+  ~3.1 GB, parakeet/nemotron 0.9 GB → ~2 GB (per rdna4 plan table). Fine-tune
+  per-family buffer only if measurement disagrees.
+- `checkEndpoint: /health` (returns readiness + configured-model count — works
+  for 1:1), `proxy: http://127.0.0.1:${PORT}` unchanged.
 
-```
-llama-server   = (llama.cpp, host)      vllm       = (vllm, host)
-sd-server      = (sd.cpp, host)         vllm-docker= (vllm, docker)
-whisper-server = (whisper.cpp, host)    kokoro-podman = (kokoro, podman)
-audio-cpp      = (audio.cpp, host)      [later] audio-cpp-podman = (audio.cpp, podman)
-```
+## 5. Docs / examples / tests
 
-### Options (decision needed)
-1. **Minimal:** keep the flat registry; factor transport helpers into shared
-   functions/mixins. Least churn, but the 2-D growth is only half-fixed.
-2. **Full:** explicit `Engine` ABC × `Transport` object, registry maps aliases.
-   Cleanest; touches every backend + `writer` entry emission.
-3. **Middle (recommended):** keep `BaseBackend` subclasses as *engines*, add a
-   `transport` collaborator object used for cmd wrapping/mapping/lifecycle.
-   Incremental; existing names unchanged; `vllm`/`vllm-docker` collapse to one
-   engine + two transports behind the alias.
+- `docs/backends/audio-cpp.md`: update engine facts (0.8.0, 80+ families),
+  backend table (`cuda|cpu|vulkan|metal|hip` in server JSON, `rocm` alias,
+  no `best`), voice mapping (`default_voice_preset`/`voice_presets`/`voice_dir`
+  absolutized), `load_options`, `model_spec_override`, hardlink note, remove
+  shared-server hints (§"one entry = one process" stays the invariant).
+- `profiles.yaml.example`: audio_cpp block + `dirs: {t2s: t2s, s2t: s2t}` +
+  uncommented matrix `tts/stt` example.
+- `llama_packer/templates/models_AGENTS.md`: copy-paste sidecars for kokoro,
+  chatterbox (clon), chatterbox_turbo (tts), parakeet/nemotron (asr).
+- Tests: backend enum (`hip`/`rocm` alias, `best` rejected, bad→cpu warn),
+  backend-capability probe, build_cmd golden with `default_voice_preset` +
+  `load_options` + absolutized `voice_dir`, precedence test (sidecar > CLI >
+  profiles), port sentinel unquoted / `${PORT}` intact. Run:
+  `PYTHONDONTWRITEBYTECODE=1 /var/uv/env/bin14/bin/python -m pytest -q -p no:cacheprovider`.
 
-### Tasks (B)
-- [ ] Choose option (1/2/3); write it into `docs/architecture.md` extension points.
-- [ ] Extract transport interface: `wrap(argv, model) -> cmd`, `mounts()`,
-      `env()`, `lifecycle()`, `proxy()`.
-- [ ] Port `vllm-docker` + `kokoro-podman` onto the transport object; prove
-      byte-identical emitted entries (golden test).
-- [ ] Make backend inference engine-aware, not transport-aware.
-- [ ] Keep `FIXED_OVERHEAD_BACKENDS` / `VLLM_BACKENDS` semantics working
-      (redefine in terms of engines, not registry names).
+## Verification (per AGENTS.md fast-iterate)
 
-### Open questions (B)
-- Does the transport ever affect *role/format* inference (e.g. a repo-id model
-  only servable offline in a container)? If so, the seam isn't purely mechanical.
-- Where does `is_available` live — engine (binary present) vs transport
-  (docker/podman present + image pullable)?
-- Do we need multi-transport for one model simultaneously, or is transport a
-  per-model choice (current behavior)?
-
----
-
-## C — configurable matrix categories
-
-### Goal
-Make co-load categories declarative so `profiles.yaml` can express the target:
-
-```yaml
-matrix:
-  categories:
-    emb:  { role: embeddings }
-    rnk:  { role: rerank }
-    tts:  { role: t2s }
-    stt:  { role: s2t }
-  evict_costs: { emb: 100, rnk: 100, tts: 100, stt: 100 }
-  sets:
-    rag:   "__CHAT_VARS__ & emb & rnk"
-    voice: "__CHAT_VARS__ & (tts | stt)"      # <- the new capability
-    # target shape: (CHAT) + ((EMB+RERANK) | (TTS&/or STT))
-```
-
-### Current pain
-Categories are hardcoded to `emb`/`rnk` (`_build_matrix_vars`); vars aren't
-configurable; a missing embed/rerank model disables the whole matrix; audio
-roles can't participate at all.
-
-### Proposed design (from `matrix-categories.md`, plus audio)
-- **Schema:** `matrix.categories: dict[name → {role, selector?, dir?, kind?}]`;
-  absent ⇒ today's `{emb: {role: embeddings}, rnk: {role: rerank}}` (back-compat).
-  `evict_costs` keys must match category names (validated).
-- **Selection:** extend `_select_model(models, role, selector, dir?, kind?)` to
-  split a role when needed (e.g. two embedding kinds), reusing
-  `utils.validate_dir_roles`.
-- **Var building:** generalize `_build_matrix_vars` → `{category: var}`; chat
-  stays synthetic `c1..cN` (aliased by `__CHAT_VARS__`); each non-chat category
-  contributes one var (fixed-overhead, at its `design_context`).
-- **Solver:** generalize `vram.solve_matrix_ctx` from
-  `(chat_list, embed_params, rerank_params)` to `(chat_list, category_params)`;
-  keep "chat solved, everything else fixed overhead"; optional per-category
-  `ctx: auto | <int>`. Behaviour identical when only `emb`/`rnk` are defined.
-- **Sets DSL:** unchanged (we only emit user-declared var names); keep
-  `__CHAT_VARS__`; `audio` categories are just more fixed-overhead vars.
-- **Audio specifics:** audio backends are already `FIXED_OVERHEAD_BACKENDS`;
-  C only makes them *declarable* (and gives them `evict_costs`).
-
-### Tasks (C)
-- [ ] Add `matrix.categories` to `profiles.yaml.example` + validation + `SPEC.md`.
-- [ ] Generalize `_build_matrix_vars` / `_expand_matrix_sets` / `_detect_matrix`.
-- [ ] Generalize `solve_matrix_ctx` + `Planner._solve_matrix*` to `category_params`.
-- [ ] Decide audio var granularity: `tts`/`stt` separate, or one `audio` category
-      with a selector/OR.
-- [ ] Matrix disabled-but-defined: today it hard-skips if embed or rerank is
-      missing — rework so a category simply contributes nothing when absent
-      (needed for "voice-only" fleets).
-- [ ] Tests: back-compat (emb/rnk only ⇒ identical output) + new audio set +
-      alt-branch (`(EMB+RERANK) | (TTS&/or STT)`).
-- [ ] Docs: `SPEC.md` Matrix Context Solving, README "packed matrix" bullet.
-
-### Open questions (C)
-- Semantics of the `+` and `|` in the target expression — confirm against
-  llama-swap's `settings.matrix` var/set grammar (can a set co-load `chat` with
-  *either* branch, and do we emit two sets or one with `|`?).
-- Does the matrix need to model *exclusive alternation* (one branch resident at
-  a time), or is `evict_costs` enough to steer it?
-- If chat is not the only solved category in future, priorities between
-  categories — keep "chat solved, rest fixed" for now.
-- Interaction with opportunistic co-load (`__COLOAD_VARS__`) once categories are
-  arbitrary.
-
----
-
-## Sequencing
-
-1. **B first, behaviour-preserving.** Refactor transport with golden tests; no
-   config output change. This is the safe foundation.
-2. **C with existing backends.** Generalize the matrix using today's
-   `kokoro-podman`/`whisper-server` as the audio categories — validates the
-   design without `audio.cpp` risk.
-3. **audio.cpp on the seam.** Add the engine (transport = host) and declare its
-   `t2s`/`s2t` categories. Q1 of `audio-cpp.md` may feed back into B.
+One model at a time, <4 min: CLI task run → `server.json` 1:1 via llama-packer
+→ `yaml.safe_load` (real newlines, `${PORT}` unquoted) → llama-swap launch →
+`pgrep -af audiocpp_server` → `GET /health` → real request (`/v1/audio/speech`
+for tts/clon, `/v1/audio/transcriptions` for asr — never trust `/v1/models`).
+Full audio.cpp reload on switch is accepted (llama-swap stop/start).
 
 ## Risks
-- **B churn** can silently change emitted commands — mitigate with exact-string
-  golden tests before/after (the repo already asserts on `cmd` strings).
-- **C solver generalization** regresses RAG sizing — mitigate with a frozen
-  back-compat fixture asserting identical `ctx`/entry output.
-- **audio.cpp unknown (Q1):** if it truly can't be proxied by llama-swap, B's
-  transport seam and C's category model both need a standalone-service variant.
 
-## Out of scope
-- Rewriting whisper/kokoro in terms of `audio-cpp`.
-- ComfyUI / additional engines beyond establishing the seam.
-- Any decision already covered by `docs/plans/audio-cpp.md` (that AI owns it).
-
-## Decisions needed before starting
-1. B: option 1 / 2 / 3.
-2. C: exact `matrix.categories` YAML shape (ratify `matrix-categories.md`).
-3. Audio category granularity (`tts`/`stt` vs `audio`).
-4. Whether B and C land as separate PRs (recommended) or one.
-
----
-
-## Completion status (2026-09-12)
-
-**B — done.** Engine and transport are independent axes (`backends/transport.py`,
-`BoundBackend`): `vllm`/`vllm-podman`/`vllm-docker` are one engine × three
-transports; engines declare `transports`; preference host > podman > docker,
-runtime-gated. `docs/architecture.md` updated (components, invariant, extension
-points).
-
-**C — done (approach (a)).** `matrix.categories` (default `emb`/`rnk`),
-per-category vars, `evict_costs` validation; non-RAG categories are
-fixed-overhead residents reserved first. `tts`/`stt` separate. Documented in
-`SPEC.md` + README.
-
-**audio-cpp — done (host).** First engine on the seam; roles `t2s`+`s2t`;
-replaces kokoro-podman (removed) and complements whisper-server (no model
-overlap).
-
-**Superseded / deferred / out of scope:**
-- Full `solve_matrix_ctx` → `category_params` generalization — **not done by
-  decision** (approach (a) chosen over (b)).
-- Missing-category / "voice-only" fleets — **not done**; `emb`+`rnk` are still
-  required to enable the matrix.
-- `+`/`|` grammar vs llama-swap `settings.matrix` — **unverified**.
-- audio-cpp **podman transport** — **future, if ever**.
-- audio.cpp **source build** — **out of scope** for llama-packer.
-- audio roles `vc`/`vad`/`music`/`sep` — parked in `docs/plans/audio-roles.md`.
+- `/tmp/audiocpp-gguf` extraction-dir collision (§0): llama-swap runs as a
+  different uid than interactive users on shared boxes; either document
+  `rm -rf /tmp/audiocpp-gguf` as a setup step or consider emitting
+  `TMPDIR=<profiles path>` in the cmd.
+- kokoro family upstream is `kokoro_tts` (82M, 54 preset voices) — GGUF
+  runtime is "local GGUF BF16/Q8", confirm the packaged kokoro-82m-q8_0 loads
+  standalone (it is in the verified GGUF table: Pass).
+- chatterbox is clone-only upstream (`clon`, `vc`) — no zero-shot `tts` task;
+  TTS requests must go through `chatterbox_turbo` (`tts`) or supply a
+  `voice_ref`. Sidecars must set task accordingly.
+- Backend enum drift is now resolved against 0.8.0 docs, but pin awareness:
+  binary on disk decides what actually runs.
+- RADV Vulkan on RDNA4: non-conformant warning is expected; watch for
+  pipeline-compile failures on kokoro/chatterbox; cpu fallback exists.

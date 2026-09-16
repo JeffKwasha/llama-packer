@@ -796,7 +796,8 @@ def main(argv: list[str] | None = None) -> None:
     if not args.no_macros:
         from llama_packer.macros import Macro, Macros
         Macro.clear()
-        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub)
+        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub,
+               hf_home=hf_home)
         # Apply env substitution to flag macro definitions as well (they were
         # built with placeholder-aware sub, but ensure consistency)
         flag_macros = Macro.definitions()

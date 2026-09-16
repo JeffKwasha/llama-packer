@@ -152,6 +152,8 @@ weaknesses: ["slow on 32GB"]
 # --- sampling / precision (usually via profiles.yaml, not here) ---
 # cache_type: q8_0
 # parallel: 1
+# batch: 2048                # per-model batch depth (sidecar > profile > fleet > role default)
+# ubatch: 512                # micro-batch; stamps the VRAM measurement shape, so changing it re-measures
 # default_mode: instruct
 # modes: { instruct: {temperature: 0.6, pres_pen: 1.5} }  # layered over the
 #   # same-named profile: unspecified keys inherit, so state only the delta
@@ -231,6 +233,23 @@ symlink is needed. If the sidecar can't share the model's stem, `model:` is
 how you point at a differently-named file. A bare basename matching files at
 several depths warns and fails; disambiguate with the relative path.
 
+## File refs
+
+Every key that names a file (`model:`, `mmproj.file:`, `speculative:`,
+`chat_template:`, `loras:` entries) takes a string or a mapping.
+`{file: foo.bar}` ≡ bare string `foo.bar`; `{hf_repo: org/repo, file:
+foo.bar}` names a hub file and tracks `refs/main` across `hf download`
+(no pinned copy); `hf_repo:` falls back to the sidecar's own when omitted.
+`hub:org/repo:file` works everywhere too. Optional `pick:` disambiguates:
+`newest`/`oldest` pick the snapshot revision, `top` keeps only snapshot-root
+files (e.g. a template repo's root file vs its `archive/` copies). Ambiguity
+fails loud. Example (directory `models.yaml`):
+
+```yaml
+chat_template: {hf_repo: peculiar-ragdoll/Qwen-Sharp-Chat-Templates,
+                file: chat_template.jinja, pick: top}
+```
+
 ## Fleet-level overrides
 
 Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
@@ -242,6 +261,8 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | Key | Meaning |
 |-----|---------|
 | `model: <file>` | Model file when stem differs; with `hf_repo:` it names the snapshot file (or a `Subdir/file` relative path) |
+| `loras: [...]` | LoRA adapter files (any file-ref form, like `chat_template:`); appended to override rules' lists |
+| `vllm_image: <img>` | Per-model vLLM container image override (vLLM backends only) |
 | `mmproj: {file: …}` | Companion block: `file:` locates the projector/draft file; other keys form a conditional overlay served only while the file is served (see Companions) |
 | `device: N` / `device: cpu` | Pin to GPU N or run on CPU |
 | `concurrency: N` | Per-model concurrency limit |
@@ -250,7 +271,7 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | `cache_type` / `parallel` | KV-cache precision / parallel slots (chat); fixed-overhead roles (image/s2t/t2s) use a fixed budget — `vram_mb` overrides. Declaring `parallel:` opts out of auto-parallel for this model |
 | `min_context` | Smallest context (tokens) at which this model still does useful agentic work (multi-step tool loops, not single replies). Rule of thumb: tool callers 131072, others half the max context. Floor of the auto-parallel search; a pinned `context_length` overrides it |
 | `vram_mb` | Fixed-overhead backends (s2t/image/t2s): pin total process VRAM (e.g. measured via nvidia-smi); wins over the file-size + buffer estimate |
-| `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
+| `mtp_spec_type` / `mtp_draft_n_max` / `mtp_draft_p_min` | Override MTP spec type / max draft tokens / min draft acceptance probability (defaults `draft-mtp` / 2 / 0.75) |
 | `image_min_tokens` / `image_max_tokens` | Image input (mmproj) only, dynamic-resolution archs (Qwen-VL family): floor/cap on image tokens per image, emitted as `--image-min-tokens`/`--image-max-tokens`. Qwen math: 1 token ≈ 28×28 px (2.5-VL) / 32×32 px (3-VL); 1024 tokens ≈ 1 MP — good floor for art/artifact critique. Gemma/SigLIP is fixed ~256 tokens/image: keys are ignored there (warned). The cap also floors the solved context (parallel × max tokens must fit `-c`) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `vllm_quantization` | vLLM `--quantization` *method* (e.g. `modelopt_mixed`) — not the metadata `quantization` field; absent = vLLM auto-detects from the checkpoint |

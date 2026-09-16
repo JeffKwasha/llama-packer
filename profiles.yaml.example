@@ -182,6 +182,13 @@ profiles:
 #   - when: {base_model: 'qwen3'}
 #     chat_template: qwen_chat_template.jinja
 #     reasoning-format: deepseek
+#   # Any file key also takes {hf_repo:, file:[, pick:]} to track a hub file
+#   # across `hf download` updates (no pinned copy); {file:} ≡ bare string.
+#   # pick tokens: newest | oldest (snapshot revision), top (snapshot root
+#   # only — skips subdirectory copies like a template repo's archive/).
+#   - when: {base_model: 'qwen3'}
+#     chat_template: {hf_repo: peculiar-ragdoll/Qwen-Sharp-Chat-Templates,
+#                     file: chat_template.jinja, pick: top}
 #   - when: {stem: 'Qwen3-32B.*safetensors'}
 #     backend: vllm-docker
 #     hf_repo: Qwen/Qwen3-32B

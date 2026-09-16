@@ -64,14 +64,17 @@ class LlamaServerBackend(BaseBackend):
         if not mtp_on:
             return [], {"mtp_enabled": False}
         spec_type = model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
-        args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max)]
+        p_min = model.mtp_draft_p_min
+        args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max),
+                "--draft-p-min", str(p_min)]
         if model.mtp and model.mtp.gguf_path:
             args += ["--spec-draft-model", str(model.mtp.gguf_path)]
         elif model.frontmatter.get("speculative"):
             logger.warning("mtp: companion %s missing for %s",
                            model.frontmatter["speculative"], model.stem)
             return [], {"mtp_enabled": False}
-        return args, {"mtp_enabled": True, "mtp_draft_max": n_max}
+        return args, {"mtp_enabled": True, "mtp_draft_max": n_max,
+                      "mtp_draft_p_min": p_min}
 
     def _image_token_args(self, model: "Model", include_mmproj: bool) -> list[str]:
         """--image-min/max-tokens flags from sidecar declarations.

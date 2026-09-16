@@ -86,7 +86,27 @@ def test_llama_server_mtp_args(make_model):
     b = LlamaServerBackend()
     args, meta = b._mtp_args(m)
     assert "--spec-type" in args and "--spec-draft-n-max" in args
-    assert meta == {"mtp_enabled": True, "mtp_draft_max": 4}
+    assert "--draft-p-min" in args
+    assert meta == {"mtp_enabled": True, "mtp_draft_max": 4,
+                    "mtp_draft_p_min": 0.75}
+
+
+def test_llama_server_mtp_draft_p_min_override(make_model):
+    m = make_model("m", mtp=True, mtp_draft_p_min=0.9)
+    args, meta = LlamaServerBackend()._mtp_args(m)
+    assert "--draft-p-min" in args
+    assert args[args.index("--draft-p-min") + 1] == "0.9"
+    assert meta["mtp_draft_p_min"] == 0.9
+
+
+def test_llama_server_mtp_draft_p_min_invalid_falls_back(make_model, caplog):
+    import logging
+    m = make_model("m", mtp=True, mtp_draft_p_min=1.5)
+    with caplog.at_level(logging.WARNING):
+        args, meta = LlamaServerBackend()._mtp_args(m)
+    assert args[args.index("--draft-p-min") + 1] == "0.75"
+    assert meta["mtp_draft_p_min"] == 0.75
+    assert any("mtp_draft_p_min" in r.message for r in caplog.records)
 
 
 def test_llama_server_cmd_has_mmap_layers_and_cache(make_model):

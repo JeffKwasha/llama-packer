@@ -132,10 +132,10 @@ def test_from_ref_with_stub_finder(tmp_path):
         def find_local(self, name, dirs):
             return g if name == "m.gguf" else None
 
-        def snapshot_exact(self, repo, name, hf_home=None):
+        def snapshot_exact(self, repo, name, hf_home=None, *a, **k):
             return g if (repo, name) == ("org/r", "m.gguf") else None
 
-        def match_snapshot(self, repo, pattern, hf_home=None):
+        def match_snapshot(self, repo, pattern, hf_home=None, *a, **k):
             return [g] if (repo, pattern) == ("org/r", "*m*.gguf") else []
 
     f = StubFinder()
@@ -200,7 +200,7 @@ def test_snapshot_listing_cached_by_mtime(tmp_path):
     (snap / "a.gguf").write_bytes(b"x")
 
     class Snappy(WeightFinder):
-        def snapshot(self, repo, hf_home=None):
+        def snapshot_dir(self, repo, hf_home=None, mode=None):
             return snap
 
     s = Snappy()
@@ -245,4 +245,26 @@ def test_audio_keys_are_consumed_fields(make_model, caplog):
         meta = m.pass_through_metadata()
     assert "vram_mb" not in meta
     assert "audio_cpp" not in meta
+    assert not [r for r in caplog.records if "unhandled frontmatter" in r.message]
+
+
+def test_removed_keys_warn_and_pass_through(make_model, caplog):
+    # attention/kv_cache/tool_args/targets/sidecar-spare are accepted but
+    # unread: using one warns (fail loud) and the value flows to metadata
+    # rather than silently doing nothing.
+    import logging
+    m = make_model("r", targets=["x"], spare="1G")
+    with caplog.at_level(logging.WARNING):
+        meta = m.pass_through_metadata()
+    assert meta["targets"] == ["x"]
+    assert any("unhandled frontmatter" in r.message for r in caplog.records)
+
+
+def test_mtp_draft_p_min_consumed(make_model, caplog):
+    import logging
+    m = make_model("p", mtp_draft_p_min=0.8)
+    assert m.mtp_draft_p_min == 0.8
+    with caplog.at_level(logging.WARNING):
+        meta = m.pass_through_metadata()
+    assert "mtp_draft_p_min" not in meta
     assert not [r for r in caplog.records if "unhandled frontmatter" in r.message]

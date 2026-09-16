@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import logging
 
-from llama_packer.model import Model
-from llama_packer.utils import hf_snapshot_file
+from llama_packer.model import Model, WeightFinder
+
+from conftest import _hf_tree
 
 
 def _sidecar(name: str) -> str:
@@ -128,33 +129,19 @@ def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
                for r in caplog.records)
 
 
-def _hf_tree(tmp_path, repo="org/repo", rev="abc123", files=("model.gguf",), with_ref=True):
-    hub = tmp_path / "hf" / "hub"
-    snap = hub / f"models--{repo.replace('/', '--')}" / "snapshots" / rev
-    snap.mkdir(parents=True)
-    for f in files:
-        p = snap / f
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"x")
-    if with_ref:
-        refs = hub / f"models--{repo.replace('/', '--')}" / "refs"
-        refs.mkdir(parents=True)
-        (refs / "main").write_text(rev)
-    return tmp_path / "hf"
-
-
-def test_hf_snapshot_file_refs_main(tmp_path):
+def test_snapshot_exact_refs_main(tmp_path):
     hf_home = _hf_tree(tmp_path)
-    hit = hf_snapshot_file("org/repo", "model.gguf", hf_home)
+    f = WeightFinder()
+    hit = f.snapshot_exact("org/repo", "model.gguf", hf_home)
     assert hit is not None and hit.name == "model.gguf"
     assert "abc123" in str(hit)
-    assert hf_snapshot_file("org/repo", "missing.gguf", hf_home) is None
-    assert hf_snapshot_file("org/other", "model.gguf", hf_home) is None
+    assert f.snapshot_exact("org/repo", "missing.gguf", hf_home) is None
+    assert f.snapshot_exact("org/other", "model.gguf", hf_home) is None
 
 
-def test_hf_snapshot_file_no_ref_single_snapshot(tmp_path):
-    hf_home = _hf_tree(tmp_path, with_ref=False)
-    hit = hf_snapshot_file("org/repo", "model.gguf", hf_home)
+def test_snapshot_exact_no_ref_single_snapshot(tmp_path):
+    hf_home = _hf_tree(tmp_path, ref=None)
+    hit = WeightFinder().snapshot_exact("org/repo", "model.gguf", hf_home)
     assert hit is not None and hit.name == "model.gguf"
 
 
@@ -179,19 +166,27 @@ def test_model_explicit_model_missing_everywhere_raises(tmp_path):
         Model(md_path, fm, hf_home=hf_home)
 
 
-def test_hf_snapshot_file_glob_exact_wins(tmp_path):
+def test_snapshot_exact_bare_and_glob(tmp_path):
     hf_home = _hf_tree(tmp_path, files=("model.gguf", "mmproj-F16.gguf"))
-    assert hf_snapshot_file("org/repo", "model.gguf", hf_home).name == "model.gguf"
-    assert hf_snapshot_file("org/repo", "mmproj*.gguf", hf_home).name == "mmproj-F16.gguf"
+    f = WeightFinder()
+    hit = f.snapshot_exact("org/repo", "model.gguf", hf_home)
+    assert hit is not None and hit.name == "model.gguf"
+    g = Model.from_ref("mmproj*.gguf", hf_repo="org/repo",
+                       hf_home=hf_home, finder=f)
+    assert g is not None and g.gguf_path is not None
+    assert g.gguf_path.name == "mmproj-F16.gguf"
 
 
-def test_hf_snapshot_file_ambiguous_glob_is_none(tmp_path, caplog):
+def test_snapshot_glob_ambiguous_is_none(tmp_path, caplog):
     from llama_packer.utils import hf_snapshot_dir
     hf_home = _hf_tree(tmp_path, files=("mmproj-F16.gguf", "mmproj-BF16.gguf"))
+    f = WeightFinder()
     with caplog.at_level(logging.WARNING):
-        assert hf_snapshot_file("org/repo", "mmproj*.gguf", hf_home) is None
+        assert Model.from_ref("mmproj*.gguf", hf_repo="org/repo",
+                              hf_home=hf_home, finder=f) is None
     assert any("ambiguous" in r.message for r in caplog.records)
-    assert hf_snapshot_dir("org/repo", hf_home).is_dir()
+    snap = hf_snapshot_dir("org/repo", hf_home)
+    assert snap is not None and snap.is_dir()
 
 
 def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
@@ -384,31 +379,38 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
 # relative paths, unique bare basenames, and single-model auto-detect.
 
 
-def test_hf_snapshot_file_subdir_exact_and_bare(tmp_path):
+def test_snapshot_exact_subdir_and_bare(tmp_path):
     hf_home = _hf_tree(tmp_path, files=("Sub/model.gguf", "README.md"))
-    hit = hf_snapshot_file("org/repo", "Sub/model.gguf", hf_home)
+    f = WeightFinder()
+    hit = f.snapshot_exact("org/repo", "Sub/model.gguf", hf_home)
     assert hit is not None and hit.parent.name == "Sub"
     # Bare basename finds the single nested hit (config files never match).
-    bare = hf_snapshot_file("org/repo", "model.gguf", hf_home)
+    bare = f.snapshot_exact("org/repo", "model.gguf", hf_home)
     assert bare is not None and bare == hit
 
 
-def test_hf_snapshot_file_bare_ambiguous_across_depths_warns(tmp_path, caplog):
+def test_snapshot_exact_bare_ambiguous_across_depths_warns(tmp_path, caplog):
     hf_home = _hf_tree(tmp_path, files=("model.gguf", "Sub/model.gguf"))
+    f = WeightFinder()
     with caplog.at_level(logging.WARNING):
-        assert hf_snapshot_file("org/repo", "model.gguf", hf_home) is None
+        assert f.snapshot_exact("org/repo", "model.gguf", hf_home) is None
     assert any("ambiguous" in r.message for r in caplog.records)
     # The explicit relative path still resolves.
-    hit = hf_snapshot_file("org/repo", "Sub/model.gguf", hf_home)
+    hit = f.snapshot_exact("org/repo", "Sub/model.gguf", hf_home)
     assert hit is not None and hit.parent.name == "Sub"
 
 
-def test_hf_snapshot_file_nested_glob(tmp_path):
+def test_snapshot_nested_glob_via_from_ref(tmp_path):
     hf_home = _hf_tree(tmp_path, files=("A/x-mmproj-F16.gguf", "B/y.gguf"))
-    hit = hf_snapshot_file("org/repo", "*mmproj*.gguf", hf_home)
-    assert hit is not None and hit.parent.name == "A"
-    hit = hf_snapshot_file("org/repo", "B/*.gguf", hf_home)
-    assert hit is not None and hit.name == "y.gguf"
+    f = WeightFinder()
+    hit = Model.from_ref("*mmproj*.gguf", hf_repo="org/repo",
+                         hf_home=hf_home, finder=f)
+    assert hit is not None and hit.gguf_path is not None
+    assert hit.gguf_path.parent.name == "A"
+    hit = Model.from_ref("B/*.gguf", hf_repo="org/repo",
+                         hf_home=hf_home, finder=f)
+    assert hit is not None and hit.gguf_path is not None
+    assert hit.gguf_path.name == "y.gguf"
 
 
 def test_model_resolves_subdir_model_from_hf_cache(tmp_path):

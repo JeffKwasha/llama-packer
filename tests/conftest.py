@@ -55,3 +55,29 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LLAMA_PACKER_CORRECTIONS",
                        str(tmp_path / "cache" / "serve-corrections.yaml"))
+
+
+def _hf_tree(tmp_path, repo="org/repo", revs=("abc123",),
+             files=("model.gguf",), ref: str | None = "first", contents=None):
+    """Fake HF hub cache: every rev in *revs* holds *files*, plus an
+    optional ``refs/main`` pointer (``ref="first"`` points at ``revs[0]``,
+    ``ref=None`` writes no pointer). *contents* maps ``(rev, file)`` to
+    bytes. Returns the HF_HOME root (``tmp_path / "hf"``)."""
+    if isinstance(revs, str):
+        revs = (revs,)
+    hub = tmp_path / "hf" / "hub"
+    repo_dir = hub / f"models--{repo.replace('/', '--')}"
+    for rev in revs:
+        snap = repo_dir / "snapshots" / rev
+        snap.mkdir(parents=True)
+        for f in files:
+            p = snap / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes((contents or {}).get((rev, f), b"x"))
+    if ref == "first":
+        ref = revs[0]
+    if ref is not None:
+        refs = repo_dir / "refs"
+        refs.mkdir(parents=True, exist_ok=True)
+        (refs / "main").write_text(ref)
+    return tmp_path / "hf"

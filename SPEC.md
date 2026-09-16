@@ -368,6 +368,7 @@ MTP is enabled when:
 When MTP is detected, these flags are appended to the `llama-server` command:
 - `--spec-type draft-mtp` — Enables the MTP draft-head speculative decoding (configurable via `mtp_spec_type`).
 - `--spec-draft-n-max 2` — Maximum number of tokens to speculate (configurable via `mtp_draft_n_max`).
+- `--draft-p-min 0.75` — Minimum draft-token acceptance probability (configurable via `mtp_draft_p_min`).
 - `--spec-draft-model <path>` — (companion MTP only) Path to the draft model file.
 
 ### Per-Model Configuration
@@ -380,10 +381,11 @@ name: my-model
 mtp: true
 mtp_spec_type: draft-mtp      # default: draft-mtp
 mtp_draft_n_max: 3            # default: 2
+mtp_draft_p_min: 0.8          # default: 0.75
 ---
 ```
 
-If absent, the module-level defaults apply (see `llama_packer/utils.py`).
+If absent, the module-level defaults apply (see `llama_packer/consts.py`).
 
 ### Baked-in vs Companion MTP
 
@@ -1020,6 +1022,24 @@ are preserved by name (not dereferenced), so a chat template symlinked into the
 HF cache stays under `${MODELS_DIR}` instead of widening it. Resolved paths are
 written into the generated `cmd` as `${VAR}` path macros.
 
+**File refs.** Every key that names a file (`model:`, `mmproj.file:`,
+`speculative:`, `chat_template:`, `loras:` entries) accepts either a string
+or a mapping. `{file: foo.bar}` is equivalent to the bare string `foo.bar`;
+`{hf_repo: org/repo, file: foo.bar}` names a file inside the local HF hub
+cache (tracked across `hf download` updates via `refs/main`, like weights —
+no pinned copy needed). `hf_repo` falls back to the model's own `hf_repo`
+when omitted (handy for LoRAs shipped in the weight repo); the legacy
+`hub:org/repo:file` string form is accepted everywhere too. An optional
+`pick:` token string (or list) disambiguates multiples: `newest` / `oldest`
+select the snapshot revision by mtime (default follows `refs/main`), and
+`top` restricts matching to files at the snapshot root (ignoring
+subdirectory copies, e.g. a template repo's `archive/` versions).
+Ambiguity still fails loud — `pick` only narrows the candidate set, it
+never silently takes the first hit. Local files always win: an absolute
+`file:` with `hf_repo:` warns and ignores the repo. Mappings merge per key
+across layers, so a sidecar `{file: x}` plus a rule `{hf_repo: R}` combine
+to `{file: x, hf_repo: R}`.
+
 **Chat templates & client kwargs.** A declared `chat_template` makes the writer
 emit `--jinja --chat-template-file <path>` (llama-server) or `--chat-template
 <path>` (vLLM), and records `metadata.chat_template` (the file stem). The
@@ -1361,9 +1381,9 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 ### Builder-consumed keys (NOT passed through)
 
 `name`, `context_length`, `description`, `cli_args`, `model`, `backend`, `hf_repo`,
-`chat_template`, `chat_template_kwargs`, `loras`, `attention`, `kv_cache`, `tool_args`,
+`chat_template`, `chat_template_kwargs`, `loras`,
 `speculative`, `speculative_config`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
-`mtp_draft_p_min`, `role`, `targets`, `allow_profiles`, `spare`, `capabilities`,
+`mtp_draft_p_min`, `role`, `allow_profiles`, `capabilities`,
 `ignore`, `device`, `concurrency`, `fit-params`, `vllm_image`, `modes`, `default_mode`,
 `reasoning-format`, `reasoning-preserve`, `cache_type`, `parallel`,
 `image_min_tokens`, `image_max_tokens`.
@@ -1374,7 +1394,6 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 |-----------------|------|--------|
 | `device` | int | GPU device index for multi-GPU pinning (`ROCR_VISIBLE_DEVICES=N` / `CUDA_VISIBLE_DEVICES=N`) |
 | `concurrency` | int | Per-model concurrency limit → `concurrencyLimit` in config |
-| `spare` | str | Additional VRAM to reserve (overrides global `--spare`) |
 | `allow_profiles` | str/list/bool | Restrict which profiles apply (regex string, list, or false to disable) |
 | `modes` | dict | Per-model sampling modes (full profiles): name → param dict. Replaces the global-profile sampling overrides for this model. Values use llama.cpp names; see [Sampling Modes](#sampling-modes) |
 | `default_mode` | str | Which declared `modes` entry is the model's default (maps to the bare `${MODEL_ID}` `setParamsByID` key). Falls back to the first mode |

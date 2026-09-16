@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from llama_packer import utils
-from llama_packer.model import Model, _DEFAULT_CONTEXT_LENGTH
+from llama_packer.model import Model, WeightFinder, _DEFAULT_CONTEXT_LENGTH
 
 
 @pytest.fixture(autouse=True)
@@ -24,10 +24,11 @@ def _clean_model_registry():
     Model.clear_registry()
 
 
-class FakeFinder:
-    """WeightFinder stand-in: returns canned resolution results."""
+class FakeFinder(WeightFinder):
+    """WeightFinder stand-in: canned local/hub hits over real dispatch."""
 
     def __init__(self, local=None, matches=None, exact=None):
+        super().__init__()
         self._local = local
         self._matches = list(matches or [])
         self._exact = exact
@@ -35,13 +36,13 @@ class FakeFinder:
     def find_local(self, name, dirs):
         return self._local
 
-    def match_snapshot(self, repo, pattern, hf_home=None):
+    def match_snapshot(self, repo, pattern, hf_home=None, *a, **k):
         return list(self._matches)
 
-    def snapshot_exact(self, repo, name, hf_home=None):
+    def snapshot_exact(self, repo, name, hf_home=None, *a, **k):
         return self._exact
 
-    def snapshot_files(self, repo, hf_home=None):
+    def snapshot_files(self, repo, hf_home=None, mode=None):
         return (None, [])
 
 
