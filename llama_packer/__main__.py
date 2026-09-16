@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import textwrap
 from typing import NoReturn
@@ -166,6 +167,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
     parser.add_argument("--audio-cpp-server", help="audiocpp_server binary for `audio-cpp` backend "
                         "(overrides profiles.yaml audio_cpp.bin / $AUDIOCPP_BIN_DIR / audiocpp_server on PATH)")
+    parser.add_argument("--audio-cpp-backend", help="audio.cpp runtime backend "
+                        "(cuda|vulkan|cpu|metal|hip; overrides profiles.yaml audio_cpp.backend; "
+                        "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
     return parser.parse_args(argv[1:] if argv else None)
@@ -585,8 +589,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # audio-cpp (audio.cpp) resource configuration (CLI > profiles.yaml
     # `audio_cpp:` section > $AUDIOCPP_BIN_DIR > audiocpp_server on PATH).
-    # `backend:` (auto|cuda|vulkan|cpu) selects the engine runtime; auto
-    # follows the detected GPU vendor (NVIDIA→cuda, AMD→vulkan, else cpu).
+    # Backend layering (resolved in AudioCppBackend.build_cmd): sidecar
+    # `audio_cpp.backend` > explicit (this block: CLI > profiles.yaml) >
+    # vendor auto (NVIDIA→cuda, AMD→vulkan, else cpu) > cpu.
     audio_cpp_cfg = profiles_cfg.get("audio_cpp") or {}
     audio_cpp_bin_raw = (args.audio_cpp_server or audio_cpp_cfg.get("bin")
                          or os.environ.get("AUDIOCPP_BIN_DIR")
@@ -597,10 +602,33 @@ def main(argv: list[str] | None = None) -> None:
         if cand.is_dir():  # AUDIOCPP_BIN_DIR may be a directory
             cand = cand / "audiocpp_server"
         audio_cpp_bin = str(cand)
-    audio_cpp_backend = str(audio_cpp_cfg.get("backend") or "auto").lower()
-    if audio_cpp_backend in ("", "auto"):
-        audio_cpp_backend = {"nvidia": "cuda", "amd": "vulkan"}.get(
-            detect_gpu_vendor(), "cpu")
+    audio_cpp_backend = str(args.audio_cpp_backend
+                            or audio_cpp_cfg.get("backend") or "").lower()
+    if audio_cpp_backend in ("auto",):
+        audio_cpp_backend = ""
+    audio_cpp_backend_auto = {"nvidia": "cuda", "amd": "vulkan"}.get(
+        detect_gpu_vendor(), "cpu")
+
+    # Probe the binary's compiled backends once (fast: --list-devices loads
+    # the ggml registry).  Parsed device labels map to the server-JSON enum;
+    # build_cmd warns when an emitted backend is missing from the probe.
+    audio_cpp_probe = ""
+    if audio_cpp_bin and os.access(audio_cpp_bin, os.X_OK):
+        _probe_labels = {"VULKAN": "vulkan", "CPU": "cpu", "CUDA": "cuda",
+                         "ROCM": "hip", "HIP": "hip", "METAL": "metal"}
+        try:
+            probe = subprocess.run([audio_cpp_bin, "--list-devices"],
+                                   capture_output=True, text=True,
+                                   timeout=30, check=False)
+            found = {_probe_labels[m.group(1).upper()]
+                     for line in (probe.stdout + probe.stderr).splitlines()
+                     if (m := re.match(r"\s*([A-Za-z]+):\d+", line))
+                     and m.group(1).upper() in _probe_labels}
+            if found:
+                audio_cpp_probe = ",".join(sorted(found))
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("audio-cpp: backend probe failed for %s: %s",
+                         audio_cpp_bin, exc)
 
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
@@ -705,11 +733,23 @@ def main(argv: list[str] | None = None) -> None:
     template_vars.setdefault("sd_bin", "sd-server")
     template_vars.setdefault("whisper_bin", "whisper-server")
     template_vars["audio_cpp_bin"] = audio_cpp_bin or AUDIO_CPP_DEFAULT_BIN
-    template_vars["audio_cpp_backend"] = audio_cpp_backend
+    if audio_cpp_backend:
+        template_vars["audio_cpp_backend"] = audio_cpp_backend
+    template_vars["audio_cpp_backend_auto"] = audio_cpp_backend_auto
+    if audio_cpp_probe:
+        template_vars["audio_cpp_bin_backends"] = audio_cpp_probe
     for _knob in AUDIO_CPP_SERVER_KNOBS:
         _value = audio_cpp_cfg.get(_knob)
-        if _value not in (None, ""):
-            template_vars[f"audio_cpp_{_knob}"] = str(_value)
+        if _value in (None, ""):
+            continue
+        if _knob == "voice_dir":
+            # Upstream resolves relative voice_dir against the config file's
+            # directory (/tmp/llama-swap/) — always emit an absolute path.
+            _value = os.path.abspath(os.path.expanduser(str(_value)))
+        template_vars[f"audio_cpp_{_knob}"] = str(_value)
+    _tmpdir = audio_cpp_cfg.get("tmpdir")
+    if _tmpdir not in (None, ""):
+        template_vars["audio_cpp_tmpdir"] = str(_tmpdir)
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
     # GPU vendor for container device flags (docker --runtime/--gpus vs

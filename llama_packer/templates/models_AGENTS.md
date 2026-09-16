@@ -128,10 +128,15 @@ role: chat                   # chat (default) | embeddings | rerank | image (sd-
 # cli_args: "--vae ae.safetensors --lora my.safetensors"  # extra backend flags (unstructured)
 # vram_mb: 1280              # fixed-overhead backends (s2t/image/t2s): pin total process VRAM
 # audio_cpp:                 # role t2s/s2t only (audio.cpp engine)
-#   family: chatterbox       # audio.cpp family (identity + routing)
-#   task: tts                # tts | clon | asr | vad | align | music | sep | …
-#   options: {temperature: 0.8, top_p: 0.8}   # family request options
-#   voice: jk                # voice-library name, or voice_ref: voices/jk.wav
+#   family: kokoro_tts       # required: audio.cpp family (resolves package specs)
+#                            # verified: kokoro_tts, chatterbox (clon only), chatterbox_turbo, qwen3_tts/asr, pocket_tts, parakeet_tdt, nemotron_asr
+#   task: tts                # default per family (kokoro_tts→tts, chatterbox→clon, chatterbox_turbo→tts, *asr→asr); else role default (t2s→tts, s2t→asr)
+#   options: {temperature: 0.8, top_p: 0.8}   # family request options → default_request_options
+#   load_options: {language: english}         # load-time options (pocket_tts language)
+#   voice: af_heart          # preset name / voice_dir wav / model-native voice id → default_voice_preset
+#   voice_ref: voices/jk.wav # path or {type: base64, data} — wins over voice (clone reference)
+#   reference_text: transcript                 # only with voice_ref
+#   backend: cpu             # per-model backend pin (cuda|vulkan|cpu|metal|hip; wins over CLI/profiles/auto)
 # image_min_tokens: 1024     # image input: min image tokens/image (dynamic-res archs, e.g. Qwen-VL; needs mmproj)
 # image_max_tokens: 4096     # image input: cap image tokens/image (bounds KV cost; unset = model default, can be huge)
 # --- agent metadata (optional; passed through) ---

@@ -11,7 +11,8 @@ Text-to-speech (`t2s`) and speech-to-text (`s2t`) via the native ggml
   `$AUDIOCPP_BIN_DIR` > `audiocpp_server` on `PATH`.
 
 audio.cpp is a pure-C++ ggml engine for audio models — TTS, ASR, VAD, voice
-conversion, music, separation — spanning 62 families / 85+ variants. It
+conversion, music, separation — spanning 80+ families / 120+ variants
+(0.8.0, verified 2026-09-16). It
 **replaces `kokoro-podman`** (its native `kokoro_tts` family supersedes the
 containerized Kokoro-FastAPI backend).
 
@@ -36,55 +37,92 @@ because `capabilities.in/out` are freeform lists.
 ```yaml
 role: t2s                      # or s2t
 audio_cpp:
-  family: chatterbox           # chatterbox | qwen3_asr | qwen3_tts | pocket_tts | …
-  task: tts                    # tts | clon | vc | asr | vad | align | music | sep | …
-  options: { guidance_scale: 0.5, temperature: 0.8, top_p: 0.8 }
-  voice: jk                    # voice-library name (server voice_dir), or
-  voice_ref: voices/jk.wav     # path / {type: base64, data: …} for clone/vc
+  family: kokoro_tts           # required — audio.cpp resolves package specs by family
+  task: tts                    # default per family (see below), else by role
+  options: { guidance_scale: 0.5, temperature: 0.8, top_p: 0.8 }   # → default_request_options
+  load_options: { language: english }        # load-time (e.g. pocket_tts language)
+  session_options: { language: english }     # session-time pass-through
+  voice: af_heart              # preset name / voice_dir wav / model-native voice id
+  voice_ref: voices/jk.wav     # path or {type: base64, data} — wins over `voice`
+  reference_text: transcript   # only with voice_ref (clone reference transcript)
+  voice_presets: {narrator: {voice_id: alba}}
+  model_spec_override: /specs  # tensor-only/legacy GGUFs (standalone GGUFs need nothing)
+  backend: cpu                 # per-model pin (wins over CLI/profiles/auto)
+  device: 0
+  threads: 4
 vram_mb: 4096                  # fixed-overhead pin (existing key)
 ```
+
+`voice`/`voice_ref` map onto upstream `default_voice_preset`:
+`voice_ref` (path or `{type: base64, data}`) emits the object form (with
+`reference_text`); `voice` emits the string form (upstream resolves a
+configured preset name, a `voice_dir` wav basename, or the model-native
+cached voice id). `voice_ref` wins, matching upstream precedence.
+
+Default `task` per verified family: `kokoro_tts→tts`, `chatterbox→clon`
+(base chatterbox is clone-only — no zero-shot `tts`; use
+`chatterbox_turbo→tts`), `qwen3_tts→tts`, `pocket_tts→tts`,
+`qwen3_asr→asr`, `parakeet_tdt→asr`, `nemotron_asr→asr`; unknown families
+fall back to the role default (`t2s→tts`, `s2t→asr`) with a warning.
 
 ## profiles.yaml
 
 ```yaml
 audio_cpp:
   bin: audiocpp_server         # or absolute path
-  backend: auto                # auto | cuda | vulkan | cpu   (auto: NVIDIA→cuda, AMD→vulkan, else cpu)
+  backend: auto                # auto | cuda | vulkan | cpu | metal | hip (rocm alias); auto: NVIDIA→cuda, AMD→vulkan, else cpu
   device: 0
+  tmpdir: /tmp/audiocpp-llama-swap   # optional: shields /tmp/audiocpp-gguf extraction cache from other-uid wedges (emitted as TMPDIR=… in the entry env)
   # applied to every emitted server.json:
-  # max_loaded_models, idle_unload_ms, busy_timeout_ms, min_free_memory_mb, voice_dir
+  # max_loaded_models, idle_unload_ms, busy_timeout_ms, min_free_memory_mb, voice_dir (absolutized), model_spec_override
 ```
+
+Precedence for the backend: sidecar `audio_cpp.backend` > `--audio-cpp-backend`
+CLI > profiles.yaml `audio_cpp.backend` > vendor auto > cpu. The packer probes
+the binary's compiled backends once (`--list-devices`) and warns when an
+emitted backend is missing from the probe (the ubuntu-x64 prebuilt reports
+`cpu,vulkan` only; `cuda`/`hip` need a matching build).
 
 ## Emitted entry
 
 One `audiocpp_server` process per sidecar (1:1) — llama-packer's
-"one entry = one process with a fixed command line" invariant. The `cmd:` is a
-`sh -c` heredoc that writes a `server.json` (the port is llama-swap's
-`${PORT}`) and execs the binary:
+"one entry = one process with a fixed command line" invariant; switching
+models reloads audio.cpp completely (accepted). The `cmd:` is a `sh -c`
+heredoc that writes a `server.json` (the port is llama-swap's `${PORT}`) and
+execs the binary:
 
 ```yaml
-"chatterbox-tts":
+"kokoro-82m":
   capabilities: { in: [text], out: [audio] }
   checkEndpoint: /health
   cmd: |
-    sh -c 'mkdir -p /tmp/llama-swap && cat > /tmp/llama-swap/audiocpp-chatterbox-${PORT}.json <<JSON
-    {"host":"127.0.0.1","port":${PORT},"backend":"cuda","device":0,"threads":1,
-     "models":[{"id":"chatterbox","family":"chatterbox","path":"…","task":"tts","mode":"offline",
-                "default_request_options":{"temperature":0.8,"top_p":0.8}}]}
+    sh -c 'mkdir -p /tmp/llama-swap && cat > /tmp/llama-swap/audiocpp-kokoro-${PORT}.json <<JSON
+    {"host":"127.0.0.1","port":${PORT},"backend":"vulkan","lazy_load":true,"device":0,"threads":4,
+     "models":[{"id":"kokoro-82m","family":"kokoro_tts","path":"…","task":"tts","mode":"offline"}]}
     JSON
-    exec /opt/audiocpp_server --config /tmp/llama-swap/audiocpp-chatterbox-${PORT}.json'
+    exec /opt/audiocpp_server --config /tmp/llama-swap/audiocpp-kokoro-${PORT}.json'
   proxy: "http://127.0.0.1:${PORT}"
 ```
+
+`lazy_load: true` is always emitted: the model id registers at server start
+and the framework load happens on the first request, matching llama-swap's
+load-on-swap semantics. `voice_dir` from profiles.yaml is absolutized
+(upstream resolves relative paths against the config file's directory,
+`/tmp/llama-swap/`). A profiles.yaml `audio_cpp.tmpdir` is emitted as
+`exec env TMPDIR=…` to shield the engine's sidecar-extraction cache
+(`/tmp/audiocpp-gguf`) from other-uid ownership wedges on shared boxes.
 
 The heredoc newlines are load-bearing: the writer emits multi-line `cmd`
 values as YAML literal blocks (`|`), never folded, so the round-trip is
 exact. The per-port `server.json` is rewritten on every model load under
 `/tmp/llama-swap/` (flat; `mkdir -p` in the `cmd` creates it).
 
-The server's own multi-model LRU (`max_loaded_models`, `/v1/tasks/unload_models`)
-is available for a shared-server deployment, but is **not** the default: the
-1:1 entry matches the whisper-server/sd-server precedent and leaves residency
-to llama-swap's matrix.
+Standalone GGUFs (the `audio-cpp/audio.cpp-gguf` packages) embed the package
+spec and every required sidecar, so no companion layout is needed;
+tensor-only/legacy GGUFs are handled with `model_spec_override`. HF snapshot
+GGUFs must be **hard links**, not symlinks into extensionless blobs — the
+engine resolves the path and rejects extensionless targets with
+`unsupported tensor source format` (use `extras/hardlink-audio.py`).
 
 ## Classification
 
@@ -133,11 +171,12 @@ resolution is `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
 
 - **Source build (operator-managed):** upstream `docs/build/linux.md` — GCC 13+,
   CMake; `-DENGINE_ENABLE_CUDA=ON` (NVIDIA), `-DENGINE_ENABLE_VULKAN=ON`
-  (portable AMD path), CPU always on. On GB10, pin `CUDAToolkit_ROOT` +
+  (portable AMD path), `-DENGINE_ENABLE_HIP=ON` (ROCm, mutually exclusive
+  with CUDA), CPU always on. On GB10, pin `CUDAToolkit_ROOT` +
   `CMAKE_CUDA_COMPILER` to avoid a mixed-toolkit build.
 - **Prebuilt:** the llama-swap unified image (`unified-cuda13`, `unified-cuda`,
-  `unified-vulkan`) bundles it; no stable standalone `audiocpp_server` tarball
-  was found.
+  `unified-vulkan`) bundles it; official ubuntu-x64 packages ship CPU+Vulkan
+  (the 0.8.0 one on this box reports `cpu,vulkan`).
 
 A container transport (podman/docker) may be added later; it is not part of the
 current host-only support.
@@ -157,3 +196,11 @@ The research brief this landed from is preserved in git history
 (`docs/plans/audio-cpp.md`, removed after migration): upstream
 `app/server/README.md`, `docs/gguf.md`, `docs/build/linux.md`, and the working
 config in llama-swap issue #36 (`@dkruyt`, 2026-07-03).
+
+**2026-09-16 rework (0.8.0):** all emitted-key claims verified against the
+0.8.0 server README + live binary (AMD R9700 / RADV Vulkan): `hip`/`rocm`
+backend, `lazy_load`, `default_voice_preset`/`voice_presets`,
+`load_options`/`session_options`, `model_spec_override`, embedded package
+specs in standalone GGUFs, symlinked-blob rejection. Live-verified families:
+kokoro `tts`, chatterbox_turbo `tts`, chatterbox `clon`, parakeet_tdt `asr`,
+nemotron_asr `asr`.

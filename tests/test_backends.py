@@ -1078,6 +1078,7 @@ def test_audio_cpp_cmd_shape(make_model):
     assert '"port":${PORT}' in cmd            # unquoted -> JSON number
     assert "\n" in cmd                            # heredoc newlines are load-bearing
     assert "\nJSON\n" in cmd                      # heredoc terminator on its own line
+    assert '"id":"chatterbox"' in cmd             # audio.cpp id == llama-swap entry id
     assert '"family":"chatterbox"' in cmd
     assert '"task":"tts"' in cmd
     assert '"backend":"cuda"' in cmd
@@ -1113,3 +1114,188 @@ def test_infer_backend_audio_cpp_vs_whisper(make_model):
     g = make_model("g", role="s2t")
     assert (infer_backend(g, {"audio_cpp_bin": "x", "whisper_bin": "y"})
             == "audio-cpp")
+
+
+# ── audio-cpp rework: layering, voice mapping, probes (0.8.0 facts) ──────
+
+def _audio_cmd(m, tvars):
+    return get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", tvars)
+
+
+def test_audio_cpp_rocm_alias_and_best_rejected(make_model):
+    m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    # rocm normalizes to hip
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_backend": "rocm"})
+    assert '"backend":"hip"' in cmd
+    # best is CLI-only upstream — rejected, falls back to cpu
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_backend": "best"})
+    assert '"backend":"cpu"' in cmd
+    # unknown value falls back to cpu
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_backend": "tpu"})
+    assert '"backend":"cpu"' in cmd
+
+
+def test_audio_cpp_sidecar_backend_wins_over_tvars(make_model):
+    m = make_model("c", role="t2s", audio_cpp={
+        "family": "kokoro_tts", "backend": "cpu"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_backend": "cuda",
+        "audio_cpp_backend_auto": "vulkan"})
+    assert '"backend":"cpu"' in cmd
+    # sidecar absent -> explicit tvars (CLI > profiles) beats vendor auto
+    m2 = make_model("c2", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m2, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_backend": "cuda",
+        "audio_cpp_backend_auto": "vulkan"})
+    assert '"backend":"cuda"' in cmd
+    # nothing explicit -> vendor auto
+    cmd, _ = get_backend("audio-cpp").build_cmd(m2, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_backend_auto": "vulkan"})
+    assert '"backend":"vulkan"' in cmd
+
+
+def test_audio_cpp_probe_warning(caplog, make_model):
+    m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    with caplog.at_level(logging.WARNING, logger="llama_packer.backends.audio_cpp"):
+        cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+            "audio_cpp_bin": "x", "audio_cpp_backend": "cuda",
+            "audio_cpp_bin_backends": "vulkan,cpu"})
+    assert '"backend":"cuda"' in cmd  # still emitted — warn, not fatal
+    assert any("does not report backend" in r.message for r in caplog.records)
+
+
+def test_audio_cpp_device_threads_sidecar_wins(make_model):
+    m = make_model("c", role="t2s", audio_cpp={
+        "family": "kokoro_tts", "device": 1, "threads": 8})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_device": 3, "audio_cpp_threads": 2})
+    assert '"device":1' in cmd
+    assert '"threads":8' in cmd
+    # sidecar absent -> tvars -> defaults (device 0, threads 4)
+    m2 = make_model("c2", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m2, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"device":0' in cmd
+    assert '"threads":4' in cmd
+
+
+def test_audio_cpp_lazy_load_always(make_model):
+    m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"lazy_load":true' in cmd
+
+
+def test_audio_cpp_voice_mapping(make_model):
+    # voice_ref -> object form (reference_text alongside)
+    m = make_model("cb", role="t2s", audio_cpp={
+        "family": "chatterbox", "voice_ref": "voices/jk.wav",
+        "reference_text": "reference transcript"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert ("default_voice_preset\":{\"voice_ref\":\"voices/jk.wav\","
+            "\"reference_text\":\"reference transcript\"}") in cmd
+    # plain voice -> string preset (preset name / voice_dir wav / voice id)
+    m2 = make_model("k", role="t2s", audio_cpp={
+        "family": "kokoro_tts", "voice": "af_heart"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m2, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"default_voice_preset":"af_heart"' in cmd
+    # voice_ref wins over voice (upstream precedence)
+    m3 = make_model("cb2", role="t2s", audio_cpp={
+        "family": "chatterbox", "voice": "jk",
+        "voice_ref": {"type": "base64", "data": "UklGRg=="}})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m3, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"default_voice_preset":{"voice_ref":{"type":"base64","data":"UklGRg=="}}' in cmd
+    assert '"jk"' not in cmd.replace('"id":"cb2"', "")
+
+
+def test_audio_cpp_voice_presets_pass_through(make_model):
+    m = make_model("cb", role="t2s", audio_cpp={
+        "family": "pocket_tts",
+        "voice_presets": {"narrator": {"voice_id": "alba"}}})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"voice_presets":{"narrator":{"voice_id":"alba"}}' in cmd
+
+
+def test_audio_cpp_load_and_session_options(make_model):
+    m = make_model("p", role="t2s", audio_cpp={
+        "family": "pocket_tts",
+        "load_options": {"language": "english"},
+        "session_options": {"language": "english"}})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"load_options":{"language":"english"}' in cmd
+    assert '"session_options":{"language":"english"}' in cmd
+
+
+def test_audio_cpp_model_spec_override(make_model):
+    # per-model sidecar key
+    m = make_model("m", role="t2s", audio_cpp={
+        "family": "qwen3_tts", "model_spec_override": "/specs/qwen3_tts.json"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"model_spec_override":"/specs/qwen3_tts.json"' in cmd
+    # profiles.yaml server knob -> top-level key
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x",
+        "audio_cpp_model_spec_override": "/specs"})
+    assert '"model_spec_override":"/specs"' in cmd
+
+
+def test_audio_cpp_family_task_defaults_and_warnings(caplog, make_model):
+    # family default task map (verified 0.8.0 loader table)
+    m = make_model("kk", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"family":"kokoro_tts"' in cmd
+    assert '"task":"tts"' in cmd
+    cb = make_model("cb", role="t2s", audio_cpp={"family": "chatterbox"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(cb, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"task":"clon"' in cmd
+    # chatterbox + tts warns clone-only
+    cbt = make_model("cbt", role="t2s", audio_cpp={
+        "family": "chatterbox", "task": "tts"})
+    with caplog.at_level(logging.WARNING,
+                         logger="llama_packer.backends.audio_cpp"):
+        get_backend("audio-cpp").build_cmd(cbt, 0, 1, "q8_0",
+                                           {"audio_cpp_bin": "x"})
+    assert any("clone-only" in r.message or "no zero-shot" in r.message
+               for r in caplog.records)
+
+
+def test_audio_cpp_missing_family_warns(caplog, make_model):
+    m = make_model("nofam", role="t2s")
+    with caplog.at_level(logging.WARNING,
+                         logger="llama_packer.backends.audio_cpp"):
+        cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                    {"audio_cpp_bin": "x"})
+    assert '"family":"nofam"' in cmd  # stem fallback, warned
+
+
+def test_audio_cpp_tmpdir_env_shield(make_model):
+    m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
+        "audio_cpp_bin": "x", "audio_cpp_tmpdir": "/tmp/audiocpp-tmp"})
+    assert cmd.endswith(
+        "exec env TMPDIR=/tmp/audiocpp-tmp x --config "
+        "/tmp/llama-swap/audiocpp-c-${PORT}.json'")
+    # absent tmpdir keeps the plain exec
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert cmd.endswith(
+        "exec x --config /tmp/llama-swap/audiocpp-c-${PORT}.json'")
+
+
+def test_audio_cpp_mode_streaming(make_model):
+    m = make_model("nm", role="s2t", audio_cpp={
+        "family": "nemotron_asr", "mode": "streaming"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
+                                                {"audio_cpp_bin": "x"})
+    assert '"mode":"streaming"' in cmd
