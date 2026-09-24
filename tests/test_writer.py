@@ -200,6 +200,30 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     assert config["models"] == {}
 
 
+def test_build_config_disables_over_budget_model(make_model, monkeypatch):
+    """A model whose weights exceed the budget must not be emitted —
+    it would be a load-time OOM landmine."""
+    from llama_packer.writer import build_config
+
+    huge = make_model("huge", backend="llama-server", context_length=8192,
+                      base_model="llama3")
+    # 50G weights on a 48G card: remaining < 0 in calc_ctx.
+    monkeypatch.setattr(
+        huge.vram, "effective_static",
+        lambda *a, **k: (50000, 0.5, 0.0, 100),
+    )
+    profiles = {
+        "defaults": {"cache_type": "q8_0", "parallel": 1},
+        "profiles": {"default": {}},
+    }
+    config = build_config(
+        [huge], profiles,
+        {"llama_bin": "/opt/llama-server"},
+        fit_bin="unused", vram_total=48 * 1024,
+    )
+    assert config["models"] == {}
+
+
 def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
     # A sidecar cache_type overrides the profile default for both the emitted
     # flags and the VRAM calc (which the grouped cache_type threads through).

@@ -172,6 +172,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
+    parser.add_argument("--idle-unload", type=int, default=None, metavar="SECONDS",
+                        help="Emit a top-level globalTTL: unload any model after SECONDS "
+                             "of inactivity (llama-swap default: 0 = never). Useful when "
+                             "another program (ComfyUI, a game) needs VRAM on short notice.")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -795,6 +799,22 @@ def main(argv: list[str] | None = None) -> None:
     (matrix_cfg, embed_model, rerank_model, matrix_categories,
      matrix_fixed) = _detect_matrix(profiles_cfg, models, args, logger)
 
+    # ── Degenerate-budget refusal ──
+    # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):
+    # nothing can load.  Refuse here, before any VRAM work, so the existing
+    # working config is never overwritten by an empty one.
+    spare_check_mb = Profiles(profiles_cfg).global_spare_mb(args.spare,
+                                                            gpu.vram_mb)
+    reserve_check = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, gpu.baseline_mb)
+    available_check = gpu.vram_mb - reserve_check - spare_check_mb
+    if gpu.vram_mb > 0 and available_check <= 0:
+        fatal("VRAM budget exhausted: %d MiB total - %d MiB reserve - "
+              "%d MiB spare = %d MiB available. Nothing can load; "
+              "not overwriting the existing config. Reduce --spare or "
+              "--baseline.",
+              gpu.vram_mb, reserve_check, spare_check_mb,
+              int(available_check))
+
     # Build config (progress bar appears only once the denominator is
     # known — total=len(models); without rich / non-TTY it is a no-op).
     # Memory margin: inflate every measured term so the affine residual
@@ -851,6 +871,12 @@ def main(argv: list[str] | None = None) -> None:
             if cmd:
                 entry["cmd"] = Macro.apply(cmd)
     if not config.get("models"):
+        if args.spare or args.baseline:
+            fatal("no model entries generated — VRAM reservation "
+                  "(--spare %s, --baseline %s) leaves too little budget "
+                  "for any model; not overwriting the existing config. "
+                  "Reduce the reservation or wait for other programs to "
+                  "exit.", args.spare or "none", args.baseline or "none")
         fatal("no model entries generated")
     logger.info("entries: %d generated", len(config["models"]))
 
@@ -874,32 +900,46 @@ def main(argv: list[str] | None = None) -> None:
             models, embed_model, rerank_model, matrix_categories,
             config.coload_stems, config.entry_ids_by_stem, logger)
         chat_var_names = [k for k in vars_ if re.fullmatch(r"c\d+", k)]
-        # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
-        chat_expr = "(" + " | ".join(chat_var_names) + ")"
-        sets_cfg = matrix_cfg.get("sets") or {}
-        sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
-        if coload_vars:
-            joined = " ".join(str(s) for s in sets_cfg.values())
-            if "__COLOAD_VARS__" not in joined:
-                logger.info(
-                    "matrix: co-loads %s included but no set references "
-                    "__COLOAD_VARS__; they stay outside the co-loading sets",
-                    coload_vars)
-        # llama-swap schema: matrix lives under routing.router.settings.matrix,
-        # not at the top level.
-        config["routing"] = {
-            "router": {
-                "use": "matrix",
-                "settings": {"matrix": {
-                    "vars": vars_,
-                    "evict_costs": matrix_cfg.get("evict_costs", {}),
-                    "sets": sets,
-                }},
-            },
-        }
+        if not chat_var_names:
+            # Every chat model was disabled by VRAM gating — a degenerate
+            # empty OR-list would be a syntactically valid but semantically
+            # broken set.  Skip matrix routing entirely: models serve
+            # individually (no co-loading) until a looser budget brings
+            # chat entries back.
+            logger.warning(
+                "matrix: no chat models survived VRAM gating; skipping "
+                "matrix routing (models will serve individually)")
+        else:
+            # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
+            chat_expr = "(" + " | ".join(chat_var_names) + ")"
+            sets_cfg = matrix_cfg.get("sets") or {}
+            sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
+            if coload_vars:
+                joined = " ".join(str(s) for s in sets_cfg.values())
+                if "__COLOAD_VARS__" not in joined:
+                    logger.info(
+                        "matrix: co-loads %s included but no set references "
+                        "__COLOAD_VARS__; they stay outside the co-loading "
+                        "sets", coload_vars)
+            # llama-swap schema: matrix lives under routing.router.settings.
+            # matrix, not at the top level.
+            config["routing"] = {
+                "router": {
+                    "use": "matrix",
+                    "settings": {"matrix": {
+                        "vars": vars_,
+                        "evict_costs": matrix_cfg.get("evict_costs", {}),
+                        "sets": sets,
+                    }},
+                },
+            }
 
     # Top-level llama-swap settings
     config["healthCheckTimeout"] = hct
+    if args.idle_unload is not None:
+        if args.idle_unload < 0:
+            fatal("--idle-unload must be >= 0 (0 disables idle unloading)")
+        config["globalTTL"] = args.idle_unload
 
     output_path = Path(args.output).absolute()
 

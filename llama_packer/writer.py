@@ -30,6 +30,7 @@ from llama_packer.consts import (
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
+    _RESERVE_VIDEO,
     ESTIMATE_ERROR_REASON,
 )
 from llama_packer.profiles import Profiles, parse_spare_mb
@@ -304,6 +305,7 @@ def _build_entry(
     ubatch: int | None = None,
     mem_vram_mib: float | None = None,
     mem_ram_mib: float | None = None,
+    vram_note: str | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -326,6 +328,9 @@ def _build_entry(
     this serving (reported verbatim as a trailing description tag via
     :func:`format_mem_tag`; ``None``/``None`` or a non-None
     ``estimate_error`` emits no tag).
+    ``vram_note`` (when set) is appended after the mem tag: the entry
+    serves below its design context because ``--spare``/``--baseline``
+    constrained the budget.
     """
     model = model.view_for(include_mmproj)
     base_id = model.template_id
@@ -489,8 +494,11 @@ def _build_entry(
     mem_tag = None
     if estimate_error is None and mem_ram_mib is not None:
         mem_tag = format_mem_tag(mem_vram_mib, mem_ram_mib)
-    if model.description or mem_tag is not None:
-        entry["description"] = _with_mem_tag(model.description, mem_tag)
+    desc = _with_mem_tag(model.description, mem_tag)
+    if vram_note:
+        desc = f"{desc} {vram_note}".strip() if desc else vram_note
+    if desc is not None:
+        entry["description"] = desc
     # The VRAM-served -c limit (vs. capabilities.context = max trained).
     metadata["ctx_size"] = ctx_size
     # Client-facing estimate health: when no VRAM estimate source worked,
@@ -881,6 +889,10 @@ class Variant:
     #: ``vision_ctx`` with the projection); None when no vision entry.
     mem_vision_vram_mib: float | None = None
     mem_vision_ram_mib: float | None = None
+    #: Non-None when the VRAM budget could not afford the design context
+    #: (``--spare``/``--baseline`` active): appended to the description so
+    #: the entry visibly carries its over-budget status.
+    vram_note: str | None = None
 
 
 def resolve_batch_ubatch(
@@ -1362,6 +1374,17 @@ class Planner:
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
             for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
+                # Reset the per-group serving view: a prior group's
+                # vision→text fallback must not leak into this group.
+                include_mmproj = not drop_mmproj.get(model.stem, False)
+                view = model.view_for(include_mmproj)
+                context_length = view.design_context
+                if view.role == "embeddings" and self.matrix_result:
+                    context_length = min(context_length,
+                                         self.matrix_result.embed_ctx)
+                elif view.role == "rerank" and self.matrix_result:
+                    context_length = min(context_length,
+                                         self.matrix_result.rerank_ctx)
                 # Ledger charge: this pool's extra reserve (pools: overrides
                 # + co-residents) joins the spare for chat solves only — RAG
                 # and fixed-overhead roles ARE residents; charging them
@@ -1437,6 +1460,96 @@ class Planner:
                         parallel = group_parallel
                         ctx_size = self._unestimated_ctx(view)
 
+                # ── VRAM gating ──
+                # Weights + compute exceed this group's budget: the model
+                # cannot load at any context.  Skip the group (a looser
+                # group may still fit) — skipped stems never reach
+                # entry_ids_by_stem, so matrix vars/sets auto-prune.
+                # With the vision projection attached, first fall back to
+                # text-only: the companion may be what no longer fits.
+                if est_error is None:
+                    over_budget = getattr(view.vram, "over_budget_reason",
+                                          None)
+                    if over_budget is not None:
+                        if (include_mmproj and model.mmproj is not None
+                                and model.mmproj.gguf_path is not None):
+                            include_mmproj = False
+                            view = model.view_for(False)
+                            context_length = view.design_context
+                            if view.role == "embeddings" and self.matrix_result:
+                                context_length = min(
+                                    context_length,
+                                    self.matrix_result.embed_ctx)
+                            elif view.role == "rerank" and self.matrix_result:
+                                context_length = min(
+                                    context_length,
+                                    self.matrix_result.rerank_ctx)
+                            if auto:
+                                pin_ctx = self._serving_pin(view)
+                                floor = resolve_min_ctx(
+                                    view, pin_ctx=pin_ctx,
+                                    tools_min_ctx=self.knobs.tools_min_ctx,
+                                    fallback_min_ctx=self.min_context,
+                                    fallback_explicit=self.min_context_explicit)
+                                cap_ctx = context_length
+                                if self.max_context is not None:
+                                    cap_ctx = min(cap_ctx, self.max_context)
+                                parallel, ctx_size = self._auto_parallel(
+                                    view, cache_type=cache_type,
+                                    spare_mb=spare_eff, include_mmproj=False,
+                                    cap_ctx=cap_ctx, floor=floor,
+                                    pin_ctx=pin_ctx,
+                                    group_parallel=(1 if uncapped
+                                                    else group_parallel),
+                                    profile=group[0][1])
+                            else:
+                                ctx_size = self._bounded_ctx(
+                                    view, parallel=parallel,
+                                    cache_type=cache_type,
+                                    spare_mb=spare_eff, include_mmproj=False,
+                                    design_ctx=self.chat_ctx,
+                                    context_length=context_length,
+                                    profile=group[0][1])
+                            over_budget = getattr(
+                                view.vram, "over_budget_reason", None)
+                            if over_budget is None:
+                                logger.info(
+                                    "%s: vision over budget; serving "
+                                    "text-only at %d", view.stem, ctx_size)
+                                est_error = getattr(
+                                    model.vram, "unestimated_reason", None) \
+                                    or getattr(view.vram,
+                                               "unestimated_reason", None)
+                                if est_error is not None:
+                                    parallel = group_parallel
+                                    ctx_size = self._unestimated_ctx(view)
+                            else:
+                                logger.warning("%s: disabled (%s)",
+                                               view.stem, over_budget)
+                                continue
+                        else:
+                            logger.warning("%s: disabled (%s)",
+                                           view.stem, over_budget)
+                            continue
+                # Squeeze note: the budget could not afford the design
+                # context and an explicit reservation (--spare/--baseline)
+                # is what pushed it over — stamp the entry description.
+                # Gate on the user-declared spare (pool-adjusted, before
+                # co-resident charges) or a baseline above the fixed floor;
+                # and only when the served ctx is actually below design
+                # (the matrix chat_ctx target can squeeze without landing
+                # under the model's own context_length).
+                vram_note: str | None = None
+                if (est_error is None
+                        and getattr(view.vram, "vram_squeezed", False)
+                        and ctx_size < context_length
+                        and (spare_mb > 0 or self.baseline_mb > _RESERVE_VIDEO)):
+                    vram_note = (
+                        f"(over configured VRAM limits — serving at "
+                        f"{ctx_size:,} of {context_length:,} design tokens; "
+                        f"re-run without --spare/--baseline for full "
+                        f"context)")
+
                 vision_ctx: int | None = None
                 if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
                     vision_ctx = ctx_size if est_error is not None else (
@@ -1446,6 +1559,13 @@ class Planner:
                             design_ctx=self.chat_ctx,
                             context_length=context_length,
                             profile=group[0][1]))
+                    if (vision_ctx is not None and est_error is None
+                            and getattr(on_view.vram, "over_budget_reason",
+                                        None) is not None):
+                        logger.warning(
+                            "%s: vision companion disabled (%s)",
+                            model.stem, on_view.vram.over_budget_reason)
+                        vision_ctx = None
                 if uncapped:
                     parallel = 0   # emit uncapped: no --max-num-seqs
 
@@ -1472,7 +1592,8 @@ class Planner:
                     estimate_error=est_error,
                     mem_vram_mib=mem[0], mem_ram_mib=mem[1],
                     mem_vision_vram_mib=vmem[0],
-                    mem_vision_ram_mib=vmem[1]))
+                    mem_vision_ram_mib=vmem[1],
+                    vram_note=vram_note))
 
                 # On-demand text-only variant: when the main entry keeps its
                 # mmproj, also plan a no-vision entry (``<id>-text``) so
@@ -1870,6 +1991,7 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
+                vram_note=v.vram_note,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX

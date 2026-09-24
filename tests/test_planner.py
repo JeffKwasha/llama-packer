@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from llama_packer.consts import _RESERVE_VIDEO
 from llama_packer.profiles import Profiles
 from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context
 
@@ -54,6 +55,50 @@ def _vision_model(tmp_path, make_model, name):
     (tmp_path / f"{name}-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
     return make_model(name, mmproj={"file": f"{name}-mmproj.gguf",
                                     "capabilities": ["image"]})
+
+
+def _gated_ctx(model, by_mmproj):
+    """calc_ctx fake keyed on include_mmproj: (ctx, over_reason, squeezed).
+
+    Sets the gating flags on the budget that owns the call so plan()'s
+    over-budget / squeeze checks see the per-view verdict.
+    """
+    def make_fake(vram_obj, flag):
+        ctx, over, sq = by_mmproj[bool(flag)]
+
+        def fake(*a, **k):
+            vram_obj.over_budget_reason = over
+            vram_obj.vram_squeezed = sq
+            return ctx
+        return fake
+
+    def fake_static(*a, **k):
+        return (100, 0.01, 10, 100)
+
+    model.vram.calc_ctx = make_fake(model.vram, False)
+    model.vram.effective_static = fake_static
+    model.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
+        model_mib=100, kv_per_token_mib=0.01, slot_mib=10.0,
+        compute_mib=100, source="fit-params")
+    on = model.view_for(True)
+    if on is not model:
+        on.vram.calc_ctx = make_fake(on.vram, True)
+        on.vram.effective_static = fake_static
+        on.vram.fit_params_static = model.vram.fit_params_static
+    else:
+        # No separate companion-on view: one budget, key on the kwarg.
+        text_ctx, text_over, text_sq = by_mmproj[False]
+        vis_ctx, vis_over, vis_sq = by_mmproj[True]
+
+        def combo(*a, include_mmproj=True, **k):
+            if include_mmproj:
+                model.vram.over_budget_reason = vis_over
+                model.vram.vram_squeezed = vis_sq
+                return vis_ctx
+            model.vram.over_budget_reason = text_over
+            model.vram.vram_squeezed = text_sq
+            return text_ctx
+        model.vram.calc_ctx = combo
 
 
 def test_profiles_spare_precedence():
@@ -317,6 +362,203 @@ def test_plan_llama_parallel_zero_warns_and_defaults(make_model, profiles,
     variants = planner.plan()["m0"]
     assert variants[0].parallel == 1
     assert any("parallel 0 is invalid" in r.message for r in caplog.records)
+
+
+# ── VRAM gating: disable / squeeze-note ──────────────────────────────────
+
+
+def test_plan_disables_over_budget_model(make_model, profiles, caplog):
+    """Weights exceed the budget: the model cannot load at any context and
+    must be skipped — skipped stems never reach entry_ids_by_stem, so
+    matrix vars/sets auto-prune (emission happens before var construction)."""
+    m = make_model("huge")
+    _fake_vram(m, (50000, 0.5, 100))  # 50G weights on a 48G card
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024)
+    variants = planner.plan()["huge"]
+    assert variants == []
+    assert any("disabled" in r.message for r in caplog.records)
+    # And it vanishes from emission entirely.
+    config = emit_config([m], {"huge": variants}, profiles, TVARS)
+    assert config["models"] == {}
+
+
+def test_plan_vram_note_with_spare(make_model, profiles):
+    """Squeezed below design ctx with --spare active → description note."""
+    m = make_model("sq", context_length=32768)
+    _fake_vram(m, (32000, 0.5, 100))
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, spare="2G")
+    variants = planner.plan()["sq"]
+    assert variants
+    v = variants[0]
+    assert v.vram_note is not None
+    assert "over configured VRAM limits" in v.vram_note
+    assert "re-run without" in v.vram_note
+    assert v.vram_note != ""
+
+
+def test_plan_no_vram_note_without_spare(make_model, profiles):
+    """Same squeeze with no spare/baseline → no note (normal operation
+    must never carry over-budget noise)."""
+    m = make_model("sq0", context_length=32768)
+    _fake_vram(m, (32000, 0.5, 100))
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, spare=None)
+    variants = planner.plan()["sq0"]
+    assert variants
+    assert variants[0].vram_note is None
+
+
+def test_emit_config_vram_note_reaches_description(make_model, profiles):
+    """End-to-end: plan → emit → the note lands in the entry description
+    after the mem tag."""
+    m = make_model("sqd", context_length=32768, description="Squeezed model.")
+    _fake_vram(m, (32000, 0.5, 100))
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, spare="2G")
+    variants = planner.plan()["sqd"]
+    config = emit_config([m], {"sqd": variants}, profiles, TVARS)
+    desc = config["models"]["sqd"]["description"]
+    assert "Squeezed model." in desc
+    assert "[VRAM" in desc
+    assert "over configured VRAM limits" in desc
+    # The note trails the mem tag.
+    assert desc.index("[VRAM") < desc.index("over configured VRAM limits")
+
+
+def test_plan_no_vram_note_with_baseline_at_reserve_floor(make_model, profiles):
+    """hardware.baseline_mb: '128m' is swallowed by max(_RESERVE_VIDEO,
+    baseline) — it does not change the reserve, so it must not fire notes."""
+    m = make_model("b128", context_length=32768)
+    _fake_vram(m, (32000, 0.5, 100))  # still squeezes below design
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, spare=None, baseline_mb=128)
+    variants = planner.plan()["b128"]
+    assert variants
+    assert variants[0].ctx_size < 32768   # genuinely squeezed
+    assert variants[0].vram_note is None  # but no note: 128 <= 1024 floor
+
+
+def test_plan_vram_note_with_baseline_above_floor(make_model, profiles):
+    """An explicit baseline above the fixed floor is a real reservation —
+    squeeze notes fire even with no --spare."""
+    m = make_model("b2g", context_length=32768)
+    _fake_vram(m, (32000, 0.5, 100))
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, spare=None,
+                      baseline_mb=2 * _RESERVE_VIDEO)
+    variants = planner.plan()["b2g"]
+    assert variants
+    assert variants[0].vram_note is not None
+    assert "over configured VRAM limits" in variants[0].vram_note
+
+
+def test_plan_no_vram_note_when_served_equals_design(make_model, profiles):
+    """vram_squeezed can fire against the matrix chat_ctx target while the
+    final clamp lands on the model's own context_length — equality must not
+    produce a 'serving at N of N' note."""
+    m = make_model("eq", context_length=32768)
+    _fake_vram(m, (100, 0.01, 10))
+
+    def fake(*a, **k):
+        m.vram.over_budget_reason = None
+        m.vram.vram_squeezed = True  # spurious: matrix target, not own design
+        return 32768
+
+    m.vram.calc_ctx = fake
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, spare="2G")
+    variants = planner.plan()["eq"]
+    assert variants
+    assert variants[0].ctx_size == 32768
+    assert variants[0].vram_note is None
+
+
+# ── vision over-budget: text-only fallback, companion suppression ─────────
+
+
+def test_plan_vision_over_budget_falls_back_to_text(tmp_path, make_model,
+                                                    profiles, caplog):
+    """Vision view cannot load, text-only can: serve text-only instead of
+    disabling the whole model.  Drop-pass keeps vision (min-context floor
+    equals the over-budget return), so the group solve is what falls back."""
+    (tmp_path / "vf-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vf", mmproj={"file": "vf-mmproj.gguf",
+                                 "capabilities": ["image"]},
+                   context_length=262144)
+    _gated_ctx(m, {
+        True: (4096, "weights + compute need 40000 MiB, only 1000 budgeted",
+               False),
+        False: (131072, None, False),
+    })
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, min_context=4096)
+    with caplog.at_level(logging.INFO, logger="llama_packer.writer"):
+        variants = planner.plan()["vf"]
+    assert variants
+    v = variants[0]
+    assert v.include_mmproj is False
+    assert v.ctx_size == 131072
+    assert v.estimate_error is None
+    assert any("vision over budget" in r.message for r in caplog.records)
+    # Companion also over budget → suppressed, but the main entry is not
+    # disabled (that warning is "vf: disabled (...)").
+    assert any("vision companion disabled" in r.message
+               for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING
+                   and r.message.startswith("vf: disabled")
+                   for r in caplog.records)
+
+
+def test_plan_vision_companion_over_budget_suppressed(tmp_path, make_model,
+                                                      profiles, caplog):
+    """Main entry already text-only; the best-effort vision companion solve
+    is over budget → no vision entry (would be a load-time OOM landmine)."""
+    (tmp_path / "vc-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vc", mmproj={"file": "vc-mmproj.gguf",
+                                 "capabilities": ["image"]},
+                   context_length=262144)
+    _gated_ctx(m, {
+        True: (4096, "weights + compute need 40000 MiB, only 1000 budgeted",
+               False),
+        False: (131072, None, False),
+    })
+    # min-context 131072: vision (4096) misses it, text hits it → drop pass
+    # drops mmproj; group starts text-only and plans the companion.
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, min_context=131072)
+    variants = planner.plan()["vc"]
+    assert variants
+    v = variants[0]
+    assert v.include_mmproj is False
+    assert v.ctx_size == 131072
+    assert v.vision_ctx is None
+    assert any("vision companion disabled" in r.message
+               for r in caplog.records)
+    # And no vision entry is emitted alongside.
+    config = emit_config([m], {"vc": variants}, profiles, TVARS)
+    assert set(config["models"]) == {"vc-text"}
+
+
+def test_plan_vision_and_text_both_over_budget_disables(tmp_path, make_model,
+                                                        profiles, caplog):
+    """Fallback is not a free pass: if text-only also cannot load, the
+    model is disabled as before."""
+    (tmp_path / "vd-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vd", mmproj={"file": "vd-mmproj.gguf",
+                                 "capabilities": ["image"]},
+                   context_length=262144)
+    over = "weights + compute need 50000 MiB, only 1000 budgeted"
+    _gated_ctx(m, {
+        True: (4096, over, False),
+        False: (4096, over, False),
+    })
+    planner = Planner([m], profiles, fit_bin="unused",
+                      vram_total=48 * 1024, min_context=4096)
+    variants = planner.plan()["vd"]
+    assert variants == []
+    assert any("disabled" in r.message for r in caplog.records)
 
 
 def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):

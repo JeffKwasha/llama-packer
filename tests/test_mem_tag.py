@@ -143,6 +143,43 @@ def test_entry_tag_without_sidecar_description(make_model):
     assert entry["description"] == "[VRAM 9.1GB RAM 64MB]"
 
 
+def test_entry_vram_note_appended_after_mem_tag(make_model):
+    _, entry = _build_entry(
+        make_model("mn", description="Some model."),
+        parallel=1,
+        cache_type="q8_0",
+        profiles_group=[("default", {})],
+        profiles_defaults={},
+        template_vars=dict(TVARS),
+        context_length=32768,
+        ctx_size=8192,
+        mem_vram_mib=9318.0,
+        mem_ram_mib=64.0,
+        vram_note="(over configured VRAM limits — serving at 8,192 of "
+                  "32,768 design tokens)",
+    )
+    assert entry["description"] == (
+        "Some model. [VRAM 9.1GB RAM 64MB] (over configured VRAM limits "
+        "— serving at 8,192 of 32,768 design tokens)"
+    )
+
+
+def test_entry_vram_note_without_mem_tag_or_description(make_model):
+    # The note alone still yields a description (entry is visibly flagged).
+    _, entry = _build_entry(
+        make_model("bare"),
+        parallel=1,
+        cache_type="q8_0",
+        profiles_group=[("default", {})],
+        profiles_defaults={},
+        template_vars=dict(TVARS),
+        context_length=32768,
+        ctx_size=8192,
+        vram_note="(over configured VRAM limits)",
+    )
+    assert entry["description"] == "(over configured VRAM limits)"
+
+
 # ── planner → emit end to end ──
 
 

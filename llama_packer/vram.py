@@ -544,6 +544,15 @@ class VramBudget:
         #: Set when no estimate source worked for this model — the planner
         #: surfaces it as metadata.estimated/estimate_error on every entry.
         self.unestimated_reason: str | None = None
+        #: Set when the budget cannot even hold weights + compute (the model
+        #: cannot load at any context) — the planner disables the entry.
+        #: ``None`` when the budget fits; reset at the top of every
+        #: ``calc_ctx`` call so each solve reports its own budget.
+        self.over_budget_reason: str | None = None
+        #: Set when the design context did not fit and the solve fell back to
+        #: a smaller context — the planner stamps a description note.
+        #: Reset alongside ``over_budget_reason`` on every ``calc_ctx`` call.
+        self.vram_squeezed: bool = False
 
     # ── saved fit-params from frontmatter ──
 
@@ -1258,10 +1267,18 @@ class VramBudget:
         if self.model.on_cpu:
             return self._design_ctx()
 
+        # Each solve reports its own budget: clear the gating flags so a
+        # tight group's verdict does not leak into a looser group's plan.
+        self.over_budget_reason = None
+        self.vram_squeezed = False
+
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
         available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
         if available <= 0:
+            self.over_budget_reason = (
+                f"VRAM budget exhausted: {int(available)} MiB available "
+                f"(total {vram_total_mb} - reserve {reserve} - spare {spare_mb})")
             logger.warning("available VRAM <= 0 for %s (spare=%d)",
                            self.model.stem, spare_mb)
             return _MIN_CTX_SIZE
@@ -1291,13 +1308,15 @@ class VramBudget:
         model_mib, kv_per_token, slot_mib, compute_mib = static
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
+            self.over_budget_reason = (
+                f"weights + compute need {int(model_mib + compute_mib)} MiB, "
+                f"only {int(available)} MiB budgeted (VRAM {vram_total_mb} - "
+                f"reserve {reserve} - spare {spare_mb})")
             logger.warning(
                 "%s: weights + compute need %d MiB, only %d MiB budgeted "
-                "(VRAM %d - reserve %d - spare %d) — serving at minimum "
-                "context %d",
+                "(VRAM %d - reserve %d - spare %d) — model cannot load",
                 self.model.stem, int(model_mib + compute_mib),
-                int(available), vram_total_mb, reserve, spare_mb,
-                _MIN_CTX_SIZE)
+                int(available), vram_total_mb, reserve, spare_mb)
             return _MIN_CTX_SIZE
 
         # Image token budget: image tokens are ordinary tokens inside the
@@ -1316,6 +1335,10 @@ class VramBudget:
                 ctx = design
             return self._raise_to_image_floor(ctx, img_floor, cap=ctx,
                                               affordable=ctx)
+
+        # Design context does not fit: serve smaller and tell the planner
+        # (the emitted description gets an over-budget note).
+        self.vram_squeezed = True
 
         # Solve the affine equation for the per-slot context
         if kv_per_token <= 0:
