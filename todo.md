@@ -155,3 +155,25 @@ metrics).
 - Upstream key drift: claims verified against 0.8.0 docs + live binary.
 - Chatterbox `clon` latency (2.1 GB Q8 clone model) — acceptable; turbo is the
   zero-shot TTS path.
+
+## Known gaps (open, 2026-09-23)
+
+- **audio §5 — per-family compute table.** Flat `_AUDIO_CPP_COMPUTE_MB = 1024`
+  (`consts.py:152`) still in use. Plan: measure peak VRAM for the 5 verified
+  models (kokoro/chatterbox/turbo/parakeet/nemotron), replace with
+  `_AUDIO_CPP_FAMILY_COMPUTE_MB` consulted by `vram.py` when
+  `backend in AUDIO_CPP_BACKENDS`. Fallback path only — sidecar `vram_mb:`
+  pins remain authoritative.
+- **3 broken sidecars (pack errors every run).** `qwen3-asr-0.6b.md` and
+  `qwen3-tts-0.6b-q8.gguf.md` name Qwen GGUF paths absent from the
+  `audio-cpp/audio.cpp-gguf` snapshot; `qwen_3_06b_base.md` needs
+  `hf download Qwen/Qwen3-0.6B-Base` (or a corrected `model:`). Operator call:
+  fix the sidecars or drop the models.
+- **ACE-Step UI label collision** — low priority, unresolved (ACE-Step1.5
+  GGUFs are in the audio.cpp snapshot but no sidecar/role wiring yet).
+- **`extras/hardlink-audio.py` WIP (uncommitted).** Two incomplete edits:
+  a debug `print(f"skipping {m.stem}")` that floods stdout for every
+  non-audio model (the script deliberately mutes the packer logger), and an
+  `hf_home` fallback to `$HF_HOME` that is redundant — `hf_hub_cache()`
+  already resolves the env var (`utils.py`). Strip the print (and trailing
+  whitespace); drop or keep the `hf_home` line knowing it is a no-op.

@@ -28,6 +28,7 @@ Official documentation (the source of truth — this page only indexes it):
 | `includeAliasesInList: true` | Presents the auto-created setParamsByID aliases in `/v1/models`; llama-swap's default is `false`, which would hide them from dynamic-list clients (OpenWebUI, OpenClaw, …) | [config.example.yaml — includeAliasesInList](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
 | `routing.router.use: matrix` + `settings.matrix` (`vars`, `evict_costs`, `sets`) | Concurrent-model swap DSL; llama-packer solves contexts/co-loads in Python and emits the *static* sets — llama-swap only does runtime load/evict within them | [groups and matrix](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/routing/groups-and-matrix.md) |
 | `healthCheckTimeout` | Startup health-check budget (auto-calculated from model size or explicit) | [config.example.yaml — healthCheckTimeout](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
+| `globalTTL` (via `--idle-unload SECONDS`) | Top-level default TTL: unload any model after SECONDS of inactivity (`0` = never; key omitted when the flag is absent). Opt-in — for co-residency with ComfyUI/games that need VRAM back without re-packing | [config.example.yaml — globalTTL](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
 
 Not a llama-swap feature: the sibling `config.env` file is llama-packer's own
 artifact (systemd `EnvironmentFile=` / docker `--env-file`) that happens to
@@ -59,7 +60,7 @@ share the path-macro values with the emitted `macros:` block.
 | Feature | Why not |
 |---|---|
 | `profiles` / `selectors` (runtime id pinning) | llama-packer emits concrete per-variant entries; routing is static, decided at pack time from measured VRAM |
-| `ttl` / auto-unload | Co-load residency is expressed via matrix sets, not timeouts |
+| per-model `ttl` | Residency is expressed via matrix sets; the *global* default is optionally emitted as `globalTTL` through `--idle-unload` (see the table above) — per-entry `ttl` is never set |
 | `hooks` (startup preload) | Preload policy belongs to the operator's service unit, not the generated config |
 | `peers` (multi-host) | Single-host fleet; multi-host is out of scope |
 | `stripParams`, `set-if-undefined`, API keys | No need in the current deployment shape |

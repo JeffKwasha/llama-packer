@@ -22,6 +22,7 @@ Features:
 - Want 'text-only' variants that skip mmproj to maximize context or parallel? Automatic.
 - budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the matrix squeezes chat context to keep them loaded instead of evicted.
 - pick some models to use `q8_0` KV cache for longer context? YES
+- ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. `--idle-unload SECONDS` additionally emits `globalTTL` so llama-swap releases VRAM after idle.
 
 
 ## Quickstart ("It's alive")
@@ -58,6 +59,7 @@ mv profiles.yaml.example profiles.yaml
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
 - **Opencode plugin.** Model info flows straight off the running server, so you never hand-edit Opencode config when you add a model (`extras/llamaswap.ts`).
 - **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a `-text` alias that drops the projection to reclaim VRAM for a much larger text-only context window (plus a `-vision-Nk` best-effort entry keeping vision available at reduced context).
+- **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. `--idle-unload SECONDS` emits `globalTTL` so llama-swap unloads idle models.
 
 
 ## What it does

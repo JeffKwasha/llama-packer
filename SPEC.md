@@ -42,6 +42,7 @@ Also emits:
 - **`macros:`** — top-level block mapping each `${VAR}` path macro to its absolute directory (see [Path Macros](#path-macros-macros-block-and-configenv)).
 - **`includeAliasesInList: true`** — presents the `${MODEL_ID}:<mode>`/`${MODEL_ID}:<profile>` aliases in `/v1/models` (llama-swap default is `false`).
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
+- **`globalTTL`** — only when `--idle-unload SECONDS` is passed; llama-swap's top-level idle-unload default (see [VRAM gating and reservation notes](#vram-gating-and-reservation-notes)).
 
 ### Writer module
 
@@ -266,6 +267,18 @@ Chat models target a minimum useful context (`_MIN_AGENTIC_CTX`, default 131072 
 - `ctx_without < min_context` too → **vision is kept**: dropping the projection cannot reach the minimum either way, so sacrificing it buys nothing (a small VLM stays a full VLM). Informational log only — no warning, since no configuration can fix a design-context limit.
 
 All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every `<id>-text` entry joins the same matrix co-loading sets as its parent `<id>` entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
+
+### VRAM gating and reservation notes
+
+When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` counterparts) shrinks the budget, the planner degrades visibly instead of emitting entries that OOM at load time:
+
+- **Over-budget disable.** `calc_ctx` records `over_budget_reason` when weights + compute do not fit any context (or the reserve/spare leaves ≤ 0 available). Such a group is **skipped** — the model is not emitted. Skipped stems never reach the matrix vars, so routing auto-prunes; if *every* chat model is gated away, matrix routing is omitted entirely (warning logged) rather than emitting a degenerate empty OR-list.
+- **Vision → text fallback.** Before disabling a vision model whose main (mmproj-on) solve is over budget, the planner re-solves with the projection detached. If the text-only fit succeeds, the entry is served without `--mmproj` (INFO logged). If text also fails, the model is disabled. Each profile group re-derives `include_mmproj` / view / design context, so one group's fallback never leaks into the next.
+- **Vision companion suppression.** When a main text entry has a best-effort `-vision-<N>k` companion and that companion's own solve is over budget, the companion entry is dropped (warning logged) rather than emitted as an OOM landmine.
+- **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted, before co-resident charges) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
+- **Degenerate refusal.** If `vram_total − reserve − spare ≤ 0`, the run fatals *before* any VRAM work (exit 1) and does **not** overwrite an existing `config.yaml`. Same guard applies when the reservation leaves zero model entries.
+
+`--idle-unload SECONDS` emits a top-level `globalTTL: SECONDS` (llama-swap: unload any model after that many seconds of inactivity; `0` = never, the llama-swap default; llama-packer omits the key when the flag is absent). Intended for co-residency with ComfyUI/games that need VRAM on short notice without re-packing.
 
 ## Matrix Context Solving
 
