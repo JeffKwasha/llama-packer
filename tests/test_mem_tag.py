@@ -184,10 +184,16 @@ def test_entry_vram_note_without_mem_tag_or_description(make_model):
 # ── planner → emit end to end ──
 
 
-def _scripted(model, ctx, quad_by_mmproj):
-    """Script both solves: ctx via calc_ctx, quads via effective_static."""
+def _scripted(model, ctx, quad_by_mmproj, ctx_by_mmproj=None):
+    """Script both solves: ctx via calc_ctx, quads via effective_static.
 
-    def fake_ctx(vram_total_mb, **kw):
+    *ctx_by_mmproj* lets a test give the text-only rung a different (larger,
+    as shedding a projection frees VRAM) context than the vision one.
+    """
+
+    def fake_ctx(vram_total_mb, include_mmproj=True, **kw):
+        if ctx_by_mmproj is not None:
+            return ctx_by_mmproj[bool(include_mmproj)]
         return ctx
 
     def fake_static(
@@ -260,7 +266,9 @@ def test_planner_text_variant_tag_differs(make_model, tmp_path):
     )
     quad_on = (2, 0.001, 10, 20)  # mmproj weight folded in
     quad_off = (1, 0.001, 10, 20)
-    _scripted(m, 200000, {True: quad_on, False: quad_off})
+    # the text rung must gain context to earn an entry at all
+    _scripted(m, 200000, {True: quad_on, False: quad_off},
+              ctx_by_mmproj={True: 200000, False: 210000})
 
     planner = Planner(
         [m], _profiles(), fit_bin="unused", vram_total=48 * 1024, min_context=131072
@@ -272,5 +280,5 @@ def test_planner_text_variant_tag_differs(make_model, tmp_path):
     main = entry_for(config, "vis")["description"]
     text = [e for i, e in config["models"].items() if "-text-" in i][0]["description"]
     assert main.endswith("[VRAM 232MB RAM 1MB]")
-    assert text.endswith("[VRAM 231MB RAM 0MB]")
+    assert text.endswith("[VRAM 241MB RAM 0MB]"), text[-40:]
     assert main != text

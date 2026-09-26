@@ -2268,14 +2268,26 @@ class Planner:
                             model, cache_type=cache_type,
                             include_mmproj=False, ctx_size=text_ctx,
                             parallel=parallel, profile=group[0][1])
-                    variants.append(Variant(
-                        parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
-                        profiles_group=group, ctx_size=text_ctx,
-                        include_mmproj=False, batch=batch, ubatch=ubatch,
-                        coload=is_coload,
-                        tools_demoted=tools_demoted,
-                        estimate_error=est_error,
-                        mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))
+                    if text_ctx > ctx_size:
+                        variants.append(Variant(
+                            parallel=parallel, cache_type=cache_type,
+                            spare_mb=spare_mb, profiles_group=group,
+                            ctx_size=text_ctx,
+                            include_mmproj=False, batch=batch, ubatch=ubatch,
+                            coload=is_coload,
+                            tools_demoted=tools_demoted,
+                            estimate_error=est_error,
+                            mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))
+                    else:
+                        # Shedding the projection bought no context — the
+                        # model is already at its design cap, or something
+                        # else is the binding constraint.  A text-only twin
+                        # at the same context is a strictly worse duplicate
+                        # of the main entry, so it is not emitted.
+                        logger.info(
+                            "mmproj: %s text-only variant would serve the "
+                            "same %d ctx as the main entry; not emitted",
+                            model.stem, text_ctx)
             plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)

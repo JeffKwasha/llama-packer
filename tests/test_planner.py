@@ -208,20 +208,22 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
                       min_context=131072)
     variants = planner.plan()["tiny"]
-    assert len(variants) == 2  # bare (vision) + on-demand -text, per group
+    # Dropping the projection buys no context here, so there is no text
+    # rung worth an entry: one vision entry, not two identical ones.
+    assert len(variants) == 1
     assert variants[0].include_mmproj is True   # main entry keeps vision
     assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
-    # Big design context so the design-clamp doesn't mask which budget was
-    # used; text ctx < vision ctx proves the variant was budgeted WITHOUT the
-    # mmproj (include_mmproj=False path).
+    # Shedding the projection frees VRAM, so the text rung must afford more
+    # context than the vision one -- that gain is the whole reason the rung
+    # earns an entry.
     (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
     m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
                                   "capabilities": ["image"]},
                    context_length=262144)
-    _scripted_ctx(m, {True: 131072, False: 100000})
+    _scripted_ctx(m, {True: 131072, False: 160000})
 
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
                       min_context=131072)
@@ -234,7 +236,7 @@ def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
     tv = variants[1]
     assert tv.include_mmproj is False
     assert tv.vision_ctx is None
-    assert tv.ctx_size == 100000
+    assert tv.ctx_size == 160000
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
     ids = set(config["models"])
@@ -246,7 +248,7 @@ def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
     assert "--mmproj" not in text["cmd"]
     assert text["name"].endswith("[text]")
     assert text["metadata"]["mmproj_skipped"] is True
-    assert text["metadata"]["ctx_size"] == 100000
+    assert text["metadata"]["ctx_size"] == 160000
     assert text["capabilities"]["in"] == ["text"]
 
 
