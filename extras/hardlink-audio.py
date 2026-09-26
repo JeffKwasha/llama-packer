@@ -58,6 +58,8 @@ def audio_cpp_models(models_dirs, dir_roles, hf_home):
                       dir_roles=dir_roles, hf_home=hf_home):
         if m.role in AUDIO_ROLES and m.hf_repo:
             yield m
+        else:
+            logger.debug("skipping %s", m.stem)
 
 
 def convert(snap_path: Path, dry_run: bool) -> str:
