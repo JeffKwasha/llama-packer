@@ -1050,3 +1050,32 @@ def test_planner_skips_text_variant_that_gains_nothing(make_model, profiles,
     variants = planner.plan()["vis"]
     assert len(variants) == 1
     assert variants[0].include_mmproj is True
+
+
+def test_matrix_vars_point_at_emitted_entry_ids(make_model, profiles, tmp_path):
+    # Category/co-load vars must name an entry that exists in `models:`.
+    # Entry ids carry the served context, so template_id no longer resolves;
+    # a var pointing at a missing id makes llama-swap reject the whole
+    # config (caught 2026-09-26 by -validate: 'var key "rnk2" references
+    # unknown model "zerank-2"').
+    from llama_packer.__main__ import _build_matrix_vars
+    emb = make_model("emb", role="embeddings")
+    rnk = make_model("rnk", role="rerank")
+    for m in (emb, rnk):
+        _fake_vram(m, (500, 0.1, 100))
+    entry_ids = {"emb": ["emb-4k"], "rnk": ["rnk-4k"]}
+    vars_, coload_vars = _build_matrix_vars(
+        [emb, rnk], emb, rnk, {"rnk2": rnk}, [], entry_ids, _quiet_logger())
+    assert vars_["emb"] == "emb-4k"
+    assert vars_["rnk"] == "rnk-4k"
+    for name, eid in vars_.items():
+        assert eid in entry_ids["emb"] or eid in entry_ids["rnk"] or \
+            eid.startswith("emb") or eid.startswith("rnk"), (name, eid)
+    assert coload_vars == []
+
+
+def _quiet_logger():
+    import logging
+    log = logging.getLogger("test-vars")
+    log.addHandler(logging.NullHandler())
+    return log

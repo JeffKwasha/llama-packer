@@ -359,25 +359,41 @@ def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
             chat_idx += 1
             vars_[f"c{chat_idx}"] = eid
     # Declared categories contribute one var each (emb, rnk, tts, stt, …);
-    # the category names are what `sets:` expressions reference.
+    # the category names are what `sets:` expressions reference.  Each must
+    # point at an EMITTED entry id, which now carries the served context
+    # (zerank-2 -> zerank-2-4k) — template_id no longer names an entry, and
+    # llama-swap rejects a var that points at a model not in the roster.
+    def entry_of(model) -> str | None:
+        ids = entry_ids_by_stem.get(model.stem) or []
+        return ids[0] if ids else None
+
     for name, model in (categories or {}).items():
         if name in vars_:
             logger.warning("matrix: category var %r collides with an existing "
                            "var; skipped", name)
             continue
-        vars_[name] = model.template_id
-    if embed_model is not None:
-        vars_.setdefault("emb", embed_model.template_id)
-    if rerank_model is not None:
-        vars_.setdefault("rnk", rerank_model.template_id)
+        eid = entry_of(model)
+        if eid is None:
+            logger.warning("matrix: category var %r: %s emitted no entry; "
+                           "omitted", name, model.stem)
+            continue
+        vars_[name] = eid
+    for name, model in (("emb", embed_model), ("rnk", rerank_model)):
+        if model is not None and name not in vars_:
+            eid = entry_of(model)
+            if eid is not None:
+                vars_[name] = eid
     by_stem = {m.stem: m for m in models}
     coload_vars: list[str] = []
     for stem in coload_stems:
         m = by_stem.get(stem)
         if m is None:
             continue
+        eid = entry_of(m)
+        if eid is None:
+            continue
         name = coload_var_name(m.role, vars_)
-        vars_[name] = m.template_id
+        vars_[name] = eid
         coload_vars.append(name)
     logger.info("matrix vars: %d chat + %d category + %d coload",
                 chat_idx, len(categories or {}), len(coload_vars))

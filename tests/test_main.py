@@ -118,12 +118,14 @@ def test_build_matrix_vars_includes_text_variants():
               m("rerank", "rnk-1")]
     # Only emitted entries become vars: alpha kept vision (has -text), beta
     # was auto-dropped (its main entry IS beta-text), ghost never emitted.
-    entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"], "beta": ["beta-text"]}
+    entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"],
+                         "beta": ["beta-text"],
+                         "emb-1": ["emb-1-4k"], "rnk-1": ["rnk-1-4k"]}
     vars_, coload_vars = _build_matrix_vars(
         models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), {},
         [], entry_ids_by_stem, logging.getLogger("test"))
     assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
-                     "emb": "emb-1", "rnk": "rnk-1"}
+                     "emb": "emb-1-4k", "rnk": "rnk-1-4k"}
     assert coload_vars == []
 
 
@@ -136,13 +138,16 @@ def test_build_matrix_vars_includes_coloads():
 
     models = [m("chat", "alpha"), m("s2t", "parakeet"), m("image", "flux"),
               m("image", "flux2")]
+    # co-load vars resolve to emitted entry ids too
+    ids = {"alpha": ["alpha-128k"], "parakeet": ["parakeet-32k"],
+           "flux": ["flux-64k"], "flux2": ["flux2-64k"]}
     vars_, coload_vars = _build_matrix_vars(
         models, None, None, {}, ["parakeet", "flux", "flux2"],
-        {"alpha": ["alpha"]}, logging.getLogger("test"))
-    assert vars_["c1"] == "alpha"
-    assert vars_["s2t"] == "parakeet"
-    assert vars_["img"] == "flux"
-    assert vars_["img2"] == "flux2"
+        ids, logging.getLogger("test"))
+    assert vars_["c1"] == "alpha-128k"
+    assert vars_["s2t"] == "parakeet-32k"
+    assert vars_["img"] == "flux-64k"
+    assert vars_["img2"] == "flux2-64k"
     assert coload_vars == ["s2t", "img", "img2"]
 
 
@@ -288,11 +293,14 @@ def test_build_matrix_vars_includes_categories():
                      m("t2s", "tts-1"))
     models = [m("chat", "alpha"), emb, rnk, tts]
     cats = {"emb": emb, "rnk": rnk, "tts": tts}
+    # Category vars resolve through the emitted entry ids, which carry the
+    # served context -- template_id is not an entry name.
+    ids = {"alpha": ["alpha-128k"], "emb-1": ["emb-1-4k"],
+           "rnk-1": ["rnk-1-4k"], "tts-1": ["tts-1-32k"]}
     vars_, coload_vars = _build_matrix_vars(
-        models, emb, rnk, cats, [], {"alpha": ["alpha"]},
-        logging.getLogger("test"))
-    assert vars_ == {"c1": "alpha", "emb": "emb-1", "rnk": "rnk-1",
-                     "tts": "tts-1"}
+        models, emb, rnk, cats, [], ids, logging.getLogger("test"))
+    assert vars_ == {"c1": "alpha-128k", "emb": "emb-1-4k",
+                     "rnk": "rnk-1-4k", "tts": "tts-1-32k"}
     assert coload_vars == []
 
 
