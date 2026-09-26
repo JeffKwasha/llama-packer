@@ -17,7 +17,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Container, Mapping
 
 import yaml
 
@@ -986,6 +986,21 @@ def plan_ladder(afford: Callable[[frozenset[str]], tuple[int, int] | None],
 CHAT_VARS_PLACEHOLDER = "__CHAT_VARS__"
 COLOAD_VARS_PLACEHOLDER = "__COLOAD_VARS__"
 
+#: Var-name prefix for an opportunistically co-loaded model, by role.  Shared
+#: with the emitter so the planner can cost a set and the router can expand
+#: it from one naming rule.
+COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
+
+
+def coload_var_name(role: str, taken: Container[str]) -> str:
+    """The co-load var name for *role*, numbered off *taken* to avoid a clash."""
+    prefix = COLOAD_VAR_PREFIX.get(role, "coload")
+    name, n = prefix, 1
+    while name in taken:
+        n += 1
+        name = f"{prefix}{n}"
+    return name
+
 
 def _strip_parens(expr: str) -> str:
     """Drop one layer of balanced outer parentheses."""
@@ -1024,6 +1039,20 @@ def _split_top(expr: str, op: str) -> list[str]:
             cur.append(ch)
     parts.append("".join(cur))
     return [s for s in (_strip_parens(p) for p in parts) if s]
+
+
+def _names_chat_slot(expr: str, coresident: frozenset[str],
+                     coload_vars: frozenset[str]) -> bool:
+    """True when a set offers a chat slot.
+
+    The chat alternatives are spelled either by the ``__CHAT_VARS__``
+    placeholder or by explicit ``c<N>`` vars.  A var name alone is not
+    enough — ``emb``, ``rnk`` and the co-load vars are also bare words, so
+    only the ``c<N>`` shape is treated as a chat var.
+    """
+    if CHAT_VARS_PLACEHOLDER in expr:
+        return True
+    return any(re.fullmatch(r"c\d+", name) for name in coresident)
 
 
 def set_coresident_vars(expr: str, chat_vars: frozenset[str],
@@ -1383,6 +1412,14 @@ class Planner:
         self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
         self.embed_model = embed_model
         self.rerank_model = rerank_model
+        # Blessed usage categories.  A model may only *tag* itself with one
+        # of these; an unblessed tag is warned about and ignored.
+        self.usage = UsageCatalogue.from_cfg(
+            getattr(profiles, "usage_cfg", None))
+        # Per-set co-resident overhead (MB) and the sets a chat model was
+        # admitted to, filled in by _solve_usage_sets.
+        self.set_overheads: dict[str, int] = {}
+        self.set_admission: dict[str, set[str]] = {}
         # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
         # fixed-overhead residents reserved alongside chat and RAG.
         self.fixed_categories = fixed_categories or []
@@ -1606,6 +1643,102 @@ class Planner:
                         model.stem, ctx_with, self.min_context, ctx_without)
         return drop
 
+    def demands_for(self, model: Model) -> tuple[UsageDemand, ...]:
+        """The usage demands in force for *model*.
+
+        A tag is only a claim: it is honoured when an entry can actually
+        meet the category's minimums, and silently ignored otherwise, so a
+        model is never held to a demand the VRAM cannot satisfy.
+        """
+        if not self.usage:
+            return ()
+        return resolve_usage(model.usage_tags, self.usage, logger)
+
+    def _price_sets(self) -> None:
+        """Cost every chat set by the residents it can hold alongside chat.
+
+        Replaces the single fleet-wide ledger charge: an entry has to
+        survive the heaviest set it lands in, and which set that is depends
+        on what the model can actually afford.
+        """
+        if not self.matrix_cfg:
+            return
+        sets_cfg = self.matrix_cfg.get("sets") or {}
+        if not sets_cfg:
+            return
+        by_stem = {m.stem: m for m in self.models}
+        taken: set[str] = set()
+        var_mb: dict[str, int] = {}
+
+        def overhead(m: Model) -> int:
+            # Same pricing the matrix solve used to reserve these, so the
+            # per-set figures and the shared solve cannot disagree.
+            oh = _coload_overhead(m, self.fit_bin, self.profiles, self.knobs,
+                                  self.llama_args)
+            return int(oh or 0)
+
+        def rag_overhead(m: Model) -> int:
+            """emb/rnk cost at their *solved* RAG context, as the matrix does.
+
+            The matrix prices these from the same quad formula it feeds
+            solve_matrix_ctx with, at the small solved context — not at
+            design context, and without the co-load headroom.
+            """
+            quad = _static_params(m, self.fit_bin,
+                                  self.profiles.default_cache_type,
+                                  measurement_args(self.profiles, m,
+                                                   self.llama_args))
+            if quad is None:
+                return 0
+            mib, factor, slots, compute = quad
+            return int(mib + compute + factor * self._rag_ctx(m) + slots)
+
+        # Declared categories: `emb`/`rnk` plus any extra (stt/tts/…).
+        for name, model in (self.fixed_categories or []):
+            if model is None:
+                continue
+            taken.add(name)
+            var_mb[name] = overhead(model)
+        for name, model in (("emb", self.embed_model),
+                            ("rnk", self.rerank_model)):
+            if model is not None and name not in taken:
+                taken.add(name)
+                var_mb[name] = rag_overhead(model)
+        # Co-loads: the matrix solve already priced them the same way.
+        coload_vars: set[str] = set()
+        for stem, mb in (getattr(self.matrix_result, "coloads", ()) or ()):
+            m = by_stem.get(stem)
+            if m is None:
+                continue
+            name = coload_var_name(m.role, taken)
+            taken.add(name)
+            var_mb[name] = int(mb)
+            coload_vars.add(name)
+
+        for sname, expr in sets_cfg.items():
+            expr = str(expr)
+            cores = set_coresident_vars(expr, frozenset(),
+                                        frozenset(coload_vars))
+            if not _names_chat_slot(expr, cores, frozenset(coload_vars)):
+                continue  # not a chat set
+            self.set_overheads[sname] = set_overhead_mb(
+                expr, var_mb, frozenset(), frozenset(coload_vars))
+        if self.set_overheads:
+            logger.info("usage: per-set co-resident overhead (MB): %s",
+                        ", ".join(f"{k}={v}" for k, v in
+                                  sorted(self.set_overheads.items())))
+
+    def _rag_ctx(self, model: Model) -> int:
+        """Served context for a RAG/fixed-overhead resident."""
+        res = self.matrix_result
+        if res is None:
+            return model.design_context
+        if model.role == "embeddings":
+            return min(model.design_context, res.embed_ctx)
+        if model.role == "rerank":
+            return min(model.design_context, res.rerank_ctx)
+        return model.design_context
+
     def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
         """Shared chat context when a matrix section is configured."""
         if not (self.matrix_cfg and self.embed_model and self.rerank_model):
@@ -1759,6 +1892,10 @@ class Planner:
         # Shared ledger: matrix residents + pools: overrides.  Per-model
         # chat solves charge this pool's extra reserve to their spare.
         self.ledger = self._build_ledger()
+        # Per-set co-resident costs, so a chat entry can be sized for the
+        # heaviest set it actually lands in rather than one fleet-wide
+        # figure.  Needs the matrix result, so it runs after the solve.
+        self._price_sets()
 
         plan: dict[str, list[Variant]] = {}
         for model in self.models:

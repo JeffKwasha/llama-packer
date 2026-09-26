@@ -32,7 +32,8 @@ from llama_packer.consts import (
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
-from llama_packer.writer import build_config, write_yaml, dump_yaml, EmittedConfig
+from llama_packer.writer import (
+    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -331,7 +332,6 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
 
 # Var-name prefix per co-load role, used in set expressions
 # (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
-_COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
 
 
 def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
@@ -376,11 +376,7 @@ def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
         m = by_stem.get(stem)
         if m is None:
             continue
-        prefix = _COLOAD_VAR_PREFIX.get(m.role, "coload")
-        name, n = prefix, 1
-        while name in vars_:
-            n += 1
-            name = f"{prefix}{n}"
+        name = coload_var_name(m.role, vars_)
         vars_[name] = m.template_id
         coload_vars.append(name)
     logger.info("matrix vars: %d chat + %d category + %d coload",
