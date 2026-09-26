@@ -1108,6 +1108,29 @@ def set_overhead_mb(expr: str, var_mb: Mapping[str, int],
     return total
 
 
+def _probe_at_overhead(planner: "Planner", model: Model,
+                       overhead_mb: int) -> tuple[int, int] | None:
+    """What ``model`` could be served at if *overhead_mb* is spoken for.
+
+    A side probe: the real solve pins a group parallel and honours
+    auto-parallel, neither of which is known yet at admission time, so this
+    asks the plain question "does a single-sequence entry still clear its
+    demand minimums" and lets the real solve refine it afterwards.
+    """
+    view = model.view_for(model.mmproj is not None
+                          and model.mmproj.gguf_path is not None)
+    cache_type = view.cache_type_for(planner.profiles.default_cache_type)
+    try:
+        ctx = planner._bounded_ctx(
+            view, parallel=1, cache_type=cache_type,
+            spare_mb=overhead_mb, include_mmproj=True)
+    except Exception:  # a probe must never break planning
+        return None
+    if ctx <= 0:
+        return None
+    return ctx, 1
+
+
 def _parse_bool_knob(key: str, v: object) -> bool:
     """Parse an opt-in knob; warn and return False on garbage."""
     if isinstance(v, bool):
@@ -1739,6 +1762,53 @@ class Planner:
             return min(model.design_context, res.rerank_ctx)
         return model.design_context
 
+    def _coresident_charge(self, model: Model, pool_id: str) -> int:
+        """Co-resident MB to charge *model*'s solve, and record its sets.
+
+        Per the matrix contract an entry must survive the heaviest set it
+        belongs to, so this charges the priciest set the model is admitted
+        to.  When no sets are configured it falls back to the ledger's
+        fleet-wide reserve, so an operator without a ``matrix:`` section
+        sees no change.
+
+        Admission: a model joins a set when, at that set's overhead, it can
+        still meet one of its usage demands.  With no declared demands the
+        model is admitted everywhere it fits, which preserves today's
+        behaviour for untagged models.
+        """
+        base = self.ledger.extra_reserve_mb(pool_id)
+        if not self.set_overheads or model.role != "chat":
+            return base
+        demands = self.demands_for(model)
+        if not demands:
+            # Untagged: keep the previous fleet-wide charge rather than
+            # inventing a per-set answer the operator never asked for.
+            return base
+
+        worst = 0
+        admitted: set[str] = set()
+        for sname, oh in sorted(self.set_overheads.items()):
+            probe = _probe_at_overhead(self, model, oh)
+            if probe is None:
+                continue
+            ctx, parallel = probe
+            if any(d.satisfied_by(ctx, parallel) for d in demands):
+                admitted.add(sname)
+                worst = max(worst, oh)
+        if not admitted:
+            # Meets nothing anywhere: charge the heaviest set so the entry
+            # is sized for the worst thing it could be asked to share with,
+            # and let the caller drop it from every set.
+            worst = max(self.set_overheads.values())
+            admitted = set(self.set_overheads)
+        self.set_admission[model.stem] = admitted
+        charge = max(base, worst)
+        logger.info(
+            "usage: %s co-resident charge %d MB (sets: %s)",
+            model.stem, charge,
+            ", ".join(sorted(admitted)) or "none")
+        return charge
+
     def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
         """Shared chat context when a matrix section is configured."""
         if not (self.matrix_cfg and self.embed_model and self.rerank_model):
@@ -1948,7 +2018,11 @@ class Planner:
                 spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                 spare_eff = spare_mb
                 if view.role == "chat":
-                    spare_eff += self.ledger.extra_reserve_mb(pool_id)
+                    # Co-residents are charged per set, not fleet-wide: the
+                    # ledger's single figure under-reserves every model that
+                    # can also land in a heavier set (ragz's Zerank alone is
+                    # 5764 MB more than rag's co-residents).
+                    spare_eff += self._coresident_charge(model, pool_id)
                 # Auto-parallel: unpinned chat models on slot-based backends
                 # get a value-function (parallel, ctx) solve instead of the
                 # group parallel.  Pinned = sidecar/block `parallel:` or any
