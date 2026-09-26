@@ -266,3 +266,71 @@ def test_rung_label_is_readable():
     assert "full" in labels
     assert "vision" in labels
     assert "draft+vision" in labels
+
+
+# ── per-set co-resident overhead ────────────────────────────────────────────
+
+from llama_packer.writer import (  # noqa: E402
+    set_coresident_vars,
+    set_overhead_mb,
+    _split_top,
+)
+
+_MB = {"emb": 749, "rnk": 1002, "rnk2": 5766, "stt": 1898, "tts": 1204,
+       "s2t": 2814, "s2t2": 1914}
+_CH = frozenset(f"c{i}" for i in range(1, 39))
+_CO = frozenset({"s2t", "s2t2"})
+
+
+def test_split_top_respects_parentheses():
+    assert _split_top("a & b & c", "&") == ["a", "b", "c"]
+    assert _split_top("a | b & c", "|") == ["a", "b & c"]
+    # a term fully wrapped in parens yields the bare term
+    assert _split_top("(a | b) & c", "&") == ["a | b", "c"]
+    # outer parens are dropped so consumers see var names
+    assert _split_top("((a))", "&") == ["a"]
+    # a `|` nested inside parens is not a top-level alternative, and the
+    # outer parens are not stripped because they belong to sub-terms
+    assert _split_top("(a | b) & c", "|") == ["(a | b) & c"]
+
+
+@pytest.mark.parametrize("expr,expected", [
+    ("__CHAT_VARS__ & emb & rnk", 749 + 1002),
+    ("__CHAT_VARS__ & emb & rnk2", 749 + 5766),
+    ("__CHAT_VARS__ & stt", 1898),
+    ("__CHAT_VARS__ & tts", 1204),
+    ("__CHAT_VARS__", 0),
+])
+def test_set_overhead_sums_coresidents(expr, expected):
+    assert set_overhead_mb(expr, _MB, _CH, _CO) == expected
+
+
+def test_set_overhead_charges_priciest_or_branch_only():
+    # emb and rnk2 are alternatives -- only one is ever resident, and the
+    # entry must survive the heavier one.
+    assert set_overhead_mb("__CHAT_VARS__ & (emb | rnk2)", _MB, _CH, _CO) == 5766
+    assert set_overhead_mb("((c1 | c2)) & emb & (rnk | rnk2)",
+                           _MB, _CH, _CO) == 749 + 5766
+
+
+def test_set_overhead_sums_coloads():
+    # co-loads genuinely stack with each other, unlike OR branches
+    assert set_overhead_mb("__CHAT_VARS__ & __COLOAD_VARS__",
+                           _MB, _CH, _CO) == 2814 + 1914
+
+
+def test_set_overhead_ignores_explicit_chat_vars():
+    assert set_overhead_mb("(c1 | c2) & emb", _MB, _CH, _CO) == 749
+    assert set_overhead_mb("c1 & emb & stt", _MB, _CH, _CO) == 749 + 1898
+
+
+def test_set_coresident_vars_names_the_residents():
+    assert set_coresident_vars("__CHAT_VARS__ & emb & rnk", _CH, _CO) == \
+        frozenset({"emb", "rnk"})
+    assert set_coresident_vars("__CHAT_VARS__ & __COLOAD_VARS__", _CH, _CO) == _CO
+    assert set_coresident_vars("__CHAT_VARS__", _CH, _CO) == frozenset()
+
+
+def test_set_overhead_ignores_unknown_vars():
+    # an unresolvable var charges nothing rather than exploding the solve
+    assert set_overhead_mb("__CHAT_VARS__ & mystery", _MB, _CH, _CO) == 0

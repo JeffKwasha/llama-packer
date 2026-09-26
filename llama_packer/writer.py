@@ -983,6 +983,102 @@ def plan_ladder(afford: Callable[[frozenset[str]], tuple[int, int] | None],
     return tuple(kept)
 
 
+CHAT_VARS_PLACEHOLDER = "__CHAT_VARS__"
+COLOAD_VARS_PLACEHOLDER = "__COLOAD_VARS__"
+
+
+def _strip_parens(expr: str) -> str:
+    """Drop one layer of balanced outer parentheses."""
+    s = expr.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    return s  # the trailing ')' closes something earlier
+        s = s[1:-1].strip()
+    return s
+
+
+def _split_top(expr: str, op: str) -> list[str]:
+    """Split *expr* on *op* at parenthesis depth 0, dropping outer parens.
+
+    ``"(emb | rnk2)"`` splits to ``["emb", "rnk2"]`` rather than the literal
+    ``["(emb", "rnk2)"]`` — every consumer here wants var names.
+    """
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in expr:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == op and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return [s for s in (_strip_parens(p) for p in parts) if s]
+
+
+def set_coresident_vars(expr: str, chat_vars: frozenset[str],
+                        coload_vars: frozenset[str]) -> frozenset[str]:
+    """The vars a set can co-reside with, i.e. everything but the chat choice.
+
+    A set names the *alternatives* for the chat slot (``__CHAT_VARS__`` or an
+    explicit ``c1 | c2``) AND-ed with the models that sit beside it.  Only the
+    AND-ed non-chat part is co-resident, and within an OR only one branch is
+    ever selected, so the branches are collapsed to their most expensive
+    member.  ``__COLOAD_VARS__`` is a genuine sum: those models co-load with
+    each other by construction.
+    """
+    out: set[str] = set()
+    for term in _split_top(expr, "&"):
+        if CHAT_VARS_PLACEHOLDER in term:
+            continue
+        alternatives = _split_top(term, "|")
+        if any(alt in chat_vars for alt in alternatives):
+            continue  # this term *is* the chat choice
+        if COLOAD_VARS_PLACEHOLDER in alternatives:
+            out |= coload_vars
+            continue
+        for alt in alternatives:
+            if alt and not alt.startswith("+"):
+                out.add(alt)
+    return frozenset(out)
+
+
+def set_overhead_mb(expr: str, var_mb: Mapping[str, int],
+                    chat_vars: frozenset[str],
+                    coload_vars: frozenset[str]) -> int:
+    """Worst-case co-resident VRAM (MB) charged to a chat model in *set*.
+
+    Per the llama-swap matrix contract a request collects every set
+    containing the requested model and activates the cheapest, so an entry
+    must survive the heaviest set it belongs to.  OR branches are
+    alternatives — only the most expensive is charged, because the operator
+    picks one — while co-loads genuinely stack and are summed.
+    """
+    total = 0
+    for term in _split_top(expr, "&"):
+        if CHAT_VARS_PLACEHOLDER in term:
+            continue
+        alternatives = _split_top(term, "|")
+        if any(alt in chat_vars for alt in alternatives):
+            continue
+        if COLOAD_VARS_PLACEHOLDER in alternatives:
+            total += sum(var_mb.get(v, 0) for v in coload_vars)
+            continue
+        # An AND-ed group of alternatives: charge the priciest branch only.
+        total += max((var_mb.get(alt, 0) for alt in alternatives), default=0)
+    return total
+
+
 def _parse_bool_knob(key: str, v: object) -> bool:
     """Parse an opt-in knob; warn and return False on garbage."""
     if isinstance(v, bool):
