@@ -1137,6 +1137,23 @@ def _probe_at_overhead(planner: "Planner", model: Model,
     return ctx, 1
 
 
+def ctx_label(ctx: int) -> str:
+    """Compact served-context label for an entry id, at most 4 characters.
+
+    A client picking a model from ``/v1/models`` has only the id to go on, so
+    the id has to carry the number that decides whether the model is usable.
+    ``262144 -> '256k'``, ``139264 -> '136k'``, ``1048762 -> '1M'``.
+
+    The unit threshold is 1000k, not 1024k, so the label is never wider than
+    four characters; above it the value switches to whole megas.  Exact
+    contexts below the threshold cannot collide, and at or above it the
+    rounding is under 0.1% — the exact number is always available in the
+    entry's ``metadata.ctx_size``.
+    """
+    k = max(int(ctx), 0) // 1024
+    return f"{k}k" if k < 1000 else f"{max(1, round(ctx / (1024 * 1024)))}M"
+
+
 def _parse_bool_knob(key: str, v: object) -> bool:
     """Parse an opt-in knob; warn and return False on garbage."""
     if isinstance(v, bool):
@@ -2671,6 +2688,11 @@ def emit_config(models: list[Model], plan: dict,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX
+            # The id carries the served context: a client choosing a model
+            # has only the id, and the text/vision suffixes are redundant
+            # with the per-entry `capabilities` block that already
+            # distinguishes them.
+            entry_id += f"-{ctx_label(v.ctx_size)}"
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "

@@ -81,3 +81,52 @@ def _hf_tree(tmp_path, repo="org/repo", revs=("abc123",),
         refs.mkdir(parents=True, exist_ok=True)
         (refs / "main").write_text(ref)
     return tmp_path / "hf"
+
+
+# ── entry-id helpers ────────────────────────────────────────────────────────
+#
+# Entry ids now carry the served context (``vis-256k``, ``vis-text-160k``),
+# so a test that wants "the text-only entry" must not hardcode the number.
+# These locate entries by shape instead, which keeps the assertions about
+# behaviour rather than about arithmetic that changes with the budget.
+
+
+def entries(config) -> dict:
+    return config["models"]
+
+
+def only_entry(config) -> dict:
+    """The single emitted entry."""
+    got = entries(config)
+    assert len(got) == 1, f"expected one entry, got {sorted(got)}"
+    return next(iter(got.values()))
+
+
+def entry_id(config, predicate) -> str:
+    """The id of the one entry matching *predicate* (id, entry)."""
+    hits = [eid for eid, e in entries(config).items() if predicate(eid, e)]
+    assert len(hits) == 1, f"expected one match for {hits} among {sorted(entries(config))}"
+    return hits[0]
+
+
+def vision_entry(config) -> dict:
+    return entries(config)[entry_id(
+        config, lambda i, e: "-vision-" not in i and not i.endswith("-text-256k")
+        and "image" in (e.get("capabilities", {}).get("in") or []))]
+
+
+def text_entry(config) -> dict:
+    """The text-only entry: capability block says text in, nothing else."""
+    return entries(config)[entry_id(
+        config, lambda i, e: (e.get("capabilities", {}).get("in") or []) == ["text"]
+        and "image" not in (e.get("capabilities", {}).get("in") or []))]
+
+
+def is_text_id(entry_id_: str) -> bool:
+    return "-text-" in entry_id_
+
+
+def entry_for(config, stem: str, which: int = 0) -> dict:
+    """The entry *config* emitted for a model stem (ids carry context now)."""
+    ids = config.entry_ids_by_stem[stem]
+    return config["models"][ids[which]]

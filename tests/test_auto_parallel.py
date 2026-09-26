@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from conftest import entry_for, only_entry
 from llama_packer.profiles import Profiles
 from llama_packer.consts import _MIN_AGENTIC_CTX
 from llama_packer.writer import (
@@ -283,7 +284,7 @@ def test_emit_parallel_in_cmd_and_metadata(make_model):
     profiles = _profiles_no_pin()
     variants = _planner(m).plan()["ap"]
     config = emit_config([m], {"ap": variants}, profiles, TVARS)
-    entry = config["models"]["ap"]
+    entry = entry_for(config, "ap")
     assert "--parallel 2" in entry["cmd"]
     assert "parallel" not in entry["metadata"]  # cmd-level, not metadata
     assert entry["metadata"]["ctx_size"] == 32768
@@ -298,7 +299,7 @@ def test_emit_vllm_max_num_seqs(make_model):
     variants = _planner(m).plan()["ap"]
     assert variants[0].parallel == 2
     config = emit_config([m], {"ap": variants}, profiles, TVARS)
-    assert "--max-num-seqs 2" in config["models"]["ap"]["cmd"]
+    assert "--max-num-seqs 2" in entry_for(config, "ap")["cmd"]
 
 
 def test_agentic_floor_default_unchanged():

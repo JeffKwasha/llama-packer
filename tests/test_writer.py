@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 
+from conftest import entry_for, only_entry
 from llama_packer.writer import _build_entry, _filter_supported
 
 
@@ -170,8 +171,9 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
         fit_bin="unused", vram_total=48 * 1024, spare=None, max_context=None,
     )
     ids = list(config["models"])
-    assert "chat" in ids
-    assert "bad" not in ids
+    # ids carry the served context, so match on the stem prefix
+    assert any(i.startswith("chat-") for i in ids), ids
+    assert not any(i.startswith("bad") for i in ids), ids
 
 
 def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
@@ -240,7 +242,7 @@ def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
         [m], profiles, {"llama_bin": "/opt/llama-server"},
         fit_bin="unused", vram_total=48 * 1024,
     )
-    cmd = config["models"]["chat"]["cmd"]
+    cmd = entry_for(config, "chat")["cmd"]
     assert "--cache-type-k f16 --cache-type-v f16" in cmd
 
 

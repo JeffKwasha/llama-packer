@@ -10,6 +10,7 @@ import pytest
 
 from llama_packer.consts import _RESERVE_VIDEO
 from llama_packer.profiles import Profiles
+from conftest import entry_for, only_entry, entry_id
 from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context, _sets_reference_coloads
 
 TVARS = {"llama_bin": "/opt/llama-server"}
@@ -150,10 +151,14 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     assert v.vision_ctx == 65536
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    # Auto-dropped main entry is renamed <id>-text (bare id always = vision).
-    assert set(config["models"]) == {"vis-text", "vis-vision-65k"}
-    main = config["models"]["vis-text"]
-    vision = config["models"]["vis-vision-65k"]
+    # Auto-dropped main entry is the text-only one; ids carry the context.
+    ids = set(config["models"])
+    assert len(ids) == 2
+    text_id = next(i for i in ids if "-text-" in i)
+    vis_id = next(i for i in ids if "-vision-65k" in i)
+    assert text_id == "vis-text-195k", text_id
+    main = config["models"][text_id]
+    vision = config["models"][vis_id]
     assert "--mmproj" not in main["cmd"]
     assert main["name"].endswith("[text]")
     assert main["metadata"]["mmproj_skipped"] is True
@@ -232,9 +237,12 @@ def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
     assert tv.ctx_size == 100000
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vis", "vis-text"}
-    assert "--mmproj" in config["models"]["vis"]["cmd"]
-    text = config["models"]["vis-text"]
+    ids = set(config["models"])
+    assert len(ids) == 2
+    vis_id = next(i for i in ids if "-text-" not in i)
+    text_id = next(i for i in ids if "-text-" in i)
+    assert "--mmproj" in config["models"][vis_id]["cmd"]
+    text = config["models"][text_id]
     assert "--mmproj" not in text["cmd"]
     assert text["name"].endswith("[text]")
     assert text["metadata"]["mmproj_skipped"] is True
@@ -419,7 +427,7 @@ def test_emit_config_vram_note_reaches_description(make_model, profiles):
                       vram_total=48 * 1024, spare="2G")
     variants = planner.plan()["sqd"]
     config = emit_config([m], {"sqd": variants}, profiles, TVARS)
-    desc = config["models"]["sqd"]["description"]
+    desc = only_entry(config)["description"]
     assert "Squeezed model." in desc
     assert "[VRAM" in desc
     assert "over configured VRAM limits" in desc
@@ -538,7 +546,7 @@ def test_plan_vision_companion_over_budget_suppressed(tmp_path, make_model,
                for r in caplog.records)
     # And no vision entry is emitted alongside.
     config = emit_config([m], {"vc": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vc-text"}
+    assert set(config["models"]) == {"vc-text-128k"}
 
 
 def test_plan_vision_and_text_both_over_budget_disables(tmp_path, make_model,
@@ -870,10 +878,10 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
     assert [v.coload for v in plan["s2t"]] == [True]
 
     config = emit_config([chat, embed, rerank, s2t], plan, profiles, TVARS)
-    chat_entry = config["models"]["chat"]
+    chat_entry = entry_for(config, "chat")
     assert chat_entry["capabilities"]["tools"] is False
     assert chat_entry["metadata"]["tools_demoted"] is True
-    assert config["models"]["s2t"]["metadata"]["ctx_size"] == 8192
+    assert entry_for(config, "s2t")["metadata"]["ctx_size"] == 8192
     assert config.coload_stems == ["s2t"]
 
 
@@ -884,8 +892,8 @@ def test_plan_no_matrix_undemoted(profiles):
     plan = planner.plan()
     assert plan["chat"][0].tools_demoted is False
     config = emit_config([chat], plan, profiles, TVARS)
-    assert config["models"]["chat"]["capabilities"]["tools"] is True
-    assert "tools_demoted" not in config["models"]["chat"]["metadata"]
+    assert only_entry(config)["capabilities"]["tools"] is True
+    assert "tools_demoted" not in only_entry(config)["metadata"]
 
 
 def test_coload_estimate_gets_headroom(profiles):
@@ -929,7 +937,7 @@ def test_plan_unestimable_chat_floor_and_metadata(make_model, profiles):
     assert v.ctx_size == 16384
     assert v.estimate_error == ESTIMATE_ERROR_REASON
     config = emit_config([m], {"ue": variants}, profiles, TVARS)
-    meta = config["models"]["ue"]["metadata"]
+    meta = only_entry(config)["metadata"]
     assert meta["estimated"] is False
     assert meta["estimate_error"] == ESTIMATE_ERROR_REASON
     assert meta["ctx_size"] == 16384

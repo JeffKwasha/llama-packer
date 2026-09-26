@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from conftest import entry_for, only_entry
 from llama_packer.profiles import Profiles
 from llama_packer.writer import (
     _build_entry,
@@ -229,7 +230,7 @@ def test_planner_mem_numbers_and_tag(make_model, tmp_path):
     assert v.mem_ram_mib == 1.0
 
     config = emit_config([m], {"m": variants}, _profiles(), TVARS)
-    desc = config["models"]["m"]["description"]
+    desc = entry_for(config, "m")["description"]
     assert desc.endswith("[VRAM 39MB RAM 1MB]")
 
 
@@ -245,7 +246,7 @@ def test_planner_cpu_model_ram_only_tag(make_model):
     assert v.mem_ram_mib == (5000 + 500 + 0.5 * 32768 + 100)
 
     config = emit_config([m], {"c": variants}, _profiles(), TVARS)
-    desc = config["models"]["c"]["description"]
+    desc = entry_for(config, "c")["description"]
     assert desc.endswith("[RAM 21.5GB]")
 
 
@@ -268,8 +269,8 @@ def test_planner_text_variant_tag_differs(make_model, tmp_path):
     assert len(variants) == 2  # main (vision) + on-demand text-only
 
     config = emit_config([m], {"vis": variants}, _profiles(), TVARS)
-    main = config["models"]["vis"]["description"]
-    text = config["models"]["vis-text"]["description"]
+    main = entry_for(config, "vis")["description"]
+    text = [e for i, e in config["models"].items() if "-text-" in i][0]["description"]
     assert main.endswith("[VRAM 232MB RAM 1MB]")
     assert text.endswith("[VRAM 231MB RAM 0MB]")
     assert main != text

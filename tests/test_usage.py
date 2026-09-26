@@ -334,3 +334,38 @@ def test_set_coresident_vars_names_the_residents():
 def test_set_overhead_ignores_unknown_vars():
     # an unresolvable var charges nothing rather than exploding the solve
     assert set_overhead_mb("__CHAT_VARS__ & mystery", _MB, _CH, _CO) == 0
+
+
+# ── the id label ────────────────────────────────────────────────────────────
+
+from llama_packer.writer import ctx_label  # noqa: E402
+
+
+@pytest.mark.parametrize("ctx,expected", [
+    (262144, "256k"),        # the user's worked example
+    (139264, "136k"),
+    (32768, "32k"),
+    (4096, "4k"),
+    (999424, "976k"),
+    (1048762, "1M"),         # and the other worked example
+    (1048576, "1M"),
+    (2097152, "2M"),
+])
+def test_ctx_label(ctx, expected):
+    assert ctx_label(ctx) == expected
+
+
+def test_ctx_label_never_exceeds_four_characters():
+    # A client scans the id list; an id that wanders past four characters
+    # stops being comparable at a glance.
+    for ctx in range(0, 4 * 1024 * 1024, 4096):
+        assert len(ctx_label(ctx)) <= 4, ctx
+
+
+def test_ctx_labels_below_the_mega_threshold_are_unique():
+    # Exact contexts must not collide, or two entries would share an id.
+    seen = {}
+    for ctx in range(0, 1000 * 1024, 1024):
+        lbl = ctx_label(ctx)
+        assert lbl not in seen, (lbl, seen.get(lbl), ctx)
+        seen[lbl] = ctx
