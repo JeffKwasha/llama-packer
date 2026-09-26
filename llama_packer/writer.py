@@ -17,6 +17,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Mapping
 
 import yaml
 
@@ -660,6 +661,326 @@ class MatrixKnobs:
         if role == "rerank":
             return self.rerank_context
         return self.coload_min_ctx
+
+
+@dataclass(frozen=True)
+class UsageDemand:
+    """One usage category's minimum serving requirements.
+
+    Declared in ``profiles.yaml`` under ``usage:``, which is the single
+    blessed vocabulary — a sidecar may only *tag* itself with a category
+    declared here.  A tag that is not blessed is warned about and ignored
+    (see :func:`resolve_usage`), so an operator always knows exactly which
+    demands are in force without reading every sidecar.
+
+    ``min_context`` / ``min_parallel`` are *minimums*, not requests: one
+    entry serving ``ctx >= min_context`` and ``parallel >= min_parallel``
+    satisfies the category, so a single entry can cover several categories
+    at once.  ``require`` lists capabilities that must survive every rung
+    of the capability/context ladder; a rung that drops one is discarded.
+    ``sacrifice`` is a *preference* order for what to give up when the
+    budget is short — it is deliberately not a cost order, because shedding
+    a capability may buy no context at all (a model already at its design
+    cap has no headroom to reclaim).
+    """
+
+    name: str
+    min_context: int = 0
+    min_parallel: int = 1
+    require: frozenset[str] = frozenset()
+    sacrifice: tuple[str, ...] = ()
+
+    def satisfied_by(self, ctx: int, parallel: int) -> bool:
+        """True when an entry served at (ctx, parallel) meets this demand."""
+        return ctx >= self.min_context and parallel >= self.min_parallel
+
+    def shed_order(self) -> tuple[str, ...]:
+        """Capabilities to give up, most-preferred-first.
+
+        Anything named in ``sacrifice`` comes first in the order given;
+        capabilities not named follow, so an unlisted ``vision`` is still
+        reachable as a last resort.  ``require`` entries never appear.
+        """
+        named = [c for c in self.sacrifice if c not in self.require]
+        return tuple(named)
+
+
+def _parse_ctx_size(v: object) -> int | None:
+    """Parse a context minimum: a positive int, or a ``128k``/``1M`` string."""
+    if isinstance(v, str):
+        s = v.strip().lower().rstrip("k").rstrip("m")
+        mult = 1024 if v.strip().lower().endswith("k") else (
+            1024 * 1024 if v.strip().lower().endswith("m") else 1)
+        try:
+            n = int(s)
+        except ValueError:
+            return None
+        return n * mult
+    if isinstance(v, bool):
+        return None
+    if not isinstance(v, (int, float)):
+        return None
+    n = int(v)
+    return n if n > 0 else None
+
+
+def _parse_capability_list(v: object) -> tuple[str, ...] | None:
+    """Parse a capability name list into a de-duplicated ordered tuple.
+
+    Order is preserved: ``sacrifice`` is a preference order and the ladder
+    walks it in the order written.
+    """
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple, set)):
+        return None
+    out: list[str] = []
+    for item in v:
+        if not isinstance(item, str):
+            return None
+        name = item.strip().lower()
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+#: Capabilities the ladder knows how to shed or require.  Keeping this
+#: explicit means a typo is a warning rather than a silently inert demand.
+KNOWN_CAPABILITIES = frozenset({"vision", "draft"})
+
+#: Default preference order when a category declares no ``sacrifice:``.
+#: Vision goes first because the demanding use cases (coding, long-context
+#: reasoning) rarely need it, while an MTP draft roughly doubles generation
+#: speed — giving that up is the expensive trade, so it is last.
+DEFAULT_SACRIFICE_ORDER: tuple[str, ...] = ("vision", "draft")
+
+
+@dataclass(frozen=True)
+class UsageCatalogue:
+    """The blessed ``usage:`` categories from ``profiles.yaml``.
+
+    ``by_name`` is the lookup the planner uses; ``order`` preserves
+    declaration order so demand reporting and tie-breaks are deterministic.
+    """
+
+    by_name: Mapping[str, UsageDemand] = field(default_factory=dict)
+    order: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.by_name)
+
+    def get(self, name: str) -> UsageDemand | None:
+        return self.by_name.get(name)
+
+    @classmethod
+    def from_cfg(cls, usage_cfg: dict | None) -> "UsageCatalogue":
+        """Parse ``usage:`` from profiles.yaml.
+
+        A malformed category is warned about and dropped rather than
+        failing the pack: a bad demand must not take the fleet offline.
+        """
+        by_name: dict[str, UsageDemand] = {}
+        order: list[str] = []
+        for name, spec in (usage_cfg or {}).items():
+            if not isinstance(name, str) or not name.strip():
+                logger.warning("usage: skipping unnamed category")
+                continue
+            name = name.strip()
+            if isinstance(spec, int) and not isinstance(spec, bool):
+                # Shorthand: `coding: 128k` == min_context only.
+                spec = {"min_context": spec}
+            if not isinstance(spec, dict):
+                logger.warning("usage: category %r is not a mapping; ignoring",
+                               name)
+                continue
+            kwargs: dict = {}
+            raw_ctx = spec.get("min_context")
+            if raw_ctx is not None:
+                ctx = _parse_ctx_size(raw_ctx)
+                if ctx is None:
+                    logger.warning("usage: %s.min_context=%r is not a positive "
+                                   "context; ignoring it", name, raw_ctx)
+                else:
+                    kwargs["min_context"] = ctx
+            raw_par = spec.get("min_parallel")
+            if raw_par is not None:
+                try:
+                    par = int(raw_par)
+                    assert par > 0
+                except (TypeError, ValueError, AssertionError):
+                    logger.warning("usage: %s.min_parallel=%r is not a "
+                                   "positive integer; ignoring it", name,
+                                   raw_par)
+                else:
+                    kwargs["min_parallel"] = par
+            for key in ("require", "sacrifice"):
+                if key not in spec:
+                    continue
+                listed = _parse_capability_list(spec[key])
+                if listed is None:
+                    logger.warning("usage: %s.%s=%r is not a list of "
+                                   "capability names; ignoring it", name, key,
+                                   spec[key])
+                    continue
+                unknown = set(listed) - KNOWN_CAPABILITIES
+                if unknown:
+                    logger.warning("usage: %s.%s names unknown capabilities "
+                                   "%s (known: %s); ignoring them", name, key,
+                                   sorted(unknown),
+                                   sorted(KNOWN_CAPABILITIES))
+                known = [c for c in listed if c in KNOWN_CAPABILITIES]
+                if key == "require":
+                    kwargs["require"] = frozenset(known)
+                else:
+                    # The declared order *is* the preference order.
+                    kwargs["sacrifice"] = tuple(known)
+            by_name[name] = UsageDemand(name=name, **kwargs)
+            order.append(name)
+        return cls(by_name=by_name, order=tuple(order))
+
+
+def resolve_usage(tags: object, catalogue: UsageCatalogue,
+                  logger_: logging.Logger | None = None) -> tuple[UsageDemand, ...]:
+    """Resolve a sidecar's ``usage:`` tags against the blessed catalogue.
+
+    An unblessed tag is warned about and ignored, so the effective demands
+    are always exactly the subset of ``profiles.yaml`` the operator wrote —
+    a sidecar can raise what it needs, never invent a category.
+
+    Accepts a bare string (one tag) or a list.  A sidecar with no tags gets
+    no demands, which leaves it governed by the global ``min_context``
+    floor as before.
+    """
+    log = logger_ or logger
+    if tags is None:
+        return ()
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple)):
+        log.warning("usage: %r is not a list of category names; ignoring",
+                    tags)
+        return ()
+    out: list[UsageDemand] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            log.warning("usage: %r is not a category name; ignoring", tag)
+            continue
+        name = tag.strip()
+        demand = catalogue.get(name)
+        if demand is None:
+            blessed = ", ".join(catalogue.order) or "(none declared)"
+            log.warning("usage: tag %r is not declared in profiles.yaml "
+                        "`usage:`; ignoring it (blessed: %s)", name, blessed)
+            continue
+        if demand not in out:
+            out.append(demand)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class Rung:
+    """One rung of the capability/context ladder: a set of shed capabilities.
+
+    ``shed`` is the set of capabilities deliberately given up at this rung
+    (empty = the model runs at full capability).  ``ctx``/``parallel`` are
+    what the budget affords *at this rung*, and ``demands`` the usage
+    categories that result.
+    """
+
+    shed: frozenset[str]
+    ctx: int
+    parallel: int
+    demands: tuple[UsageDemand, ...]
+
+    @property
+    def label(self) -> str:
+        """Human-readable rung name for logs (``full`` when nothing shed)."""
+        return "+".join(sorted(self.shed)) if self.shed else "full"
+
+
+def _shed_order(demands: tuple[UsageDemand, ...],
+                sheddable: frozenset[str]) -> tuple[str, ...]:
+    """Merge every demand's sacrifice preference into one shed order.
+
+    An entry serving several categories must satisfy all of them, so the
+    order is the *most protective* across them: a capability any demand
+    requires is never shed, and capabilities named by an earlier demand
+    sort earlier.  Anything still unranked follows
+    :data:`DEFAULT_SACRIFICE_ORDER` — vision before draft, since an MTP
+    draft roughly doubles generation speed and is the costly thing to
+    lose.
+    """
+    required: set[str] = set()
+    preference: list[str] = []
+    for d in demands:
+        required |= set(d.require)
+        for cap in d.sacrifice:
+            if cap not in preference:
+                preference.append(cap)
+    for cap in DEFAULT_SACRIFICE_ORDER:
+        if cap not in preference:
+            preference.append(cap)
+    order = [c for c in preference if c in sheddable and c not in required]
+    order += sorted(sheddable - required - set(order))
+    return tuple(order)
+
+
+def plan_ladder(afford: Callable[[frozenset[str]], tuple[int, int] | None],
+                demands: tuple[UsageDemand, ...],
+                sheddable: frozenset[str],
+                ) -> tuple[Rung, ...]:
+    """Enumerate the capability ladder and keep the rungs worth emitting.
+
+    *afford* maps a set of shed capabilities to the ``(ctx, parallel)`` the
+    budget allows at that rung, or ``None`` when that rung does not fit.
+    It is called for every subset rather than walked in a fixed order,
+    because ``sacrifice`` is a *preference*, not a cost order: shedding a
+    capability may buy no context at all, and a rung that gains nothing is
+    not worth an entry.
+
+    Rungs are kept when they satisfy at least one demand and actually gain
+    context over the next-more-capable rung — so a model already at its
+    design cap does not get a redundant text-only twin.
+    """
+    order = _shed_order(demands, sheddable)
+    required: set[str] = set()
+    for d in demands:
+        required |= set(d.require)
+
+    # Enumerate every subset (not a fixed-order walk: `sacrifice` is a
+    # preference, and shedding may buy nothing at all).
+    subsets: list[frozenset[str]] = [frozenset()]
+    for cap in order:
+        subsets += [s | {cap} for s in subsets]
+
+    # Keep the rungs worth an entry, ordered most-capable first (fewest
+    # capabilities shed, ties by preference order).
+    rungs: list[Rung] = []
+    for shed in sorted(subsets, key=lambda s: (len(s),
+                                               tuple(order.index(c)
+                                                     for c in sorted(s)))):
+        if shed & required:
+            continue  # a demand requires one of these; never shed it
+        got = afford(shed)
+        if got is None:
+            continue
+        ctx, parallel = got
+        met = tuple(d for d in demands if d.satisfied_by(ctx, parallel))
+        if demands and not met:
+            continue  # satisfies nothing: this rung is pointless
+        rungs.append(Rung(shed=shed, ctx=ctx, parallel=parallel, demands=met))
+
+    # A rung earns an entry only by buying context over *every* more capable
+    # rung; otherwise it is a strictly worse duplicate (same context, fewer
+    # capabilities).  This is what stops a model already at its design cap
+    # from getting a redundant text-only twin.
+    kept: list[Rung] = []
+    best_ctx = -1
+    for rung in rungs:
+        if rung.ctx > best_ctx:
+            kept.append(rung)
+            best_ctx = rung.ctx
+    return tuple(kept)
 
 
 def _parse_bool_knob(key: str, v: object) -> bool:

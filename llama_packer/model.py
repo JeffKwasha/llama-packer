@@ -568,6 +568,7 @@ class Model:
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel", "min_context",
+        "usage", "allow_mtp_shed",
         "image_min_tokens", "image_max_tokens",
         # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
         "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
@@ -1360,6 +1361,35 @@ class Model:
     @property
     def allow_profiles(self) -> list[str] | None:
         return self.frontmatter.get("allow_profiles")
+
+    @property
+    def usage_tags(self) -> list[str] | None:
+        """Usage categories this model is *used for* (``usage:`` in the sidecar).
+
+        A tag is only a claim.  The planner honours it when an entry can
+        actually meet that category's minimums, and ignores it otherwise —
+        so declaring a category never guarantees it.  Tags must be blessed
+        in profiles.yaml ``usage:``; an unblessed tag is warned about and
+        dropped (see :func:`llama_packer.writer.resolve_usage`).
+        """
+        v = self.frontmatter.get("usage")
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, (list, tuple)):
+            return None
+        return [str(x).strip() for x in v if isinstance(x, str) and x.strip()]
+
+    @property
+    def allow_mtp_shed(self) -> bool:
+        """Opt-in to shedding the MTP draft companion to buy context.
+
+        Speculative decoding roughly doubles generation speed, so dropping
+        the draft is a real cost and is never done implicitly — a sidecar
+        must ask for it.  A model with no draft companion is unaffected.
+        """
+        return bool(self.frontmatter.get("allow_mtp_shed", False))
 
     @property
     def modes(self) -> dict[str, dict] | None:

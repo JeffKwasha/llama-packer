@@ -30,6 +30,17 @@ class Profiles:
         self._cfg = cfg or {}
         self.defaults: dict = self._cfg.get("defaults", {}) or {}
         self.profile_list: dict = self._cfg.get("profiles", {}) or {}
+        self.usage_list: dict = self._cfg.get("usage", {}) or {}
+
+    @property
+    def usage_cfg(self) -> dict:
+        """Raw ``usage:`` section — the blessed usage categories.
+
+        Declared here (not per sidecar) so the vocabulary of minimum
+        contexts is written down exactly once.  See
+        :class:`llama_packer.writer.UsageCatalogue`.
+        """
+        return self.usage_list
 
     # ── fleet-wide defaults ──
 
