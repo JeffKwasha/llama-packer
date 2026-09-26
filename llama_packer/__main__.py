@@ -927,8 +927,13 @@ def main(argv: list[str] | None = None) -> None:
                 for sname in sets_cfg:
                     per_set[sname] = [
                         var for var in chat_var_names
-                        if sname in config.set_admission.get(
-                            id_stem.get(vars_[var], ""), ())]
+                        # A model with no admission entry is untagged and
+                        # belongs everywhere; only a tagged model is subject
+                        # to the filter.
+                        if (config.set_admission.get(
+                                id_stem.get(vars_[var], "") or var) is None
+                            or sname in config.set_admission[
+                                id_stem.get(vars_[var], "") or var])]
                 dropped = {s: sorted(set(chat_var_names) - set(v))
                            for s, v in per_set.items()
                            if set(v) != set(chat_var_names)}
