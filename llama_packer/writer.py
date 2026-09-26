@@ -1584,6 +1584,7 @@ class Planner:
         floor: int,
         pin_ctx: int | None,
         group_parallel: int,
+        min_parallel: int = 1,
         profile: dict | None = None,
     ) -> tuple[int, int]:
         """Solve (parallel, ctx) for one unpinned chat variant.
@@ -1595,6 +1596,11 @@ class Planner:
         loop breaks at the first unaffordable slot count (affordability
         falls as slots rise).  Falls back to today's outcome (group
         parallel, max affordable ctx) when the floor is unreachable.
+
+        *min_parallel* is a soft floor from a usage demand: candidates that
+        meet it win outright, but meeting the context floor takes precedence,
+        because the context is the property the entry id advertises and
+        concurrency is only a throughput preference.
         """
         power = self.knobs.parallel_power
         # vLLM's continuous batching makes a slot cost KV only (no per-slot
@@ -1618,7 +1624,7 @@ class Planner:
 
         fallback = (group_parallel,
                     min(maxctx(group_parallel), cap_ctx))
-        best: tuple[float, int, int] | None = None  # (score, p, ctx)
+        cands: list[tuple[int, int]] = []
         for p in range(1, pmax + 1):
             m = maxctx(p)
             if m < floor:
@@ -1630,6 +1636,16 @@ class Planner:
                 ctx = min(pin_ctx, cap_ctx)
             if ctx < floor:
                 continue
+            cands.append((p, ctx))
+        # A usage demand's min_parallel is preferred, but never at the cost
+        # of the context floor: the id advertises the context, and a client
+        # that cannot fit its prompt has nothing to gain from a spare slot.
+        if min_parallel > 1:
+            preferred = [c for c in cands if c[0] >= min_parallel]
+            if preferred:
+                cands = preferred
+        best: tuple[float, int, int] | None = None  # (score, p, ctx)
+        for p, ctx in cands:
             score = parallel_value(ctx, floor, p, power)
             if best is None or score > best[0]:
                 best = (score, p, ctx)
@@ -2088,10 +2104,26 @@ class Planner:
                     cap_ctx = context_length
                     if self.max_context is not None:
                         cap_ctx = min(cap_ctx, self.max_context)
+                    # A usage demand is a floor the value function may not
+                    # trade below: `coding`'s 128k is the reason the model is
+                    # tagged, so auto-parallel optimising *past* it is fine
+                    # and trading under it is not.
+                    demands = self.demands_for(model)
+                    min_parallel = max((d.min_parallel for d in demands),
+                                       default=1)
+                    if demands:
+                        want = max(d.min_context for d in demands)
+                        if want > floor:
+                            logger.info(
+                                "auto-parallel: %s usage demand raises the "
+                                "context floor %d -> %d",
+                                view.stem, floor, want)
+                            floor = want
                     parallel, ctx_size = self._auto_parallel(
                         view, cache_type=cache_type, spare_mb=spare_eff,
                         include_mmproj=include_mmproj, cap_ctx=cap_ctx,
                         floor=floor, pin_ctx=pin_ctx,
+                        min_parallel=min_parallel,
                         group_parallel=parallel, profile=group[0][1])
                 else:
                     ctx_size = self._bounded_ctx(

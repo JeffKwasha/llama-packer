@@ -271,6 +271,8 @@ def test_rung_label_is_readable():
 # ── per-set co-resident overhead ────────────────────────────────────────────
 
 from llama_packer.writer import (  # noqa: E402
+    MatrixKnobs,
+    Planner,
     set_coresident_vars,
     set_overhead_mb,
     _split_top,
@@ -369,3 +371,64 @@ def test_ctx_labels_below_the_mega_threshold_are_unique():
         lbl = ctx_label(ctx)
         assert lbl not in seen, (lbl, seen.get(lbl), ctx)
         seen[lbl] = ctx
+
+
+# ── auto-parallel respects demand floors ────────────────────────────────────
+
+
+def _auto_par(table, **kw):
+    """Drive _auto_parallel against a scripted (parallel -> ctx) table."""
+    from llama_packer.writer import MatrixKnobs as _MK
+    pl = Planner.__new__(Planner)
+    pl.knobs = _MK(auto_parallel_max=8, parallel_power=0.75)
+    pl.vram_total = 48 * 1024
+    pl.fit_bin = "unused"
+    pl.memory_margin = 0.04
+    pl.baseline_mb = 0
+    pl.chat_ctx = 262144
+    pl.profiles = _profiles_stub()
+    pl.max_context = None
+    pl._bounded_ctx = lambda *a, **k: table.get(k.get("parallel", 1), 32768)
+
+    class _V:
+        stem = "m"
+        backend = "llama-server"
+
+    return pl._auto_parallel(
+        _V(), cache_type="q8_0", spare_mb=0, include_mmproj=False,
+        cap_ctx=262144, pin_ctx=None, group_parallel=1, **kw)
+
+
+def test_min_parallel_is_honoured_when_a_candidate_qualifies():
+    # Every slot count clears the 64k chat floor, so a demand for 4 slots
+    # must not be quietly served with fewer.
+    table = {p: 262144 for p in range(1, 9)}
+    p, ctx = _auto_par(table, floor=65536, min_parallel=4)
+    assert p >= 4, (p, ctx)
+    assert ctx >= 65536
+
+
+def test_context_floor_outranks_min_parallel():
+    # Two slots would drop under the demand's 64k floor, so the single wide
+    # window is served instead. Concurrency is a preference; the context is
+    # what the entry id advertises, and a client that cannot fit its prompt
+    # gains nothing from a spare slot.
+    table = {1: 262144, 2: 40000}
+    p, ctx = _auto_par(table, floor=65536, min_parallel=2)
+    assert (p, ctx) == (1, 262144), (p, ctx)
+
+
+def test_demand_never_trades_below_its_context_floor():
+    # The budget only reaches ~96k however few slots are used, so a 128k
+    # coding demand is unreachable: no candidate qualifies and the solver
+    # falls back rather than inventing a context. Dropping the model from
+    # the sets it cannot serve is the admission pass's job, not this one's.
+    table = {p: 98304 for p in range(1, 9)}
+    p, ctx = _auto_par(table, floor=131072, min_parallel=1)
+    assert (p, ctx) == (1, 98304), (p, ctx)
+
+
+def _profiles_stub(**kw):
+    from types import SimpleNamespace
+    return SimpleNamespace(default_cache_type=kw.get("default_cache_type", "q8_0"),
+                           default_parallel=1)
