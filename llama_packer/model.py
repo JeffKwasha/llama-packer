@@ -1698,6 +1698,19 @@ class Model:
         return True, n_max
 
     @property
+    def mtp_baked_in(self) -> bool:
+        """True when speculative decoding uses nextn layers in the main GGUF.
+
+        The serve-correction table's ``mtp`` dimension means exactly this
+        shape.  A separate draft companion is costed from file size by
+        :meth:`vram.VramBudget.effective_static` at plan time, so a
+        companion witness's delta must never be filed under (or looked up
+        as) the baked-in row.  One predicate for both sides: the probe
+        that writes the row and the packer that reads it.
+        """
+        return self.mtp is None and self._mtp_info()[0]
+
+    @property
     def mtp_draft_p_min(self) -> float:
         """Min draft-token acceptance probability (`mtp_draft_p_min:`).
 

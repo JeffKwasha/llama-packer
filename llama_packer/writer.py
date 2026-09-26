@@ -1201,6 +1201,7 @@ class Planner:
             knobs=self.knobs, memory_margin=self.memory_margin,
             llama_args=self.llama_args, synthetic=synthetic,
             fixed_categories=self.fixed_categories,
+            coload_sets=self.matrix_cfg.get("sets"),
         )
         self.synthetic_quads = synthetic
         # Flag the synthesized models so plan() serves them at their
@@ -1641,6 +1642,24 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
     return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)
 
 
+def _sets_reference_coloads(sets_cfg: dict | None) -> bool:
+    """True when any routing set can actually co-locate a co-load with chat.
+
+    The opportunistic co-load pass reserves each candidate's VRAM against
+    *every* chat solve, on the premise that llama-swap will hold it
+    alongside the chat model.  That only happens if some set expression
+    references the ``__COLOAD_VARS__`` placeholder — the sole way a
+    co-load's var reaches a set.  A co-load with no set referencing it is
+    evicted independently, so its reservation buys nothing and only
+    shrinks context (observed 2026-09-26: two unreferenced ASR co-loads
+    charged 4725 MB and collapsed a 27B's context from 188416 to 32768).
+    Such models belong in ``__CHAT_VARS__`` instead — alternatives that
+    evict chat rather than co-residents that shrink it.
+    """
+    return any("__COLOAD_VARS__" in str(expr)
+               for expr in (sets_cfg or {}).values())
+
+
 def _solve_matrix_context(
     chat_models: list[Model],
     embed_model: Model,
@@ -1656,6 +1675,7 @@ def _solve_matrix_context(
     llama_args: str = "",
     synthetic: dict[str, tuple[int, float, float, int]] | None = None,
     fixed_categories: list[tuple[str, Model]] | None = None,
+    coload_sets: dict | None = None,
 ) -> MatrixSolve | None:
     """Solve the shared VRAM budget for chat context plus co-loads.
 
@@ -1675,8 +1695,12 @@ def _solve_matrix_context(
     3. *Opportunistic co-loads* (§2): enabled ``s2t``/``image`` models not on
        the GPU pool's excluded list, smallest fixed overhead first, are
        included while the chat solve stays at or above the floor
-        (``tools_min_ctx`` when a tools chat model can keep it, else
-        ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+       (``tools_min_ctx`` when a tools chat model can keep it, else
+       ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+       Skipped entirely when no routing set references
+       ``__COLOAD_VARS__`` (*coload_sets*): a co-load nothing can
+       co-locate is never resident with chat, so reserving for it would
+       only cost context.
 
     Unestimable participants (every estimate source failed) stay in the
     solve with a zero-cost placeholder — charged nothing extra — served at
@@ -1888,26 +1912,39 @@ def _solve_matrix_context(
 
         # 3b. Opportunistic co-loads: s2t/image models that are *not* already
         #     a declared category, smallest fixed overhead first.
-        overheads: list[tuple[int, str, Model]] = []
-        for m in chat_models:
-            if m.role not in ("s2t", "image") or m.stem in declared_stems:
-                continue
-            oh = _coload_overhead(m, fit_bin, profiles, knobs,
-                                  llama_args)
-            if oh is None:
-                logger.warning("matrix: co-load %s skipped: cannot size it",
-                               m.stem)
-                continue
-            overheads.append((oh, m.stem, m))
-        for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
-            ctx = _reserve(oh, stem, declared=False)
-            if ctx is None:
-                logger.warning(
-                    "matrix: co-load %s skipped: would drop chat ctx below "
-                    "the floor %d", stem, floor)
-            else:
-                logger.info("matrix: co-load %s included (%d MB, chat_ctx=%d)",
-                            stem, oh, ctx)
+        #     Gated on some set referencing __COLOAD_VARS__: reserving a
+        #     co-load nothing can co-locate charges every chat solve for
+        #     residency that never happens.  Models too big to live beside
+        #     chat belong in __CHAT_VARS__ (they evict chat instead).
+        if not _sets_reference_coloads(coload_sets):
+            logger.info(
+                "matrix: no routing set references __COLOAD_VARS__; "
+                "skipping opportunistic co-loads (they cannot be "
+                "co-located with chat, so reserving their VRAM would only "
+                "shrink context — put them in __CHAT_VARS__ to have them "
+                "evict chat instead)")
+        else:
+            overheads: list[tuple[int, str, Model]] = []
+            for m in chat_models:
+                if m.role not in ("s2t", "image") or m.stem in declared_stems:
+                    continue
+                oh = _coload_overhead(m, fit_bin, profiles, knobs,
+                                      llama_args)
+                if oh is None:
+                    logger.warning("matrix: co-load %s skipped: cannot size it",
+                                   m.stem)
+                    continue
+                overheads.append((oh, m.stem, m))
+            for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
+                ctx = _reserve(oh, stem, declared=False)
+                if ctx is None:
+                    logger.warning(
+                        "matrix: co-load %s skipped: would drop chat ctx below "
+                        "the floor %d", stem, floor)
+                else:
+                    logger.info(
+                        "matrix: co-load %s included (%d MB, chat_ctx=%d)",
+                        stem, oh, ctx)
     return MatrixSolve(
         chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
         coloads=tuple(coloads), squeeze=squeeze,

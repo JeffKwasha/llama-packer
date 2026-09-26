@@ -873,8 +873,9 @@ class VramBudget:
         # The correction's mtp dimension means "a draft is baked into the
         # main GGUF" — that is what the witness measured and what delta_d
         # prices.  A separate draft companion does not qualify (its cost
-        # is folded in by effective_static instead).
-        mtp_on = self.model.mtp is None and self.model._mtp_info()[0]
+        # is folded in by effective_static instead).  Model.mtp_baked_in is
+        # the same predicate memory_probe files the row under.
+        mtp_on = self.model.mtp_baked_in
         corr = get_serve_correction(self.model.arch or "unknown", cache_type,
                                     mtp_on, shape)
         if corr is not None:

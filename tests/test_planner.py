@@ -10,7 +10,7 @@ import pytest
 
 from llama_packer.consts import _RESERVE_VIDEO
 from llama_packer.profiles import Profiles
-from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context
+from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context, _sets_reference_coloads
 
 TVARS = {"llama_bin": "/opt/llama-server"}
 
@@ -610,6 +610,54 @@ def _fake_vram(m, params):
         compute_mib=compute, source="fit-params")
 
 
+# The co-load pass is gated on some set referencing __COLOAD_VARS__ — the
+# only way a co-load's var reaches a set.  Tests of the pass itself opt in
+# with this; the gate has its own test below.
+COLOAD_SETS = {"talk": "__CHAT_VARS__ & tts & __COLOAD_VARS__"}
+
+
+def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
+    # A co-load whose var no set can reach is never resident with chat, so
+    # reserving its VRAM against every chat solve buys nothing and only
+    # shrinks context.  Regression (2026-09-26): two unreferenced ASR
+    # co-loads charged 4725 MB and collapsed a 27B from 188416 to 32768.
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings", context_length=8192)
+    rerank = make("r", role="rerank", context_length=8192)
+    s2t = make("s2t", role="s2t", vram_mb=640, context_length=8192)
+    _fake_vram(chat, (8000, 0.4, 500))
+    for m in (embed, rerank):
+        _fake_vram(m, (500, 0.1, 100))
+    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0.0, 0)
+    s2t.vram.fit_params_static = lambda *a, **k: None
+    fleet = [chat, embed, rerank, s2t]
+    knobs = MatrixKnobs(min_chat_ctx=8192)
+
+    # The operator's sets name only chat + declared categories, so nothing
+    # can co-locate the co-load: it must not be reserved.
+    without = _solve_matrix_context(
+        fleet, embed, rerank, fit_bin="unused", vram_total=48 * 1024,
+        spare=None, profiles=profiles, knobs=knobs,
+        coload_sets={"rag": "__CHAT_VARS__ & emb & rnk"})
+    assert without is not None
+    assert without.coloads == ()
+
+    # Same fleet, one set that can actually co-locate the co-load: the
+    # candidate is admitted and its VRAM is charged.
+    with_ref = _solve_matrix_context(
+        fleet, embed, rerank, fit_bin="unused", vram_total=48 * 1024,
+        spare=None, profiles=profiles, knobs=knobs, coload_sets=COLOAD_SETS)
+    assert with_ref is not None
+    assert with_ref.coloads == (("s2t", 640),)
+
+
+def test_sets_reference_coloads():
+    assert _sets_reference_coloads(COLOAD_SETS) is True
+    assert _sets_reference_coloads({"rag": "__CHAT_VARS__ & emb & rnk"}) is False
+    assert _sets_reference_coloads({}) is False
+    assert _sets_reference_coloads(None) is False
+
+
 def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
@@ -630,7 +678,9 @@ def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
     result = _solve_matrix_context(
         [chat, embed, rerank, s2t, img], embed, rerank,
         fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
+        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     # available = 49152-2048 = 47104; emb+rnk capped to 4096 = 2*1009 = 2018
     # baseline chat budget = 45086-8500 = 36586 -> capped 32768
@@ -666,7 +716,9 @@ def test_solve_matrix_reads_block_tokens_from_on_view(
     monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
     result = _solve_matrix_context(
         [m, e, r], e, r, fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
+        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     floors = {mod.stem: floor for mod, _, _, _, _, _, floor
               in captured["chat_models"]}
@@ -688,7 +740,9 @@ def test_solve_matrix_floor_blocks_all_coloads(profiles):
     result = _solve_matrix_context(
         [chat, embed, rerank, s2t], embed, rerank,
         fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=24576))
+        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=24576),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     # chat_budget = 47104-2018-8500 = 36586 -> factor 1.0 -> round 32768,
     # capped 32768 >= floor -> s2t fits.
@@ -713,7 +767,9 @@ def test_solve_matrix_tools_floor_blocks_coload(profiles):
     result = _solve_matrix_context(
         [chat, embed, rerank, img], embed, rerank,
         fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(tools_min_ctx=20000))
+        profiles=profiles, knobs=MatrixKnobs(tools_min_ctx=20000),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     assert result.chat_ctx == 32768
     assert result.coloads == ()
@@ -732,7 +788,9 @@ def test_solve_matrix_squeeze_adopted(profiles):
         [chat, embed, rerank], embed, rerank,
         fit_bin="unused", vram_total=64 * 1024, spare=None,
         profiles=profiles,
-        knobs=MatrixKnobs(embed_context=32768, rerank_context=32768))
+        knobs=MatrixKnobs(embed_context=32768, rerank_context=32768),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     # baseline: rnk+emb at 32768 eat 33968; chat -> 22528. squeezed to 20480:
     # chat -> 32768. gain 10240 >= 4096 -> adopted.
@@ -752,7 +810,9 @@ def test_coload_on_cpu_costs_zero(profiles):
     result = _solve_matrix_context(
         [chat, embed, rerank, s2t], embed, rerank,
         fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
+        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     assert result.coloads == (("s2t", 0),)
 
@@ -794,7 +854,8 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
                       vram_total=64 * 1024,
                       matrix_cfg={"min_chat_ctx": 8192,
                                   "embed_context": 32768,
-                                  "rerank_context": 32768},
+                                  "rerank_context": 32768,
+                                  "sets": COLOAD_SETS},
                       embed_model=embed, rerank_model=rerank)
     plan = planner.plan()
 
@@ -842,7 +903,9 @@ def test_coload_estimate_gets_headroom(profiles):
     result = _solve_matrix_context(
         [chat, embed, rerank, s2t], embed, rerank,
         fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192))
+        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
+        coload_sets=COLOAD_SETS,
+    )
     assert result is not None
     # overhead = (1 + 100) * 1.25 = 126
     assert result.coloads == (("s2t", 126),)
@@ -954,5 +1017,7 @@ def test_solve_matrix_aborts_when_nothing_measurable(profiles):
     result = _solve_matrix_context(
         [chat], embed, embed,
         fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles)
+        profiles=profiles,
+        coload_sets=COLOAD_SETS,
+    )
     assert result is None

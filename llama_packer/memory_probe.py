@@ -229,9 +229,21 @@ def affine_report(
                 "rep_stem": model.stem,
                 "cache_type": cache_type,
                 "shape": (llama_args or "").strip()}
-        mtp_on, _ = model._mtp_info()
-        save_serve_correction(model.arch or "unknown", cache_type, mtp_on,
-                              corr)
+        # The correction table's mtp dimension is the *baked-in* draft shape
+        # only (Model.mtp_baked_in — the same predicate the packer keys its
+        # lookup on).  A witness that ran with --spec-draft-model carries the
+        # companion's own weights/KV in its delta, and the reader adds those
+        # separately via effective_static, so filing it would double-count
+        # here and over-reserve every baked-in model of the same arch.
+        if model.mtp_baked_in:
+            save_serve_correction(model.arch or "unknown", cache_type,
+                                  True, corr)
+        else:
+            logger.info("%s: draft companion %s measured but not filed as a "
+                        "serve correction — the table's mtp dimension is "
+                        "baked-in drafts only; arch %r stays uncorrected "
+                        "for this shape",
+                        model.stem, model.mtp.stem, model.arch or "unknown")
     residuals: dict[str, float] = {}
     max_abs = 0.0
     max_total_abs = 0.0

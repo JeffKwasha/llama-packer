@@ -203,6 +203,15 @@ reports the max residual against the law (FAIL above 0.5%) — the fast
 sanity check when a new architecture family appears. The underlying helpers
 (`llama_packer.memory_probe`) are importable by other tools.
 
+A passing probe also files a per-arch serve correction (serve truth minus the
+fit-params estimate) in the machine-local `serve-corrections.yaml`, keyed
+`arch|cache_type|mtp`. **The `mtp` dimension is the baked-in-draft shape only**
+(`Model.mtp_baked_in`): a model with a `speculative:` companion is costed from
+file size by `effective_static` instead, so a companion witness's delta — which
+carries the companion's own weights and KV — would double-count there and
+over-reserve every baked-in model of the same arch. Such a probe reports the
+measurement but files no row, and the arch stays uncorrected for that shape.
+
 ### Companion (mmproj / MTP) VRAM accounting
 
 Companion GGUFs cannot be measured by `llama-fit-params` — mmproj files fail to load as standalone models, and MTP draft heads abort on a missing `ctx_other`. Their VRAM is therefore folded into the main model's budget via a combined "effective static" pass (`llama_packer/vram.py:effective_static`):
@@ -348,6 +357,8 @@ After the squeeze pass, enabled `s2t` and `image` models that are **not already 
 - Shared process overhead is counted once per process, not per model — a multi-model entry (e.g. a speech server hosting ASR + VAD + diarization) is budgeted as Σ(weights + per-model activations) + one shared constant; pin the entry with `vram_mb` to encode the sum directly.
 
 Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision) in addition to one var per declared category, and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
+
+**The pass is gated on `__COLOAD_VARS__` being referenced.** Reserving a co-load's VRAM against every chat solve is only sound if llama-swap can actually hold it beside the chat model, and the placeholder is the only way a co-load's var reaches a set. With no set referencing it, the co-load is evicted independently, so the reservation buys nothing and only costs context — so the whole opportunistic pass is skipped with an INFO line. Models too large to live beside chat belong in `__CHAT_VARS__`: they then evict chat (an alternative in the same bucket) rather than shrinking it. Declared `categories:` are exempt — naming one is explicit operator intent, and a category's own name is what a set references.
 
 ### tools demotion
 
