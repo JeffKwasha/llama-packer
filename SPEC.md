@@ -277,6 +277,16 @@ Chat models target a minimum useful context (`_MIN_AGENTIC_CTX`, default 131072 
 
 All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every `<id>-text` entry joins the same matrix co-loading sets as its parent `<id>` entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
 
+**A text-only rung must earn its entry.** The text variant is emitted only when `ctx_without > ctx_with` — that is, only when shedding the projection actually buys context. A model already at its design cap (or one whose binding constraint is something else) reclaims nothing, and a text twin at identical context is a strictly worse duplicate of the main entry. Ten models shipped one before this rule (2026-09-26): `gemma4-12b`, `gemma4-26b-cerebellum`, `glimmer-30b`, `lfm25-vl-16b`, `minicpm-v-4_6-thinking`, `ornith-15-9b-ad`, `qwen3-vl-8b`, `qwen35-4b-uncensored`, `qwen36-35b-nail`, `huihui-qwen3-vl-4b`.
+
+### Entry ids carry the served context
+
+Every emitted id ends in the context it serves, at most four characters: `qwen38-27b-dirk-136k`, `voyage-4-nano-4k`. A client choosing from `/v1/models` has only the id to go on, and the context is the property that decides whether the model is usable. `ctx_label()` uses `ctx // 1024` below 1000k and whole megas above it, so `262144 → 256k` and `1048762 → 1M`. Below the threshold the label is exact and therefore collision-free; above it the rounding is under 0.1% and `metadata.ctx_size` carries the exact value.
+
+The `-text` suffix survives as a *marker*, not a discriminator: per-entry `capabilities` already distinguishes a text-only serving from a vision one, which is how a client should tell them apart. Ids are the client-visible contract, so this was a clean break — no deprecation shim and no alias.
+
+Because ids carry the context, anything that *references* an entry must resolve through `entry_ids_by_stem` (stem → emitted ids) rather than `Model.template_id`, which stopped naming an entry. A matrix var pointing at a `template_id` makes llama-swap reject the whole config — and because `-watch-config` degrades to the previous config rather than failing, that shows up as *stale ids* rather than an error. Validate with `llama-swap -config <file> -validate`.
+
 ### VRAM gating and reservation notes
 
 When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` counterparts) shrinks the budget, the planner degrades visibly instead of emitting entries that OOM at load time:
@@ -288,6 +298,27 @@ When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` 
 - **Degenerate refusal.** If `vram_total − reserve − spare ≤ 0`, the run fatals *before* any VRAM work (exit 1) and does **not** overwrite an existing `config.yaml`. Same guard applies when the reservation leaves zero model entries.
 
 `--idle-unload SECONDS` emits a top-level `globalTTL: SECONDS` (llama-swap: unload any model after that many seconds of inactivity; `0` = never, the llama-swap default; llama-packer omits the key when the flag is absent). Intended for co-residency with ComfyUI/games that need VRAM on short notice without re-packing.
+
+### Demand-driven planning (`usage:`)
+
+The global `min_context` is one floor for the whole fleet, which cannot say "coding wants 128k, Q&A is fine with 32k". `profiles.yaml` gains a `usage:` section — the single **blessed vocabulary** of what models are used for:
+
+```yaml
+usage:
+  coding: {min_context: 128k, min_parallel: 1, sacrifice: [vision]}
+  chat:   {min_context: 64k,  min_parallel: 2, sacrifice: [draft, vision]}
+  qa:     {min_context: 32k,  min_parallel: 2, require: [vision]}
+```
+
+A sidecar tags itself with `usage: [coding, chat]`. **A tag is a claim, not a guarantee**: the planner honours it only where an entry can actually meet the minimums. A tag not declared in `profiles.yaml` is warned about and ignored, so the demands in force are exactly the ones the operator wrote — a sidecar can raise what it needs but never invent a category. Untagged models are governed by the global `min_context` exactly as before, which is what makes the migration incremental. `min_context:` in a sidecar still parses and still means one implicit category.
+
+Three things follow from this.
+
+**Set membership is derived, not declared.** llama-swap's matrix router collects every set containing the requested model and activates the *cheapest* (ties by definition order), and only the requested model is actually started — set membership is permission to co-reside, not a promise to load. So an entry must survive the **heaviest set it belongs to**, which is a per-set number the single fleet-wide ledger charge could not express. `set_overhead_mb()` prices each set from its expression: an OR branch is an alternative so only the priciest is charged (`& (emb | rnk2)` costs rnk2's 5766 MB, not both), while `__COLOAD_VARS__` is a genuine sum because those models co-load with each other. A model is admitted to a set when it can still meet one of its demands at that set's overhead, and `__CHAT_VARS__` expands **per set** to the models that qualify. A 27B that meets `coding` beside emb+rnk but not beside a 5.7 GB reranker joins `rag` and is dropped from `ragz`; it is not forced to size for the heavier of the two. Any model excluded from a set is logged by name.
+
+**The capability ladder is a preference, not a cost order.** `plan_ladder()` enumerates subsets of the shed-able capabilities (`vision`, `draft`) and keeps a rung only when it satisfies a demand **and** buys context over every more capable rung. Shedding can buy nothing — a model at its design cap has nothing to reclaim — which is why the ladder enumerates rather than walking `sacrifice` in order. `require` removes a rung outright; an entry serving several categories takes the *most protective* order across them. The default order is vision before draft, because coding rarely needs vision while an MTP draft roughly doubles generation speed; shedding a draft is opt-in per model (`allow_mtp_shed:`). `min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the id advertises.
+
+**Co-loads must be groupable to be reserved.** A co-load's VRAM was charged against every chat solve on the premise that llama-swap would hold it beside chat. That premise needs the candidate's var to reach a routing set, and `__COLOAD_VARS__` is the only way. With no set referencing it, the co-load is evicted independently, so the reservation bought nothing and only cost context; the whole opportunistic pass is now skipped with an INFO line. Declared `categories:` are exempt — naming one is explicit operator intent, and a category is referenced by its own name. Models too large to live beside chat belong in `__CHAT_VARS__`, where they evict chat rather than shrinking it.
 
 ## Matrix Context Solving
 
