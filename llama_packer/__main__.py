@@ -432,18 +432,25 @@ def _health_check_timeout(models, args) -> int:
 
 
 def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
-                        coload_vars: list[str], logger) -> dict:
+                        coload_vars: list[str], logger,
+                        chat_expr_by_set: dict[str, str] | None = None,
+                        ) -> dict:
     """Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs.
 
     Placeholders expand to parenthesized OR-lists of VAR NAMES (not model
     IDs — the llama-swap sets DSL references var names, which map to model
     IDs via ``vars``).  With no co-loads included, a ``__COLOAD_VARS__`` term
     is dropped from the expression entirely.
+
+    *chat_expr_by_set* overrides the chat OR-list per set, so a model that
+    cannot hold its context alongside a set's residents is left out of that
+    set alone instead of every set.
     """
-    coload_expr = "(" + " | ".join(coload_vars) + ")" if coload_vars else None
+    coload_expr = ("(" + " | ".join(coload_vars) + ")") if coload_vars else None
     expanded: dict[str, str] = {}
     for sname, sexpr in sets_cfg.items():
-        expr = sexpr.replace("__CHAT_VARS__", chat_expr)
+        this_chat = (chat_expr_by_set or {}).get(sname, chat_expr)
+        expr = sexpr.replace("__CHAT_VARS__", this_chat)
         if coload_expr:
             expr = expr.replace("__COLOAD_VARS__", coload_expr)
         else:
@@ -909,7 +916,37 @@ def main(argv: list[str] | None = None) -> None:
             # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
             chat_expr = "(" + " | ".join(chat_var_names) + ")"
             sets_cfg = matrix_cfg.get("sets") or {}
-            sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
+            # Per-set chat lists: a model that cannot meet its usage demands
+            # beside a set's residents is dropped from that set only.  An
+            # untagged model is in every set, exactly as before.
+            id_stem = {eid: stem
+                       for stem, ids in config.entry_ids_by_stem.items()
+                       for eid in ids}
+            per_set: dict[str, list[str]] = {}
+            if config.set_admission:
+                for sname in sets_cfg:
+                    per_set[sname] = [
+                        var for var in chat_var_names
+                        if sname in config.set_admission.get(
+                            id_stem.get(vars_[var], ""), ())]
+                dropped = {s: sorted(set(chat_var_names) - set(v))
+                           for s, v in per_set.items()
+                           if set(v) != set(chat_var_names)}
+                for sname, gone in sorted(dropped.items()):
+                    if gone:
+                        stems = sorted({id_stem.get(vars_[g], g) or g
+                                        for g in gone})
+                        logger.info(
+                            "usage: set %r excludes %d chat model(s) that "
+                            "cannot meet their demands beside it: %s",
+                            sname, len(stems),
+                            ", ".join(st[:24] for st in stems[:8])
+                            + (" ..." if len(stems) > 8 else ""))
+            sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars,
+                                       logger,
+                                       chat_expr_by_set={
+                                           s: "(" + " | ".join(v) + ")"
+                                           for s, v in per_set.items() if v})
             if coload_vars:
                 joined = " ".join(str(s) for s in sets_cfg.values())
                 if "__COLOAD_VARS__" not in joined:

@@ -566,6 +566,12 @@ def _build_entry(
 # always ``<id>-text`` (see :func:`emit_config`).
 TEXT_SUFFIX = "-text"
 
+#: Reserved key under which :meth:`Planner.plan` carries the per-set
+#: admission map for the emitter.  ``emit_config`` is a pure function of the
+#: plan dict, so planner state that the emitter needs rides along under a
+#: key no model stem can collide with (NUL is not valid in a stem).
+SET_ADMISSION_KEY = "\x00set_admission"
+
 
 @dataclass(frozen=True)
 class MatrixKnobs:
@@ -1967,7 +1973,8 @@ class Planner:
         # figure.  Needs the matrix result, so it runs after the solve.
         self._price_sets()
 
-        plan: dict[str, list[Variant]] = {}
+        # values are Variant lists, except the reserved admission key
+        plan: dict = {}
         for model in self.models:
             include_mmproj = not drop_mmproj.get(model.stem, False)
             view = model.view_for(include_mmproj)
@@ -2255,6 +2262,10 @@ class Planner:
             plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
+        # The admission map is planner state, not a variant, but the emitter
+        # is a pure function of `plan` — so it rides along under a key no
+        # stem can collide with, and is popped by the caller.
+        plan[SET_ADMISSION_KEY] = dict(self.set_admission)
         return plan
 
 
@@ -2618,7 +2629,7 @@ def _coload_overhead(
 # ── Emission ──────────────────────────────────────────────────────────────
 
 
-def emit_config(models: list[Model], plan: dict[str, list[Variant]],
+def emit_config(models: list[Model], plan: dict,
                 profiles: Profiles, template_vars: dict) -> EmittedConfig:
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
@@ -2692,8 +2703,10 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
             entries[vision_id] = vision_entry
             owner[vision_id] = model.stem
 
+    set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
-                           coload_stems=sorted(coload_stems))
+                           coload_stems=sorted(coload_stems),
+                           set_admission=set_admission)
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -2718,10 +2731,15 @@ class EmittedConfig(dict):
     """
 
     def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
-                 coload_stems: list[str] | None = None, **kwargs):
+                 coload_stems: list[str] | None = None,
+                 set_admission: dict[str, set[str]] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
         self.coload_stems: list[str] = coload_stems or []
+        # stem -> the chat sets that model was admitted to.  Only populated
+        # for models carrying a usage tag; an untagged model appears in every
+        # set, which is the pre-existing behaviour.
+        self.set_admission: dict[str, set[str]] = set_admission or {}
 
     def plain(self) -> dict:
         return dict(self)
