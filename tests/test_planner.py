@@ -1031,3 +1031,22 @@ def test_solve_matrix_aborts_when_nothing_measurable(profiles):
         coload_sets=COLOAD_SETS,
     )
     assert result is None
+
+
+def test_planner_skips_text_variant_that_gains_nothing(make_model, profiles,
+                                                       tmp_path):
+    # A model already at its design cap cannot reclaim context by shedding
+    # the projection, so the text rung earns no entry. Regression: ten
+    # models shipped a -text twin at identical context (2026-09-26).
+    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
+                                  "capabilities": ["image"]},
+                   context_length=262144)
+    # Same context with and without the projection: nothing to gain.
+    _scripted_ctx(m, {True: 200000, False: 200000})
+
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
+                      min_context=131072)
+    variants = planner.plan()["vis"]
+    assert len(variants) == 1
+    assert variants[0].include_mmproj is True
