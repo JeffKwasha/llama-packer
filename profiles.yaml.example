@@ -8,6 +8,45 @@ defaults:
   min_p: 0.01
   pres_pen: 0.0
 
+# ── Usage categories (optional) ───────────────────────
+# The blessed vocabulary of what models are *used for*. A sidecar tags itself
+# with these names (`usage: [coding, qa]`) and the planner honours a tag only
+# when an entry can actually meet its minimums — a tag is a claim, never a
+# guarantee. An unblessed tag is warned about and ignored, so the demands in
+# force are exactly the ones written here.
+#
+# min_context / min_parallel are floors, not requests: one entry at
+# ctx >= 128k and parallel >= 2 satisfies all three categories below, so
+# nothing forces three entries per model.
+#
+# require:   capabilities that survive every rung of the capability/context
+#            ladder. A model that cannot keep one is dropped from a set
+#            rather than degraded.
+# sacrifice: what to give up first when the budget is short. This is a
+#            *preference*, not a cost order — shedding can buy no context at
+#            all (a model already at its design cap has nothing to reclaim),
+#            so the ladder enumerates rungs rather than walking them.
+#            Unlisted capabilities follow the default order: vision before
+#            draft, because an MTP draft roughly doubles generation speed.
+#            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
+#
+# Demands are applied per set: a model that meets `coding` beside emb+rnk
+# but not beside a 5.7 GB reranker joins `rag` and is dropped from `ragz`.
+# Only `role: chat` models are considered.
+usage:
+  coding:
+    min_context: 128k
+    min_parallel: 1
+    sacrifice: [vision]
+  chat:
+    min_context: 64k
+    min_parallel: 2
+    sacrifice: [draft, vision]
+  qa:
+    min_context: 32k
+    min_parallel: 2
+    require: [vision]
+
 # Model roots (CLI --models-dir overrides this). Role is selected by the
 # first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →
 # embeddings, rerank/ → rerank; other subdirs (img/, misc/, tmp/…) are
