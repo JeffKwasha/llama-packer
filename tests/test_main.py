@@ -120,8 +120,8 @@ def test_build_matrix_vars_includes_text_variants():
     # was auto-dropped (its main entry IS beta-text), ghost never emitted.
     entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"], "beta": ["beta-text"]}
     vars_, coload_vars = _build_matrix_vars(
-        models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), [],
-        entry_ids_by_stem, logging.getLogger("test"))
+        models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), {},
+        [], entry_ids_by_stem, logging.getLogger("test"))
     assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
                      "emb": "emb-1", "rnk": "rnk-1"}
     assert coload_vars == []
@@ -137,7 +137,7 @@ def test_build_matrix_vars_includes_coloads():
     models = [m("chat", "alpha"), m("s2t", "parakeet"), m("image", "flux"),
               m("image", "flux2")]
     vars_, coload_vars = _build_matrix_vars(
-        models, None, None, ["parakeet", "flux", "flux2"],
+        models, None, None, {}, ["parakeet", "flux", "flux2"],
         {"alpha": ["alpha"]}, logging.getLogger("test"))
     assert vars_["c1"] == "alpha"
     assert vars_["s2t"] == "parakeet"
@@ -190,8 +190,8 @@ def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
               _stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk = _detect_matrix({}, models, args,
-                                       logging.getLogger("test"))
+        cfg, emb, rnk, cats, fixed = _detect_matrix({}, models, args,
+                                                    logging.getLogger("test"))
     assert cfg is None and emb is None and rnk is None
     assert "matrix: disabled" in caplog.text
     assert "emb1" in caplog.text and "rnk1" in caplog.text
@@ -206,8 +206,8 @@ def test_detect_matrix_silent_without_rag_models(caplog):
     models = [_stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, _, _ = _detect_matrix({}, models, args,
-                                   logging.getLogger("test"))
+        cfg, _, _, cats, fixed = _detect_matrix({}, models, args,
+                                                logging.getLogger("test"))
     assert cfg is None
     assert "matrix: disabled" not in caplog.text
 
@@ -223,8 +223,93 @@ def test_detect_matrix_selects_when_section_present(caplog):
     args = SimpleNamespace(embed=None, rerank=None)
     matrix_cfg = {"sets": {"rag": "__CHAT_VARS__ & emb & rnk"}}
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk = _detect_matrix({"matrix": matrix_cfg}, models, args,
-                                       logging.getLogger("test"))
+        cfg, emb, rnk, cats, fixed = _detect_matrix({"matrix": matrix_cfg},
+                                                    models, args,
+                                                    logging.getLogger("test"))
     assert cfg is matrix_cfg
     assert emb.stem == "emb1" and rnk.stem == "rnk1"
+    assert cats == {"emb": emb, "rnk": rnk}
+    assert fixed == []
     assert "matrix: disabled" not in caplog.text
+
+
+def test_detect_matrix_custom_categories(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
+              _stub_model("tts1", "t2s"), _stub_model("stt1", "s2t"),
+              _stub_model("c1", "chat")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    matrix_cfg = {
+        "categories": {"emb": {"role": "embeddings"},
+                       "rnk": {"role": "rerank"},
+                       "tts": {"role": "t2s"},
+                       "stt": {"role": "s2t"}},
+        "evict_costs": {"emb": 100, "tts": 50},
+        "sets": {"voice": "__CHAT_VARS__ & (tts | stt)"},
+    }
+    with caplog.at_level(logging.WARNING):
+        cfg, emb, rnk, cats, fixed = _detect_matrix(
+            {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
+    assert cfg is matrix_cfg
+    assert set(cats) == {"emb", "rnk", "tts", "stt"}
+    assert cats["tts"].stem == "tts1" and cats["stt"].stem == "stt1"
+    # Non-RAG categories are fixed-overhead residents, in declaration order.
+    assert [n for n, _ in fixed] == ["tts", "stt"]
+    assert "evict_costs key" not in caplog.text
+
+
+def test_detect_matrix_warns_unknown_evict_cost(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    with caplog.at_level(logging.WARNING):
+        _detect_matrix({"matrix": {"evict_costs": {"nope": 5}}}, models, args,
+                       logging.getLogger("test"))
+    assert "evict_costs key" in caplog.text
+
+
+def test_build_matrix_vars_includes_categories():
+    import logging
+
+    from llama_packer.__main__ import _build_matrix_vars
+
+    def m(role, tid):
+        return SimpleNamespace(role=role, template_id=tid, stem=tid)
+
+    emb, rnk, tts = (m("embeddings", "emb-1"), m("rerank", "rnk-1"),
+                     m("t2s", "tts-1"))
+    models = [m("chat", "alpha"), emb, rnk, tts]
+    cats = {"emb": emb, "rnk": rnk, "tts": tts}
+    vars_, coload_vars = _build_matrix_vars(
+        models, emb, rnk, cats, [], {"alpha": ["alpha"]},
+        logging.getLogger("test"))
+    assert vars_ == {"c1": "alpha", "emb": "emb-1", "rnk": "rnk-1",
+                     "tts": "tts-1"}
+    assert coload_vars == []
+
+
+def test_parse_args_idle_unload():
+    from llama_packer.__main__ import parse_args
+
+    args = parse_args(["prog", "--idle-unload", "600"])
+    assert args.idle_unload == 600
+    # Off by default: no globalTTL key is emitted.
+    args = parse_args(["prog"])
+    assert args.idle_unload is None
+
+
+def test_parse_args_spare_and_baseline():
+    from llama_packer.__main__ import parse_args
+
+    args = parse_args(["prog", "--spare", "20G", "--baseline", "10G"])
+    assert args.spare == "20G"
+    assert args.baseline == "10G"
+

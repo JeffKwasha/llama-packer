@@ -218,13 +218,16 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
         ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=1024)
     assert ctx == _MIN_CTX_SIZE
     # The warning must say what the user gets and why: needs vs budget and
-    # the effect (served at minimum context).
+    # the verdict (the model cannot load — the planner disables it).
     msg = next(r.message for r in caplog.records
                if "need" in r.message and "budget" in r.message)
     assert "30000" in msg          # needs MiB
     assert "29696" in msg          # budgeted MiB (32768 - 2048 - 1024)
-    assert "minimum context" in msg
-    assert str(_MIN_CTX_SIZE) in msg
+    assert "cannot load" in msg
+    # The budget verdict is recorded for the planner's gating check.
+    assert model.vram.over_budget_reason is not None
+    assert "30000" in model.vram.over_budget_reason
+    assert model.vram.vram_squeezed is False
 
 
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
@@ -233,6 +236,59 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
     # available = 32768 - 2048 - 3072 = 27648; remaining = 27648-11000 = 16648
     # design cost = 16384 <= 16648 -> design still fits
     assert ctx == 32768
+
+
+# ── over-budget / squeeze gating flags ───────────────────────────────────
+
+
+def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
+    import logging
+
+    fm = {"model_mib": 1000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+          "compute_mib": 100, "cache_type": "q8_0",
+          "source": "llama-server", "shape": ""}
+    model = make_model("nb", **{"derived": fm})
+    with caplog.at_level(logging.WARNING):
+        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=40000)
+    assert ctx == _MIN_CTX_SIZE
+    assert model.vram.over_budget_reason is not None
+    assert "exhausted" in model.vram.over_budget_reason
+    assert model.vram.vram_squeezed is False
+
+
+def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
+    # Weights fit but the full 32768 design context does not: the solve
+    # falls back smaller and flags the squeeze for the description note.
+    fm = {"model_mib": 32000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+          "compute_mib": 100, "cache_type": "q8_0",
+          "source": "llama-server", "shape": ""}
+    model = make_model("sq", **{"derived": fm})
+    ctx = model.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    # available = 47104; remaining = 47104 - 32100 = 15004
+    # design cost = 16384 > 15004 -> squeezed; not over budget.
+    assert ctx < 32768
+    assert model.vram.over_budget_reason is None
+    assert model.vram.vram_squeezed is True
+
+
+def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
+    """Flags are per-solve: a tight call's verdict must not leak into the
+    next call's plan (groups may carry different spare)."""
+    tight = make_model("r1", **{"derived": {
+        "model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+        "compute_mib": 100, "cache_type": "q8_0",
+        "source": "llama-server", "shape": ""}})
+    tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    assert tight.vram.over_budget_reason is not None
+
+    # Same budget object, looser effective budget via the fitting block:
+    # swap the measured quad for one that fits and the flags must clear.
+    tight.vram.effective_static = lambda *a, **k: (
+        1000, 0.5, 0.0, 100)
+    ctx = tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    assert tight.vram.over_budget_reason is None
+    assert tight.vram.vram_squeezed is False
+    assert ctx >= _MIN_CTX_SIZE
 
 
 def test_calc_ctx_memory_margin_shrinks_ctx(make_model):

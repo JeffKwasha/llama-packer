@@ -68,10 +68,10 @@ from llama_packer.consts import (
     _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
     _WEIGHT_CPU_MAP_TOLERANCE_MIB,
-    _KOKORO_COMPUTE_MB,
+    _AUDIO_CPP_COMPUTE_MB,
     ESTIMATE_ERROR_REASON,
 )
-from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
+from llama_packer.backends import (AUDIO_CPP_BACKENDS, FIXED_OVERHEAD_BACKENDS,
                                    SD_BACKENDS, VLLM_BACKENDS,
                                    WHISPER_BACKENDS, get_backend)
 
@@ -89,7 +89,7 @@ _FIT_PARAMS_REQUIRED = frozenset(
 # Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
                      **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
-                     **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
+                     **{n: _AUDIO_CPP_COMPUTE_MB for n in AUDIO_CPP_BACKENDS}}
 
 # Persisted blocks acceptable without re-measurement.  The retired plain
 # fit-params measurement (KV-pool only, no corrections) is deliberately
@@ -544,6 +544,15 @@ class VramBudget:
         #: Set when no estimate source worked for this model — the planner
         #: surfaces it as metadata.estimated/estimate_error on every entry.
         self.unestimated_reason: str | None = None
+        #: Set when the budget cannot even hold weights + compute (the model
+        #: cannot load at any context) — the planner disables the entry.
+        #: ``None`` when the budget fits; reset at the top of every
+        #: ``calc_ctx`` call so each solve reports its own budget.
+        self.over_budget_reason: str | None = None
+        #: Set when the design context did not fit and the solve fell back to
+        #: a smaller context — the planner stamps a description note.
+        #: Reset alongside ``over_budget_reason`` on every ``calc_ctx`` call.
+        self.vram_squeezed: bool = False
 
     # ── saved fit-params from frontmatter ──
 
@@ -917,6 +926,7 @@ class VramBudget:
         fit_bin: str,
         cache_type: str = "q8_0",
         llama_args: str = "",
+        allow_cpu: bool = False,
     ) -> FitParams | None:
         """Get affine VRAM constants for this model at *cache_type*.
 
@@ -929,17 +939,22 @@ class VramBudget:
         ``-ub``) — the in-memory cache and the persisted block are both
         shape-bound, so a profiles/batch-key change re-measures instead of
         reusing stale compute terms.  ``remeasure`` (CLI ``--remeasure``)
-        skips the saved-block path entirely.
+        skips the saved-block path entirely.  ``allow_cpu`` measures
+        CPU-resident models too (their constants describe host RAM, used
+        for the emitted memory tag — never for VRAM sizing); without it
+        CPU-resident models return None as before.
         """
         shape = (llama_args or "").strip()
         if (cache_type, shape) in self._static_cache:
             return self._static_cache[(cache_type, shape)]
 
-        if self.model.backend in FIXED_OVERHEAD_BACKENDS \
-                or getattr(self.model, "on_cpu", False):
+        if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Fixed-overhead backends are sized from file size + a fixed
             # buffer (effective_static); CPU-resident models are not
             # VRAM-bound.  Neither has meaningful FitParams.
+            return None
+        if getattr(self.model, "on_cpu", False) and not allow_cpu:
+            # CPU-resident models are not VRAM-bound (see allow_cpu).
             return None
 
         # 1. Saved values from frontmatter (legacy fit-params blocks and
@@ -1126,6 +1141,7 @@ class VramBudget:
         design_ctx: int | None = None,
         include_mmproj: bool = True,
         llama_args: str = "",
+        allow_cpu: bool = False,
     ) -> tuple[int, float, float, int] | None:
         """Combined affine VRAM constants for main model plus its companions.
 
@@ -1134,15 +1150,17 @@ class VramBudget:
         numbers, so downstream context math sees a single budget.  The MTP
         draft is folded only when the main block did *not* come from the
         serve-shaped measurement — those blocks are measured with the
-        draft running and already carry it.
+        draft running and already carry it.  ``allow_cpu`` is passed
+        through to :meth:`fit_params_static` (host-RAM constants for the
+        emitted memory tag on CPU-resident models).
         """
         cache_key = ("effective", cache_type, include_mmproj, llama_args)
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
-        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t,
-        # kokoro-podman t2s): VRAM = weights (file size, 0 when baked into the
-        # image) + a fixed runtime buffer, no KV terms.  These are excluded
+        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t):
+        # VRAM = weights (file size, 0 when baked into a container image) + a
+        # fixed runtime buffer, no KV terms.  These are excluded
         # from the shared chat matrix, so precise factors are irrelevant;
         # calc_ctx returns design_ctx when kv_per_token_mib==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
@@ -1171,7 +1189,8 @@ class VramBudget:
             return params
 
         main = self.fit_params_static(fit_bin, cache_type=cache_type,
-                                      llama_args=llama_args)
+                                       llama_args=llama_args,
+                                       allow_cpu=allow_cpu)
         if main is None:
             return None
 
@@ -1248,10 +1267,18 @@ class VramBudget:
         if self.model.on_cpu:
             return self._design_ctx()
 
+        # Each solve reports its own budget: clear the gating flags so a
+        # tight group's verdict does not leak into a looser group's plan.
+        self.over_budget_reason = None
+        self.vram_squeezed = False
+
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
         available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
         if available <= 0:
+            self.over_budget_reason = (
+                f"VRAM budget exhausted: {int(available)} MiB available "
+                f"(total {vram_total_mb} - reserve {reserve} - spare {spare_mb})")
             logger.warning("available VRAM <= 0 for %s (spare=%d)",
                            self.model.stem, spare_mb)
             return _MIN_CTX_SIZE
@@ -1281,13 +1308,15 @@ class VramBudget:
         model_mib, kv_per_token, slot_mib, compute_mib = static
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
+            self.over_budget_reason = (
+                f"weights + compute need {int(model_mib + compute_mib)} MiB, "
+                f"only {int(available)} MiB budgeted (VRAM {vram_total_mb} - "
+                f"reserve {reserve} - spare {spare_mb})")
             logger.warning(
                 "%s: weights + compute need %d MiB, only %d MiB budgeted "
-                "(VRAM %d - reserve %d - spare %d) — serving at minimum "
-                "context %d",
+                "(VRAM %d - reserve %d - spare %d) — model cannot load",
                 self.model.stem, int(model_mib + compute_mib),
-                int(available), vram_total_mb, reserve, spare_mb,
-                _MIN_CTX_SIZE)
+                int(available), vram_total_mb, reserve, spare_mb)
             return _MIN_CTX_SIZE
 
         # Image token budget: image tokens are ordinary tokens inside the
@@ -1306,6 +1335,10 @@ class VramBudget:
                 ctx = design
             return self._raise_to_image_floor(ctx, img_floor, cap=ctx,
                                               affordable=ctx)
+
+        # Design context does not fit: serve smaller and tell the planner
+        # (the emitted description gets an over-budget note).
+        self.vram_squeezed = True
 
         # Solve the affine equation for the per-slot context
         if kv_per_token <= 0:

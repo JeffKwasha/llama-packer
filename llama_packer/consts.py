@@ -146,7 +146,10 @@ _SD_COMPUTE_MB = 512
 # errs toward reserving more, like the other fixed heuristics here.
 _VLLM_PER_SEQ_MIB = 32.0
 _WHISPER_COMPUTE_MB = 100
-_KOKORO_COMPUTE_MB = 3072
+# audio.cpp: weights + a session/vocoder/diffusion buffer.  Family-dependent
+# (ASR/VAD ~512 … diffusion TTS ~3072); operators pin the exact figure with
+# the sidecar `vram_mb:` key when a family drifts from this default.
+_AUDIO_CPP_COMPUTE_MB = 1024
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # Diffusion architecture regex patterns
@@ -184,3 +187,12 @@ _DEFAULT_DIR_ROLES = {
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 _NON_CHAT_ROLES = frozenset({"embeddings", "rerank", "image", "s2t", "t2s"})
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Weight-file suffixes
+# The only files that can be models. Snapshot listings and companion
+# scans filter to these so config/asset subdirs (tokenizer/,
+# 1_Pooling/, speech_tokenizer/ config) never match.
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+_WEIGHT_SUFFIXES = frozenset({".gguf", ".safetensors", ".bin", ".onnx"})

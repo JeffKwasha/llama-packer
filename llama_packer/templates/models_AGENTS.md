@@ -26,8 +26,8 @@ matches the model file next to it. The directory sets the role:
 | `embed/` | embeddings | nested dirs keep the role |
 | `rerank/` | rerank | |
 | `img/` | image | sd-server; opt-in via profiles.yaml `dirs:` |
-| `s2t/` | s2t | whisper-server; opt-in; `.bin` needs an authored sidecar |
-| `t2s/` | t2s | kokoro-podman; opt-in; sidecar only needs `hf_repo: hexgrad/Kokoro-82M` |
+| `s2t/` | s2t | whisper.cpp `.bin` (whisper-server) or audio.cpp GGUFs (audio-cpp); opt-in; `.bin` needs an authored sidecar |
+| `t2s/` | t2s | audio-cpp; opt-in; sidecar declares `audio_cpp: {family, task}` |
 | (any) `<name>.safetensors` | by dir or `role:` | vLLM |
 | (any) `<name>.md` | — | sidecar for the model file above |
 
@@ -102,7 +102,8 @@ serves (identity falls back to the stem). For an HF-cache GGUF: `parameters`
 from the size in the filename (`31B`), `quantization` is the exact suffix after
 the last `-` (`...i1-Q4_K_M.gguf` → `Q4_K_M`), `context_length` is the GGUF
 header value (`262144` for gemma4 — matches `ls` filename and `README.md`),
-`model:` is the snapshot filename, `hf_repo:`/`hf_url:` is the repo id.
+`model:` is the snapshot filename (or a `Subdir/file` relative path when the
+file sits in a snapshot subdirectory), `hf_repo:`/`hf_url:` is the repo id.
 
 ```yaml
 ---
@@ -114,7 +115,7 @@ quantization: Q4_K_M         # exact suffix from snapshot filename: Q4_K_M, Q6_K
 context_length: 262144       # architectural max (from GGUF header; gemma4 = 262144)
 description: "one-line summary."
 # --- file & huggingface ---
-model: model.gguf            # snapshot filename when the file lives in the HF cache (with hf_repo:)
+model: model.gguf            # snapshot filename (or Subdir/file path) when the file lives in the HF cache (with hf_repo:)
 hf_repo: org/model           # HF cache repo id — required with model: for cache files
 hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one line
 # mmproj:                       # only if the snapshot actually contains *mmproj*.gguf
@@ -123,9 +124,19 @@ hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one 
 # speculative: model.mtp.gguf  # only if the snapshot actually contains *mtp*.gguf
 # mtp: true                  # only when MTP heads are baked into the main GGUF
 # --- serving ---
-role: chat                   # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server) | t2s (kokoro-podman)
+role: chat                   # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server / audio-cpp) | t2s (audio-cpp)
 # cli_args: "--vae ae.safetensors --lora my.safetensors"  # extra backend flags (unstructured)
 # vram_mb: 1280              # fixed-overhead backends (s2t/image/t2s): pin total process VRAM
+# audio_cpp:                 # role t2s/s2t only (audio.cpp engine)
+#   family: kokoro_tts       # required: audio.cpp family (resolves package specs)
+#                            # verified: kokoro_tts, chatterbox (clon only), chatterbox_turbo, qwen3_tts/asr, pocket_tts, parakeet_tdt, nemotron_asr
+#   task: tts                # default per family (kokoro_tts→tts, chatterbox→clon, chatterbox_turbo→tts, *asr→asr); else role default (t2s→tts, s2t→asr)
+#   options: {temperature: 0.8, top_p: 0.8}   # family request options → default_request_options
+#   load_options: {language: english}         # load-time options (pocket_tts language)
+#   voice: af_heart          # preset name / voice_dir wav / model-native voice id → default_voice_preset
+#   voice_ref: voices/jk.wav # path or {type: base64, data} — wins over voice (clone reference)
+#   reference_text: transcript                 # only with voice_ref
+#   backend: cpu             # per-model backend pin (cuda|vulkan|cpu|metal|hip; wins over CLI/profiles/auto)
 # image_min_tokens: 1024     # image input: min image tokens/image (dynamic-res archs, e.g. Qwen-VL; needs mmproj)
 # image_max_tokens: 4096     # image input: cap image tokens/image (bounds KV cost; unset = model default, can be huge)
 # --- agent metadata (optional; passed through) ---
@@ -146,6 +157,8 @@ weaknesses: ["slow on 32GB"]
 # --- sampling / precision (usually via profiles.yaml, not here) ---
 # cache_type: q8_0
 # parallel: 1
+# batch: 2048                # per-model batch depth (sidecar > profile > fleet > role default)
+# ubatch: 512                # micro-batch; stamps the VRAM measurement shape, so changing it re-measures
 # default_mode: instruct
 # modes: { instruct: {temperature: 0.6, pres_pen: 1.5} }  # layered over the
 #   # same-named profile: unspecified keys inherit, so state only the delta
@@ -219,9 +232,28 @@ Convention: brand + major version; minor only when it changed the architecture
 ## HuggingFace resolution
 
 For a hub-cached model, set `model:` to the exact snapshot filename (get it
-with `ls <snapshot>/`) and `hf_repo: org/repo` (or `hf_url:`). No symlink is
-needed. If the sidecar can't share the model's stem, `model:` is how you point
-at a differently-named file.
+with `ls <snapshot>/`) — or a `Subdir/file` relative path when the file sits
+in a snapshot subdirectory — and `hf_repo: org/repo` (or `hf_url:`). No
+symlink is needed. If the sidecar can't share the model's stem, `model:` is
+how you point at a differently-named file. A bare basename matching files at
+several depths warns and fails; disambiguate with the relative path.
+
+## File refs
+
+Every key that names a file (`model:`, `mmproj.file:`, `speculative:`,
+`chat_template:`, `loras:` entries) takes a string or a mapping.
+`{file: foo.bar}` ≡ bare string `foo.bar`; `{hf_repo: org/repo, file:
+foo.bar}` names a hub file and tracks `refs/main` across `hf download`
+(no pinned copy); `hf_repo:` falls back to the sidecar's own when omitted.
+`hub:org/repo:file` works everywhere too. Optional `pick:` disambiguates:
+`newest`/`oldest` pick the snapshot revision, `top` keeps only snapshot-root
+files (e.g. a template repo's root file vs its `archive/` copies). Ambiguity
+fails loud. Example (directory `models.yaml`):
+
+```yaml
+chat_template: {hf_repo: peculiar-ragdoll/Qwen-Sharp-Chat-Templates,
+                file: chat_template.jinja, pick: top}
+```
 
 ## Fleet-level overrides
 
@@ -233,7 +265,9 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 
 | Key | Meaning |
 |-----|---------|
-| `model: <file>` | Model file when stem differs; with `hf_repo:` it names the snapshot file |
+| `model: <file>` | Model file when stem differs; with `hf_repo:` it names the snapshot file (or a `Subdir/file` relative path) |
+| `loras: [...]` | LoRA adapter files (any file-ref form, like `chat_template:`); appended to override rules' lists |
+| `vllm_image: <img>` | Per-model vLLM container image override (vLLM backends only) |
 | `mmproj: {file: …}` | Companion block: `file:` locates the projector/draft file; other keys form a conditional overlay served only while the file is served (see Companions) |
 | `device: N` / `device: cpu` | Pin to GPU N or run on CPU |
 | `concurrency: N` | Per-model concurrency limit |
@@ -242,7 +276,7 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | `cache_type` / `parallel` | KV-cache precision / parallel slots (chat); fixed-overhead roles (image/s2t/t2s) use a fixed budget — `vram_mb` overrides. Declaring `parallel:` opts out of auto-parallel for this model |
 | `min_context` | Smallest context (tokens) at which this model still does useful agentic work (multi-step tool loops, not single replies). Rule of thumb: tool callers 131072, others half the max context. Floor of the auto-parallel search; a pinned `context_length` overrides it |
 | `vram_mb` | Fixed-overhead backends (s2t/image/t2s): pin total process VRAM (e.g. measured via nvidia-smi); wins over the file-size + buffer estimate |
-| `mtp_spec_type` / `mtp_draft_n_max` | Override MTP spec type / max draft tokens (defaults `draft-mtp` / 2) |
+| `mtp_spec_type` / `mtp_draft_n_max` / `mtp_draft_p_min` | Override MTP spec type / max draft tokens / min draft acceptance probability (defaults `draft-mtp` / 2 / 0.75) |
 | `image_min_tokens` / `image_max_tokens` | Image input (mmproj) only, dynamic-resolution archs (Qwen-VL family): floor/cap on image tokens per image, emitted as `--image-min-tokens`/`--image-max-tokens`. Qwen math: 1 token ≈ 28×28 px (2.5-VL) / 32×32 px (3-VL); 1024 tokens ≈ 1 MP — good floor for art/artifact critique. Gemma/SigLIP is fixed ~256 tokens/image: keys are ignored there (warned). The cap also floors the solved context (parallel × max tokens must fit `-c`) |
 | `speculative_config: {...}` | vLLM `--speculative-config` JSON verbatim |
 | `vllm_quantization` | vLLM `--quantization` *method* (e.g. `modelopt_mixed`) — not the metadata `quantization` field; absent = vLLM auto-detects from the checkpoint |

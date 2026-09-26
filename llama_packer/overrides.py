@@ -22,6 +22,7 @@ import logging
 import re
 from pathlib import Path
 
+from llama_packer import utils
 from llama_packer.backends import SETTING_KEYS
 
 logger = logging.getLogger(__name__)
@@ -114,33 +115,56 @@ def compile_rule_list(raw_rules, origin: str) -> list[tuple]:
 def resolve_setting_paths(model) -> list[str]:
     """Resolve chat_template / loras refs to absolute files.
 
-    Paths are resolved relative to the sidecar's own directory (the natural
-    "file next to the model" convention).  Absolute refs pass through.  Returns
-    a list of human-readable error strings (empty when all resolve); resolved
-    paths are stored on ``model`` attributes the backends read.
+    Each ref is any file ref: a string (absolute path, or relative to the
+    sidecar's own directory — the natural "file next to the model"
+    convention — plus ``hub:org/repo:file`` hub refs and snapshot
+    filename/globs when the model declares ``hf_repo``) or a mapping
+    (``{file:}`` ≡ the bare string; ``{hf_repo:, file:[, pick:]}`` names a
+    hub file, ``hf_repo`` defaulting to the model's own). Absolute refs
+    pass through. Returns a list of human-readable error strings (empty
+    when all resolve); resolved paths are stored on ``model`` attributes
+    the backends read.
     """
     errors: list[str] = []
-    base = model.md_path.parent
+    anchors = [model.md_path.parent]
+    repo_default = model.frontmatter.get("hf_repo")
+
+    def _resolve(ref) -> Path | None:
+        return model._finder.resolve_path(ref, anchors=anchors,
+                                          repo=repo_default,
+                                          hf_home=model._hf_home)
+
+    def _describe(ref) -> str:
+        return utils.describe_ref(ref, repo_default)
 
     ct = model.frontmatter.get("chat_template")
-    if isinstance(ct, str) and ct:
-        p = Path(ct) if Path(ct).is_absolute() else base / ct
-        if p.is_file():
-            model._resolved_chat_template = p.absolute()
+    if ct is None or ct is False or ct == "":
+        pass  # unset (False/empty also disables an inherited template)
+    elif isinstance(ct, (str, dict)):
+        hit = _resolve(ct)
+        if hit is not None and hit.is_file():
+            model._resolved_chat_template = hit.absolute()
         else:
-            errors.append(f"chat_template file not found: {ct}")
+            errors.append(f"chat_template file not found: {_describe(ct)}")
+    else:
+        errors.append(f"chat_template file not found: {ct!r}")
 
     loras = model.frontmatter.get("loras") or []
-    if isinstance(loras, str):
+    if isinstance(loras, (str, dict)):
         loras = [loras]
     resolved: list[Path] = []
-    for ref in loras:
-        ref_path = Path(str(ref))
-        p = ref_path if ref_path.is_absolute() else base / ref_path
-        if p.is_file():
-            resolved.append(p.absolute())
-        else:
-            errors.append(f"lora file not found: {ref}")
+    if isinstance(loras, list):
+        for ref in loras:
+            if not isinstance(ref, (str, dict)):
+                errors.append(f"lora file not found: {ref!r}")
+                continue
+            hit = _resolve(ref)
+            if hit is not None and hit.is_file():
+                resolved.append(hit.absolute())
+            else:
+                errors.append(f"lora file not found: {_describe(ref)}")
+    elif loras:
+        errors.append(f"lora file not found: {loras!r}")
     if resolved:
         model._resolved_loras = resolved
 

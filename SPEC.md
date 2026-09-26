@@ -42,6 +42,7 @@ Also emits:
 - **`macros:`** — top-level block mapping each `${VAR}` path macro to its absolute directory (see [Path Macros](#path-macros-macros-block-and-configenv)).
 - **`includeAliasesInList: true`** — presents the `${MODEL_ID}:<mode>`/`${MODEL_ID}:<profile>` aliases in `/v1/models` (llama-swap default is `false`).
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
+- **`globalTTL`** — only when `--idle-unload SECONDS` is passed; llama-swap's top-level idle-unload default (see [VRAM gating and reservation notes](#vram-gating-and-reservation-notes)).
 
 ### Writer module
 
@@ -69,9 +70,9 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Shared embed/rerank/chat VRAM budget solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
+| `matrix` | Configurable co-resident `categories` + shared chat/RAG VRAM solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
-| `vllm` | Backend resources: `image`, `bin`, `docker_args`, `container_port`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
+| `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
 | `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
@@ -267,9 +268,21 @@ Chat models target a minimum useful context (`_MIN_AGENTIC_CTX`, default 131072 
 
 All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every `<id>-text` entry joins the same matrix co-loading sets as its parent `<id>` entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
 
+### VRAM gating and reservation notes
+
+When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` counterparts) shrinks the budget, the planner degrades visibly instead of emitting entries that OOM at load time:
+
+- **Over-budget disable.** `calc_ctx` records `over_budget_reason` when weights + compute do not fit any context (or the reserve/spare leaves ≤ 0 available). Such a group is **skipped** — the model is not emitted. Skipped stems never reach the matrix vars, so routing auto-prunes; if *every* chat model is gated away, matrix routing is omitted entirely (warning logged) rather than emitting a degenerate empty OR-list.
+- **Vision → text fallback.** Before disabling a vision model whose main (mmproj-on) solve is over budget, the planner re-solves with the projection detached. If the text-only fit succeeds, the entry is served without `--mmproj` (INFO logged). If text also fails, the model is disabled. Each profile group re-derives `include_mmproj` / view / design context, so one group's fallback never leaks into the next.
+- **Vision companion suppression.** When a main text entry has a best-effort `-vision-<N>k` companion and that companion's own solve is over budget, the companion entry is dropped (warning logged) rather than emitted as an OOM landmine.
+- **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted, before co-resident charges) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
+- **Degenerate refusal.** If `vram_total − reserve − spare ≤ 0`, the run fatals *before* any VRAM work (exit 1) and does **not** overwrite an existing `config.yaml`. Same guard applies when the reservation leaves zero model entries.
+
+`--idle-unload SECONDS` emits a top-level `globalTTL: SECONDS` (llama-swap: unload any model after that many seconds of inactivity; `0` = never, the llama-swap default; llama-packer omits the key when the flag is absent). Intended for co-residency with ComfyUI/games that need VRAM on short notice without re-packing.
+
 ## Matrix Context Solving
 
-When `profiles.yaml` defines a `matrix` section with `embed` and `rerank` models, the system solves a shared VRAM budget equation across all model types:
+When `profiles.yaml` defines a `matrix` section, the system solves a shared VRAM budget equation across all model types. The co-resident classes are declared by `categories:` — defaulting to the RAG pair `emb`/`rnk`, with additional fixed-overhead categories (e.g. `tts`/`stt`) allowed:
 
 ```
 reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
@@ -279,7 +292,32 @@ chat_ctx solves Σ(chat_weight + chat_factor × chat_ctx) = available - embed - 
 
 The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (at their declared contexts). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models. Smaller chat models are never raised above their own design context — they are only clamped down to it. Unestimable chat participants ("riders", zero-cost placeholders) ride the measurable models' solve: they never set the shared bar (their native max would inflate `chat_ctx` for everyone and suppress tools demotion) and are flagged `estimated: false`.
 
-Embed/rerank models are auto-selected as the smallest model of each type, or matched by `--embed`/`--rerank` CLI selectors. **They always serve single-slot**: a declared `parallel:` on an embeddings/rerank model is ignored with a note — resident parallelism must never buy context away from the main chat it serves.
+Embed/rerank models are auto-selected as the smallest model of each role, or matched by `--embed`/`--rerank` CLI selectors (declared categories select by their `role:`). **They always serve single-slot**: a declared `parallel:` on an embeddings/rerank model is ignored with a note — resident parallelism must never buy context away from the main chat it serves.
+
+### Categories
+
+`matrix.categories:` maps a category **name** (the var name referenced by `sets:`) to the role that selects its model:
+
+```yaml
+matrix:
+  categories:
+    emb: {role: embeddings}
+    rnk: {role: rerank}
+    tts: {role: t2s}      # optional fixed-overhead resident
+    stt: {role: s2t}
+  evict_costs: {emb: 100, rnk: 100, tts: 50, stt: 50}
+  sets:
+    rag:   "__CHAT_VARS__ & emb & rnk"
+    voice: "__CHAT_VARS__ & (tts | stt)"
+```
+
+- Defaults to `{emb: {role: embeddings}, rnk: {role: rerank}}`, so existing configs are unchanged.
+- `emb`/`rnk` drive the shared chat-context solve below. Every **other** declared category is a **fixed-overhead resident**: reserved alongside chat and RAG, smallest-first, while chat stays at or above the co-load floor.
+- A category that cannot be sized is skipped with a warning; one that does not fit the floor is **not reserved** (its var is still emitted, so a `sets:` branch referencing it may over-subscribe — the warning is the signal).
+- `evict_costs:` keys must be declared category names; an unknown key is warned about and left to llama-swap (which ignores it).
+- Model selection is by role, with the same smallest-VRAM / `--embed`/`--rerank` selector logic used for the RAG pair.
+
+`tts` and `stt` are separate categories because switching between them forces a resident reload; `(tts | stt)` in a set is a runtime choice, not a co-load. Additional audio roles (`vc`, `vad`, `music`, `separation`) are recorded in [docs/plans/audio-roles.md](docs/plans/audio-roles.md).
 
 ### Knobs (matrix section keys)
 
@@ -302,14 +340,14 @@ When the baseline solve puts chat below `tools_min_ctx`, the solver re-solves wi
 
 ### Opportunistic co-loads
 
-After the squeeze pass, enabled `s2t` and `image` models (not `t2s` — containerized, separate pool; not `embeddings`/`rerank` — unconditional residents) are included smallest-fixed-overhead-first while the chat solve stays at or above the floor:
+After the squeeze pass, enabled `s2t` and `image` models that are **not already declared categories** (and not `embeddings`/`rerank` — unconditional residents) are included smallest-fixed-overhead-first while the chat solve stays at or above the floor. Declared non-RAG categories (e.g. `tts`/`stt`) are reserved *first*, before this opportunistic pass:
 
 - floor = `tools_min_ctx` when a chat model declares `tools` and the baseline still keeps it; otherwise `min_chat_ctx`.
 - A candidate that would drop chat below the floor is skipped with a warning naming model and MB; it does not block smaller candidates later in the list.
 - Fixed overhead = weights + fixed compute (zero KV terms for these backends). An operator-pinned `vram_mb` sidecar field is authoritative (`source: config`); otherwise the file-size + per-backend-buffer estimate applies, padded by `estimate_headroom` when no measurement exists. CPU-resident candidates cost 0.
 - Shared process overhead is counted once per process, not per model — a multi-model entry (e.g. a speech server hosting ASR + VAD + diarization) is budgeted as Σ(weights + per-model activations) + one shared constant; pin the entry with `vram_mb` to encode the sum directly.
 
-Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision), and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
+Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision) in addition to one var per declared category, and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
 
 ### tools demotion
 
@@ -343,6 +381,7 @@ MTP is enabled when:
 When MTP is detected, these flags are appended to the `llama-server` command:
 - `--spec-type draft-mtp` — Enables the MTP draft-head speculative decoding (configurable via `mtp_spec_type`).
 - `--spec-draft-n-max 2` — Maximum number of tokens to speculate (configurable via `mtp_draft_n_max`).
+- `--draft-p-min 0.75` — Minimum draft-token acceptance probability (configurable via `mtp_draft_p_min`).
 - `--spec-draft-model <path>` — (companion MTP only) Path to the draft model file.
 
 ### Per-Model Configuration
@@ -355,10 +394,11 @@ name: my-model
 mtp: true
 mtp_spec_type: draft-mtp      # default: draft-mtp
 mtp_draft_n_max: 3            # default: 2
+mtp_draft_p_min: 0.8          # default: 0.75
 ---
 ```
 
-If absent, the module-level defaults apply (see `llama_packer/utils.py`).
+If absent, the module-level defaults apply (see `llama_packer/consts.py`).
 
 ### Baked-in vs Companion MTP
 
@@ -527,10 +567,11 @@ modes:
 ## vLLM Backend
 
 A model can be served with vLLM instead of llama-server by an override
-rule (see below) that sets `backend: vllm` (host binary) or `backend: vllm-docker`
-(container). The emitted entry runs `vllm serve`, published to llama-swap's `${PORT}`
-host macro. Everything else works identically: aliases/modes (`filters.setParamsByID`),
-`metadata`, capabilities, matrix routing.
+rule (see below) that sets `backend: vllm` (host binary), `backend: vllm-podman`
+or `backend: vllm-docker` (container). The emitted entry runs `vllm serve`,
+published to llama-swap's `${PORT}` host macro. Everything else works
+identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
+matrix routing.
 
 All three roles are supported, mapped onto vLLM's pooling interface:
 
@@ -547,7 +588,7 @@ LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`
 # profiles.yaml
 overrides:
   - when: {base_model: 'qwen3\\.30b'}
-    backend: vllm            # or vllm-docker
+    backend: vllm            # or vllm-podman / vllm-docker
     hf_repo: Qwen/Qwen3-30B-A3B-Instruct
 ```
 
@@ -617,7 +658,7 @@ architectural max) and vLLM's own startup profiling bounds the actual allocation
 
 ### Image / binary precedence
 
-The container image (`vllm-docker`) is resolved, highest to lowest:
+The container image (`vllm-podman`/`vllm-docker`) is resolved, highest to lowest:
 
 1. Per-model `vllm_image:` frontmatter
 2. `--vllm-image` CLI flag
@@ -630,18 +671,20 @@ The binary (`vllm`) is resolved, highest to lowest:
 2. `vllm.bin` in `profiles.yaml`
 3. Built-in default (`vllm` on PATH)
 
-`profiles.yaml` `vllm:` also configures `docker_args`, `container_port` and `hf_cache`
-(`vllm-docker`).
+`profiles.yaml` `vllm:` also configures `container_args` (legacy `docker_args` /
+`podman_args`), `container_port`, `container_vendor` and `hf_cache` for the
+container pairs.
 
-### Container (vllm-docker)
+### Container (vllm-podman / vllm-docker)
 
-llama-swap has no native container abstraction: a dockerized backend is a normal entry
-whose `cmd:` is `docker run --name ${MODEL_ID} … <image> <vllm serve flags>` — server
+llama-swap has no native container abstraction: a containerized backend is a normal entry
+whose `cmd:` is `<runtime> run --name ${MODEL_ID} … <image> <vllm serve flags>` — server
 flags are argv after the image, container env is `-e` inside `cmd` (an entry's `env:` list
-reaches only the docker client process). Two upstream-documented lifecycle fields are
-emitted with every vllm-docker entry:
+reaches only the container client process). docker and podman share one implementation
+(see [docs/transports/](docs/transports/)); two upstream-documented lifecycle fields are
+emitted with every container entry:
 
-- `cmdStop: docker stop ${MODEL_ID}` — an unload (swap, manual, or TTL) stops the
+- `cmdStop: <runtime> stop ${MODEL_ID}` — an unload (swap, manual, or TTL) stops the
   *container*; without it llama-swap can only kill the `docker run` client, leaving the
   container running with its VRAM held.
 - `unloadTimeout: 30` — must exceed the stop grace ("docker stop is slow").
@@ -665,12 +708,13 @@ layouts map by real location):
 2. Under any `models_dir` (e.g. `~/models`) → `/models`, `/models2`, … (already bound).
 3. Else → read-only parent bind (`-v <parent>:/extN`) and an `/extN/<name>` ref.
 
-Every vllm-docker entry also gets `-e HF_HOME=/root/.cache/huggingface` and
+Every vLLM container entry also gets `-e HF_HOME=/root/.cache/huggingface` and
 `-e HF_HUB_OFFLINE=1`: **llama-packer never downloads**. A repo-id model that is not
 pre-staged in the mounted hub fails fast at startup — that is the cache-miss case, not a
 bug; llama-packer warns at pack time when `hf_cache` is unset for a repo-id model.
 
-`docker_args` (default `--runtime=nvidia --gpus all --shm-size=16g`) is the operator's
+`container_args` (default: vendor-detected device flags + `--shm-size=16g`;
+legacy keys `docker_args`/`podman_args`) is the operator's
 flexibility point for container-runtime specifics: GPU device selection
 (`--gpus device=N` / `-e CUDA_VISIBLE_DEVICES=N`), `--ipc=host` vs `--shm-size`, and
 extra read-only binds (e.g. vLLM/flashinfer/triton JIT caches — without them every start
@@ -812,76 +856,23 @@ the smallest ones join the shared resident set while chat keeps its floor.
 The emitted `--parallel` maps the sidecar/profile slot count to concurrent
 transcription workers.
 
-## Audio Backend (kokoro-podman)
+## Audio Backend (audio-cpp)
 
-A model with `role: t2s` (opt-in: a `t2s/` directory plus `dirs: {t2s: t2s}` in
-`profiles.yaml`) is served with **kokoro-podman** — [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
-text-to-speech via [remsky/Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI)
-in **rootless podman** (OpenAI-compatible `POST /v1/audio/speech`,
-`GET /v1/audio/voices`, health on `/`, container port 8880).
+A model with `role: t2s` (text-to-speech) or `role: s2t` (ASR) is served
+through the native **audio.cpp** engine (`audiocpp_server`). The full contract
+— roles, sidecar keys (`audio_cpp: {family, task, options, voice, voice_ref}`),
+profiles.yaml keys (`audio_cpp: {bin, backend, device, …}`), the emitted
+`sh -c` heredoc, classification, VRAM and matrix categories — lives in
+[docs/backends/audio-cpp.md](docs/backends/audio-cpp.md).
 
 ```yaml
 # profiles.yaml
-dirs: {t2s: t2s}
-backends: [llama-server, kokoro-podman]
+dirs: {t2s: t2s, s2t: s2t}
+backends: [llama-server, audio-cpp]
 ```
 
-```yaml
-# sidecar: t2s/kokoro-v1.md — weights and ~50 voicepacks are baked into the
-# image, so hf_repo alone identifies the model; no local file required.
----
-name: kokoro-v1
-hf_repo: hexgrad/Kokoro-82M
-description: "Kokoro-82M text-to-speech"
----
-```
-
-Emitted entry (NVIDIA example):
-
-```yaml
-kokoro-v1:
-  cmd: podman run --init --rm --name ${MODEL_ID} -p ${PORT}:8880 --device nvidia.com/gpu=all ghcr.io/remsky/kokoro-fastapi-gpu:latest
-  proxy: http://127.0.0.1:${PORT}
-  checkEndpoint: /
-  capabilities: {in: [text], out: [audio]}
-```
-
-### Vendor selection
-
-The GPU vendor picks both the default image tag and device pass-through flags:
-
-| vendor | default image | podman flags |
-|--------|--------------|--------------|
-| nvidia | `ghcr.io/remsky/kokoro-fastapi-gpu:latest` | `--device nvidia.com/gpu=all` |
-| amd | `ghcr.io/remsky/kokoro-fastapi-rocm:latest` | `--device /dev/kfd --device /dev/dri --group-add video --group-add render` |
-| cpu | `ghcr.io/remsky/kokoro-fastapi-cpu:latest` | *(none)* |
-
-Detection probes `amd-smi`/`rocminfo` then `nvidia-smi`. Precedence for the
-image: CLI `--kokoro-image` > profiles.yaml `t2s.image:` > vendor default.
-`t2s.vendor:` (`auto|nvidia|amd|cpu`) overrides detection for tag *and* flags;
-`t2s.podman_args:` replaces the auto flags entirely; `t2s.container_port`
-overrides 8880; `t2s.voices_dir:` bind-mounts a persistent voicepack directory
-(read-write — the server loads `.pt` packs per request and saves combined
-voices back). Pin to an upstream release tag rather than `:latest` for
-stability (`gpu:-cu128` for RTX 50-series / Blackwell).
-
-### Voices
-
-No per-model configuration: voices live server-side in the image (~50 packs),
-selected per request via the JSON body (`"voice": "af_heart"`, weighted mixes
-like `"af_bella(2)+af_sky(1)"`) and listed at `/v1/audio/voices`.
-
-### Capabilities and VRAM
-
-`role: t2s` emits `capabilities: {in: [text], out: [audio]}` (Speech badge).
-VRAM is fixed overhead: weights are baked into the image so `model_mib` is 0
-unless a local file resolves, plus a conservative 3072 MiB runtime buffer (the
-PyTorch/CUDA floor is ~2.4 GiB, peaks near 4 GiB under load — upstream
-`/dev/unload` benchmarks). The entry is excluded from the shared chat matrix
-solve. A local `.onnx` copy may resolve by same-stem sidecar convention inside
-the `t2s/` dir.
-
-
+GGML whisper `.bin` models remain on `whisper-server` (see the section above) —
+audio.cpp has no whisper family and cannot load them.
 
 ## Override Rules
 
@@ -1024,14 +1015,16 @@ exactly like one in a sidecar (same merge rule, same validation).
 
 **Backend inference.** When neither the sidecar nor any rule declares a
 `backend`, one is inferred from the model's file format (`backends.infer_backend`):
-the registry walks backends in **registration order** — `llama-server`,
-`vllm-docker`, `vllm` — and picks the first whose registered formats cover the
-model AND whose required resources are configured (llama-server binary, vLLM
-image / binary). For this purpose **a locally resolved model file's extension
+the registry walks backends in **registration order** — `llama-server`, `vllm`,
+`vllm-podman`, `vllm-docker`, `sd-server`, `whisper-server`, `audio-cpp` — and
+picks the first whose registered formats cover the model AND whose required
+resources are configured (llama-server binary, vLLM image / binary, container
+runtime on `PATH`). For this purpose **a locally resolved model file's extension
 wins over `hf_repo`**: an HF repo id only drives selection when the model has
-no local file. Today that means `.gguf` → `llama-server` and safetensors /
-`hf_repo` → `vllm-docker` (falling back to host `vllm` when only the binary is
-configured). A format no available backend covers logs an error and the
+no local file. Today that means `.gguf` → `llama-server`; safetensors /
+`hf_repo` → the vLLM pairs (host first, then podman/docker); `.bin` under
+`s2t/` → `whisper-server`; audio GGUFs under `t2s/`/`s2t/` → `audio-cpp`. A
+format no available backend covers logs an error and the
 model's entries are skipped; so does a rule or sidecar naming an unregistered
 `backend`.
 
@@ -1041,6 +1034,24 @@ file logs an error and the model's entries are skipped (fail loud). Symlinks
 are preserved by name (not dereferenced), so a chat template symlinked into the
 HF cache stays under `${MODELS_DIR}` instead of widening it. Resolved paths are
 written into the generated `cmd` as `${VAR}` path macros.
+
+**File refs.** Every key that names a file (`model:`, `mmproj.file:`,
+`speculative:`, `chat_template:`, `loras:` entries) accepts either a string
+or a mapping. `{file: foo.bar}` is equivalent to the bare string `foo.bar`;
+`{hf_repo: org/repo, file: foo.bar}` names a file inside the local HF hub
+cache (tracked across `hf download` updates via `refs/main`, like weights —
+no pinned copy needed). `hf_repo` falls back to the model's own `hf_repo`
+when omitted (handy for LoRAs shipped in the weight repo); the legacy
+`hub:org/repo:file` string form is accepted everywhere too. An optional
+`pick:` token string (or list) disambiguates multiples: `newest` / `oldest`
+select the snapshot revision by mtime (default follows `refs/main`), and
+`top` restricts matching to files at the snapshot root (ignoring
+subdirectory copies, e.g. a template repo's `archive/` versions).
+Ambiguity still fails loud — `pick` only narrows the candidate set, it
+never silently takes the first hit. Local files always win: an absolute
+`file:` with `hf_repo:` warns and ignores the repo. Mappings merge per key
+across layers, so a sidecar `{file: x}` plus a rule `{hf_repo: R}` combine
+to `{file: x, hf_repo: R}`.
 
 **Chat templates & client kwargs.** A declared `chat_template` makes the writer
 emit `--jinja --chat-template-file <path>` (llama-server) or `--chat-template
@@ -1059,33 +1070,36 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | Backend | Model formats | Roles |
 |---------|--------------|-------|
 | `llama-server` | `.gguf` | chat, embeddings, rerank |
-| `vllm` | safetensors, `hf_repo` | chat |
-| `vllm-docker` | safetensors, `hf_repo` | chat |
+| `vllm` / `vllm-podman` / `vllm-docker` | safetensors, `hf_repo` | chat, embeddings, rerank |
 | `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | image |
 | `whisper-server` | `.bin` (s2t dir only) | s2t |
-| `kokoro-podman` | `.onnx`, `hf_repo` | t2s |
+| `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | t2s, s2t |
 
 ## Backend Selection
 
 profiles.yaml's ordered `backends:` list both **enables** and **prioritizes**
 backends; when absent, every registered backend is usable in registration
-order (`llama-server`, `vllm-docker`, `vllm`, `sd-server`):
+order: engines in declaration order (`llama-server`, `vllm`, `sd-server`,
+`whisper-server`, `audio-cpp`) and, within an engine, transports in
+`host` > `podman` > `docker` order:
 
 ```yaml
 # profiles.yaml
 backends:
   - llama-server    # tried first for everything it can serve
-  - vllm-docker     # enabled, second preference
+  - vllm            # vLLM host binary
+  - vllm-podman     # container pair
   - sd-server       # image generation (opt-in; needs dirs: img: image)
-  # vllm            # absent = disabled, even with resources configured
+  # vllm-docker     # absent = disabled, even with resources configured
 ```
 
-Inference walks this list (availability still filters: an entry without its
-binary/image configured is skipped) and picks the first backend whose formats
-and roles cover the model. An explicit sidecar/override `backend:` pin to a
-disabled name is an error that skips that model — pinning bypasses *inference*,
-never policy. Registration order: `llama-server`, `vllm-docker`, `vllm`,
-`sd-server`, `whisper-server`, `kokoro-podman`.
+Inference walks this list (availability still filters: a pair without its
+binary/image configured, or without its container runtime on `PATH`, is
+skipped) and picks the first backend whose formats and roles cover the model.
+An explicit sidecar/override `backend:` pin to a disabled name is an error that
+skips that model — pinning bypasses *inference*, never policy. Registration
+order: `llama-server`, `vllm`, `vllm-podman`, `vllm-docker`, `sd-server`,
+`whisper-server`, `audio-cpp`.
 
 ## Global backend args
 
@@ -1106,8 +1120,8 @@ sd:
 ```
 
 The same *intent* maps to different flags per engine, so each backend owns its
-own `args` (kokoro is a containerized service — `t2s.podman_args` plays that
-role). Values must be a string of flags (a non-string value aborts the run)
+own `args` (audio.cpp is a config-file service — its knobs live under
+`audio_cpp:`). Values must be a string of flags (a non-string value aborts the run)
 and are validated with shlex at build time (bad quoting aborts the run);
 they don't feed the VRAM estimator — they're operator responsibility, like
 sidecar `cli_args`.
@@ -1207,7 +1221,7 @@ pushed, its models are built, then children are visited:
 | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
 | `rerank` | `rerank` | Reranker models |
 | `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
-| `t2s` | `t2s` | Text-to-speech (kokoro via podman; opt-in via `dirs: {t2s: t2s}`) |
+| `t2s` | `t2s` | Text-to-speech (audio.cpp via audio-cpp; opt-in via `dirs: {t2s: t2s}`) |
 | `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
 
   Files at the root itself default to `chat`; files under any other
@@ -1380,9 +1394,9 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 ### Builder-consumed keys (NOT passed through)
 
 `name`, `context_length`, `description`, `cli_args`, `model`, `backend`, `hf_repo`,
-`chat_template`, `chat_template_kwargs`, `loras`, `attention`, `kv_cache`, `tool_args`,
+`chat_template`, `chat_template_kwargs`, `loras`,
 `speculative`, `speculative_config`, `mmproj`, `mtp`, `mtp_spec_type`, `mtp_draft_n_max`,
-`mtp_draft_p_min`, `role`, `targets`, `allow_profiles`, `spare`, `capabilities`,
+`mtp_draft_p_min`, `role`, `allow_profiles`, `capabilities`,
 `ignore`, `device`, `concurrency`, `fit-params`, `vllm_image`, `modes`, `default_mode`,
 `reasoning-format`, `reasoning-preserve`, `cache_type`, `parallel`,
 `image_min_tokens`, `image_max_tokens`.
@@ -1393,7 +1407,6 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 |-----------------|------|--------|
 | `device` | int | GPU device index for multi-GPU pinning (`ROCR_VISIBLE_DEVICES=N` / `CUDA_VISIBLE_DEVICES=N`) |
 | `concurrency` | int | Per-model concurrency limit → `concurrencyLimit` in config |
-| `spare` | str | Additional VRAM to reserve (overrides global `--spare`) |
 | `allow_profiles` | str/list/bool | Restrict which profiles apply (regex string, list, or false to disable) |
 | `modes` | dict | Per-model sampling modes (full profiles): name → param dict. Replaces the global-profile sampling overrides for this model. Values use llama.cpp names; see [Sampling Modes](#sampling-modes) |
 | `default_mode` | str | Which declared `modes` entry is the model's default (maps to the bare `${MODEL_ID}` `setParamsByID` key). Falls back to the first mode |

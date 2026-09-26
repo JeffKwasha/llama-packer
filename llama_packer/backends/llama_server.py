@@ -32,6 +32,7 @@ class LlamaServerBackend(BaseBackend):
         "reasoning-format", "reasoning-preserve",
         "batch", "ubatch",
     })
+    host_requires = frozenset({"llama_bin"})
 
     # Per-role server-mode flags, appended after the shared core arguments.
     # The batch half moved to first-class ``batch:``/``ubatch:`` planning
@@ -57,23 +58,23 @@ class LlamaServerBackend(BaseBackend):
     def default_batch_ubatch(self, role: str) -> tuple[int, int]:
         return self._ROLE_BATCH.get(role, (2048, 512))
 
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("llama_bin"))
-
     def _mtp_args(self, model: "Model") -> tuple[list[str], dict]:
         """Speculative-decoding flags plus metadata contributions."""
         mtp_on, n_max = model._mtp_info()
         if not mtp_on:
             return [], {"mtp_enabled": False}
         spec_type = model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
-        args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max)]
+        p_min = model.mtp_draft_p_min
+        args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max),
+                "--draft-p-min", str(p_min)]
         if model.mtp and model.mtp.gguf_path:
             args += ["--spec-draft-model", str(model.mtp.gguf_path)]
         elif model.frontmatter.get("speculative"):
             logger.warning("mtp: companion %s missing for %s",
                            model.frontmatter["speculative"], model.stem)
             return [], {"mtp_enabled": False}
-        return args, {"mtp_enabled": True, "mtp_draft_max": n_max}
+        return args, {"mtp_enabled": True, "mtp_draft_max": n_max,
+                      "mtp_draft_p_min": p_min}
 
     def _image_token_args(self, model: "Model", include_mmproj: bool) -> list[str]:
         """--image-min/max-tokens flags from sidecar declarations.

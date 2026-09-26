@@ -22,6 +22,7 @@ Features:
 - Want 'text-only' variants that skip mmproj to maximize context or parallel? Automatic.
 - budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the matrix squeezes chat context to keep them loaded instead of evicted.
 - pick some models to use `q8_0` KV cache for longer context? YES
+- ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. `--idle-unload SECONDS` additionally emits `globalTTL` so llama-swap releases VRAM after idle.
 
 
 ## Quickstart ("It's alive")
@@ -58,6 +59,7 @@ mv profiles.yaml.example profiles.yaml
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
 - **Opencode plugin.** Model info flows straight off the running server, so you never hand-edit Opencode config when you add a model (`extras/llamaswap.ts`).
 - **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a `-text` alias that drops the projection to reclaim VRAM for a much larger text-only context window (plus a `-vision-Nk` best-effort entry keeping vision available at reduced context).
+- **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. `--idle-unload SECONDS` emits `globalTTL` so llama-swap unloads idle models.
 
 
 ## What it does
@@ -81,7 +83,7 @@ UI badges from these), driven by `role:` plus declared capabilities:
 | `embeddings` | `embed/` | text → vectors | llama-server / vLLM | `/v1/embeddings` |
 | `rerank` | `rerank/` | query+docs → scores | llama-server / vLLM | `/v1/rerank` |
 | `s2t` | `s2t/` (opt-in) | audio → text | whisper-server | `/v1/audio/transcriptions` |
-| `t2s` | `t2s/` (opt-in) | text → audio | kokoro-podman | `/v1/audio/speech` |
+| `t2s` | `t2s/` (opt-in) | text → audio | audio-cpp | `/v1/audio/speech` |
 | `image` | `img/` (opt-in) | text+image → image (or video if video capability / video-arch) | sd-server | `/sdapi/v1/txt2img` |
 
 On a **chat** model, `capabilities: [image]` adds image *input* (`vision`
@@ -128,11 +130,11 @@ Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](p
 |---|---|
 | `defaults` / `profiles` | `temperature`, `top_p`, `cache_type`, `parallel`, `spare` (+ `base * N` expressions, `description` docs-only) |
 | `models_dirs` / `dirs` / `hf_home` | discovery roots & dir→role map (`it2t: chat`) |
-| `backends` / `vllm` | enable list (`llama-server`, `vllm-docker`), `image`/`bin`/`docker_args` |
+| `backends` / `vllm` | enable list (`llama-server`, `vllm-podman`, `vllm-docker`), `image`/`bin`/`container_args` (legacy `docker_args`) |
 | `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
-| `matrix` | shared `emb`/`rnk` co-loading sets via `__CHAT_VARS__` |
+| `matrix` | co-resident `categories` (default `emb`/`rnk`; e.g. add `tts`/`stt`), sets via `__CHAT_VARS__` |
 
 Profiles overlay `defaults` and emit `filters.setParamsByID`; sidecar `modes:` / `allow_profiles:` replace or filter them per-model. See [SPEC → profiles.yaml](SPEC.md#profilesyaml) for the full table.
 
@@ -142,7 +144,7 @@ Run `llama-packer --agents` to write an `AGENTS.md` sidecar guide into each mode
 
 ### vLLM backend
 
-Serve a model with vLLM instead of llama-server via an override rule in `profiles.yaml` (or a one-off `backend:` line in its sidecar): `backend: vllm` runs the host binary, `backend: vllm-docker` runs a container. Memory sizing, image/binary precedence, and budget details are in [SPEC.md → vLLM Backend](SPEC.md#vllm-backend).
+Serve a model with vLLM instead of llama-server via an override rule in `profiles.yaml` (or a one-off `backend:` line in its sidecar): `backend: vllm` runs the host binary, `backend: vllm-podman` / `backend: vllm-docker` run a container. Memory sizing, image/binary precedence, and budget details are in [docs/backends/vllm.md](docs/backends/vllm.md).
 
 DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM detection falls back to the unified pool, and per-model recipe keys (`vllm_quantization`, `moe_backend`, `mamba:`, `tool_call_parser`, `reasoning_parser`) cover the Blackwell model recipes. Docker entries are self-contained: HF_HOME root mounted read-only at `/root/.cache/huggingface` (offline — models must be pre-staged), `cmdStop`/`unloadTimeout` for container lifecycle, explicit `proxy`.
 
@@ -166,8 +168,8 @@ DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM dete
 - Support multi-image/tensor-parallel vLLM provisioning
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
-- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [SPEC.md](SPEC.md#image-backend-sd-server) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
-- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [SPEC.md → Audio Backend](SPEC.md#audio-backend-whisper-server)
-- Text-to-speech via `kokoro-podman` (Kokoro-82M in rootless podman, NVIDIA + AMD/ROCm) — **available** as `role: t2s` with `dirs: {t2s: t2s}` and `backends: [kokoro-podman]` (opt-in; weights baked into the image — an `hf_repo`-only sidecar suffices; fixed ~3 GiB VRAM); see [SPEC.md → Audio Backend (kokoro-podman)](SPEC.md#audio-backend-kokoro-podman)
+- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [docs/backends/sd-server.md](docs/backends/sd-server.md) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
+- Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as `role: t2s` / `role: s2t` with `dirs: {t2s: t2s, s2t: s2t}` and `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
-- Configurable matrix categories (e.g. run `stable-diffusion` alongside `VL embedding` and `chat` — not just `emb`/`rnk`) — see [docs/plans/matrix-categories.md](docs/plans/matrix-categories.md)
+- Configurable matrix categories — **available**: declare co-resident classes beyond `emb`/`rnk` (e.g. `tts`/`stt`) and reference them in `sets:`; see [SPEC → Matrix Context Solving](SPEC.md#matrix-context-solving)

@@ -1,11 +1,15 @@
 # llama_packer/backends/vllm.py
-"""vLLM backends: host-binary and containerized serving.
+"""vLLM engine: safetensors / HF-repo serving.
 
-Both serve safetensors / HF-repo models.  Roles map onto vLLM's serving
-tasks: chat (generation), embeddings (``--task embed``) and rerank
-(``--task score``, exposing /v1/rerank and /v1/score).  Speculative
-decoding applies to generation only.  LoRA is not yet wired into vLLM's
-module registry, so a declared ``loras`` setting is warned about and skipped.
+Serves chat, embeddings (``--task embed``) and rerank (``--task score``)
+models, either as a host binary or inside a container.  The *engine* owns the
+serve command line; the *transport* (``transport.py``) owns how that command
+is launched — host process, docker or podman — and translates the model /
+chat-template / speculative-draft paths for containers.
+
+Speculative decoding applies to generation only.  LoRA is not yet wired into
+vLLM's module registry, so a declared ``loras`` setting is warned about and
+skipped.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import json
 import logging
 import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, ClassVar
+from typing import TYPE_CHECKING, Callable
 
 from llama_packer import utils
 from llama_packer.consts import (
@@ -22,21 +26,21 @@ from llama_packer.consts import (
     VLLM_DEFAULT_GPU_MEM_UTIL,
     VLLM_DEFAULT_BIN,
     VLLM_DEFAULT_CONTAINER_PORT,
-    VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_IMAGE,
 )
 from llama_packer.backends.base import BaseBackend
+from llama_packer.backends.transport import (
+    CONTAINER_HF_HOME,
+    HostTransport,
+    Launch,
+    Transport,
+    container_device_flags,
+)
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
 
 logger = logging.getLogger(__name__)
-
-# In-container HF cache root (the images' default HOME cache).  The profiles
-# ``vllm.hf_cache`` (host HF_HOME root — the dir containing ``hub/``) is
-# bind-mounted here; HF_HUB_OFFLINE keeps every lookup inside that mounted hub
-# — llama-packer never downloads.
-_CONTAINER_HF_HOME = "/root/.cache/huggingface"
 
 # Our cache_type values that map onto vLLM's --kv-cache-dtype. vLLM supports
 # only auto (f16/bf16/f32) and fp8 KV caches; our q8_* precisions are ~8-bit
@@ -190,69 +194,26 @@ def _spec_meta(model: "Model") -> dict:
     return meta
 
 
-def _map_paths_into(paths: list[Path], models_dirs,
-                    hf_cache: str | None = None) -> tuple[list[str], list[str]]:
-    """Map host paths for use inside the vLLM container.
+def _container_args(tvars: dict, runtime: str) -> str:
+    """Extra runtime flags for a container launch.
 
-    Resolution order per path (``Path.resolve()`` first, so symlinked layouts
-    map by their *real* location — an HF snapshot symlinked under ``~/models``
-    maps into the HF cache branch):
-
-    1. under ``hf_cache`` (host HF_HOME root — the dir containing ``hub/``) →
-       ``/root/.cache/huggingface/<rel>``;
-       the whole root is bind-mounted separately, so HF snapshot blob symlinks
-       (``file → ../../blobs/<hash>``) resolve
-    2. under any of ``models_dirs`` → that dir's container target (``/models``,
-       ``/models2``, ...)
-    3. else → dedicated read-only parent bind (``-v <parent>:/extN``) and an
-       ``/extN/<name>`` ref
-
-    Returns ``(container_refs, docker_mount_flags)``.  The hf_cache *mount* is
-    not part of the returned mounts — emit ``-v <hf_cache>:/root/.cache/huggingface``
-    once in build_cmd when hf_cache is configured.
+    Precedence: explicit ``container_args`` > the legacy per-runtime key
+    (``docker_args``/``podman_args``) > a vendor-detected default.
     """
-    if isinstance(models_dirs, (str, Path)):
-        models_dirs = [str(models_dirs)]
-    hf_root = Path(hf_cache).resolve() if hf_cache else None
-    roots = [
-        (Path(d).resolve(), "/models" if i == 0 else f"/models{i + 1}")
-        for i, d in enumerate(models_dirs) if d
-    ]
-    refs: list[str] = []
-    mounts: list[str] = []
-    parent_targets: dict[Path, str] = {}
-    for p in sorted(paths, key=str):
-        rp = p.resolve()
-        mapped = False
-        if hf_root is not None:
-            try:
-                rel = rp.relative_to(hf_root)
-            except ValueError:
-                pass
-            else:
-                refs.append(f"{_CONTAINER_HF_HOME}/{rel}")
-                mapped = True
-        if not mapped:
-            for root, target in roots:
-                try:
-                    rel = rp.relative_to(root)
-                except ValueError:
-                    continue
-                refs.append(f"{target}/{rel}")
-                mapped = True
-                break
-        if mapped:
-            continue
-        parent = rp.parent
-        if parent not in parent_targets:
-            idx = len(parent_targets)
-            parent_targets[parent] = f"/ext{idx}"
-            mounts.append(f"-v {parent}:{parent_targets[parent]}")
-        refs.append(f"{parent_targets[parent]}/{rp.name}")
-    return refs, mounts
+    explicit = tvars.get("container_args")
+    if explicit:
+        return str(explicit)
+    legacy = tvars.get(f"{runtime}_args")
+    if legacy:
+        return str(legacy)
+    vendor = str(tvars.get("container_vendor") or "cpu")
+    device = container_device_flags(vendor, runtime)
+    return " ".join(filter(None, (device, "--shm-size=16g")))
 
 
-class VllmHostBackend(BaseBackend):
+class VllmBackend(BaseBackend):
+    """The vLLM engine (serve command); launcher supplied by the transport."""
+
     name = "vllm"
     formats = frozenset({".safetensors", "hf_repo"})
     roles = frozenset({"chat", "embeddings", "rerank"})
@@ -261,12 +222,12 @@ class VllmHostBackend(BaseBackend):
         "vllm_quantization", "moe_backend", "mamba",
         "tool_call_parser", "reasoning_parser",
     })
-
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("vllm_bin"))
-
-    def _model_ref(self, model: "Model") -> str:
-        return model.hf_repo or str(model.gguf_path)
+    #: One engine, three launchers.
+    transports = frozenset({"host", "podman", "docker"})
+    host_requires = frozenset({"vllm_bin"})
+    container_requires = frozenset({"vllm_image"})
+    # Overridden at bind time; host is the standalone default.
+    transport: Transport = HostTransport()
 
     # Per-role serving task (mirrors llama-server's _ROLE_FLAGS symmetry).
     _ROLE_TASK = {
@@ -288,7 +249,7 @@ class VllmHostBackend(BaseBackend):
         spec_override: dict | None = None,
     ) -> list[str]:
         flags = [
-            "--model", model_ref or self._model_ref(model),
+            "--model", model_ref,
             "--served-model-name", "${MODEL_ID}",
             "--host", "0.0.0.0", "--port", str(port),
             "--max-model-len", str(ctx_size),
@@ -320,8 +281,9 @@ class VllmHostBackend(BaseBackend):
             ref = map_path(ct) if map_path else str(ct)
             flags += ["--chat-template", ref]
         if model.role == "chat":
-            # Speculative decoding is a generation-only feature.  Docker passes
-            # its rewritten copy (container refs); host derives from frontmatter.
+            # Speculative decoding is a generation-only feature.  A container
+            # transport passes its rewritten copy (container refs); host
+            # derives from frontmatter.
             spec = spec_override if spec_override is not None \
                 else _speculative_config(model)
             if spec:
@@ -348,63 +310,23 @@ class VllmHostBackend(BaseBackend):
         batch: int | None = None,
         ubatch: int | None = None,
     ) -> tuple[str, dict]:
-        gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
+        transport = self.transport
+        is_container = transport.container
+        gpu_mem_util = str(tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL))
         vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
-        flags = self._serve_flags(model, ctx_size, "${PORT}", str(gpu_mem_util),
-                                  cache_type=cache_type, parallel=parallel,
-                                  batch=batch)
-        cmd = utils.render_command(
-            [vllm_bin, "serve"], flags,
-            global_args=_strip_llama_only_flags(tvars.get("vllm_args") or ""),
-            cli_args=_strip_llama_only_flags(
-                (model.frontmatter.get("cli_args") or "").strip()),
-        )
-        return cmd, _spec_meta(model)
+        container_port = int(tvars.get("container_port", VLLM_DEFAULT_CONTAINER_PORT))
 
-
-class VllmDockerBackend(VllmHostBackend):
-    name = "vllm-docker"
-    # Container lifecycle (see BaseBackend): llama-swap stops the container
-    # itself on swap/unload — without cmdStop it can only kill the docker run
-    # client, leaving the container running with its VRAM held.  unloadTimeout
-    # must exceed the stop grace (docker stop is slow).
-    stop_cmd = "docker stop ${MODEL_ID}"
-    unload_timeout = 30
-
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("vllm_image"))
-
-    def build_cmd(
-        self,
-        model: "Model",
-        ctx_size: int,
-        parallel: int,
-        cache_type: str,
-        tvars: dict,
-        include_mmproj: bool = True,
-        batch: int | None = None,
-        ubatch: int | None = None,
-    ) -> tuple[str, dict]:
-        # Per-model sidecar `vllm_image:` overrides the global default.
-        gpu_mem_util = tvars.get("gpu_mem_util", VLLM_DEFAULT_GPU_MEM_UTIL)
-        container_port = tvars.get("container_port", VLLM_DEFAULT_CONTAINER_PORT)
-        docker_args = tvars.get("docker_args", VLLM_DEFAULT_DOCKER_ARGS)
-        image = model.vllm_image or tvars.get("vllm_image", VLLM_DEFAULT_IMAGE)
-        models_dirs = tvars.get("models_dirs") or [tvars.get("models_dir", "")]
-        models_dirs = [d for d in models_dirs if d]
-        hf_cache = str(tvars.get("hf_cache") or "")
-
-        # Every path-shaped value inside cmd must be a container path.  Model
-        # refs that are repo ids stay verbatim (resolved offline through the
-        # mounted hub); the local file is mapped only when it IS the ref (a
-        # repo id makes the local file irrelevant — mapping it would add a
-        # pointless bind).
-        model_ref = model.hf_repo or None
-        if model_ref is None and model.gguf_path is not None:
-            model_ref = str(model.gguf_path)
+        model_ref = model.hf_repo or (
+            str(model.gguf_path) if model.gguf_path is not None else None)
+        # Invariant: vLLM only serves models with a repo id or a local file.
+        assert model_ref is not None
         spec = _speculative_config(model) if model.role == "chat" else None
         if spec is not None:
             spec = dict(spec)  # rewrite our copy — never mutate the frontmatter
+
+        # Every path-shaped value inside cmd must be a launch-side path.  A
+        # repo-id ref stays verbatim (resolved offline through the mounted
+        # hub); the local file is mapped only when it IS the ref.
         extra_paths: list[Path] = []
         ct = model.resolved_chat_template
         if ct is not None:
@@ -419,35 +341,25 @@ class VllmDockerBackend(VllmHostBackend):
                     extra_paths.append(Path(v))
                     spec_path_keys.append(key)
 
-        refs, ext_mounts = _map_paths_into(extra_paths, models_dirs, hf_cache or None)
+        paths = transport.path_map(tvars, extra_paths)
+        ref = paths.ref
 
-        def ref_for(path: Path) -> str:
-            """Container ref of the Nth mapped path (paths are sorted by str)."""
-            for p, ref in zip(sorted(extra_paths, key=str), refs):
-                if p == path:
-                    return ref
-            return str(path)
-
-        container_model_ref = None
-        if model_ref is not None:
-            container_model_ref = ref_for(Path(model_ref))
-        if model.hf_repo and not hf_cache:
+        if is_container and model.hf_repo and not str(tvars.get("hf_cache") or ""):
             logger.warning("vllm-docker: %s: hf_cache is not configured and the "
                            "model ref is a repo id — with HF_HUB_OFFLINE=1 the "
                            "entry cannot resolve (set profiles.yaml vllm.hf_cache)",
                            model.stem)
-        if spec:
+        if is_container and spec:
             for key in spec_path_keys:
-                spec[key] = ref_for(Path(spec[key]))
+                spec[key] = ref(Path(spec[key]))
 
-        def _map(p: Path) -> str:
-            return ref_for(p)
-
-        vllm_bin = tvars.get("vllm_bin", VLLM_DEFAULT_BIN)
+        resolved_ref = ref(Path(model_ref)) if model_ref is not None else None
         serve_flags = self._serve_flags(
-            model, ctx_size, str(container_port), gpu_mem_util,
-            cache_type=cache_type, parallel=parallel, map_path=_map,
-            batch=batch, model_ref=container_model_ref, spec_override=spec,
+            model, ctx_size, str(container_port) if is_container else "${PORT}",
+            gpu_mem_util, cache_type=cache_type, parallel=parallel,
+            map_path=ref, batch=batch,
+            model_ref=resolved_ref if is_container else model_ref,
+            spec_override=spec,
         )
         serve = utils.render_command(
             [vllm_bin, "serve"], serve_flags,
@@ -455,23 +367,17 @@ class VllmDockerBackend(VllmHostBackend):
             cli_args=_strip_llama_only_flags(
                 (model.frontmatter.get("cli_args") or "").strip()),
         )
-        bind = [
-            f"-v {d}:{'/models' if i == 0 else f'/models{i + 1}'}"
-            for i, d in enumerate(models_dirs)
-        ]
-        docker_parts = [
-            "docker run --init --rm",
-            docker_args,
-            "--name ${MODEL_ID}",
-            *bind,
-            # Shared HF hub: repo-id refs resolve from the mounted cache and
-            # HF_HUB_OFFLINE forbids downloads (llama-packer never fetches).
-            *( [f"-v {hf_cache}:{_CONTAINER_HF_HOME}"] if hf_cache else [] ),
-            f"-e HF_HOME={_CONTAINER_HF_HOME}",
-            "-e HF_HUB_OFFLINE=1",
-            *ext_mounts,
-            f"-p ${{PORT}}:{container_port}",
-            image,
-        ]
-        cmd = " ".join(docker_parts) + " " + serve
+        if not is_container:
+            return serve, _spec_meta(model)
+
+        # Container: hand the engine-specific bits to the transport, which
+        # owns the `docker run` / `podman run` wrapper, mounts and lifecycle.
+        image = model.vllm_image or tvars.get("vllm_image", VLLM_DEFAULT_IMAGE)
+        launch = Launch(
+            image=image,
+            port=container_port,
+            args=_container_args(tvars, transport.name),
+            env=(f"HF_HOME={CONTAINER_HF_HOME}", "HF_HUB_OFFLINE=1"),
+        )
+        cmd = transport.wrap(serve, model, launch, paths)
         return cmd, _spec_meta(model)

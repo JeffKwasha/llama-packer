@@ -23,16 +23,18 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
 - [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)
 - [`llama_packer/discover.py`](llama_packer/discover.py) — depth-first model discovery, empty stub sidecars, HF-blobs guard
-- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, dir-role map (`_DEFAULT_DIR_ROLES`, `dir_role_map`), HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`), header-only model-kind classification (`classify_file`, `gguf_header_probe`, `sniff_safetensors`, `hf_readme_kind`)
+- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, dir-role map (`_DEFAULT_DIR_ROLES`, `dir_role_map`), HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_dir`, `snapshot_weight_paths`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`), header-only model-kind classification (`classify_file`, `gguf_header_probe`, `sniff_safetensors`, `hf_readme_kind`)
 
 ## Backends
 
-- llama-server — GGUF chat/embeddings/rerank; role flags, MTP, mmproj, chat-template, LoRA
-- vLLM — safetensors / `hf_repo`; all roles (`--task embed`/`--task score` for pooling); `vllm serve` (host binary)
-- vLLM docker — same, wrapped in `docker run` with bind-mounts for chat-template/lora dirs; per-model `vllm_image:` override
-- sd-server — stable-diffusion.cpp image generation (`role: image`, opt-in via `dirs: {img: image}`)
-- whisper-server — whisper.cpp speech-to-text (`role: s2t`, opt-in via `dirs: {s2t: s2t}`; GGML `.bin` + authored sidecar)
-- kokoro-podman — Kokoro-82M text-to-speech in rootless podman (`role: t2s`, opt-in via `dirs: {t2s: t2s}`; vendor-detected NVIDIA/AMD/CPU image)
+Engines and transports are independent axes: each engine declares the transports it runs under and the registry binds one backend per valid pair (`vllm`, `vllm-podman`, `vllm-docker`). Per-backend docs in [docs/backends/](docs/backends/), transports in [docs/transports/](docs/transports/).
+
+- llama-server — GGUF chat/embeddings/rerank; role flags, MTP, mmproj, chat-template, LoRA ([doc](docs/backends/llama-server.md))
+- vLLM — safetensors / `hf_repo`; all roles (`--task embed`/`--task score` for pooling); host + podman + docker ([doc](docs/backends/vllm.md))
+- sd-server — stable-diffusion.cpp image generation ([doc](docs/backends/sd-server.md))
+- whisper-server — whisper.cpp speech-to-text, GGML `.bin` ([doc](docs/backends/whisper-server.md))
+- audio-cpp — audio.cpp TTS/ASR (replaces the retired kokoro-podman) ([doc](docs/backends/audio-cpp.md))
+- Transport: host · podman · docker ([host](docs/transports/host.md), [docker](docs/transports/docker.md), [podman](docs/transports/podman.md)); inference prefers host > podman > docker and gates each container pair on its runtime being on `PATH`
 - Backend selection: sidecar/override `backend:` wins (validated against profiles.yaml `backends:` enable list); else inferred from file format + roles, gated by the enable list and configured resources (see SPEC.md "Backend Selection")
 - Global backend args: profiles.yaml `<section>.args` (llama_server / vllm / sd / whisper) — fleet-wide flags, built-ins < args < role flags < per-model `cli_args` (see SPEC.md "Global backend args")
 - See SPEC.md "vLLM Backend" + "Override Rules" and [docs/plans/vllm-gb10.md](docs/plans/vllm-gb10.md)
@@ -43,10 +45,12 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [FAQ.md](FAQ.md) — why HF-hub models don't show up and how to serve them (sidecar `model:`+`hf_repo:` vs symlinks)
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
+- [docs/backends/](docs/backends/) — one doc per engine (llama-server, vllm, sd-server, whisper-server, audio-cpp): roles/formats, command shape, config keys, VRAM
+- [docs/transports/](docs/transports/) — host / docker / podman: launch wrapping, path translation, mounts, lifecycle
 - [docs/new-model-pipeline.md](docs/new-model-pipeline.md) — what happens when a model is added: fit-params estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch keys; deleting `derived:` costs seconds, never a probe
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
 - [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
-- [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins)
+- [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel, audio-roles: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins)
 - [docs/reference.md](docs/reference.md) — external links
 
 ## Data dirs

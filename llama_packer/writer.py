@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from llama_packer.consts import (
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
+    _RESERVE_VIDEO,
     ESTIMATE_ERROR_REASON,
 )
 from llama_packer.profiles import Profiles, parse_spare_mb
@@ -55,8 +57,70 @@ def _model_can_reason(model: Model) -> bool:
 
 
 def _strip_repeat_ws(text: str) -> str:
-    """Collapse runs of whitespace to single spaces (templates with | blocks)."""
-    return " ".join(text.split())
+    """Collapse runs of whitespace to single spaces (templates with | blocks).
+
+    Newlines are preserved: multi-line values (e.g. audio-cpp's heredoc
+    ``cmd``) depend on them.
+    """
+    return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def _fmt_mib(mib: float) -> str:
+    """Human memory size: ``X.XGB`` at/above 1 GiB, integer ``MB`` below.
+
+    Small values stay truthful (``RAM 64MB``, never ``0.0GB``) so a tiny
+    host residue is distinguishable from a missing number.
+    """
+    if mib >= 1024:
+        return f"{mib / 1024:.1f}GB"
+    return f"{int(round(mib))}MB"
+
+
+def format_mem_tag(
+    vram_mib: float | None,
+    ram_mib: float,
+    *,
+    spill_mib: float | None = None,
+    ssd_mib: float | None = None,
+) -> str:
+    """Memory-allocation tag appended to emitted entry descriptions.
+
+    A verbatim report of the decided TOTAL allocation attributable to the
+    entry (weights + companions + context at the served ``(ctx, slots)``)
+    — never capped, never re-solved: an impossible-looking ``VRAM 73.0GB``
+    on a 32 GB card is printed as decided.  ``vram_mib=None`` is a
+    CPU-resident serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
+    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (disk-resident weights)
+    are reserved grammar for a future allocator that decides a split —
+    today's allocator never splits, so callers leave them None.
+    """
+    if vram_mib is None:
+        tag = f"RAM {_fmt_mib(ram_mib)}"
+    else:
+        vram_part = f"VRAM {_fmt_mib(vram_mib)}"
+        if spill_mib is not None:
+            vram_part += f" + {_fmt_mib(spill_mib)}"
+        tag = f"{vram_part} RAM {_fmt_mib(ram_mib)}"
+    if ssd_mib is not None:
+        tag += f" SSD {_fmt_mib(ssd_mib)}"
+    return f"[{tag}]"
+
+
+# A previously emitted memory tag at the end of a description (stripped
+# before appending a fresh one, so copying a generated description back
+# into a sidecar never stacks tags on re-pack).
+_MEM_TAG_RE = re.compile(r"\s*\[(?:VRAM|RAM)\b[^\]]*\]\s*$")
+
+
+def _with_mem_tag(description: str | None, tag: str | None) -> str | None:
+    """Description with a fresh memory tag appended (idempotent).
+
+    Returns None only when there is neither a description nor a tag.
+    """
+    if tag is None:
+        return description
+    base = _MEM_TAG_RE.sub("", description or "").rstrip()
+    return f"{base} {tag}" if base else tag
 
 
 def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> list[Model]:
@@ -97,13 +161,6 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
                 if not fm_arch:
                     logger.warning("sidecar %s: diffusion arch %r but no architecture: set (e.g. architecture: wan/hunyuan-video/flux) for backend routing",
                                    model.stem, arch)
-
-        # s2t/t2s/image must not be served as chat via llama-server
-        if model.role in ("s2t", "t2s", "image") and backend.name == "llama-server":
-            logger.error("skipping %s: role %r must not use backend %r (use %s)",
-                         model.stem, model.role, backend.name,
-                         {"s2t":"whisper-server","t2s":"kokoro-podman","image":"sd-server"}[model.role])
-            continue
 
         # Capability / companion cross-check: a companion file is not a
         # capability — what it enables must be declared where it is served.
@@ -246,6 +303,9 @@ def _build_entry(
     estimate_error: str | None = None,
     batch: int | None = None,
     ubatch: int | None = None,
+    mem_vram_mib: float | None = None,
+    mem_ram_mib: float | None = None,
+    vram_note: str | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -260,9 +320,17 @@ def _build_entry(
 
     The first step resolves the serving view: with a companion block, the
     companion-on variant serves the block merged over the frontmatter while
-    the companion-off variant serves the base frontmatter (strip-by-recompute
+    the     companion-off variant serves the base frontmatter (strip-by-recompute
     — purpose is emergent from the block, never hardcoded).  Pass the base
     model here, not a view: views return themselves from ``view_for``.
+
+    ``mem_vram_mib``/``mem_ram_mib`` are the decided TOTAL allocation for
+    this serving (reported verbatim as a trailing description tag via
+    :func:`format_mem_tag`; ``None``/``None`` or a non-None
+    ``estimate_error`` emits no tag).
+    ``vram_note`` (when set) is appended after the mem tag: the entry
+    serves below its design context because ``--spare``/``--baseline``
+    constrained the budget.
     """
     model = model.view_for(include_mmproj)
     base_id = model.template_id
@@ -423,8 +491,14 @@ def _build_entry(
         entry["filters"] = {"setParamsByID": set_params}
     if model.name:
         entry["name"] = model.name + name_suffix
-    if model.description:
-        entry["description"] = model.description
+    mem_tag = None
+    if estimate_error is None and mem_ram_mib is not None:
+        mem_tag = format_mem_tag(mem_vram_mib, mem_ram_mib)
+    desc = _with_mem_tag(model.description, mem_tag)
+    if vram_note:
+        desc = f"{desc} {vram_note}".strip() if desc else vram_note
+    if desc is not None:
+        entry["description"] = desc
     # The VRAM-served -c limit (vs. capabilities.context = max trained).
     metadata["ctx_size"] = ctx_size
     # Client-facing estimate health: when no VRAM estimate source worked,
@@ -460,13 +534,13 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # Proxied backends (sd-server, whisper-server) are proxied HTTP services,
-    # not llama-swap managed inference — expose the standard proxy fields so
-    # llama-swap can health-check and route.  checkEndpoint "/" avoids the
-    # /health pitfall (Discussion #866: sd-server returns 200 on / only).
+    # Proxied backends (sd-server, whisper-server, audio-cpp) are proxied HTTP
+    # services, not llama-swap managed inference — expose the standard proxy
+    # fields so llama-swap can health-check and route.  Each backend names its
+    # own health path (sd-server answers "/"; audio.cpp exposes /health).
     if backend.proxied:
         entry["proxy"] = "http://127.0.0.1:${PORT}"
-        entry["checkEndpoint"] = "/"
+        entry["checkEndpoint"] = getattr(backend, "check_endpoint", "/")
 
     # Container lifecycle (llama-swap docker orchestration): cmdStop stops the
     # container itself — without it a swap/unload kills only the `docker run`
@@ -804,6 +878,21 @@ class Variant:
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
+    #: Decided TOTAL memory attributable to this serving (weights +
+    #: companions + context at the served ctx/slots), in MiB — the numbers
+    #: the emitted description tag reports verbatim.  ``mem_vram_mib=None``
+    #: is a CPU-resident serving (RAM-only tag).  Both None when undecided
+    #: (no estimate) — then no tag is emitted.
+    mem_vram_mib: float | None = None
+    mem_ram_mib: float | None = None
+    #: Same pair for the best-effort vision companion entry (served at
+    #: ``vision_ctx`` with the projection); None when no vision entry.
+    mem_vision_vram_mib: float | None = None
+    mem_vision_ram_mib: float | None = None
+    #: Non-None when the VRAM budget could not afford the design context
+    #: (``--spare``/``--baseline`` active): appended to the description so
+    #: the entry visibly carries its over-budget status.
+    vram_note: str | None = None
 
 
 def resolve_batch_ubatch(
@@ -858,6 +947,7 @@ class Planner:
         matrix_cfg: dict | None = None,
         embed_model: Model | None = None,
         rerank_model: Model | None = None,
+        fixed_categories: list[tuple[str, Model]] | None = None,
         baseline_mb: int = 0,
         min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
@@ -876,6 +966,9 @@ class Planner:
         self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
         self.embed_model = embed_model
         self.rerank_model = rerank_model
+        # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
+        # fixed-overhead residents reserved alongside chat and RAG.
+        self.fixed_categories = fixed_categories or []
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.min_context_explicit = min_context_explicit
@@ -1107,6 +1200,7 @@ class Planner:
             baseline_mb=self.baseline_mb, drop_stems=drop_stems,
             knobs=self.knobs, memory_margin=self.memory_margin,
             llama_args=self.llama_args, synthetic=synthetic,
+            fixed_categories=self.fixed_categories,
         )
         self.synthetic_quads = synthetic
         # Flag the synthesized models so plan() serves them at their
@@ -1182,6 +1276,50 @@ class Planner:
                            model.stem, e)
             return 0
 
+    def _variant_memory(
+        self,
+        view,
+        *,
+        cache_type: str,
+        include_mmproj: bool,
+        ctx_size: int,
+        parallel: int,
+        profile: dict | None,
+    ) -> tuple[float | None, float | None]:
+        """Decided TOTAL memory (MiB) attributable to one serving variant.
+
+        ``(vram_mib, ram_mib)`` evaluated from the combined affine quad at
+        the variant's served ``(ctx_size, parallel)`` — weights + folded
+        companions + context — exactly what the emitted description tag
+        reports verbatim (no capping, no re-solving).  CPU-resident
+        servings return ``(None, ram_mib)`` (host-RAM constants via
+        ``allow_cpu`` — never used for VRAM sizing).  ``(None, None)``
+        when undecidable (no estimate source worked).  ``parallel <= 0``
+        (uncapped vLLM) is priced single-seq, matching its ctx solve.
+        """
+        quad = view.vram.effective_static(
+            self.fit_bin, cache_type=cache_type,
+            include_mmproj=include_mmproj,
+            llama_args=measurement_args(self.profiles, view,
+                                        self.llama_args, profile),
+            allow_cpu=True,
+        )
+        if quad is None:
+            return (None, None)
+        model_mib, kv_factor, slot_mib, compute_mib = quad
+        p = parallel if parallel > 0 else 1
+        total = (model_mib + compute_mib
+                 + kv_factor * ctx_size * p + slot_mib * p)
+        if view.on_cpu:
+            return (None, float(total))
+        files_mb = view.size_mb
+        if include_mmproj and view.mmproj is not None \
+                and view.mmproj.gguf_path is not None:
+            files_mb += view.mmproj.size_mb
+        if view.mtp is not None and view.mtp.gguf_path is not None:
+            files_mb += view.mtp.size_mb
+        return (float(total), max(0.0, float(files_mb - model_mib)))
+
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
@@ -1236,6 +1374,17 @@ class Planner:
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
             for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
+                # Reset the per-group serving view: a prior group's
+                # vision→text fallback must not leak into this group.
+                include_mmproj = not drop_mmproj.get(model.stem, False)
+                view = model.view_for(include_mmproj)
+                context_length = view.design_context
+                if view.role == "embeddings" and self.matrix_result:
+                    context_length = min(context_length,
+                                         self.matrix_result.embed_ctx)
+                elif view.role == "rerank" and self.matrix_result:
+                    context_length = min(context_length,
+                                         self.matrix_result.rerank_ctx)
                 # Ledger charge: this pool's extra reserve (pools: overrides
                 # + co-residents) joins the spare for chat solves only — RAG
                 # and fixed-overhead roles ARE residents; charging them
@@ -1311,6 +1460,96 @@ class Planner:
                         parallel = group_parallel
                         ctx_size = self._unestimated_ctx(view)
 
+                # ── VRAM gating ──
+                # Weights + compute exceed this group's budget: the model
+                # cannot load at any context.  Skip the group (a looser
+                # group may still fit) — skipped stems never reach
+                # entry_ids_by_stem, so matrix vars/sets auto-prune.
+                # With the vision projection attached, first fall back to
+                # text-only: the companion may be what no longer fits.
+                if est_error is None:
+                    over_budget = getattr(view.vram, "over_budget_reason",
+                                          None)
+                    if over_budget is not None:
+                        if (include_mmproj and model.mmproj is not None
+                                and model.mmproj.gguf_path is not None):
+                            include_mmproj = False
+                            view = model.view_for(False)
+                            context_length = view.design_context
+                            if view.role == "embeddings" and self.matrix_result:
+                                context_length = min(
+                                    context_length,
+                                    self.matrix_result.embed_ctx)
+                            elif view.role == "rerank" and self.matrix_result:
+                                context_length = min(
+                                    context_length,
+                                    self.matrix_result.rerank_ctx)
+                            if auto:
+                                pin_ctx = self._serving_pin(view)
+                                floor = resolve_min_ctx(
+                                    view, pin_ctx=pin_ctx,
+                                    tools_min_ctx=self.knobs.tools_min_ctx,
+                                    fallback_min_ctx=self.min_context,
+                                    fallback_explicit=self.min_context_explicit)
+                                cap_ctx = context_length
+                                if self.max_context is not None:
+                                    cap_ctx = min(cap_ctx, self.max_context)
+                                parallel, ctx_size = self._auto_parallel(
+                                    view, cache_type=cache_type,
+                                    spare_mb=spare_eff, include_mmproj=False,
+                                    cap_ctx=cap_ctx, floor=floor,
+                                    pin_ctx=pin_ctx,
+                                    group_parallel=(1 if uncapped
+                                                    else group_parallel),
+                                    profile=group[0][1])
+                            else:
+                                ctx_size = self._bounded_ctx(
+                                    view, parallel=parallel,
+                                    cache_type=cache_type,
+                                    spare_mb=spare_eff, include_mmproj=False,
+                                    design_ctx=self.chat_ctx,
+                                    context_length=context_length,
+                                    profile=group[0][1])
+                            over_budget = getattr(
+                                view.vram, "over_budget_reason", None)
+                            if over_budget is None:
+                                logger.info(
+                                    "%s: vision over budget; serving "
+                                    "text-only at %d", view.stem, ctx_size)
+                                est_error = getattr(
+                                    model.vram, "unestimated_reason", None) \
+                                    or getattr(view.vram,
+                                               "unestimated_reason", None)
+                                if est_error is not None:
+                                    parallel = group_parallel
+                                    ctx_size = self._unestimated_ctx(view)
+                            else:
+                                logger.warning("%s: disabled (%s)",
+                                               view.stem, over_budget)
+                                continue
+                        else:
+                            logger.warning("%s: disabled (%s)",
+                                           view.stem, over_budget)
+                            continue
+                # Squeeze note: the budget could not afford the design
+                # context and an explicit reservation (--spare/--baseline)
+                # is what pushed it over — stamp the entry description.
+                # Gate on the user-declared spare (pool-adjusted, before
+                # co-resident charges) or a baseline above the fixed floor;
+                # and only when the served ctx is actually below design
+                # (the matrix chat_ctx target can squeeze without landing
+                # under the model's own context_length).
+                vram_note: str | None = None
+                if (est_error is None
+                        and getattr(view.vram, "vram_squeezed", False)
+                        and ctx_size < context_length
+                        and (spare_mb > 0 or self.baseline_mb > _RESERVE_VIDEO)):
+                    vram_note = (
+                        f"(over configured VRAM limits — serving at "
+                        f"{ctx_size:,} of {context_length:,} design tokens; "
+                        f"re-run without --spare/--baseline for full "
+                        f"context)")
+
                 vision_ctx: int | None = None
                 if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
                     vision_ctx = ctx_size if est_error is not None else (
@@ -1320,8 +1559,29 @@ class Planner:
                             design_ctx=self.chat_ctx,
                             context_length=context_length,
                             profile=group[0][1]))
+                    if (vision_ctx is not None and est_error is None
+                            and getattr(on_view.vram, "over_budget_reason",
+                                        None) is not None):
+                        logger.warning(
+                            "%s: vision companion disabled (%s)",
+                            model.stem, on_view.vram.over_budget_reason)
+                        vision_ctx = None
                 if uncapped:
                     parallel = 0   # emit uncapped: no --max-num-seqs
+
+                if est_error is not None:
+                    mem: tuple[float | None, float | None] = (None, None)
+                    vmem: tuple[float | None, float | None] = (None, None)
+                else:
+                    mem = self._variant_memory(
+                        view, cache_type=cache_type,
+                        include_mmproj=include_mmproj, ctx_size=ctx_size,
+                        parallel=parallel, profile=group[0][1])
+                    vmem = self._variant_memory(
+                        on_view, cache_type=cache_type,
+                        include_mmproj=True, ctx_size=vision_ctx,
+                        parallel=parallel, profile=group[0][1]) \
+                        if vision_ctx is not None else (None, None)
 
                 variants.append(Variant(
                     parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
@@ -1329,7 +1589,11 @@ class Planner:
                     include_mmproj=include_mmproj, batch=batch, ubatch=ubatch,
                     vision_ctx=vision_ctx,
                     coload=is_coload, tools_demoted=tools_demoted,
-                    estimate_error=est_error))
+                    estimate_error=est_error,
+                    mem_vram_mib=mem[0], mem_ram_mib=mem[1],
+                    mem_vision_vram_mib=vmem[0],
+                    mem_vision_ram_mib=vmem[1],
+                    vram_note=vram_note))
 
                 # On-demand text-only variant: when the main entry keeps its
                 # mmproj, also plan a no-vision entry (``<id>-text``) so
@@ -1345,13 +1609,20 @@ class Planner:
                             design_ctx=self.chat_ctx,
                             context_length=context_length,
                             profile=group[0][1]))
+                    tmem: tuple[float | None, float | None] = \
+                        (None, None) if est_error is not None else \
+                        self._variant_memory(
+                            model, cache_type=cache_type,
+                            include_mmproj=False, ctx_size=text_ctx,
+                            parallel=parallel, profile=group[0][1])
                     variants.append(Variant(
                         parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
                         profiles_group=group, ctx_size=text_ctx,
                         include_mmproj=False, batch=batch, ubatch=ubatch,
                         coload=is_coload,
                         tools_demoted=tools_demoted,
-                        estimate_error=est_error))
+                        estimate_error=est_error,
+                        mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))
             plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
@@ -1384,6 +1655,7 @@ def _solve_matrix_context(
     memory_margin: float = _MEMORY_MARGIN,
     llama_args: str = "",
     synthetic: dict[str, tuple[int, float, float, int]] | None = None,
+    fixed_categories: list[tuple[str, Model]] | None = None,
 ) -> MatrixSolve | None:
     """Solve the shared VRAM budget for chat context plus co-loads.
 
@@ -1420,6 +1692,7 @@ def _solve_matrix_context(
     spare_mb = parse_spare_mb(spare, vram_total)
 
     drop_stems = drop_stems or set()
+    fixed_categories = fixed_categories or []
 
     # Get static params for chat models (companion VRAM folded in).
     # The drop decision (mmproj skipped to reach the min useful context) is
@@ -1580,9 +1853,44 @@ def _solve_matrix_context(
         else knobs.min_chat_ctx
     coloads: list[tuple[str, int]] = []
     if chat_ctx >= floor:
+        declared_stems = {m.stem for _, m in fixed_categories}
+        used = 0
+
+        def _reserve(oh: int, stem: str, declared: bool) -> int | None:
+            """Reserve *oh* MB if chat stays at/above the floor; else None."""
+            nonlocal used
+            ctx = _solve(embed_ctx, rerank_ctx, fixed_overhead_mb=used + oh)
+            if ctx < floor:
+                return None
+            used += oh
+            if not declared:
+                coloads.append((stem, oh))
+            return ctx
+
+        # 3a. Declared categories (explicit operator intent, e.g. tts/stt)
+        #     are reserved first; one that does not fit is reported and left
+        #     unreserved.
+        for name, m in fixed_categories:
+            oh = _coload_overhead(m, fit_bin, profiles, knobs, llama_args)
+            if oh is None:
+                logger.warning("matrix: category %r (%s) skipped: cannot size it",
+                               name, m.stem)
+                continue
+            ctx = _reserve(oh, m.stem, declared=True)
+            if ctx is None:
+                logger.warning(
+                    "matrix: category %r (%s) does not fit below the chat "
+                    "floor %d; not reserved", name, m.stem, floor)
+            else:
+                logger.info(
+                    "matrix: category %r (%s) reserved (%d MB, chat_ctx=%d)",
+                    name, m.stem, oh, ctx)
+
+        # 3b. Opportunistic co-loads: s2t/image models that are *not* already
+        #     a declared category, smallest fixed overhead first.
         overheads: list[tuple[int, str, Model]] = []
         for m in chat_models:
-            if m.role not in ("s2t", "image"):
+            if m.role not in ("s2t", "image") or m.stem in declared_stems:
                 continue
             oh = _coload_overhead(m, fit_bin, profiles, knobs,
                                   llama_args)
@@ -1591,18 +1899,15 @@ def _solve_matrix_context(
                                m.stem)
                 continue
             overheads.append((oh, m.stem, m))
-        used = 0
         for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
-            ctx = _solve(embed_ctx, rerank_ctx, fixed_overhead_mb=used + oh)
-            if ctx >= floor:
-                used += oh
-                coloads.append((stem, oh))
+            ctx = _reserve(oh, stem, declared=False)
+            if ctx is None:
+                logger.warning(
+                    "matrix: co-load %s skipped: would drop chat ctx below "
+                    "the floor %d", stem, floor)
+            else:
                 logger.info("matrix: co-load %s included (%d MB, chat_ctx=%d)",
                             stem, oh, ctx)
-            else:
-                logger.warning(
-                    "matrix: co-load %s skipped: would drop chat ctx to %d "
-                    "(floor %d)", stem, ctx, floor)
     return MatrixSolve(
         chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
         coloads=tuple(coloads), squeeze=squeeze,
@@ -1685,6 +1990,8 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 tools_demoted=v.tools_demoted,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
+                mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
+                vram_note=v.vram_note,
             )
             if text_only:
                 entry_id += TEXT_SUFFIX
@@ -1709,6 +2016,8 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
                 tools_demoted=v.tools_demoted,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
+                mem_vram_mib=v.mem_vision_vram_mib,
+                mem_ram_mib=v.mem_vision_ram_mib,
             )
             vision_id += f"-vision-{n_k}k"
             if vision_id in entries:
@@ -1764,6 +2073,7 @@ def build_config(
     matrix_cfg: dict | None = None,
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
+    fixed_categories: list[tuple[str, Model]] | None = None,
     baseline_mb: int = 0,
     min_context: int = _MIN_AGENTIC_CTX,
     min_context_explicit: bool = False,
@@ -1786,6 +2096,9 @@ def build_config(
         matrix_cfg: Matrix configuration for embed/rerank context solving
         embed_model: Embedding model (if matrix configured)
         rerank_model: Reranking model (if matrix configured)
+        fixed_categories: Declared matrix categories beyond the RAG pair
+            (name, model), e.g. tts/stt — reserved as fixed-overhead
+            residents alongside chat and RAG (matrix categories).
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
@@ -1809,7 +2122,8 @@ def build_config(
         supported, profiles, fit_bin, vram_total,
         spare=spare, max_context=max_context,
         matrix_cfg=matrix_cfg, embed_model=embed_model,
-        rerank_model=rerank_model, baseline_mb=baseline_mb,
+        rerank_model=rerank_model, fixed_categories=fixed_categories,
+        baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
         memory_margin=memory_margin,
         llama_args=template_vars.get("llama_args", ""),
@@ -1818,8 +2132,34 @@ def build_config(
     return emit_config(supported, planner.plan(), profiles, template_vars)
 
 
+class _LiteralDumper(yaml.Dumper):
+    """YAML dumper that keeps newlines intact via literal blocks.
+
+    PyYAML's default renders multi-line strings as folded (single-quoted)
+    scalars, which collapse load-bearing newlines (e.g. audio-cpp's
+    heredoc ``cmd``) into spaces.  Forcing ``|`` style on strings that
+    contain a newline makes the round-trip exact.  Scoped to this subclass
+    so no global ``yaml.add_representer`` side effects leak elsewhere.
+    """
+
+
+def _literal_str_representer(dumper, data):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_LiteralDumper.add_representer(str, _literal_str_representer)
+
+
+def dump_yaml(payload: dict) -> str:
+    """Serialize *payload* to a YAML string, preserving embedded newlines."""
+    return yaml.dump(payload, default_flow_style=False, sort_keys=False,
+                     allow_unicode=True, Dumper=_LiteralDumper)
+
+
 def write_yaml(config: dict, path: Path | str) -> None:
     """Write config to YAML file."""
     payload = config.plain() if isinstance(config, EmittedConfig) else config
     with open(path, "w") as f:
-        yaml.dump(payload, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        f.write(dump_yaml(payload))

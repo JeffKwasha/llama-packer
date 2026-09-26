@@ -200,6 +200,30 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     assert config["models"] == {}
 
 
+def test_build_config_disables_over_budget_model(make_model, monkeypatch):
+    """A model whose weights exceed the budget must not be emitted —
+    it would be a load-time OOM landmine."""
+    from llama_packer.writer import build_config
+
+    huge = make_model("huge", backend="llama-server", context_length=8192,
+                      base_model="llama3")
+    # 50G weights on a 48G card: remaining < 0 in calc_ctx.
+    monkeypatch.setattr(
+        huge.vram, "effective_static",
+        lambda *a, **k: (50000, 0.5, 0.0, 100),
+    )
+    profiles = {
+        "defaults": {"cache_type": "q8_0", "parallel": 1},
+        "profiles": {"default": {}},
+    }
+    config = build_config(
+        [huge], profiles,
+        {"llama_bin": "/opt/llama-server"},
+        fit_bin="unused", vram_total=48 * 1024,
+    )
+    assert config["models"] == {}
+
+
 def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
     # A sidecar cache_type overrides the profile default for both the emitted
     # flags and the VRAM calc (which the grouped cache_type threads through).
@@ -382,7 +406,7 @@ def test_chat_models_still_have_no_proxy_fields(make_model):
     assert "checkEndpoint" not in entry
 
 
-# ── t2s (kokoro-podman) role ─────────────────────────────────────────────
+# ── t2s role capabilities (serving backend: audio-cpp) ───────────────────
 
 def test_t2s_role_is_text_in_audio_out(make_model):
     model = make_model("k", role="t2s")
@@ -391,8 +415,78 @@ def test_t2s_role_is_text_in_audio_out(make_model):
     assert caps["out"] == ["audio"]
 
 
-def test_t2s_entry_gets_proxy_fields(make_model):
-    model = make_model("k", role="t2s", backend="kokoro-podman")
-    entry = _entry_of(model)
+def test_audio_cpp_entry_proxy_and_health(make_model):
+    # audio.cpp is a proxied HTTP service: llama-swap needs proxy + its own
+    # health path (/health), unlike sd-server/whisper-server which answer "/".
+    model = make_model("a", role="t2s", backend="audio-cpp")
+    _, entry = _build_entry(
+        model, parallel=1, cache_type="q8_0",
+        profiles_group=[("default", {})], profiles_defaults={},
+        template_vars={"audio_cpp_bin": "/opt/audiocpp_server"},
+        context_length=0, ctx_size=0,
+    )
     assert entry["proxy"] == "http://127.0.0.1:${PORT}"
-    assert entry["checkEndpoint"] == "/"
+    assert entry["checkEndpoint"] == "/health"
+    assert entry["capabilities"]["in"] == ["text"]
+    assert entry["capabilities"]["out"] == ["audio"]
+    assert entry["cmd"].startswith("sh -c ")
+    assert "\n" in entry["cmd"]  # heredoc newlines survive emit (_strip_repeat_ws)
+
+
+# ── config serialization contract ─────────────────────────────────────────
+
+def test_emitted_config_plain_is_a_plain_dict():
+    from llama_packer.writer import EmittedConfig
+
+    ec = EmittedConfig({"models": {"m": {"cmd": "x"}}},
+                       entry_ids_by_stem={"m": ["m"]}, coload_stems=["e"])
+    plain = ec.plain()
+    assert type(plain) is dict
+    assert plain == {"models": {"m": {"cmd": "x"}}}
+    # Build-time metadata is not part of the serialized document.
+    assert ec.entry_ids_by_stem == {"m": ["m"]}
+
+
+def test_write_yaml_round_trips_without_python_tags(tmp_path):
+    import yaml
+
+    from llama_packer.writer import EmittedConfig, write_yaml
+
+    ec = EmittedConfig({"models": {"m": {"cmd": "x"}},
+                        "macros": {"A": "--a 1"}},
+                       entry_ids_by_stem={"m": ["m"]})
+    out = tmp_path / "config.yaml"
+    write_yaml(ec, out)
+    text = out.read_text()
+    assert yaml.safe_load(text) == ec.plain()
+    assert "python/object" not in text
+
+
+def test_write_yaml_accepts_plain_dict(tmp_path):
+    import yaml
+
+    from llama_packer.writer import write_yaml
+
+    cfg = {"models": {}, "macros": {}}
+    out = tmp_path / "config.yaml"
+    write_yaml(cfg, out)
+    assert yaml.safe_load(out.read_text()) == cfg
+
+
+def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
+    # Regression: multi-line cmd (audio-cpp heredoc) must round-trip with
+    # newlines intact — PyYAML's default folded style collapses them.
+    import yaml
+
+    from llama_packer.backends import get_backend
+    from llama_packer.writer import write_yaml
+
+    model = make_model("chatterbox", role="t2s", backend="audio-cpp")
+    cmd, _ = get_backend("audio-cpp").build_cmd(
+        model, 0, 1, "q8_0", {"audio_cpp_bin": "/opt/audiocpp_server"})
+    assert "\n" in cmd
+    out = tmp_path / "config.yaml"
+    write_yaml({"models": {"m": {"cmd": cmd}}}, out)
+    text = out.read_text()
+    assert yaml.safe_load(text)["models"]["m"]["cmd"] == cmd
+

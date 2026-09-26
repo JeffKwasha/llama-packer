@@ -23,6 +23,7 @@ from typing import Callable, Sequence
 import yaml
 
 from llama_packer import utils
+from llama_packer.model import default_finder
 
 from typing import TYPE_CHECKING
 
@@ -59,49 +60,67 @@ def _flags_from_cache_parallel(settings: dict | None) -> dict[str, str]:
     return out
 
 
+def _resolve_macro_path(ref, base_dir: Path, hf_home=None, finder=None):
+    """Resolve a macro file ref to an absolute-path string, or None.
+
+    Best-effort (macros only compress displayed commands — the backends
+    render the real flags): unresolvable refs warn and are skipped.
+    """
+    f = finder or default_finder()
+    hit = f.resolve_path(ref, anchors=[base_dir] if base_dir else [],
+                         hf_home=hf_home)
+    if hit is None:
+        logger.warning("macros: file ref %r did not resolve (skipped)", ref)
+        return None
+    try:
+        rp = utils.smart_resolve(hit)
+    except Exception:
+        rp = hit.resolve()
+    return str(rp)
+
+
 def _flags_for_settings(
-    settings: dict, base_dir: Path, sub: Callable[[str], str] | None
+    settings: dict, base_dir: Path, sub: Callable[[str], str] | None,
+    hf_home=None, finder=None,
 ) -> dict[str, str]:
     """Map builder settings to flag chunks.
 
     Handles ``cache_type``, ``parallel``, ``chat_template``,
     ``loras``, ``reasoning-format``, ``reasoning-preserve``, ``cli_args``.
-    Paths are resolved against *base_dir* and then passed through *sub*
+    File refs (any file-ref form: local paths resolve against *base_dir*,
+    hub refs via the HF cache) are resolved and then passed through *sub*
     (placeholder substitution) when provided.
     """
     flags: dict[str, str] = {}
     flags.update(_flags_from_cache_parallel(settings))
 
     if "chat_template" in settings and settings["chat_template"]:
-        raw = str(settings["chat_template"])
-        p = Path(raw)
-        if not p.is_absolute():
-            p = base_dir / raw if base_dir else p
-        # Use smart_resolve to preserve symlinks on same mount (mirrors model layer)
-        try:
-            rp = utils.smart_resolve(p)
-        except Exception:
-            rp = p.resolve()
-        val = sub(str(rp)) if sub else str(rp)
-        # presence of a chat template implies --jinja as well
-        flags["--jinja"] = ""
-        flags["--chat-template-file"] = val
+        raw = settings["chat_template"]
+        if not isinstance(raw, (str, dict)):
+            logger.warning("macros: ignoring malformed chat_template %r", raw)
+        else:
+            val = _resolve_macro_path(raw, base_dir, hf_home, finder)
+            if val is not None:
+                val = sub(val) if sub else val
+                # presence of a chat template implies --jinja as well
+                flags["--jinja"] = ""
+                flags["--chat-template-file"] = val
 
     if "loras" in settings and settings["loras"]:
         loras = settings["loras"]
-        if isinstance(loras, str):
+        if isinstance(loras, (str, dict)):
             loras = [loras]
         resolved = []
-        for lo in loras:
-            lp = Path(str(lo))
-            if not lp.is_absolute():
-                lp = base_dir / str(lo) if base_dir else lp
-            try:
-                rp = utils.smart_resolve(lp)
-            except Exception:
-                rp = lp.resolve()
-            resolved.append(sub(str(rp)) if sub else str(rp))
-        flags["--lora"] = ",".join(resolved)
+        if isinstance(loras, list):
+            for lo in loras:
+                if not isinstance(lo, (str, dict)):
+                    logger.warning("macros: ignoring malformed lora %r", lo)
+                    continue
+                val = _resolve_macro_path(lo, base_dir, hf_home, finder)
+                if val is not None:
+                    resolved.append(sub(val) if sub else val)
+        if resolved:
+            flags["--lora"] = ",".join(resolved)
 
     if "reasoning-format" in settings and settings["reasoning-format"]:
         flags["--reasoning-format"] = str(settings["reasoning-format"])
@@ -279,11 +298,13 @@ class Macros:
         profiles: "Profiles | None" = None,
         models_dirs: Sequence[Path | str] | None = None,
         sub: Callable[[str], str] | None = None,
+        hf_home=None,
     ) -> None:
         self.profiles_cfg = profiles_cfg or {}
         self.profiles = profiles
         self.models_dirs = [Path(d) for d in (models_dirs or [])]
         self.sub = sub
+        self.hf_home = hf_home if hf_home is not None else self.profiles_cfg.get("hf_home")
 
         # Start clean for this build
         # Note: caller may have cleared already; we clear to ensure no stale state
@@ -314,9 +335,9 @@ class Macros:
                     continue
                 if not isinstance(mval, str):
                     logger.warning(
-                        "macros: macro %r value must be a string (got %T), ignored",
+                        "macros: macro %r value must be a string (got %s), ignored",
                         mname,
-                        type(mval),
+                        type(mval).__name__,
                     )
                     continue
                 try:
@@ -355,7 +376,8 @@ class Macros:
                 defaults = data.get("defaults") or {}
                 agg_flags: dict[str, str] = {}
                 if isinstance(defaults, dict):
-                    agg_flags.update(_flags_for_settings(defaults, base_dir, self.sub))
+                    agg_flags.update(_flags_for_settings(defaults, base_dir, self.sub,
+                                                         self.hf_home))
 
                 # overrides — merge all settings (last wins) to capture common flags
                 overrides = data.get("overrides") or []
@@ -370,7 +392,8 @@ class Macros:
                                 continue
                             merged_settings[k] = v
                 if isinstance(merged_settings, dict) and merged_settings:
-                    agg_flags.update(_flags_for_settings(merged_settings, base_dir, self.sub))
+                    agg_flags.update(_flags_for_settings(merged_settings, base_dir, self.sub,
+                                                         self.hf_home))
 
                 if agg_flags:
                     Macro(mname, f"{cfg_path}:defaults+overrides", agg_flags)

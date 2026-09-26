@@ -24,6 +24,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
+from llama_packer.backends.transport import HostTransport, Transport
+
 if TYPE_CHECKING:
     from llama_packer.model import Model
 
@@ -44,6 +46,9 @@ SETTING_KEYS = frozenset({
     # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
     "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
     "reasoning_parser",
+    # audio-cpp engine block (rendered into server.json by audio-cpp;
+    # other backends warn it as unhandled)
+    "audio_cpp",
 })
 FRAMEWORK_CONSUMED = frozenset({"backend", "hf_repo"})
 METADATA_ONLY = frozenset({"chat_template_kwargs"})
@@ -52,21 +57,33 @@ METADATA_ONLY = frozenset({"chat_template_kwargs"})
 class BaseBackend(ABC):
     """A serving engine that renders a Model into a llama-swap ``cmd``."""
 
-    name: ClassVar[str]
-    formats: ClassVar[frozenset[str]]
-    roles: ClassVar[frozenset[str]]
-    handles: ClassVar[frozenset[str]]
+    name: str
+    formats: frozenset[str]
+    roles: frozenset[str]
+    handles: frozenset[str]
+    #: Transports this engine can run under (see ``transport.py``).  The
+    #: registry materialises one bound backend per supported pair.
+    transports: ClassVar[frozenset[str]] = frozenset({"host"})
+    #: ``avail`` keys the engine needs to launch, split by transport kind.
+    host_requires: ClassVar[frozenset[str]] = frozenset()
+    container_requires: ClassVar[frozenset[str]] = frozenset()
+    #: The launcher this engine is bound to (set by the registry binding;
+    #: host is the standalone default so engines remain directly testable).
+    transport: Transport = HostTransport()
     # True when the server is a proxied HTTP service (llama-swap needs the
     # `proxy:` + `checkEndpoint:` fields instead of managing inference).
-    proxied: ClassVar[bool] = False
+    proxied: bool = False
+    # Health path llama-swap polls for a proxied server.  "/" suits sd-server;
+    # audio.cpp exposes /health; whisper-server accepts "/".
+    check_endpoint: str = "/"
     # Container lifecycle (llama-swap docker orchestration, docs/kb
     # guides/model-runtime/ttl-and-unloading.md): `cmdStop` stops the container
     # itself — without it llama-swap can only stop the `docker run` client
     # process, leaving the container running and its VRAM held.  `unloadTimeout`
     # must exceed the stop grace (docker stop is slow).  Only container backends
     # set these; None keeps llama-server entries free of both fields.
-    stop_cmd: ClassVar[str | None] = None
-    unload_timeout: ClassVar[int | None] = None
+    stop_cmd: str | None = None
+    unload_timeout: int | None = None
 
     def unsupported_reason(self, model: "Model") -> str | None:
         """Return why this backend cannot serve *model*, or None if it can."""
@@ -92,15 +109,11 @@ class BaseBackend(ABC):
             logger.warning("backend %s cannot handle setting %r (ignored)",
                            self.name, key)
 
-    def is_available(self, avail: dict) -> bool:
-        """True when the resources this backend needs to launch are configured.
-
-        ``avail`` maps resource names to their configured values (e.g.
-        ``llama_bin``, ``vllm_image``, ``vllm_bin``).  Backends override this
-        to gate format-based inference: a format is only auto-assigned to a
-        backend that can actually run with the current configuration.
-        """
-        return True
+    def supports(self, avail: dict, transport: Transport) -> bool:
+        """Whether this engine can launch under *transport* with *avail*."""
+        required = (self.container_requires if transport.container
+                    else self.host_requires)
+        return all(avail.get(key) for key in required)
 
     def default_batch_ubatch(self, role: str) -> tuple[int, int]:
         """``(batch, ubatch)`` defaults for *role* when nothing is

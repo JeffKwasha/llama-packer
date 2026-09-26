@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import textwrap
 from typing import NoReturn
@@ -31,12 +32,12 @@ from llama_packer.consts import (
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
-from llama_packer.writer import build_config, write_yaml, EmittedConfig
+from llama_packer.writer import build_config, write_yaml, dump_yaml, EmittedConfig
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
-from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES, KOKORO_CONTAINER_PORT
-
+from llama_packer.backends.audio_cpp import (AUDIO_CPP_DEFAULT_BIN,
+                                             AUDIO_CPP_SERVER_KNOBS)
 
 
 
@@ -164,10 +165,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
     parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
                         "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
-    parser.add_argument("--kokoro-image", help="container image for `kokoro-podman` backend "
-                         "(overrides profiles.yaml t2s.image; default: vendor-detected upstream image)")
+    parser.add_argument("--audio-cpp-server", help="audiocpp_server binary for `audio-cpp` backend "
+                        "(overrides profiles.yaml audio_cpp.bin / $AUDIOCPP_BIN_DIR / audiocpp_server on PATH)")
+    parser.add_argument("--audio-cpp-backend", help="audio.cpp runtime backend "
+                        "(cuda|vulkan|cpu|metal|hip; overrides profiles.yaml audio_cpp.backend; "
+                        "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
+    parser.add_argument("--idle-unload", type=int, default=None, metavar="SECONDS",
+                        help="Emit a top-level globalTTL: unload any model after SECONDS "
+                             "of inactivity (llama-swap default: 0 = never). Useful when "
+                             "another program (ComfyUI, a game) needs VRAM on short notice.")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -250,14 +258,19 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
 def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     """Resolve the swap-matrix configuration before build_config.
 
-    Returns (matrix_cfg, embed_model, rerank_model). Without a ``matrix:``
-    section the matrix is disabled — make that state visible when the fleet
-    actually has RAG models, otherwise a silently missing co-loading setup
-    looks exactly like a bug (it has, repeatedly).
+    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
+
+    ``categories`` maps each declared category name → its selected model
+    (defaults: ``emb``/``rnk`` bound to the embeddings/rerank models).  The
+    RAG pair still drives the shared chat-context solve; every *other*
+    category (e.g. ``tts``/``stt``) is returned in ``fixed`` as a
+    fixed-overhead resident reserved alongside chat and RAG.
+
+    Without a ``matrix:`` section the matrix is disabled — make that state
+    visible when the fleet actually has RAG models, otherwise a silently
+    missing co-loading setup looks exactly like a bug (it has, repeatedly).
     """
     matrix_cfg = profiles_cfg.get("matrix")
-    embed_model = None
-    rerank_model = None
     if not matrix_cfg:
         emb = _select_model(models, "embeddings", args.embed, logger)
         rnk = _select_model(models, "rerank", args.rerank, logger)
@@ -266,18 +279,54 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
                 "matrix: disabled — profiles.yaml has no matrix: section; "
                 "RAG co-loading off (emb: %s, rnk: %s)",
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
-        return None, None, None
+        return None, None, None, {}, ()
     embed_model = _select_model(models, "embeddings", args.embed, logger)
     rerank_model = _select_model(models, "rerank", args.rerank, logger)
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
-        return None, None, None
+        return None, None, None, {}, ()
     if rerank_model is None:
         logger.warning("no rerank model found; skipping matrix")
-        return None, None, None
+        return None, None, None, {}, ()
+
+    # Declared categories (defaults bind the RAG pair).  Category names are
+    # the matrix var names; roles may repeat (e.g. tts/stt on t2s/s2t).
+    cat_specs = matrix_cfg.get("categories") or {
+        "emb": {"role": "embeddings"}, "rnk": {"role": "rerank"}}
+    categories: dict[str, "Model"] = {}
+    for name, spec in cat_specs.items():
+        spec = spec if isinstance(spec, dict) else {}
+        role = str(spec.get("role") or "")
+        selector = spec.get("selector")
+        if not role:
+            logger.warning("matrix: category %r has no role; omitted", name)
+            continue
+        model = _select_model(models, role, selector, logger)
+        if model is None:
+            logger.warning("matrix: category %r: no %s model%s; omitted",
+                           name, role,
+                           f" matching {selector!r}" if selector else "")
+            continue
+        categories[str(name)] = model
+    # Back-compat: the canonical RAG names always resolve.
+    categories.setdefault("emb", embed_model)
+    categories.setdefault("rnk", rerank_model)
+
+    known = set(categories)
+    for key in (matrix_cfg.get("evict_costs") or {}):
+        if key not in known:
+            logger.warning("matrix: evict_costs key %r is not a declared "
+                           "category %s; llama-swap will ignore it",
+                           key, sorted(known))
+
+    fixed = [(n, m) for n, m in categories.items()
+             if m is not embed_model and m is not rerank_model]
     logger.info("matrix embed: %s", embed_model.stem)
     logger.info("matrix rerank: %s", rerank_model.stem)
-    return matrix_cfg, embed_model, rerank_model
+    if fixed:
+        logger.info("matrix categories: %s",
+                    ", ".join(f"{n}={m.stem}" for n, m in fixed))
+    return matrix_cfg, embed_model, rerank_model, categories, fixed
 
 
 # Var-name prefix per co-load role, used in set expressions
@@ -285,7 +334,7 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
 _COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
 
 
-def _build_matrix_vars(models: list, embed_model, rerank_model,
+def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
                        coload_stems: list[str],
                        entry_ids_by_stem: dict[str, list[str]], logger) -> tuple[dict, list[str]]:
     """Auto-collect matrix vars: chat entries + selected embed/rerank + co-loads.
@@ -309,10 +358,18 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
         for eid in entry_ids_by_stem.get(m.stem, []):
             chat_idx += 1
             vars_[f"c{chat_idx}"] = eid
+    # Declared categories contribute one var each (emb, rnk, tts, stt, …);
+    # the category names are what `sets:` expressions reference.
+    for name, model in (categories or {}).items():
+        if name in vars_:
+            logger.warning("matrix: category var %r collides with an existing "
+                           "var; skipped", name)
+            continue
+        vars_[name] = model.template_id
     if embed_model is not None:
-        vars_["emb"] = embed_model.template_id
+        vars_.setdefault("emb", embed_model.template_id)
     if rerank_model is not None:
-        vars_["rnk"] = rerank_model.template_id
+        vars_.setdefault("rnk", rerank_model.template_id)
     by_stem = {m.stem: m for m in models}
     coload_vars: list[str] = []
     for stem in coload_stems:
@@ -326,8 +383,8 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
             name = f"{prefix}{n}"
         vars_[name] = m.template_id
         coload_vars.append(name)
-    logger.info("matrix vars: %d chat + emb + rnk + %d coload",
-                chat_idx, len(coload_vars))
+    logger.info("matrix vars: %d chat + %d category + %d coload",
+                chat_idx, len(categories or {}), len(coload_vars))
     return vars_, coload_vars
 
 
@@ -534,18 +591,48 @@ def main(argv: list[str] | None = None) -> None:
             cand = cand / "whisper-server"
         whisper_bin = str(cand)
 
-    # kokoro-podman resource configuration (CLI > profiles.yaml `t2s:` section >
-    # vendor-detected upstream image).  `vendor:` (auto|nvidia|amd|cpu) picks
-    # the default image tag AND device flags; `image:`/--kokoro-image overrides
-    # the tag only; `podman_args:` replaces the auto device flags entirely.
-    t2s_cfg = profiles_cfg.get("t2s") or {}
-    kokoro_vendor = str(t2s_cfg.get("vendor") or detect_gpu_vendor())
-    if kokoro_vendor not in KOKORO_DEFAULT_IMAGES:
-        logger.warning("profiles.yaml t2s.vendor: %r unknown (auto/nvidia/amd/cpu); "
-                       "using cpu defaults", kokoro_vendor)
-        kokoro_vendor = "cpu"
-    kokoro_image = str(args.kokoro_image or t2s_cfg.get("image")
-                       or KOKORO_DEFAULT_IMAGES[kokoro_vendor])
+    # audio-cpp (audio.cpp) resource configuration (CLI > profiles.yaml
+    # `audio_cpp:` section > $AUDIOCPP_BIN_DIR > audiocpp_server on PATH).
+    # Backend layering (resolved in AudioCppBackend.build_cmd): sidecar
+    # `audio_cpp.backend` > explicit (this block: CLI > profiles.yaml) >
+    # vendor auto (NVIDIA→cuda, AMD→vulkan, else cpu) > cpu.
+    audio_cpp_cfg = profiles_cfg.get("audio_cpp") or {}
+    audio_cpp_bin_raw = (args.audio_cpp_server or audio_cpp_cfg.get("bin")
+                         or os.environ.get("AUDIOCPP_BIN_DIR")
+                         or shutil.which("audiocpp_server"))
+    audio_cpp_bin = None
+    if audio_cpp_bin_raw:
+        cand = Path(str(audio_cpp_bin_raw))
+        if cand.is_dir():  # AUDIOCPP_BIN_DIR may be a directory
+            cand = cand / "audiocpp_server"
+        audio_cpp_bin = str(cand)
+    audio_cpp_backend = str(args.audio_cpp_backend
+                            or audio_cpp_cfg.get("backend") or "").lower()
+    if audio_cpp_backend in ("auto",):
+        audio_cpp_backend = ""
+    audio_cpp_backend_auto = {"nvidia": "cuda", "amd": "vulkan"}.get(
+        detect_gpu_vendor(), "cpu")
+
+    # Probe the binary's compiled backends once (fast: --list-devices loads
+    # the ggml registry).  Parsed device labels map to the server-JSON enum;
+    # build_cmd warns when an emitted backend is missing from the probe.
+    audio_cpp_probe = ""
+    if audio_cpp_bin and os.access(audio_cpp_bin, os.X_OK):
+        _probe_labels = {"VULKAN": "vulkan", "CPU": "cpu", "CUDA": "cuda",
+                         "ROCM": "hip", "HIP": "hip", "METAL": "metal"}
+        try:
+            probe = subprocess.run([audio_cpp_bin, "--list-devices"],
+                                   capture_output=True, text=True,
+                                   timeout=30, check=False)
+            found = {_probe_labels[m.group(1).upper()]
+                     for line in (probe.stdout + probe.stderr).splitlines()
+                     if (m := re.match(r"\s*([A-Za-z]+):\d+", line))
+                     and m.group(1).upper() in _probe_labels}
+            if found:
+                audio_cpp_probe = ",".join(sorted(found))
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("audio-cpp: backend probe failed for %s: %s",
+                         audio_cpp_bin, exc)
 
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
@@ -558,7 +645,11 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
             "whisper_bin": whisper_bin or "",
-            "kokoro_image": kokoro_image,
+            "audio_cpp_bin": audio_cpp_bin or "",
+            # Container runtimes: probed once so container transports are only
+            # inferred when their runtime is actually on PATH.
+            "docker": bool(shutil.which("docker")),
+            "podman": bool(shutil.which("podman")),
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
@@ -645,15 +736,30 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["vllm_bin"] = vllm_bin
     template_vars.setdefault("sd_bin", "sd-server")
     template_vars.setdefault("whisper_bin", "whisper-server")
-    template_vars["kokoro_image"] = kokoro_image
-    template_vars["kokoro_vendor"] = kokoro_vendor
-    template_vars["podman_args"] = str(t2s_cfg.get("podman_args") or "")
-    template_vars["kokoro_container_port"] = str(
-        t2s_cfg.get("container_port") or KOKORO_CONTAINER_PORT)
-    if t2s_cfg.get("voices_dir"):
-        template_vars["voices_dir"] = str(t2s_cfg["voices_dir"])
+    template_vars["audio_cpp_bin"] = audio_cpp_bin or AUDIO_CPP_DEFAULT_BIN
+    if audio_cpp_backend:
+        template_vars["audio_cpp_backend"] = audio_cpp_backend
+    template_vars["audio_cpp_backend_auto"] = audio_cpp_backend_auto
+    if audio_cpp_probe:
+        template_vars["audio_cpp_bin_backends"] = audio_cpp_probe
+    for _knob in AUDIO_CPP_SERVER_KNOBS:
+        _value = audio_cpp_cfg.get(_knob)
+        if _value in (None, ""):
+            continue
+        if _knob == "voice_dir":
+            # Upstream resolves relative voice_dir against the config file's
+            # directory (/tmp/llama-swap/) — always emit an absolute path.
+            _value = os.path.abspath(os.path.expanduser(str(_value)))
+        template_vars[f"audio_cpp_{_knob}"] = str(_value)
+    _tmpdir = audio_cpp_cfg.get("tmpdir")
+    if _tmpdir not in (None, ""):
+        template_vars["audio_cpp_tmpdir"] = str(_tmpdir)
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
+    # GPU vendor for container device flags (docker --runtime/--gpus vs
+    # podman --device); overridable per run via profiles.yaml.
+    template_vars["container_vendor"] = str(
+        vllm_cfg.get("container_vendor") or detect_gpu_vendor())
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
     # Host HF_HOME root bind-mounted into vllm-docker containers
     # (/root/.cache/huggingface).  HF_HUB_OFFLINE forbids downloads, so this
@@ -690,8 +796,24 @@ def main(argv: list[str] | None = None) -> None:
                     template_vars["gpu_mem_util"])
 
     # Detect matrix configuration before build_config
-    matrix_cfg, embed_model, rerank_model = _detect_matrix(
-        profiles_cfg, models, args, logger)
+    (matrix_cfg, embed_model, rerank_model, matrix_categories,
+     matrix_fixed) = _detect_matrix(profiles_cfg, models, args, logger)
+
+    # ── Degenerate-budget refusal ──
+    # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):
+    # nothing can load.  Refuse here, before any VRAM work, so the existing
+    # working config is never overwritten by an empty one.
+    spare_check_mb = Profiles(profiles_cfg).global_spare_mb(args.spare,
+                                                            gpu.vram_mb)
+    reserve_check = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, gpu.baseline_mb)
+    available_check = gpu.vram_mb - reserve_check - spare_check_mb
+    if gpu.vram_mb > 0 and available_check <= 0:
+        fatal("VRAM budget exhausted: %d MiB total - %d MiB reserve - "
+              "%d MiB spare = %d MiB available. Nothing can load; "
+              "not overwriting the existing config. Reduce --spare or "
+              "--baseline.",
+              gpu.vram_mb, reserve_check, spare_check_mb,
+              int(available_check))
 
     # Build config (progress bar appears only once the denominator is
     # known — total=len(models); without rich / non-TTY it is a no-op).
@@ -714,6 +836,7 @@ def main(argv: list[str] | None = None) -> None:
             models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
             spare=args.spare, max_context=max_ctx,
             matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
+            fixed_categories=matrix_fixed,
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
@@ -733,7 +856,8 @@ def main(argv: list[str] | None = None) -> None:
     if not args.no_macros:
         from llama_packer.macros import Macro, Macros
         Macro.clear()
-        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub)
+        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub,
+               hf_home=hf_home)
         # Apply env substitution to flag macro definitions as well (they were
         # built with placeholder-aware sub, but ensure consistency)
         flag_macros = Macro.definitions()
@@ -747,6 +871,12 @@ def main(argv: list[str] | None = None) -> None:
             if cmd:
                 entry["cmd"] = Macro.apply(cmd)
     if not config.get("models"):
+        if args.spare or args.baseline:
+            fatal("no model entries generated — VRAM reservation "
+                  "(--spare %s, --baseline %s) leaves too little budget "
+                  "for any model; not overwriting the existing config. "
+                  "Reduce the reservation or wait for other programs to "
+                  "exit.", args.spare or "none", args.baseline or "none")
         fatal("no model entries generated")
     logger.info("entries: %d generated", len(config["models"]))
 
@@ -767,41 +897,55 @@ def main(argv: list[str] | None = None) -> None:
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
         vars_, coload_vars = _build_matrix_vars(
-            models, embed_model, rerank_model, config.coload_stems,
-            config.entry_ids_by_stem, logger)
+            models, embed_model, rerank_model, matrix_categories,
+            config.coload_stems, config.entry_ids_by_stem, logger)
         chat_var_names = [k for k in vars_ if re.fullmatch(r"c\d+", k)]
-        # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
-        chat_expr = "(" + " | ".join(chat_var_names) + ")"
-        sets_cfg = matrix_cfg.get("sets") or {}
-        sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
-        if coload_vars:
-            joined = " ".join(str(s) for s in sets_cfg.values())
-            if "__COLOAD_VARS__" not in joined:
-                logger.info(
-                    "matrix: co-loads %s included but no set references "
-                    "__COLOAD_VARS__; they stay outside the co-loading sets",
-                    coload_vars)
-        # llama-swap schema: matrix lives under routing.router.settings.matrix,
-        # not at the top level.
-        config["routing"] = {
-            "router": {
-                "use": "matrix",
-                "settings": {"matrix": {
-                    "vars": vars_,
-                    "evict_costs": matrix_cfg.get("evict_costs", {}),
-                    "sets": sets,
-                }},
-            },
-        }
+        if not chat_var_names:
+            # Every chat model was disabled by VRAM gating — a degenerate
+            # empty OR-list would be a syntactically valid but semantically
+            # broken set.  Skip matrix routing entirely: models serve
+            # individually (no co-loading) until a looser budget brings
+            # chat entries back.
+            logger.warning(
+                "matrix: no chat models survived VRAM gating; skipping "
+                "matrix routing (models will serve individually)")
+        else:
+            # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
+            chat_expr = "(" + " | ".join(chat_var_names) + ")"
+            sets_cfg = matrix_cfg.get("sets") or {}
+            sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
+            if coload_vars:
+                joined = " ".join(str(s) for s in sets_cfg.values())
+                if "__COLOAD_VARS__" not in joined:
+                    logger.info(
+                        "matrix: co-loads %s included but no set references "
+                        "__COLOAD_VARS__; they stay outside the co-loading "
+                        "sets", coload_vars)
+            # llama-swap schema: matrix lives under routing.router.settings.
+            # matrix, not at the top level.
+            config["routing"] = {
+                "router": {
+                    "use": "matrix",
+                    "settings": {"matrix": {
+                        "vars": vars_,
+                        "evict_costs": matrix_cfg.get("evict_costs", {}),
+                        "sets": sets,
+                    }},
+                },
+            }
 
     # Top-level llama-swap settings
     config["healthCheckTimeout"] = hct
+    if args.idle_unload is not None:
+        if args.idle_unload < 0:
+            fatal("--idle-unload must be >= 0 (0 disables idle unloading)")
+        config["globalTTL"] = args.idle_unload
 
     output_path = Path(args.output).absolute()
 
     if args.dry_run:
         payload = config.plain() if isinstance(config, EmittedConfig) else config
-        sys.stdout.write(yaml.dump(payload, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        sys.stdout.write(dump_yaml(payload))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
     else:
