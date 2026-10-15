@@ -4,9 +4,10 @@
     ./extras/install.py --user lemonade --group models
     ./extras/install.py --user lemonade --group models --dry-run
 
-Creates the service user, lays out the run directory, installs the
-binaries, regenerates ``config.yaml`` with llama-packer, writes a
-hardened unit derived from ``llama-swap.service.in``, and starts it.
+Creates the service user, lays out the run directory, fetches the
+binaries (by running ``extras/update.py``, which owns that), regenerates
+``config.yaml`` with llama-packer, writes a hardened unit derived from
+``llama-swap.service.in``, and starts it.
 
 Two properties of the generated unit drive most of the choices here.
 
@@ -233,55 +234,58 @@ def prepare_dir(r: Runner, dir_: Path, group: str) -> None:
 
 
 def install_binaries(r: Runner, dir_: Path, mode: str) -> None:
-    """Place ``llama-swap`` and one llama.cpp build under *dir_*.
+    """Put ``llama-swap`` and a llama.cpp build under *dir_*.
 
-    ``copy`` is the default because the service must survive a rebuild
-    of the repo it was deployed from; ``link`` hardlinks instead (no
-    second copy on platter storage, but the files are then shared inode
-    for inode with the repo). ``download`` delegates to
-    ``extras/update.py``, which installs into its own cwd.
+    Delegates to ``extras/update.py``, which already owns downloading,
+    checksumming and pruning, and installs into its own cwd. Reimplementing
+    that here would give two copies of the same logic to keep in step --
+    so this step runs the updater rather than duplicating it.
+
+    It runs *before* the config is generated, and that ordering is load
+    bearing rather than cosmetic: ``find_bin_dir`` resolves the llama
+    binary relative to the working directory, so a config generated
+    before the binaries are in place is a config that points nowhere.
     """
     if mode == "skip":
         print("  binaries: skipped (--binaries skip)")
-        return
-    if mode == "download":
-        logger.info("fetching binaries into %s via extras/update.py", dir_)
+    else:
+        logger.info("fetching binaries into %s via extras/update.py "
+                    "(set GITHUB_TOKEN for the API rate limit)", dir_)
         r.run([sys.executable, str(REPO / "extras" / "update.py")], cwd=dir_)
-        return
+    require_binaries(r, dir_)
 
-    swap = REPO / "llama-swap"
-    if not swap.is_file():
-        raise InstallError(
-            f"{swap} not found — run ./extras/update.py in the repo first, "
-            "or pass --binaries download")
-    build = newest_build(REPO)
-    if build is None:
-        raise InstallError(
-            "no llama-b* build with a llama-server found in "
-            f"{REPO} — run ./extras/update.py, or pass --binaries download")
+def require_binaries(r: Runner, dir_: Path) -> None:
+    """Fail early when the config would have nothing to point at.
 
-    logger.info("installing %s and %s", swap.name, build.name)
-    for src in (swap, build):
-        dst = dir_ / src.name
+    Checked here so the error names the missing piece, instead of surfacing
+    as llama-packer's ``no llama-b#### directory found here`` from inside the
+    config-generation step.
+    """
+    if newest_build(dir_) is None or not (dir_ / "llama-swap").exists():
         if r.dry_run:
-            print(f"  {src} -> {dst}")
-            continue
-        if dst.is_dir() and dst.is_symlink():
-            dst.unlink()
-        elif dst.is_dir():
-            shutil.rmtree(dst)
-        elif dst.exists():
-            dst.unlink()
-        if mode == "link" and src.is_file():
-            try:
-                os.link(src, dst)
-                continue
-            except OSError:
-                logger.warning("hardlink failed for %s; copying", src.name)
-        if src.is_dir():
-            shutil.copytree(src, dst, symlinks=True)
-        else:
-            shutil.copy2(src, dst)
+            return
+        raise InstallError(
+            f"{dir_} has no llama-b* build with a llama-server and no "
+            "llama-swap; run ./extras/install.py without --binaries skip, "
+            f"or populate it with: (cd {dir_} && {REPO / 'extras' / 'update.py'})")
+
+
+def backup(path: Path, dry_run: bool) -> Path | None:
+    """Copy *path* aside to ``<name>.bak-<n>`` before overwriting it.
+
+    An install replaces a working config and a working unit in one step.
+    A regeneration can move every context (see :func:`generate_config`), so
+    the previous pair has to be recoverable without a `git checkout` -- they
+    are both gitignored, machine-local files with no other copy.
+    """
+    if dry_run or not path.exists():
+        return None
+    n = 1
+    while (dst := path.with_name(f"{path.name}.bak-{n}")).exists():
+        n += 1
+    shutil.copy2(path, dst)
+    logger.info("backed up %s -> %s", path, dst.name)
+    return dst
 
 
 def check_writable(r: Runner, path: Path, user: str, what: str) -> None:
@@ -309,6 +313,13 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
     As the service user rather than root, so the ``derived:`` blocks it
     persists into the model tree belong to the same account that serves
     them — and so nothing in the config-generation path needs root.
+
+    Run from *dir_*, not the repo. ``find_bin_dir`` resolves the llama
+    binary relative to the working directory, and the emitted ``LLAMA_DIR``
+    macro is derived from wherever that binary was found — so generating
+    from the repo produces a config that points back at the repo, and
+    everything installed under *dir_* is ignored. Generating from *dir_*
+    makes the config self-referential: it names the build it will run.
     """
     cmd = [packer, "--models-dir", *args.models_dir,
            "--profiles", str(args.profiles),
@@ -317,17 +328,24 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
         cmd += ["--spare", args.spare]
     if args.vram:
         cmd += ["--vram", args.vram]
-    logger.info("regenerating config as %s (this sizes every context)", user)
-    print(f"  $ runuser -u {user} -- {' '.join(cmd)}")
+    if not args.spare:
+        logger.warning("--spare not given: the budget is re-solved from "
+                       "auto-detected VRAM, so contexts may differ from the "
+                       "config being replaced (pass the previous --spare to "
+                       "reproduce it)")
+    logger.info("regenerating config as %s, from %s (this sizes every context)",
+                user, dir_)
+    print(f"  $ cd {dir_} && runuser -u {user} -- {' '.join(cmd)}")
     if r.dry_run:
         return
+    backup(dir_ / "config.yaml", r.dry_run)
     env = {
         **os.environ,
         # No home by construction; give the tools somewhere sane to look.
         "HOME": str(dir_),
         "HF_HOME": args.hf_home or os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface")),
     }
-    res = r.run(["runuser", "-u", user, "--", *cmd], cwd=REPO, env=env,
+    res = r.run(["runuser", "-u", user, "--", *cmd], cwd=dir_, env=env,
                 capture=True)
     if res.stdout:
         print(res.stdout.rstrip())
@@ -400,6 +418,7 @@ def install_unit(r: Runner, args: argparse.Namespace, dir_: Path) -> Path:
             print(f"    {ln}")
     if r.dry_run:
         return unit
+    backup(unit, r.dry_run)
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text(body)
     os.chmod(unit, 0o644)
@@ -536,10 +555,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="HF cache root for the config-generation run")
     p.add_argument("--packer", default=None,
                    help="llama-packer executable (default: this repo's venv)")
-    p.add_argument("--binaries", choices=("copy", "link", "download", "skip"),
-                   default="copy",
-                   help="copy from this repo (default), hardlink, download "
-                        "via extras/update.py, or leave alone")
+    p.add_argument("--binaries", choices=("update", "skip"), default="update",
+                   help="run extras/update.py in the run directory first "
+                        "(default), or leave the binaries already there")
     p.add_argument("--unit", default="/etc/systemd/system/llama-swap.service",
                    help="unit file path to write")
     p.add_argument("--memory-high", default="32G",

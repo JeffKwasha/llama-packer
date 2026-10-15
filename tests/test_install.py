@@ -192,3 +192,68 @@ def test_dry_run_prints_without_executing(tmp_path, capsys):
     ins.Runner(True).run(["touch", str(marker)])
     assert not marker.exists()
     assert str(marker) in capsys.readouterr().out
+
+
+# --- binaries and backups --------------------------------------------------
+
+
+def test_require_binaries_fails_when_config_would_point_nowhere(tmp_path):
+    # find_bin_dir resolves relative to the cwd, so a config generated
+    # before the binaries land is a config that points nowhere. Better to
+    # say so here than as llama-packer's "no llama-b#### directory found".
+    r = ins.Runner(False)
+    with pytest.raises(ins.InstallError, match="no llama-b"):
+        ins.require_binaries(r, tmp_path)
+
+
+def test_require_binaries_passes_once_populated(tmp_path):
+    build = tmp_path / "llama-b11658"
+    build.mkdir()
+    (build / "llama-server").write_text("x")
+    (tmp_path / "llama-swap").write_text("x")
+    ins.require_binaries(ins.Runner(False), tmp_path)
+
+
+def test_backup_keeps_the_previous_config(tmp_path):
+    # Both are gitignored and machine-local, so an install that overwrites
+    # them has no other way back: a regeneration can move every context.
+    live = tmp_path / "config.yaml"
+    live.write_text("models: {}\n")
+    made = ins.backup(live, dry_run=False)
+    assert made.read_text() == "models: {}\n"
+    assert live.read_text() == "models: {}\n"      # untouched by the copy
+    # A second backup must not clobber the first.
+    live.write_text("models: {a: 1}\n")
+    again = ins.backup(live, dry_run=False)
+    assert again.name == "config.yaml.bak-2"
+    assert made.name == "config.yaml.bak-1"
+
+
+def test_backup_noop_without_file(tmp_path):
+    assert ins.backup(tmp_path / "absent", dry_run=False) is None
+
+
+def test_config_is_generated_from_the_run_directory(tmp_path, monkeypatch):
+    # LLAMA_DIR is derived from wherever find_bin_dir located the binary,
+    # so generating from the repo would emit a config pointing back at the
+    # repo and leave everything in the run directory unused.
+    seen = {}
+    monkeypatch.setattr(ins, "REPO", tmp_path / "repo")
+    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    (tmp_path / "repo").mkdir()
+    opt = tmp_path / "opt"
+    opt.mkdir()
+
+    class _R:
+        dry_run = False
+
+        def run(self, argv, **kw):
+            seen["cwd"] = kw.get("cwd")
+            for name in ("config.yaml", "config.env"):
+                (kw["cwd"] / name).write_text("x")
+            return type("R", (), {"stdout": "", "returncode": 0})()
+
+    args = _args(models_dir=["/models"], profiles=tmp_path / "p.yaml",
+                 spare=None, vram=None, hf_home=None)
+    ins.generate_config(_R(), "svc", opt, args, "llama-packer")
+    assert seen["cwd"] == opt

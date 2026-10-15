@@ -18,14 +18,77 @@ never recreates the user and never drops an existing config.
 | Preflight | root, systemd, at least one GPU device node |
 | Account | `useradd --system --no-create-home --shell /usr/sbin/nologin` if absent; added to `render`, `video` and `--group` |
 | Run directory | `<dir>` as `root:<group>` mode `2775` |
-| Binaries | `llama-swap` + the highest-numbered `llama-b*` build from the repo (or `--binaries download` / `link` / `skip`) |
-| Config | llama-packer run **as the service user**, writing `<dir>/config.yaml` and the sibling `config.env` |
+| Binaries | `extras/update.py` run with `<dir>` as its cwd |
+| Config | llama-packer run **as the service user** from `<dir>`, writing `<dir>/config.yaml` and the sibling `config.env` |
 | Unit | [`extras/llama-swap.service.in`](../extras/llama-swap.service.in) rendered, `systemd-analyze verify`-ed, written to `/etc/systemd/system/llama-swap.service` |
 | Start | `llama-swap -validate` first, then `systemctl enable --now`, then a `/v1/models` probe |
+
+Existing `config.yaml` and the installed unit are copied to `<name>.bak-N`
+before being overwritten — both are gitignored and machine-local, so there
+is no other way back.
 
 Useful flags: `--dir` (run directory), `--listen` (default
 `127.0.0.1:8123`), `--spare`/`--vram` (passed to llama-packer), `--dry-run`,
 `--no-start`, `--memory-high/--memory-max/--swap-max`.
+
+## Two orderings that are load-bearing
+
+**Binaries before config.** `find_bin_dir` resolves the llama binary
+relative to the working directory, and the emitted `LLAMA_DIR` macro is
+derived from wherever that binary was found. A config generated before the
+binaries are in place is a config that points nowhere; a config generated
+from the repo is a config that points *back at the repo*, leaving
+everything in `<dir>` unused. So the updater runs first, and llama-packer
+runs with `<dir>` as its cwd — which also makes the result self-referential,
+naming the build it will actually run.
+
+**`--spare` decides whether contexts move.** Regenerating re-solves the
+whole fleet. Without `--spare` the budget comes from auto-detected VRAM,
+which may differ from whatever produced the config being replaced — every
+context, id and matrix set can shift. Pass the same `--spare` the current
+config was built with to reproduce it.
+
+## The updater is the installer for binaries
+
+`extras/update.py` already owns downloading, sha256 verification and
+pruning, and installs into its own cwd — so `install.py` runs it rather
+than keeping a second copy of that logic in step. `--binaries skip` leaves
+the binaries alone if you have already populated the directory.
+
+That does mean **an update needs the GitHub API** (and `GITHUB_TOKEN` for
+the rate limit). There is deliberately no systemd timer for it. A new
+llama.cpp build changes the binary that VRAM constants were measured
+against — `derived: shape` records the flag string, not the build — so
+binaries moving without a re-pack would leave the config silently serving
+with a stale compute term. `-watch-config` watches the config only, so the
+swap would not even be visible as a reload. If you want this automated, the
+safe shape is a timer that updates **and** re-packs together, and refuses
+the swap when `llama-swap -validate` rejects the result; that is a separate
+piece of work from this installer.
+
+## Engines this repo does not ship
+
+`extras/update.py` fetches llama.cpp and llama-swap only. Audio.cpp
+(`audiocpp_server`) is out of scope — [docs/backends/audio-cpp.md](backends/audio-cpp.md)
+says so — so the installer does not touch it, and an absolute path in the
+generated config is correct and expected. Point at it however you prefer:
+
+```yaml
+# profiles.yaml
+audio_cpp:
+  bin: /mnt/pool/data/tools/audiocpp/audiocpp_server
+```
+
+Resolution order: `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
+`$AUDIOCPP_BIN_DIR` (a file *or* a directory) > `audiocpp_server` on
+`PATH`.
+
+One interaction worth knowing: audio.cpp entries write their generated
+`server.json` under `/tmp/llama-swap/`. The unit sets `PrivateTmp=true`,
+which gives the service its own writable `/tmp` — correct, but it means the
+path is not shared with the host, so a TTS entry cannot be debugged by
+looking at that directory from a shell. `profiles.yaml audio_cpp.tmpdir`
+overrides it if you need a shared location.
 
 ## Why the service user has no home
 
