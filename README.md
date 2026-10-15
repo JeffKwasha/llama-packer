@@ -37,6 +37,30 @@ uv run llama-packer --models-dir ~/models --output ~/llama-swap-config.yaml
 ./llama-swap --config ~/llama-swap-config.yaml
 ```
 
+Targets are positional: `update.py all` fetches llama.cpp, llama-swap,
+audio.cpp, whisper.cpp and stable-diffusion.cpp; a bare run fetches only the
+first two, the only ones that publish a `checksums.txt`. See
+[extras/README.md](extras/README.md).
+
+`profiles.yaml` is optional at this stage — the bundled defaults are used and
+you get a warning saying so. Copy `profiles.yaml.example` to `profiles.yaml`
+next (see [Profiles](#profiles-profilesyaml)) to start tuning.
+
+## Running it as a service
+
+The Quickstart leaves you with a foreground process. For a persistent,
+systemd-managed deployment rooted at `/opt/llama`:
+
+```sh
+sudo ./extras/install.py --user llama --group models --models-dir /mnt/ai/models
+```
+
+That creates the service account, fetches the binaries, regenerates the config
+under that account, writes a hardened unit, and starts it — then reports what
+the API is actually advertising. `--dry-run` prints every change first. The
+unit, the account's deliberately empty home, and the group that may re-pack
+the config are all explained in [docs/install.md](docs/install.md).
+
 ## Beyond the smoketest
 
 You're thinking that wasn't impressive, llama-packer guessed poorly, didn't know capabilities like vision or tool calling .. etc 
@@ -82,9 +106,15 @@ UI badges from these), driven by `role:` plus declared capabilities:
 | `chat` | `chat/` `vision/` `doc/` | text (+image if image, +video if video, +audio if audio) → text (+audio if speech, +video if omni/video-arch) | llama-server / vLLM | `/v1/chat/completions` |
 | `embeddings` | `embed/` | text → vectors | llama-server / vLLM | `/v1/embeddings` |
 | `rerank` | `rerank/` | query+docs → scores | llama-server / vLLM | `/v1/rerank` |
-| `s2t` | `s2t/` (opt-in) | audio → text | whisper-server | `/v1/audio/transcriptions` |
+| `s2t` | `s2t/` (opt-in) | audio → text | whisper-server, audio-cpp | `/v1/audio/transcriptions` |
 | `t2s` | `t2s/` (opt-in) | text → audio | audio-cpp | `/v1/audio/speech` |
 | `image` | `img/` (opt-in) | text+image → image (or video if video capability / video-arch) | sd-server | `/sdapi/v1/txt2img` |
+
+Both `s2t` backends are available and the choice is per-model: `whisper-server`
+covers the whisper model family, `audio-cpp` covers its own (`parakeet`,
+`nemotron_asr`, `qwen3_asr`, `voxtral_realtime`, …) and can also serve `t2s` from
+the same process. `extras/update.py all` fetches every one of these engines;
+see [docs/backends/](docs/backends/) for the per-engine sidecars and VRAM model.
 
 On a **chat** model, `capabilities: [image]` adds image *input* (`vision`
 was removed — llama-swap modalities are text/audio/image/video), `[video]`
@@ -152,6 +182,8 @@ DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM dete
 
 - [SPEC.md](SPEC.md) — detailed configuration specification
 - [docs/architecture.md](docs/architecture.md) — component map, invariants, extension points
+- [docs/install.md](docs/install.md) — systemd deployment from a run directory ([extras/install.py](extras/install.py))
+- [docs/backends/](docs/backends/) — per-engine notes: llama-server, vLLM, sd-server, whisper-server, audio-cpp
 - [profiles.yaml.example](profiles.yaml.example) — commented starter for `profiles.yaml`; [llama_packer/profiles.yaml](llama_packer/profiles.yaml) is the bundled fallback
 
 ## Limitations
