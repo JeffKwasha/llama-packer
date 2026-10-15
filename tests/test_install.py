@@ -259,3 +259,74 @@ def test_config_is_generated_from_the_run_directory(tmp_path, monkeypatch):
                  spare=None, vram=None, hf_home=None)
     ins.generate_config(_R(), "svc", opt, args, "llama-packer")
     assert seen["cwd"] == opt
+
+
+# --- hf_home resolution ----------------------------------------------------
+
+
+def test_install_does_not_invent_hf_home(monkeypatch, tmp_path):
+    # Under sudo the environment is stripped, so the obvious invention
+    # (Path.home()/".cache") resolves to *root's* cache and every hf_repo
+    # model silently stops resolving. llama-packer already has a chain for
+    # this; install.py must not add a fourth mechanism over it.
+    monkeypatch.setenv("HF_HOME", "/should/not/be/used")
+    seen = {}
+    monkeypatch.setattr(ins, "REPO", Path("/repo"))
+    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+
+    class _R:
+        dry_run = False
+
+        def run(self, argv, **kw):
+            seen["env"] = kw.get("env", {})
+            seen["argv"] = argv
+            cwd = kw.get("cwd")
+            (cwd / "config.yaml").write_text("models: {}\n")
+            (cwd / "config.env").write_text(
+                "LLAMA_DIR=/opt/llama/llama-b11669\nHF_HOME=/mnt/ai/huggingface\n")
+            return type("R", (), {"stdout": "", "returncode": 0})()
+
+    d = tmp_path
+    args = _args(models_dir=["/models"], profiles=Path("/p.yaml"), spare=None,
+                 vram=None, hf_home=None)
+    ins.generate_config(_R(), "svc", d, args, "llama-packer")
+    # HF_HOME is neither pinned nor injected into the pack-time environment.
+    assert seen["env"]["HF_HOME"] == "/should/not/be/used"  # inherited, not set
+    assert "--hf-home" not in seen["argv"]
+
+
+def test_install_passes_hf_home_through(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+
+    class _R:
+        dry_run = False
+
+        def run(self, argv, **kw):
+            seen["argv"] = argv
+            cwd = kw.get("cwd")
+            (cwd / "config.yaml").write_text("models: {}\n")
+            (cwd / "config.env").write_text("HF_HOME=/mnt/ai/huggingface\n")
+            return type("R", (), {"stdout": "", "returncode": 0})()
+
+    args = _args(models_dir=["/models"], profiles=Path("/p.yaml"), spare=None,
+                 vram=None, hf_home="/mnt/ai/huggingface")
+    ins.generate_config(_R(), "svc", tmp_path, args, "llama-packer")
+    i = seen["argv"].index("--hf-home")
+    assert seen["argv"][i + 1] == "/mnt/ai/huggingface"
+
+
+def test_report_resolved_warns_on_missing_hf_home(tmp_path, caplog):
+    (tmp_path / "config.env").write_text(
+        "LLAMA_DIR=/opt/llama/llama-b11669\nHF_HOME=/root/.cache/huggingface\n")
+    ins.report_resolved(tmp_path)
+    warnings = [r.getMessage() for r in caplog.records]
+    assert any("HF_HOME" in w and "does not exist" in w for w in warnings), warnings
+
+
+def test_report_resolved_quiet_when_hf_home_exists(tmp_path, caplog):
+    existing = tmp_path / "hfcache"
+    existing.mkdir()
+    (tmp_path / "config.env").write_text(f"HF_HOME={existing}\n")
+    ins.report_resolved(tmp_path)
+    assert not caplog.records, [r.message for r in caplog.records]

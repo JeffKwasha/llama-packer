@@ -328,6 +328,8 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
         cmd += ["--spare", args.spare]
     if args.vram:
         cmd += ["--vram", args.vram]
+    if args.hf_home:
+        cmd += ["--hf-home", args.hf_home]
     if not args.spare:
         logger.warning("--spare not given: the budget is re-solved from "
                        "auto-detected VRAM, so contexts may differ from the "
@@ -339,17 +341,41 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
     if r.dry_run:
         return
     backup(dir_ / "config.yaml", r.dry_run)
-    env = {
-        **os.environ,
-        # No home by construction; give the tools somewhere sane to look.
-        "HOME": str(dir_),
-        "HF_HOME": args.hf_home or os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface")),
-    }
+    env = {**os.environ, "HOME": str(dir_)}
+    # HF_HOME is deliberately NOT synthesized here. llama-packer resolves it
+    # itself (`--hf-home` > profiles.yaml `hf_home` > `$HF_HOME` >
+    # `~/.cache/huggingface`); inventing a value would be a fourth mechanism
+    # over a chain that already exists, and under `sudo` — which strips the
+    # environment — the obvious invention (Path.home()/".cache") resolves to
+    # *root's* cache, quietly orphaning every hf_repo model. Pass --hf-home,
+    # or run with `sudo -E`, and check the value reported below.
     res = r.run(["runuser", "-u", user, "--", *cmd], cwd=dir_, env=env,
                 capture=True)
     for path in ("config.yaml", "config.env"):
         if not (dir_ / path).is_file():
             raise InstallError(f"llama-packer did not produce {dir_ / path}")
+    report_resolved(dir_)
+
+
+def report_resolved(dir_: Path) -> None:
+    """Print the path macros the emitted config actually resolved to.
+
+    Read back from ``config.env`` rather than predicted, because these are
+    the values that decide whether the service can read the weights at all.
+    A wrong HF_HOME is silent — the entries simply stop resolving — so it is
+    worth showing rather than assuming.
+    """
+    try:
+        text = (dir_ / "config.env").read_text()
+    except OSError:
+        return
+    for line in text.splitlines():
+        if line.startswith(("HF_HOME=", "MODELS_DIR=", "LLAMA_DIR=")):
+            name, _, value = line.partition("=")
+            print(f"    {name}={value}")
+            if name == "HF_HOME" and not Path(value).is_dir():
+                logger.warning("HF_HOME=%s does not exist — hf_repo models "
+                               "will not resolve; pass --hf-home", value)
 
 
 def render_unit(args: argparse.Namespace, dir_: Path) -> str:

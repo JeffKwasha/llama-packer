@@ -31,6 +31,32 @@ Useful flags: `--dir` (run directory), `--listen` (default
 `127.0.0.1:8123`), `--spare`/`--vram` (passed to llama-packer), `--dry-run`,
 `--no-start`, `--memory-high/--memory-max/--swap-max`.
 
+## Pass `--hf-home` if your models come from an HF cache
+
+llama-packer resolves the HF cache root itself:
+
+```
+--hf-home > profiles.yaml hf_home: > $HF_HOME > ~/.cache/huggingface
+```
+
+The installer does **not** pick one for you. Under `sudo` the environment is
+stripped by default, so `$HF_HOME` usually does not survive and the fallback
+resolves against *root's* home — which quietly orphans every `hf_repo` model
+(the kokoro TTS entries and anything else served from a hub snapshot) rather
+than failing loudly.
+
+Either pass it explicitly:
+
+```sh
+sudo ./extras/install.py --user lemonade --group models \
+  --models-dir /mnt/ai/models --hf-home /mnt/ai/huggingface
+```
+
+or preserve the environment with `sudo -E`. The installer reads back the
+`config.env` it just generated and prints the resolved `HF_HOME`, `LLAMA_DIR`
+and `MODELS_DIR`, warning if `HF_HOME` is not a directory. That is deliberate:
+a wrong value has no error, it just makes entries stop resolving.
+
 ## No per-engine configuration is needed
 
 llama-packer resolves **every** host binary — `llama-server` and
