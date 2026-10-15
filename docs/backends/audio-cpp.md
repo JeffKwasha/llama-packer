@@ -164,7 +164,7 @@ alongside chat and RAG while the chat context stays at/above the co-load floor.
 ## Build / install
 
 **llama-packer does not build audio.cpp** — obtaining the binary is out of
-scope, as with the other engines (`extras/update` only downloads llama.cpp and
+scope, as with the other engines (`extras/update.py` only downloads llama.cpp and
 llama-swap). Point the backend at an `audiocpp_server` you built or obtained;
 resolution is `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
 `$AUDIOCPP_BIN_DIR` > `audiocpp_server` on `PATH`.

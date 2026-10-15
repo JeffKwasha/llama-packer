@@ -12,7 +12,7 @@ This document covers every installation method, a Linux setup script with full e
 |---|---|
 | **Python** | 3.10 or newer |
 | **uv** | The Astral `uv` package manager (`pip install uv` or follow [uv.getting-started](https://docs.astral.sh/uv/getting-started/installation/)) |
-| **llama.cpp builds** | Prebuilt binaries in `llama-b*/` directories (created by `extras/update`), OR set `LLAMA_BIN_DIR` to an existing directory containing `llama-server` and `llama-fit-params` |
+| **llama.cpp builds** | Prebuilt binaries in `llama-b*/` directories (created by `extras/update.py`), OR set `LLAMA_BIN_DIR` to an existing directory containing `llama-server` and `llama-fit-params` |
 | **GPU** | NVIDIA (CUDA) or AMD (ROCm) GPU for VRAM detection and model serving |
 | **git** | Required for cloning the repository |
 | **Linux** | This guide targets Linux; macOS should work similarly with path adjustments |
@@ -20,7 +20,7 @@ This document covers every installation method, a Linux setup script with full e
 ### Assumptions
 
 - The project is cloned or will be cloned to a known directory.
-- `llama-b*/` build directories exist in the repo root, created by running `./extras/update` from the repo root. If absent, the tool requires `LLAMA_BIN_DIR` to point at a directory containing `llama-server` and `llama-fit-params`.
+- `llama-b*/` build directories exist in the repo root, created by running `./extras/update.py` from the repo root. If absent, the tool requires `LLAMA_BIN_DIR` to point at a directory containing `llama-server` and `llama-fit-params`.
 - `models/` directory exists (or is configured via `profiles.yaml` `models_dirs:`) containing GGUF files and `.md` sidecar metadata.
 - `profiles.yaml` exists (either `./profiles.yaml` or the bundled default in `llama_packer/profiles.yaml`).
 
@@ -93,28 +93,27 @@ ln -s /opt/llama.cpp/llama-b9123 ./llama-b9123
 llama-packer --dry-run   # finds llama-b9123 in cwd
 ```
 
-All three are equivalent. Option A is the cleanest for persistent setups (add it to your shell profile or `config.env`). Option C is useful if you want `extras/update`'s symlink management to track your build alongside any others it downloads.
+All three are equivalent. Option A is the cleanest for persistent setups (add it to your shell profile or `config.env`). Option C is useful if you want `extras/update.py`'s symlink management to track your build alongside any others it downloads.
 
-#### How `extras/update` Relates to This
+#### How `extras/update.py` Relates to This
 
-`extras/update` always installs into the **repo root** as `llama-bXXXXX/` directories (e.g., `./llama-b10819/`). It has no env var or flag to change the install target — the path is hardcoded:
+`extras/update.py` installs into **the directory you run it from** as `llama-bXXXXX/` directories (e.g., `./llama-b10819/`). There is no env var or flag to change the install target — the path is just the cwd:
 
-```bash
-# From extras/update line 19-20:
-INSTALL_DIR="$SCRIPT_DIR"
-[[ "$(basename "$SCRIPT_DIR")" == "extras" ]] && INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+```python
+# From extras/update.py, in main():
+install_dir = Path.cwd()
 ```
 
 So if you want llama.cpp in `/opt/llama.cpp/` rather than the repo root, you have two paths:
 
-1. **Run `extras/update` normally, then relocate**:
+1. **Run `extras/update.py` from your target directory, then relocate**:
    ```bash
-   ./extras/update --cpp-only b9123    # installs to ./llama-b9123/
-   mv llama-b9123 /opt/llama.cpp/      # move it where you want
+   cd /opt/llama.cpp/
+   /path/to/extras/update.py --cpp-only b9123    # installs to ./llama-b9123/
    export LLAMA_BIN_DIR=/opt/llama.cpp/llama-b9123
    ```
 
-2. **Skip `extras/update` entirely** — manually download the release tarball from [github.com/ggml-org/llama.cpp/releases](https://github.com/ggml-org/llama.cpp/releases) and extract it to your chosen location, then point `LLAMA_BIN_DIR` at it. The script is a convenience wrapper around GitHub API calls + `curl` + `tar`; nothing in it is required for the tool to function.
+2. **Skip `extras/update.py` entirely** — manually download the release tarball from [github.com/ggml-org/llama.cpp/releases](https://github.com/ggml-org/llama.cpp/releases) and extract it to your chosen location, then point `LLAMA_BIN_DIR` at it. The script is a convenience wrapper around the GitHub API calls + `curl` + `tar`; nothing in it is required for the tool to function.
 
 The key invariant: wherever the binaries end up, `llama-packer` just needs a directory containing both `llama-server` and `llama-fit-params`. The directory name doesn't matter when using `LLAMA_BIN_DIR` or `--llama-server`; it only matters for auto-detection (which expects the `llama-b####` naming convention).
 
@@ -146,7 +145,7 @@ export INSTALL_ROOT
 
 # llama.cpp build directory: path containing llama-server and llama-fit-params.
 # If set, overrides the auto-detected llama-b#### directories.
-# Leave empty to use the llama-b*/ dirs under INSTALL_ROOT (created by extras/update).
+# Leave empty to use the llama-b*/ dirs under INSTALL_ROOT (created by extras/update.py).
 # Example: "/opt/llama/cpp/build" or "~/llama-builds"
 export LLAMA_BIN_DIR="${LLAMA_BIN_DIR:-}"
 
@@ -167,7 +166,7 @@ export HF_HOME
 : "${PYTHON_VERSION:=3.12}"
 export PYTHON_VERSION
 
-# Whether to run ./extras/update to fetch llama.cpp binaries.
+# Whether to run ./extras/update.py to fetch llama.cpp binaries.
 # Set to "1" (default) to attempt the download. Requires git + curl.
 # Set to "0" to skip — you must provide llama-b*/ dirs manually or set LLAMA_BIN_DIR.
 : "${RUN_UPDATER:=1}"
@@ -232,9 +231,9 @@ check_prereqs() {
     fi
     log "  git: found"
 
-    # curl (for extras/update)
+    # curl (for extras/update.py)
     if [ "${RUN_UPDATER}" = "1" ] && ! command -v curl &>/dev/null; then
-        warn "curl not found; skipping llama.cpp download via extras/update"
+        warn "curl not found; skipping llama.cpp download via extras/update.py"
         export RUN_UPDATER=0
     fi
 
@@ -278,12 +277,12 @@ setup_llama_cpp() {
     fi
 
     if [ "${RUN_UPDATER}" = "1" ]; then
-        log "Running extras/update to fetch llama.cpp binaries..."
-        if [ -x "${SCRIPTS_DIR}/update" ]; then
-            bash "${SCRIPTS_DIR}/update" --cpp-only
+        log "Running extras/update.py to fetch llama.cpp binaries..."
+        if [ -x "${SCRIPTS_DIR}/update.py" ]; then
+            python3 "${SCRIPTS_DIR}/update.py" --cpp-only
         else
-            warn "extras/update not found at ${SCRIPTS_DIR}/update. Skipping llama.cpp download."
-            warn "Set LLAMA_BIN_DIR to point at a directory with llama-server and llama-fit-params, or run ./extras/update manually."
+            warn "extras/update.py not found at ${SCRIPTS_DIR}/update.py. Skipping llama.cpp download."
+            warn "Set LLAMA_BIN_DIR to point at a directory with llama-server and llama-fit-params, or run ./extras/update.py manually."
         fi
     else
         log "Run_Updater=0 — skipping llama.cpp download."
@@ -357,7 +356,7 @@ verify_install() {
         if [ -n "${bin_dir}" ]; then
             log "  Auto-detected llama.cpp build: ${bin_dir}"
         else
-            warn "No llama-server binary auto-detected. Set LLAMA_BIN_DIR or run ./extras/update."
+            warn "No llama-server binary auto-detected. Set LLAMA_BIN_DIR or run ./extras/update.py."
         fi
     fi
 
@@ -379,7 +378,7 @@ verify_install() {
     echo "   HF_HOME          = ${HF_HOME}"
     echo "   UV_CACHE_DIR     = ${UV_CACHE_DIR}"
     echo ""
-    echo " Run ./extras/update to update llama.cpp and llama-swap binaries."
+    echo " Run ./extras/update.py to update llama.cpp and llama-swap binaries."
     echo "==========================================================="
 }
 
@@ -416,7 +415,7 @@ main "$@"
 | `LLAMA_BIN_DIR` | _(auto)_ | Points directly at a directory with `llama-server`/`llama-fit-params`. Bypasses `llama-b*/` detection. |
 | `MODELS_DIR` | `~/models` | Default model directory for `llama-packer --models-dir` |
 | `HF_HOME` | `~/.cache/huggingface` | Hugging Face cache root; also becomes `${HF_HOME}` macro in generated config |
-| `RUN_UPDATER` | `1` | Whether to auto-run `extras/update` to download llama.cpp binaries |
+| `RUN_UPDATER` | `1` | Whether to auto-run `extras/update.py` to download llama.cpp binaries |
 | `USE_LOCKFILE` | `1` | If `1`, uses `uv.lock` for deterministic installs; if `0`, resolves fresh |
 | `UV_CACHE_DIR` | `~/.cache/uv` | uv's cache directory for downloaded packages |
 | `UV_BINARY` | `uv` | Path to the `uv` binary if not on PATH |
@@ -433,9 +432,9 @@ Creates a temporary virtual environment, installs `llama-packer` and all its dep
 
 Installs the package in **editable** mode. The console script `llama-packer` is created on `PATH` and points to the source tree. Any edits to `.py` files take effect immediately without reinstalling. Dependencies (`pyyaml`, `ruamel-yaml`, `vllm-memory-estimator`) are installed into a virtual environment. This is the recommended persistent installation method.
 
-### `./extras/update`
+### `./extras/update.py`
 
-Downloads and installs prebuilt `llama.cpp` and `llama-swap` binaries from GitHub releases into the `llama-b*/` directories. Required for `llama-packer` to find the `llama-server` binary (via `find_bin_dir`). Uses `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` environment variables for higher API rate limits. Supports `--cpp-only`, `--swap-only`, `--vulkan`, `--rocm`, and specific version tags.
+Downloads and installs prebuilt `llama.cpp` and `llama-swap` binaries from GitHub releases into the **directory you run it from** as `llama-b*/` directories. Required for `llama-packer` to find the `llama-server` binary (via `find_bin_dir`). Stdlib-only Python. Uses `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` environment variables for higher API rate limits. Supports `--cpp-only`, `--swap-only`, `--skip-swap`, `--swap-version TAG`, `--keep-swap N`, `--arch`, plus `vulkan` (default), `rocm`, `latest`, and specific version tags. Both sides are pruned after a successful install: the newest `KEEP_VERSIONS` (3) `llama-b*/` directories and the newest `--keep-swap N` / `KEEP_SWAP_VERSIONS` (2) `llama-swap-v*` binaries; a versioned file that a symlink still points at is never removed. Downloads are sha256-verified before install; a mismatch leaves the current install untouched.
 
 ### `llama-packer --dry-run`
 
@@ -529,7 +528,7 @@ Writes an `AGENTS.md` guide into each models directory from the bundled template
 | **Provenance** | None by default. No SBOM, no build attestations, no checksum verification for the installed package. |
 | **Key risk** | Repository compromise: if the GitHub account is hacked, malicious code can be pushed and immediately pulled by all users installing from `main`. |
 | **Key risk** | No access control on the `git+https` URL — anyone can clone, but only collaborators can push. Public repos allow anyone to create issues, open PRs, and potentially inject code via merge. |
-| **Key risk** | `extras/update` downloads binaries from GitHub releases without signature verification (the script explicitly notes this gap: "PGP signature check: not implemented"). |
+| **Key risk** | `extras/update.py` downloads binaries from GitHub releases without signature verification (the script explicitly notes this gap: "PGP signature check: not implemented"). |
 | **Mitigation** | Pin to a specific commit hash or tag, not `main`. Verify commit signatures with `git verify-commit`. Use `uv.lock` to pin exact dependency versions. |
 
 #### Side-by-Side Security Summary
@@ -540,7 +539,7 @@ Writes an `AGENTS.md` guide into each models directory from the bundled template
 | **Immutable releases** | Once uploaded, cannot be changed | Git history is append-only but refs can be force-pushed |
 | **2FA enforcement** | PyPI enforces 2FA for publishing | GitHub 2FA optional; depends on maintainer |
 | **Dependency integrity** | `uv.lock` pins hashes | `uv.lock` pins hashes |
-| **Binary safety** | Wheel is pre-built, uploaded | `extras/update` downloads binaries with no signature check |
+| **Binary safety** | Wheel is pre-built, uploaded | `extras/update.py` downloads binaries with no signature check |
 | **Supply chain attacks** | Lower risk: trusted publisher, PyPI infrastructure | Higher risk: depends on GitHub account security, no provenance |
 | **Transparency** | All uploads logged, public audit trail | Git history visible, but no formal attestation |
 | **Speed of compromise** | Slow (requires account takeover + PyPI 2FA bypass) | Fast (single compromised credential pushes to main) |
@@ -549,7 +548,7 @@ Writes an `AGENTS.md` guide into each models directory from the bundled template
 
 - **For personal/development use**: GitHub-direct is fine. Pin to a specific tag, verify commits if security is a concern, and use `uv.lock`.
 - **For production/deployment**: PyPI would be preferable if published, due to its stronger provenance and immutability guarantees. Alternatively, pin GitHub installs to a signed tag and verify with `git verify-commit`.
-- **For the `extras/update` script**: Add GPG signature verification for downloaded binaries. The script currently acknowledges this gap explicitly.
+- **For the `extras/update.py` script**: Add GPG signature verification for downloaded binaries. The script currently acknowledges this gap explicitly.
 
 ---
 
@@ -575,7 +574,7 @@ Expected. The package is not on PyPI. Use `uv run --with git+https://github.com/
 ### `llama-packer` exits with "no llama-b#### directory found"
 
 The tool needs `llama-server` and `llama-fit-params` binaries. Either:
-1. Run `./extras/update` to download them.
+1. Run `./extras/update.py` to download them.
 2. Set `LLAMA_BIN_DIR` to an existing directory containing both binaries.
 3. Pass `--llama-server /path/to/llama-server` on the CLI.
 

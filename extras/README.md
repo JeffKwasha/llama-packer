@@ -3,11 +3,19 @@
 Helper scripts that live next to this repo but aren't part of the
 llama-packer Python package.
 
-- [`update`](update) — downloads/installs prebuilt `llama.cpp` + `llama-swap`
-  binaries into the **current working directory**. Run `./extras/update --help`
-  for options. The CPU architecture is auto-detected for both downloads
+- [`update.py`](update.py) — downloads/installs prebuilt `llama.cpp` + `llama-swap`
+  binaries into the **current working directory**. Run `./extras/update.py --help`
+  for options. Pure stdlib Python (no venv/deps), so it runs on a bare box too.
+  The CPU architecture is auto-detected for both downloads
   (llama.cpp `x64`/`arm64`; llama-swap `linux_amd64`/`linux_arm64`); `--arch`
-  overrides it. Run it from wherever you want the binaries installed.
+  overrides it. Run it from wherever you want the binaries installed. Superseded
+  versions are pruned after each install — the newest 3 `llama-b*/` dirs and the
+  newest 2 `llama-swap-v*` binaries (`--keep-swap N`); anything a symlink still
+  points at is kept. Downloads are sha256-verified against the release
+  `checksums.txt` before anything is installed (a mismatch quarantines the file
+  as `_HASH_FAIL_*` and leaves the current binary alone). Rewritten from bash in
+  2026-10: `--help` now exits 0 instead of 1, and `. extras/update.py --help`
+  (sourcing) can no longer kill your shell the way the bash version did.
 - [`fit-sweep`](fit-sweep) — llama-fit-params VRAM data points for the affine
   law `VRAM(C, p) = fixed + c·C + D·p`. Header-only (~0.6 s/run, no tensor
   data, no server, no meaningful VRAM use): safe on platter storage and
