@@ -47,6 +47,13 @@ ESTIMATE_ERROR_REASON = (
 # VRAM reservation (MB)
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+# Fixed base the OS/driver/compositor holds before any model loads.
+# Observed on the reference AMD R9700 (ROCm, KDE Wayland, two outputs):
+# idle USED_VRAM 1665-1796 MiB, of which display scanout is only ~101 MiB —
+# the rest is compositor textures + driver overhead.  The 2048 total is the
+# base; variable tenants (immich, browsers) are the *slack* the operator
+# covers with ``--spare`` / ``profiles.yaml hardware.spare``.  See
+# docs/plans/phase0-vram-baseline.md.
 _RESERVE_SYSTEM = 1024
 _RESERVE_VIDEO = 1024
 
