@@ -164,13 +164,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vllm-image", help="vLLM docker image for `vllm-docker` backend models "
                          "(overrides profiles.yaml vllm.image)")
     parser.add_argument("--vllm-server", help="vLLM binary for `vllm` backend models "
-                         "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
+                         "(overrides profiles.yaml vllm.bin / $VLLM_BIN_DIR / the run directory)")
     parser.add_argument("--sd-server", help="sd-server binary for `sd-server` backend "
-                         "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
+                         "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / the run directory)")
     parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
-                        "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
+                        "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / the run directory)")
     parser.add_argument("--audio-cpp-server", help="audiocpp_server binary for `audio-cpp` backend "
-                        "(overrides profiles.yaml audio_cpp.bin / $AUDIOCPP_BIN_DIR / audiocpp_server on PATH)")
+                        "(overrides profiles.yaml audio_cpp.bin / $AUDIOCPP_BIN_DIR / the run directory)")
     parser.add_argument("--audio-cpp-backend", help="audio.cpp runtime backend "
                         "(cuda|vulkan|cpu|metal|hip; overrides profiles.yaml audio_cpp.backend; "
                         "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")

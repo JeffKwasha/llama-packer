@@ -6,8 +6,12 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
 - **Engine:** llama.cpp · **Transports:** host only (`llama-server`).
 - **Roles:** `chat`, `embeddings`, `rerank`.
 - **Formats:** `.gguf`.
-- **Binary:** `--llama-server` > `profiles.yaml llama_server.bin` >
-  `$LLAMA_BIN_DIR` > `llama-server` on `PATH` (see `find_bin_dir`).
+- **Binary:** `--llama-server` > `$LLAMA_BIN_DIR` > the run directory, scanned
+  for the highest `llama-b<NNNN>/` (see `find_bin_dir`). There is no
+  `profiles.yaml` key and no `PATH` fallback for this one: a build that is
+  not a versioned `llama-b*` directory is not a build the planner can size
+  against. Its cwd scan is the reason the other backends' resolution gained a
+  run-directory tier too.
 - **Proxied:** no — llama-swap manages the process and proxies by port.
 
 ## Command shape

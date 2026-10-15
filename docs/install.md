@@ -88,12 +88,14 @@ safe shape is a timer that updates **and** re-packs together, and refuses
 the swap when `llama-swap -validate` rejects the result; that is a separate
 piece of work from this installer.
 
-## Engines this repo does not ship
+## Engines not fetched by a bare run
 
-`extras/update.py` fetches llama.cpp and llama-swap only. Audio.cpp
-(`audiocpp_server`) is out of scope — [docs/backends/audio-cpp.md](backends/audio-cpp.md)
-says so — so the installer does not touch it, and an absolute path in the
-generated config is correct and expected. Point at it however you prefer:
+`extras/update.py all` fetches llama.cpp, llama-swap, audio.cpp,
+whisper.cpp and stable-diffusion.cpp, so with that run the run directory
+holds every engine and nothing needs pointing anywhere else. A bare
+`extras/update.py` fetches only llama.cpp + llama-swap, in which case the
+other engines are still configured by path — [docs/backends/audio-cpp.md](backends/audio-cpp.md)
+has the detail. Point at them however you prefer:
 
 ```yaml
 # profiles.yaml

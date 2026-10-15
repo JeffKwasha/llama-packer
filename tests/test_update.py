@@ -1,4 +1,4 @@
-"""Tests for extras/update.py — the llama.cpp + llama-swap installer.
+"""Tests for extras/update.py — the prebuilt server-binary installer.
 
 The installer reaches only two seams (``gh_api`` and ``download``), so every
 network path is monkeypatched here; nothing in this file touches the network

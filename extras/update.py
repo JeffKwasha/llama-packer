@@ -10,20 +10,37 @@ Unlike the bash version this can never be "sourced" harmlessly into a shell
 (the ``. extras/update --help`` habit that used to close the terminal): a
 Python script always runs as its own process.
 
-Usage: ./extras/update.py [version|vulkan|rocm] [options]
-Examples:
-    ./extras/update.py             # Latest llama.cpp Vulkan + latest llama-swap
+Usage: ./extras/update.py [target|backend|version ...] [options]
+
+Targets are positional selectors; `all` must be typed in full.
+
+    ./extras/update.py             # llama.cpp + llama-swap (the verified two)
+    ./extras/update.py all         # every target, including the unverified three
+    ./extras/update.py llama       # llama.cpp + llama-swap
+    ./extras/update.py ll          # same, abbreviated
+    ./extras/update.py cpp         # llama.cpp alone
+    ./extras/update.py swap        # llama-swap alone
+    ./extras/update.py audio       # audio.cpp -> audiocpp_server
+    ./extras/update.py whisper     # whisper.cpp -> whisper-server
+    ./extras/update.py sd          # stable-diffusion.cpp -> sd-server
+    ./extras/update.py "s*"        # globs select a set (here: swap + sd)
+
+Backends are positional, and apply to whichever targets offer one:
+
+    ./extras/update.py sd rocm     # native ROCm build
+    ./extras/update.py llama rocm
+
+Versions still work, in the historical shapes:
+
     ./extras/update.py b8913       # Specific llama.cpp version + latest llama-swap
     ./extras/update.py vulkan      # Latest Vulkan build + latest llama-swap
-    ./extras/update.py rocm         # Latest ROCm build + latest llama-swap
-    ./extras/update.py --swap-only  # Only update llama-swap
-    ./extras/update.py --cpp-only   # Only update llama.cpp
+    ./extras/update.py rocm        # Latest ROCm build + latest llama-swap
     ./extras/update.py --swap-only v252  # Specific llama-swap version
     ./extras/update.py --skip-swap  # Skip llama-swap update
-    ./extras/update.py --audio-cpp --whisper   # Also update the audio engines
 
-The audio engines are opt-in and off by default, because unlike llama.cpp
-and llama-swap **neither publishes a ``checksums.txt``** (see ENGINES).
+audio.cpp, whisper.cpp and stable-diffusion.cpp publish no `checksums.txt`, so
+those installs are unverified and say so; a bare run deliberately leaves them
+alone.
 
 Standard library only — no venv, no third-party deps.
 exit 1

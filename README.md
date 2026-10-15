@@ -32,7 +32,7 @@ prerequisites: git + python 3.10 + uv + linux (and your GPU driver supports vulk
 ```sh
 git clone https://github.com/JeffKwasha/llama-packer.git
 cd llama-packer
-./extras/update.py  # fetches llama.cpp + llama-swap binaries
+./extras/update.py       # llama.cpp + llama-swap; add `all` for every engine
 uv run llama-packer --models-dir ~/models --output ~/llama-swap-config.yaml
 ./llama-swap --config ~/llama-swap-config.yaml
 ```

@@ -178,7 +178,8 @@ profiles:
 
 # ── sd-server backend (optional, image generation) ───────
 # Defaults for `backend: sd-server` (stable-diffusion.cpp).  CLI --sd-server
-# wins over this, then $SD_BIN_DIR, then `sd-server` on PATH.
+# wins over this, then $SD_BIN_DIR, then the run directory (cwd),
+# then `sd-server` on PATH.
 # Unlike chat models, image models are fixed VRAM (weights + 512 MiB
 # overhead) and excluded from the shared chat matrix — a 40 GB flux model won't
 # collapse the chat budget.
@@ -189,8 +190,8 @@ profiles:
 
 # ── whisper-server backend (optional, speech-to-text) ─────
 # Defaults for `backend: whisper-server` (whisper.cpp examples/server).
-# CLI --whisper-server wins over this, then $WHISPER_BIN_DIR, then
-# `whisper-server` on PATH.  Opt-in: add `s2t: s2t` under `dirs:` above;
+# CLI --whisper-server wins over this, then $WHISPER_BIN_DIR, then the
+# run directory (cwd), then `whisper-server` on PATH.  Opt-in: add `s2t: s2t` under `dirs:` above;
 # each model needs an authored same-stem sidecar next to its GGML .bin
 # (e.g. ggml-large-v3.md beside ggml-large-v3.bin).  Fixed VRAM overhead,
 # excluded from the shared chat matrix.
@@ -203,7 +204,8 @@ profiles:
 # ── audio-cpp backend (optional, TTS + ASR + music) ───────
 # Defaults for `backend: audio-cpp` (native ggml audiocpp_server, 0xShug0).
 # CLI --audio-cpp-server/--audio-cpp-backend win over this, then
-# $AUDIOCPP_BIN_DIR, then `audiocpp_server` on PATH.  Opt-in: add
+# $AUDIOCPP_BIN_DIR, then the run directory (cwd), then
+# `audiocpp_server` on PATH.  Opt-in: add
 # `t2s: t2s` and/or `s2t: s2t` under `dirs:` above.  Fixed VRAM overhead
 # (file size + family buffer), excluded from the shared chat matrix.
 # One entry per sidecar (1:1) — switching models reloads audio.cpp.
