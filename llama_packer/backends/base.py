@@ -115,11 +115,13 @@ class BaseBackend(ABC):
                     else self.host_requires)
         return all(avail.get(key) for key in required)
 
-    def default_batch_ubatch(self, role: str) -> tuple[int, int]:
+    def default_batch_ubatch(self, role: str) -> tuple[int | None, int | None]:
         """``(batch, ubatch)`` defaults for *role* when nothing is
-        configured — the llama.cpp builtins.  llama-server overrides per
-        role (embed/rerank keep their tuned batch depth)."""
-        return (2048, 512)
+        configured.  ``None`` means **"emit nothing"** — the engine's own
+        builtin applies — which is why the default here is ``(None, None)``
+        rather than a hardcoded copy of it.  llama-server overrides per role
+        (embed/rerank keep their tuned batch depth)."""
+        return (None, None)
 
     @abstractmethod
     def build_cmd(

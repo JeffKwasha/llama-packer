@@ -1299,27 +1299,32 @@ class Model:
         self,
         profile: dict | None,
         fleet: dict | None,
-        role_defaults: tuple[int, int],
-    ) -> tuple[int, int]:
+        role_defaults: tuple[int | None, int | None],
+    ) -> tuple[int | None, int | None]:
         """Resolved ``(batch, ubatch)`` for the serve command and the VRAM
         measurement shape — sidecar ``batch:``/``ubatch:`` > profile keys >
-        fleet ``llama_server: batch:/ubatch:`` > role defaults (the llama.cpp
-        builtins).  Both render explicitly on every llama-server command;
+        fleet ``llama_server: batch:/ubatch:`` > role defaults.  Each half
+        resolves independently.  ``None`` means "nothing configured": the
+        backend renders no flag and the engine's own builtin applies.  A
+        malformed value is warned about and falls through to the next tier
+        (which may itself be ``None``) rather than to a magic number.
         ``ubatch`` also stamps the measurement shape (``-ub`` shapes the
         compute buffer, ``batch`` measurably does not)."""
-        def tier(value: object, fallback: int, key: str) -> int:
+        def tier(value: object, fallback: int | None, key: str) -> int | None:
             if value is None:
                 return fallback
             if isinstance(value, bool) or not isinstance(value, (int, str)):
-                logger.warning("%s: %s=%r is not a positive integer; using %d",
-                               self.stem, key, value, fallback)
+                logger.warning("%s: %s=%r is not a positive integer; using %s",
+                               self.stem, key, value, fallback if fallback is not None
+                               else "the engine default")
                 return fallback
             try:
                 parsed = int(value)
                 assert parsed > 0
             except (ValueError, AssertionError):
-                logger.warning("%s: %s=%r is not a positive integer; using %d",
-                               self.stem, key, value, fallback)
+                logger.warning("%s: %s=%r is not a positive integer; using %s",
+                               self.stem, key, value, fallback if fallback is not None
+                               else "the engine default")
                 return fallback
             return parsed
 

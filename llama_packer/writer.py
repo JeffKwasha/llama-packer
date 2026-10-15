@@ -28,6 +28,7 @@ from llama_packer import utils
 from llama_packer.consts import (
     _DIFFUSION_ARCH_RES,
     _KV_CACHE_BYTES,
+    _LLAMA_CPP_DEFAULT_UBATCH,
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
@@ -1472,17 +1473,18 @@ class Variant:
 
 def resolve_batch_ubatch(
     profiles: Profiles, model: Model, profile: dict | None = None,
-) -> tuple[int, int]:
+) -> tuple[int | None, int | None]:
     """Resolved ``(batch, ubatch)`` for *model* — sidecar keys > profile
-    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults
-    (the llama.cpp builtins).  One resolution site: the rendered command
+    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults.
+    ``None`` means "nothing configured": the backend renders no flag and the
+    engine's builtin applies.  One resolution site: the rendered command
     and the VRAM measurement shape both consume these values, so the serve
     and the estimate can never drift apart on batch flags."""
     try:
         backend = get_backend(model.backend)
         role_defaults = backend.default_batch_ubatch(model.role)
     except KeyError:
-        role_defaults = (2048, 512)
+        role_defaults = (None, None)
     return model.batch_ubatch_for(
         profile, profiles.llama_server_cfg if profiles else {}, role_defaults)
 
@@ -1492,10 +1494,19 @@ def measurement_args(
     profile: dict | None = None,
 ) -> str:
     """The exact flag string VRAM constants are measured (and shape-stamped)
-    under: global args + the model's resolved ``-ub``.  ``batch`` is
+    under: global args + the model's effective ``-ub``.  ``batch`` is
     excluded — measured to have no VRAM effect, so throughput tuning must
-    not invalidate estimates."""
+    not invalidate estimates.
+
+    The *effective* ubatch is stamped, not just an explicitly configured one:
+    an unset key still serves at llama.cpp's builtin, so the compute buffer
+    the constants were measured for is the one the server will actually
+    allocate.  Omitting it would change every ``derived: shape`` key and
+    force a fleet-wide re-measurement for a flag that has not moved.
+    """
     _, ubatch = resolve_batch_ubatch(profiles, model, profile)
+    if ubatch is None:
+        ubatch = _LLAMA_CPP_DEFAULT_UBATCH
     base = (global_args or "").strip()
     return f"{base} -ub {ubatch}".strip()
 

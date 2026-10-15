@@ -522,14 +522,31 @@ def test_llama_server_batch_ubatch_render_and_defaults(make_model):
     assert "-b 2048 -ub 512" in cmd
     assert "-b 512" not in cmd and "-ub 512" in cmd
     assert "--flash-attn on" in cmd
-    # Role defaults: embed/rerank keep their tuned depth when nothing set.
-    assert be.default_batch_ubatch("embeddings") == (4096, 512)
-    assert be.default_batch_ubatch("rerank") == (4096, 512)
-    assert be.default_batch_ubatch("chat") == (2048, 512)
+    # Role defaults: embed/rerank keep their tuned batch depth; an unset
+    # half is None = "render nothing", so llama.cpp's builtin applies.
+    assert be.default_batch_ubatch("embeddings") == (4096, None)
+    assert be.default_batch_ubatch("rerank") == (4096, None)
+    assert be.default_batch_ubatch("chat") == (None, None)
     # cli_args -b/-ub warn once (shadowed + invisible to measurement).
     cmd2, _ = be.build_cmd(make_model("w", cli_args="-b 4096"), 32768, 1,
                            "q8_0", tv, batch=2048, ubatch=512)
     assert "-b 4096 -ub 512" in cmd2  # named flags win per-flag
+
+
+def test_llama_server_unset_batch_ubatch_renders_no_flag(make_model):
+    # The whole point of the None tier: with nothing configured the command
+    # carries no -b/-ub at all, so llama.cpp's own defaults (-b 2048,
+    # -ub 512) stand and a future upstream default change is picked up free.
+    be = LlamaServerBackend()
+    cmd, _ = be.build_cmd(make_model("c"), 32768, 1, "q8_0", _tvars())
+    assert " -b " not in cmd and "-ub " not in cmd
+    # Either half may be set independently.
+    cmd, _ = be.build_cmd(make_model("c"), 32768, 1, "q8_0", _tvars(),
+                          batch=None, ubatch=256)
+    assert "-ub 256" in cmd and "-b " not in cmd
+    cmd, _ = be.build_cmd(make_model("c"), 32768, 1, "q8_0", _tvars(),
+                          batch=4096, ubatch=None)
+    assert "-b 4096" in cmd and "-ub " not in cmd
 
 
 def test_llama_server_batch_ubatch_resolution_cascade(make_model):
@@ -553,6 +570,32 @@ def test_llama_server_batch_ubatch_resolution_cascade(make_model):
         "--flash-attn on -ub 1024"
     assert measurement_args(profiles, m2, "--flash-attn on") == \
         "--flash-attn on -ub 2048"
+
+
+def test_measurement_shape_stamps_builtin_ubatch(make_model):
+    # Nothing configured anywhere: the serve command renders no -ub, but the
+    # *effective* ubatch is still llama.cpp's 512, so the shape must stamp it.
+    # Dropping it would change every derived: shape key and force a
+    # fleet-wide re-measurement for a flag that never moved.
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import measurement_args
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"},
+                         "llama_server": {"args": "--flash-attn on"}})
+    m = make_model("c", role="chat")
+    assert measurement_args(profiles, m, "--flash-attn on") == \
+        "--flash-attn on -ub 512"
+
+
+def test_batch_ubatch_malformed_falls_through_to_builtin(make_model, caplog):
+    # A garbage value is warned about and falls through to the next tier —
+    # which for an unset fleet is None (emit nothing), not a magic number.
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import resolve_batch_ubatch
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"},
+                         "llama_server": {"batch": 2048}})
+    m = make_model("c", role="chat", ubatch="wide")
+    assert resolve_batch_ubatch(profiles, m) == (2048, None)
+    assert any("ubatch" in r.message for r in caplog.records)
 
 
 def test_llama_server_global_args_per_model_cli_args_win(make_model):

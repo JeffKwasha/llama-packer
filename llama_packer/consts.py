@@ -22,6 +22,16 @@ _MIN_CTX_SIZE = 4096
 # (tool-call loops, long sessions). 128k.
 _MIN_AGENTIC_CTX = 131072
 
+# llama-server's own builtins (`llama-server --help`): the effective values
+# when no ``batch:``/``ubatch:`` is configured and the flag is therefore not
+# rendered at all.  Kept in one place so the VRAM measurement shape can stamp
+# the *effective* ubatch while the serve command stays clean — the compute
+# buffer the estimate is calibrated for is the one llama.cpp will use either
+# way.  Verify against the build after a llama.cpp upgrade:
+#   llama-server --help | grep -A1 -- '--ubatch-size'
+_LLAMA_CPP_DEFAULT_BATCH = 2048
+_LLAMA_CPP_DEFAULT_UBATCH = 512
+
 # Reason string emitted as metadata.estimate_error on entries for models
 # with no usable VRAM estimate (metadata.estimated=false): every estimate
 # source failed (fit-params measurement, safetensors header, vLLM

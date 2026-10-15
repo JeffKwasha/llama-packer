@@ -131,7 +131,8 @@ class Profiles:
         names within a group become ``setParamsByID`` keys.  ``batch``/``ubatch``
         are part of the key so per-profile values cannot collide inside one
         entry's command (they render per entry and stamp the measurement
-        shape).  When no profile matches, a single group derived from
+        shape); ``None`` is a group key like any other and means "no flag
+        rendered".  When no profile matches, a single group derived from
         ``defaults`` is returned.
 
         Embed/rerank always serve single-slot: their parallel is pinned to 1
@@ -142,7 +143,7 @@ class Profiles:
             from llama_packer.backends import get_backend
             role_defaults = get_backend(model.backend).default_batch_ubatch(model.role)
         except Exception:
-            role_defaults = (2048, 512)
+            role_defaults = (None, None)
         rag_role = model.role in ("embeddings", "rerank")
         groups: dict[tuple, list] = {}
         for pname, resolved in self.matched_for(model):

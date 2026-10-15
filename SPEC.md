@@ -1182,11 +1182,20 @@ sources overwrite earlier values). The same order applies to every backend:
 2. global `<section>.args` — so e.g. `-b 512` tunes chat models only
 3. per-role flags (embed/rerank mode flags) **+ the resolved named batch
    keys** — `batch:`/`ubatch:` (sidecar > profile > `llama_server:` fleet
-   section > role defaults: chat 2048/512, embed/rerank 4096/512) render
-   explicitly on every llama-server command and win over conflicting
-   `args` values; `cli_args` `-b`/`-ub` is warned about (shadowed, and
-   invisible to the VRAM measurement)
+   section > role defaults) render explicitly on every llama-server command
+   and win over conflicting `args` values; `cli_args` `-b`/`-ub` is warned
+   about (shadowed, and invisible to the VRAM measurement)
 4. per-model sidecar `cli_args:`
+
+**A batch key that is unset anywhere in the cascade renders no flag at all**,
+so llama.cpp's own builtin applies (`-b` 2048, `-ub` 512) — the defaults are
+not copied into the command, which would pin them against upstream. The only
+value declared by default is the embed/rerank `batch` of 4096, a genuine
+throughput tuning with no VRAM effect; a malformed value is warned about and
+falls through to the next tier. `ubatch` is the one half that reaches the VRAM
+measurement shape, and it is stamped with its **effective** value: an unset
+key still serves at the builtin, so `measurement_args()` substitutes it and
+`derived: shape` keys stay stable across an upstream default change.
 
 Note that the map keys on exact flag spelling: `-fa` and `--flash-attn` are
 distinct keys — use the spelling you want in the final command.
