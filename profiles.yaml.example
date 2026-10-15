@@ -12,8 +12,8 @@ defaults:
 # The blessed vocabulary of what models are *used for*. A sidecar tags itself
 # with these names (`usage: [coding, qa]`) and the planner honours a tag only
 # when an entry can actually meet its minimums — a tag is a claim, never a
-# guarantee. An unblessed tag is warned about and ignored, so the demands in
-# force are exactly the ones written here.
+# guarantee. An unblessed tag is warned about and ignored, so the categories
+# in force are exactly the ones written here.
 #
 # min_context / min_parallel are floors, not requests: one entry at
 # ctx >= 128k and parallel >= 2 satisfies all three categories below, so
@@ -30,7 +30,7 @@ defaults:
 #            draft, because an MTP draft roughly doubles generation speed.
 #            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
 #
-# Demands are applied per set: a model that meets `coding` beside emb+rnk
+# Categories are applied per set: a model that meets `coding` beside emb+rnk
 # but not beside a 5.7 GB reranker joins `rag` and is dropped from `ragz`.
 # Only `role: chat` models are considered.
 usage:
@@ -148,7 +148,13 @@ profiles:
 #
 # batch/ubatch are first-class planning keys with a resolution cascade:
 #   sidecar batch:/ubatch:  >  profile key  >  llama_server: here  >  role
-#   defaults (chat 2048/512, embed/rerank 4096/512 — llama.cpp builtins)
+#   defaults (embed/rerank 4096 for batch; chat declares nothing)
+# Leaving a key unset anywhere in that cascade means **no flag is rendered**
+# and llama.cpp's own builtin applies (-b 2048, -ub 512) — so an upstream
+# default change is picked up for free instead of being pinned here. Only
+# the embed/rerank batch depth is declared by default, because it is a real
+# tuning (throughput, no VRAM cost) rather than a copy of the builtin.
+# A malformed value is warned about and falls through to the next tier.
 # `ubatch` shapes the compute buffer (~6 MiB per -ub token on Vulkan, no
 # throughput cost measured) and stamps the VRAM measurement shape; `batch`
 # has no VRAM effect and is deliberately not part of the shape.

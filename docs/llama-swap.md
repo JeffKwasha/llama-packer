@@ -41,8 +41,8 @@ share the path-macro values with the emitted `macros:` block.
   life of that process. llama.cpp has no runtime API to attach/detach an mmproj
   or resize context, so each such difference is a *separate entry*, and moving
   between entries is an unload + relaunch (the "swap"). This is why vision
-  on/off variants are distinct ids (`<id>` vs `<id>-text` vs
-  `<id>-vision-<N>k`), not one entry with a toggle.
+  on/off variants are distinct ids (the vision-less variant's id simply lacks
+  the `i`/`v` capability flags), not one entry with a toggle.
 - **No-reload variants exist only for request-body parameters.** llama-swap's
   `setParamsByID` rewrites the outgoing request per model id and auto-creates
   an alias per key (`model:high`, …). That is exactly what llama-packer uses

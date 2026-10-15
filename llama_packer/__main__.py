@@ -134,14 +134,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Write the AGENTS.md model guide to the models directory if missing "
                              "(never overwrites an existing file; bundled template)")
     parser.add_argument("--extra-dirs", nargs="*", default=["embed", "rerank"], help="Extra subdirectories of --models-dir to scan for orphan GGUFs (default: embed rerank)")
-    parser.add_argument("--spare", help="Additional VRAM to reserve on TOP of the fixed 2048 MiB system+driver reserve "
-                                         "(1024 MiB OS/driver + 1024 MiB video framebuffer): suffixed (2G, 512m, 64k) or bare number "
+    parser.add_argument("--spare", help="Extra VRAM to reserve on top of the fixed 2048 MiB base "
+                                         "(1024 OS/driver + 1024 compositor). This is the operator's slack for "
+                                         "other VRAM tenants (immich, browsers, games): suffixed (2G, 512m, 64k) or bare number "
                                          "(auto: GB if < 3×VRAM, else MB)")
     parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection). "
                                          "The fixed 2048 MiB system+video reserve plus --spare are subtracted before budgeting context.")
-    parser.add_argument("--baseline", help="Driver/compositor VRAM already in use, added to the fixed 2048 MiB reserve "
+    parser.add_argument("--baseline", help="Compositor/desktop VRAM already in use. Replaces the fixed 1024 MiB "
+                                          "compositor portion when larger, so reserve = 1024 + max(1024, baseline); "
+                                          "values <=1024 are a no-op. Use --spare for extra tenants/headroom instead. "
                                           "(default: 0; live auto-detection is disabled so the packer's own resident model "
-                                          "servers are not counted against the budget). Set only when other non-model processes occupy VRAM.")
+                                          "servers are not counted against the budget).")
     parser.add_argument("--unified-system-mb", help="System memory reserved for the OS on unified-memory hosts "
                                           "(GB10/DGX Spark, Apple Silicon): suffixed (8G, 4096m) or bare MB. "
                                           "Default: 8192 (8 GiB). Only applies to auto-detected unified pools; "
@@ -339,9 +342,9 @@ def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
                        entry_ids_by_stem: dict[str, list[str]], logger) -> tuple[dict, list[str]]:
     """Auto-collect matrix vars: chat entries + selected embed/rerank + co-loads.
 
-    Each chat model contributes a var per emitted entry id (the bare id and,
-    when present, its text-only variant — see writer.TEXT_SUFFIX), so text
-    variants join the same co-loading sets as their parent entry.  The
+    Each chat model contributes a var per emitted entry id (the vision
+    serving and, when present, its vision-less variant), so those variants
+    join the same co-loading sets as their parent entry.  The
     stem → ids mapping comes from the emitter (EmittedConfig) so naming is
     owned in exactly one place.  Opportunistically included non-chat models
     (``coload_stems``, from the matrix solve) contribute one role-prefixed
@@ -999,7 +1002,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.dry_run:
         payload = config.plain() if isinstance(config, EmittedConfig) else config
-        sys.stdout.write(dump_yaml(payload))
+        sys.stdout.write(dump_yaml(
+            payload, getattr(config, "set_overheads", None)))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
     else:

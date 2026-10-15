@@ -432,3 +432,195 @@ def _profiles_stub(**kw):
     from types import SimpleNamespace
     return SimpleNamespace(default_cache_type=kw.get("default_cache_type", "q8_0"),
                            default_parallel=1)
+
+
+# ── id grammar: a stable task name + served capability flags ────────────────
+
+
+from llama_packer.writer import (  # noqa: E402
+    Variant,
+    category_label,
+    emit_config,
+    flags_label,
+    served_flags,
+)
+from llama_packer.profiles import Profiles  # noqa: E402
+
+TVARS = {"llama_bin": "/opt/llama-server"}
+
+
+def _id_cat() -> UsageCatalogue:
+    return UsageCatalogue.from_cfg({
+        "coding": {"min_context": "128k", "min_parallel": 1,
+                   "sacrifice": ["vision"]},
+        "chat": {"min_context": "64k", "min_parallel": 2},
+        "qa": {"min_context": "32k", "min_parallel": 2, "require": ["vision"]},
+    })
+
+
+@pytest.mark.parametrize("caps,expected", [
+    (["tools", "image", "video", "audio", "speech"], "tivas"),
+    (["video", "tools"], "tv"),          # emission order, not input order
+    (["image"], "i"),
+    ([], ""),
+    (None, ""),
+])
+def test_flags_label_subset_and_order(caps, expected):
+    assert flags_label(caps) == expected
+
+
+def test_category_label_picks_heaviest_satisfied():
+    cat = _id_cat()
+    demands = _demands(cat, "qa", "chat", "coding")
+    assert category_label(demands, cat) == "coding"
+
+
+def test_category_label_tie_breaks_by_declaration_order():
+    cat = UsageCatalogue.from_cfg({"a": {"min_context": "64k"},
+                                   "b": {"min_context": "64k"}})
+    # b listed first but a is declared first — declaration order wins.
+    assert category_label(_demands(cat, "b", "a"), cat) == "a"
+
+
+def test_category_label_none_without_demands():
+    assert category_label((), _id_cat()) is None
+
+
+def test_served_flags_drops_image_and_demoted_tools(make_model, tmp_path):
+    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x")
+    m = make_model("vis", capabilities=["tools", "image", "video"],
+                   mmproj={"file": "vis-mmproj.gguf", "capabilities": ["image"]})
+    assert served_flags(m, True, False) == "tiv"
+    # no-mmproj serving sheds the image/video inputs the companion enabled
+    assert served_flags(m, False, False) == "t"
+    # tools demoted (served below tools_min_ctx) cannot be claimed
+    assert served_flags(m, True, True) == "iv"
+
+
+def _variant(ctx, usage):
+    return Variant(parallel=1, cache_type="q8_0", spare_mb=0,
+                   profiles_group=[("default", {})], ctx_size=ctx,
+                   include_mmproj=True, usage=usage)
+
+
+def _profiles_with_usage() -> Profiles:
+    return Profiles({
+        "defaults": {"cache_type": "q8_0", "parallel": 1},
+        "usage": {"coding": {"min_context": "128k", "min_parallel": 1},
+                  "chat": {"min_context": "64k", "min_parallel": 2},
+                  "qa": {"min_context": "32k", "min_parallel": 2}},
+    })
+
+
+def test_emit_id_names_heaviest_category_with_flags(make_model):
+    m = make_model("qwen38", context_length=262144,
+                   capabilities=["tools", "image"])
+    cat = UsageCatalogue.from_cfg(_profiles_with_usage().usage_cfg)
+    usage = _demands(cat, "coding", "chat", "qa")
+    config = emit_config([m], {"qwen38": [_variant(160000, usage)]},
+                         _profiles_with_usage(), TVARS)
+    assert list(config["models"]) == ["qwen38.coding.ti"]
+    entry = config["models"]["qwen38.coding.ti"]
+    assert entry["metadata"]["usage"] == ["coding", "chat", "qa"]
+    assert entry["metadata"]["ctx_size"] == 160000
+    assert "coding" in entry["name"] and "156k" in entry["name"]
+
+
+def test_ids_stable_when_context_changes(make_model):
+    # The whole point: a repack that moves the solve must not rename the id,
+    # because opencode/hermes cache model ids at startup.
+    m = make_model("qwen38", context_length=262144,
+                   capabilities=["tools", "image"])
+    profiles = _profiles_with_usage()
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    usage = _demands(cat, "coding", "chat")
+    a = emit_config([m], {"qwen38": [_variant(140000, usage)]}, profiles, TVARS)
+    b = emit_config([m], {"qwen38": [_variant(155000, usage)]}, profiles, TVARS)
+    assert list(a["models"]) == list(b["models"]) == ["qwen38.coding.ti"]
+
+
+def test_untagged_falls_back_to_context_label(make_model):
+    m = make_model("plain", context_length=262144)
+    config = emit_config([m], {"plain": [_variant(131072, ())]},
+                         _profiles_with_usage(), TVARS)
+    assert list(config["models"]) == ["plain.128k"]
+
+
+def test_same_model_two_groups_disambiguated(make_model):
+    # Two profile groups (e.g. different cache_type) can land on the same
+    # category+flags; the first keeps the stable name, the duplicate appends
+    # its context rather than colliding into a fatal error.
+    m = make_model("qwen38", context_length=262144,
+                   capabilities=["tools", "image"])
+    profiles = _profiles_with_usage()
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    usage = (cat.get("coding"),)
+    variants = [_variant(150000, usage), _variant(140000, usage)]
+    config = emit_config([m], {"qwen38": variants}, profiles, TVARS)
+    assert list(config["models"]) == ["qwen38.coding.ti",
+                                      "qwen38.coding.ti-136k"]
+
+
+def test_category_slugged_for_the_id(make_model):
+    # Operator category names must not leak invalid characters into the id
+    # (opencode excludes '#', llama-swap needs routeable/YAML-safe keys).
+    m = make_model("m", context_length=262144, capabilities=["tools"])
+    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
+                         "usage": {"My Code!": {"min_context": "64k"}}})
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    v = _variant(80000, (cat.get("My Code!"),))
+    config = emit_config([m], {"m": [v]}, profiles, TVARS)
+    assert list(config["models"]) == ["m.my-code.t"]
+
+
+def test_unusable_category_name_falls_back_to_ctx(make_model):
+    m = make_model("m", context_length=262144)
+    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
+                         "usage": {"***": {"min_context": "64k"}}})
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    v = _variant(80000, (cat.get("***"),))
+    config = emit_config([m], {"m": [v]}, profiles, TVARS)
+    assert list(config["models"]) == ["m.78k"]
+
+
+def test_dump_yaml_annotates_set_memory():
+    # The config documents its own memory split: a comment above each set.
+    # Only direct children of `sets:` are annotated, so a var that happens to
+    # share a set's name is left alone.
+    from llama_packer.writer import dump_yaml
+    text = dump_yaml(
+        {"routing": {"router": {"settings": {"matrix": {
+            "vars": {"rag": "m", "c1": "m2"},
+            "sets": {"rag": "c1 & emb", "voice": "c1 & stt"},
+        }}}}},
+        {"rag": 1751, "voice": 1898})
+    assert "# rag: 1751 MiB allocated to its co-resident models (1.71 GiB)" in text
+    assert "# voice: 1898 MiB allocated to its co-resident models (1.85 GiB)" in text
+    assert text.count("# rag:") == 1  # the `vars: rag` key is not annotated
+
+
+def test_met_demands_enforces_require(make_model, tmp_path):
+    # A serving must never be named for a category whose `require` it fails:
+    # a text-only serving cannot claim a `require: [vision]` category.
+    from llama_packer.writer import Planner
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
+    profiles = Profiles({
+        "defaults": {"cache_type": "q8_0", "parallel": 1},
+        "usage": {"qa": {"min_context": "32k", "require": ["vision"]}},
+    })
+    with_vis = make_model("v", context_length=65536,
+                          capabilities=["image"],
+                          usage=["qa"],
+                          mmproj={"file": "v-mmproj.gguf",
+                                  "capabilities": ["image"]})
+    planner = Planner([with_vis], profiles, fit_bin="unused",
+                      vram_total=48 * 1024)
+    assert [d.name for d in planner.met_demands(
+        with_vis, 65536, 1, include_mmproj=True)] == ["qa"]
+    assert planner.met_demands(
+        with_vis, 65536, 1, include_mmproj=False) == ()
+    # No mmproj at all (the `…-vision` misnomer case): text only, no claim.
+    plain = make_model("p", context_length=65536, usage=["qa"])
+    planner = Planner([plain], profiles, fit_bin="unused", vram_total=48 * 1024)
+    assert planner.met_demands(plain, 65536, 1, include_mmproj=True) == ()
+

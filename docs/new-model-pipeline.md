@@ -92,8 +92,8 @@ Per model (and per profile group `(parallel, cache_type, spare, batch,
 ubatch)`):
 
 - **mmproj keep/drop pass** — vision stays when the minimum useful context
-  is affordable *with* the projection; a dropped main entry is emitted as
-  `<id>-text` with a best-effort vision companion entry.
+  is affordable *with* the projection; a dropped main entry is emitted without
+  the `i`/`v` capability flags and keeps a best-effort vision companion entry.
 - **Auto-parallel** (chat, unpinned) — a value-function solve over slot
   counts `p = 1..8`: `score = (ctx/floor)^0.5 × slots^0.75`, where `ctx` is
   the affine solve at that `p`. The floor cascades: sidecar `min_context:`

@@ -17,7 +17,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Container, Mapping
+from typing import Callable, Container, Iterable, Mapping
 
 import yaml
 
@@ -301,6 +301,7 @@ def _build_entry(
     include_mmproj: bool = True,
     name_suffix: str = "",
     tools_demoted: bool = False,
+    usage: tuple["UsageDemand", ...] = (),
     estimate_error: str | None = None,
     batch: int | None = None,
     ubatch: int | None = None,
@@ -502,6 +503,11 @@ def _build_entry(
         entry["description"] = desc
     # The VRAM-served -c limit (vs. capabilities.context = max trained).
     metadata["ctx_size"] = ctx_size
+    # The blessed usage categories this serving actually satisfies — the same
+    # set the id's category segment names.  Client-facing so a metadata-aware
+    # picker (or the opencode plugin) can filter without parsing the id.
+    if usage:
+        metadata["usage"] = [d.name for d in usage]
     # Client-facing estimate health: when no VRAM estimate source worked,
     # the entry is served at its minimum useful context with a conservative
     # matrix reserve — tell clients so they can treat it differently.
@@ -560,11 +566,6 @@ def _build_entry(
 
 # ── Planning ──────────────────────────────────────────────────────────────
 
-
-# Entry-id suffix of every no-mmproj variant.  Invariant: the bare ``<id>``
-# always serves vision when the model has an mmproj; the text-only serving is
-# always ``<id>-text`` (see :func:`emit_config`).
-TEXT_SUFFIX = "-text"
 
 #: Reserved key under which :meth:`Planner.plan` carries the per-set
 #: admission map for the emitter.  ``emit_config`` is a pure function of the
@@ -1138,11 +1139,12 @@ def _probe_at_overhead(planner: "Planner", model: Model,
 
 
 def ctx_label(ctx: int) -> str:
-    """Compact served-context label for an entry id, at most 4 characters.
+    """Compact served-context label, at most 4 characters.
 
-    A client picking a model from ``/v1/models`` has only the id to go on, so
-    the id has to carry the number that decides whether the model is usable.
-    ``262144 -> '256k'``, ``139264 -> '136k'``, ``1048762 -> '1M'``.
+    Used in the display name (always) and as the entry-id tail for an
+    *untagged* serving — one satisfying no blessed ``usage:`` category, so
+    there is no stable task name to use.  ``262144 -> '256k'``,
+    ``139264 -> '136k'``, ``1048762 -> '1M'``.
 
     The unit threshold is 1000k, not 1024k, so the label is never wider than
     four characters; above it the value switches to whole megas.  Exact
@@ -1152,6 +1154,80 @@ def ctx_label(ctx: int) -> str:
     """
     k = max(int(ctx), 0) // 1024
     return f"{k}k" if k < 1000 else f"{max(1, round(ctx / (1024 * 1024)))}M"
+
+
+#: Flag letters for the id capability segment, in fixed emission order.
+#: ``t`` tools, ``i`` image input, ``v`` video input, ``a`` audio input,
+#: ``s`` audio (speech) output.  A serving with none of these (plain text in,
+#: text out, no tools) emits no segment — the absence is the statement.
+FLAG_LETTERS: tuple[tuple[str, str], ...] = (
+    ("tools", "t"),
+    ("image", "i"),
+    ("video", "v"),
+    ("audio", "a"),
+    ("speech", "s"),
+)
+
+
+def flags_label(capabilities: Iterable[str] | None) -> str:
+    """The id flag segment for a *served* capability set.
+
+    Each letter is present iff the serving actually carries it, so a rung
+    whose tools were demoted (served below ``tools_min_ctx``) does not claim
+    ``t``.  Returns ``""`` when nothing qualifies — a plain text-input/text-
+    output serving has nothing to flag.  The letters are joined in
+    :data:`FLAG_LETTERS` order (deterministic, so the id is stable).
+    """
+    caps_l = {str(c).lower() for c in (capabilities or ())}
+    return "".join(letter for cap, letter in FLAG_LETTERS if cap in caps_l)
+
+
+def served_flags(model: "Model", include_mmproj: bool,
+                 tools_demoted: bool) -> str:
+    """The flag segment for *model* as actually served by this variant.
+
+    Mirrors :func:`_build_entry`'s capability handling: a no-mmproj serving
+    drops the ``image``/``video`` inputs (when a companion exists), and a
+    demoted serving drops ``tools`` — so the id's flags cannot claim a
+    capability the entry does not advertise.  Keeping this next to the
+    emitter's own cap derivation is deliberate: both read the same
+    ``model.capabilities`` vocabulary.
+    """
+    caps = [str(c).lower() for c in model.capabilities]
+    if (not include_mmproj and model.role != "image"
+            and model.mmproj and model.mmproj.gguf_path):
+        caps = [c for c in caps if c not in ("image", "video")]
+    if tools_demoted:
+        caps = [c for c in caps if c != "tools"]
+    return flags_label(caps)
+
+
+def category_label(demands: Iterable["UsageDemand"], catalogue: "UsageCatalogue") -> str | None:
+    """The id category segment: the heaviest satisfied ``usage:`` category.
+
+    "Heaviest" is the one with the largest declared ``min_context`` (ties by
+    catalogue declaration order, so the choice is deterministic).  A serving
+    that meets several categories is named for the most demanding one — an
+    id may under-claim, never over-claim, so a client picking the entry for
+    that task is guaranteed the minimums hold.  ``None`` when the serving
+    satisfies no blessed category (untagged, or below every floor): the
+    emitter then falls back to the context label.
+    """
+    best: UsageDemand | None = None
+    for d in demands or ():
+        if best is None:
+            best = d
+            continue
+        if d.min_context > best.min_context:
+            best = d
+        elif d.min_context == best.min_context:
+            # Tie → catalogue declaration order decides.
+            try:
+                if catalogue.order.index(d.name) < catalogue.order.index(best.name):
+                    best = d
+            except ValueError:
+                pass
+    return best.name if best is not None else None
 
 
 def _parse_bool_knob(key: str, v: object) -> bool:
@@ -1349,9 +1425,10 @@ class Variant:
 
     ``vision_ctx`` is set only when mmproj was dropped from the main variant
     but a companion exists — the emitter then adds a best-effort vision entry.
-    A variant with ``include_mmproj=False`` is emitted as the ``<id>-text``
-    entry (this is both the on-demand text-only variant of a vision-keeping
-    model and the renamed main entry of an auto-dropped model).
+    A variant with ``include_mmproj=False`` is emitted as the vision-less
+    ``.<category>.<flags>`` entry (this is both the on-demand text-only
+    variant of a vision-keeping model and the renamed main entry of an
+    auto-dropped model).
     """
     parallel: int
     cache_type: str
@@ -1359,14 +1436,20 @@ class Variant:
     profiles_group: list[tuple[str, dict]] = field(compare=False)
     ctx_size: int
     include_mmproj: bool
-    #: Resolved ``-b``/``-ub`` (sidecar > profile > fleet > role); rendered
-    #: explicitly on every llama-server command; ``ubatch`` also stamps the
-    #: VRAM measurement shape.
+    #: Resolved ``-b``/``-ub`` (sidecar > profile > fleet > role).  ``None``
+    #: renders no flag — llama.cpp's own builtin then applies.  ``ubatch``
+    #: also feeds the VRAM measurement shape (see :func:`measurement_args`).
     batch: int | None = None
     ubatch: int | None = None
     vision_ctx: int | None = None
     coload: bool = False
     tools_demoted: bool = False
+    #: The blessed ``usage:`` categories this *rung* actually satisfies (the
+    #: ids it is named for).  Empty for an untagged/unmeasured serving.
+    usage: tuple[UsageDemand, ...] = ()
+    #: Categories satisfied by the best-effort vision companion (served at
+    #: ``vision_ctx``); empty when there is no companion or it is unmeasured.
+    vision_usage: tuple[UsageDemand, ...] = ()
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
@@ -1665,12 +1748,13 @@ class Planner:
         """Decide per chat model whether the main entry keeps its mmproj.
 
         A model keeps vision when it reaches the minimum useful context WITH
-        the projection loaded; otherwise the main entry drops it (and is
-        emitted as ``<id>-text``; a best-effort vision variant is emitted
-        alongside) — but only when dropping actually helps: a model whose
-        design context is below the minimum even text-only keeps its vision,
-        since sacrificing it buys nothing.  Uses the global spare and fleet
-        defaults; per-profile spare still bounds ctx per group.
+        the projection loaded; otherwise the main entry drops it (the
+        vision-less serving carries no ``i``/``v`` flag and a best-effort
+        vision variant is emitted alongside) — but only when dropping
+        actually helps: a model whose design context is below the minimum
+        even text-only keeps its vision, since sacrificing it buys nothing.
+        Uses the global spare and fleet defaults; per-profile spare still
+        bounds ctx per group.
         """
         drop: dict[str, bool] = {}
         global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
@@ -1715,6 +1799,30 @@ class Planner:
         if not self.usage:
             return ()
         return resolve_usage(model.usage_tags, self.usage, logger)
+
+    def met_demands(self, model: Model, ctx: int, parallel: int,
+                    include_mmproj: bool, tools_demoted: bool = False,
+                    ) -> tuple[UsageDemand, ...]:
+        """Demands this exact serving satisfies, ``require`` included.
+
+        ``satisfied_by`` only checks the context/slot minimums; a category
+        may also *require* a capability.  An id must never over-claim, so a
+        vision-less serving cannot be named for a ``require: [vision]``
+        category even when its context clears the floor.
+        """
+        out: list[UsageDemand] = []
+        served_flags_str = served_flags(model, include_mmproj, tools_demoted)
+        for d in self.demands_for(model):
+            if not d.satisfied_by(ctx, parallel):
+                continue
+            if "vision" in d.require and not (
+                    {"i", "v"} & set(served_flags_str)):
+                continue
+            if "draft" in d.require and not (
+                    model.mtp is not None or model.mtp_baked_in):
+                continue
+            out.append(d)
+        return tuple(out)
 
     def _price_sets(self) -> None:
         """Cost every chat set by the residents it can hold alongside chat.
@@ -2251,6 +2359,16 @@ class Planner:
                             "%s: vision companion disabled (%s)",
                             model.stem, on_view.vram.over_budget_reason)
                         vision_ctx = None
+                vision_usage: tuple[UsageDemand, ...] = ()
+                if vision_ctx is not None and est_error is None:
+                    vision_usage = self.met_demands(
+                        model, vision_ctx, parallel, include_mmproj=True)
+                # Computed before `parallel` is zeroed for uncapped vLLM:
+                # a slot count is what satisfies a category, and 0 would
+                # silently drop every demand from the id.
+                demand_parallel = parallel
+                rung_usage = () if est_error is not None else self.met_demands(
+                    model, ctx_size, parallel, include_mmproj, tools_demoted)
                 if uncapped:
                     parallel = 0   # emit uncapped: no --max-num-seqs
 
@@ -2274,17 +2392,18 @@ class Planner:
                     include_mmproj=include_mmproj, batch=batch, ubatch=ubatch,
                     vision_ctx=vision_ctx,
                     coload=is_coload, tools_demoted=tools_demoted,
+                    usage=rung_usage,
+                    vision_usage=vision_usage,
                     estimate_error=est_error,
                     mem_vram_mib=mem[0], mem_ram_mib=mem[1],
                     mem_vision_vram_mib=vmem[0],
                     mem_vision_ram_mib=vmem[1],
                     vram_note=vram_note))
 
-                # On-demand text-only variant: when the main entry keeps its
-                # mmproj, also plan a no-vision entry (``<id>-text``) so
-                # clients can pick the lower-memory serving.  When the main
-                # entry was auto-dropped it IS the ``-text`` entry, so no
-                # separate variant is needed.
+                # On-demand vision-less variant: when the main entry keeps its
+                # mmproj, also plan a no-vision entry so clients can pick the
+                # lower-memory serving.  When the main entry was auto-dropped
+                # it IS that entry, so no separate variant is needed.
                 if (include_mmproj and view.role == "chat"
                         and model.mmproj and model.mmproj.gguf_path):
                     text_ctx = ctx_size if est_error is not None else (
@@ -2301,6 +2420,10 @@ class Planner:
                             include_mmproj=False, ctx_size=text_ctx,
                             parallel=parallel, profile=group[0][1])
                     if text_ctx > ctx_size:
+                        text_usage = () if est_error is not None else (
+                            self.met_demands(model, text_ctx, demand_parallel,
+                                            include_mmproj=False,
+                                            tools_demoted=tools_demoted))
                         variants.append(Variant(
                             parallel=parallel, cache_type=cache_type,
                             spare_mb=spare_mb, profiles_group=group,
@@ -2308,6 +2431,7 @@ class Planner:
                             include_mmproj=False, batch=batch, ubatch=ubatch,
                             coload=is_coload,
                             tools_demoted=tools_demoted,
+                            usage=text_usage,
                             estimate_error=est_error,
                             mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))
                     else:
@@ -2695,48 +2819,96 @@ def emit_config(models: list[Model], plan: dict,
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
-    entry.  Id invariant: the bare ``<id>`` always serves vision when the
-    model has an mmproj — every no-mmproj variant is emitted as
-    ``<id>`` + :data:`TEXT_SUFFIX` (name suffix ``[text]``), whether it is
-    the on-demand text-only variant or the main entry of an auto-dropped
-    model.  A variant with ``vision_ctx`` additionally emits a best-effort
-    vision companion entry, id-suffixed ``-vision-<N>k`` where
-    ``N = vision_ctx // 1000`` (e.g. 92567 → ``-vision-92k``).
+    entry.  Entry ids are **stable across repacks**: they name the task, not
+    the solved context.  Grammar ``<template_id>.<category>.<flags>`` where
+
+    - ``<category>`` is the heaviest ``usage:`` category the rung satisfies
+      (:func:`category_label`); untagged servings fall back to the context
+      label (:func:`ctx_label`), their pre-``usage:`` behaviour;
+    - ``<flags>`` is the served capability segment (:func:`flags_label`),
+      omitted entirely for a plain text-in/text-out serving.
+
+    Capability/value detail lives in the display ``name`` and in
+    ``metadata`` (``ctx_size``, ``usage``), never in the id: opencode/hermes
+    cache the id at startup, so a context-derived suffix would force a
+    restart on every repack.  A variant with ``vision_ctx`` additionally
+    emits a best-effort vision companion entry (its flags carry the
+    ``i``/``v`` the vision-less main lacks).
 
     Raises ValueError on duplicate entry ids (two models slugging to the same
     id); callers surface it as a fatal configuration error.  Returns an
     :class:`EmittedConfig` whose ``entry_ids_by_stem`` maps each model stem to
     the ids it produced.
     """
+    catalogue = UsageCatalogue.from_cfg(getattr(profiles, "usage_cfg", None))
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}
     coload_stems: set[str] = set()
+    # Per-model tails already used: two profile groups (e.g. different
+    # cache_type) can land on the same category+flags, and they still need
+    # distinct ids.  The first keeps the stable name; later duplicates append
+    # their context label (deterministic given the plan's iteration order).
+    used_tails: dict[str, set[str]] = {}
+
+    def unique_tail(stem: str, tail: str, ctx: int) -> str:
+        taken = used_tails.setdefault(stem, set())
+        cand = tail
+        n = 1
+        while cand in taken:
+            n += 1
+            cand = (f"{tail}-{ctx_label(ctx)}" if n == 2
+                    else f"{tail}-{ctx_label(ctx)}-{n}")
+        taken.add(cand)
+        return cand
+
+    def id_and_suffix(v: Variant, ctx: int, flags: str,
+                      usage: tuple["UsageDemand", ...] | None = None
+                      ) -> tuple[str, str]:
+        """The ``.<category>.<flags>`` id tail and the display suffix.
+
+        *flags* is the served capability segment (:func:`served_flags`);
+        *usage* overrides the variant's own satisfied categories (the vision
+        companion serves at a different context, so it may satisfy a
+        different set).
+        """
+        cat = category_label(v.usage if usage is None else usage, catalogue)
+        # The category is operator-chosen; a name that does not survive id
+        # slugging (or slugs empty) falls back to the context label so the id
+        # stays within the model_id charset (opencode/llama-swap/shell-safe).
+        cat_id = utils.slugify(cat) if cat is not None else ""
+        if not cat_id:
+            cat = None
+        tail = cat_id if cat_id else ctx_label(ctx)
+        disp = f" · {cat}" if cat is not None else ""
+        disp += f" {ctx_label(ctx)}"
+        if flags:
+            tail += f".{flags}"
+            disp += f" [{flags}]"
+        return tail, disp
+
     for model in models:
         for v in plan.get(model.stem, []):
             view = model.view_for(v.include_mmproj)
             context_length = view.design_context
-            text_only = not v.include_mmproj
             if v.coload:
                 coload_stems.add(model.stem)
+            flags = served_flags(view, v.include_mmproj, v.tools_demoted)
+            tail, disp = id_and_suffix(v, v.ctx_size, flags)
+            tail = unique_tail(model.stem, tail, v.ctx_size)
             entry_id, entry = _build_entry(
                 view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
-                name_suffix=" [text]" if text_only else "",
+                name_suffix=disp,
                 tools_demoted=v.tools_demoted,
+                usage=v.usage,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
                 vram_note=v.vram_note,
             )
-            if text_only:
-                entry_id += TEXT_SUFFIX
-            # The id carries the served context: a client choosing a model
-            # has only the id, and the text/vision suffixes are redundant
-            # with the per-entry `capabilities` block that already
-            # distinguishes them.
-            entry_id += f"-{ctx_label(v.ctx_size)}"
+            entry_id += f".{tail}"
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "
@@ -2747,27 +2919,32 @@ def emit_config(models: list[Model], plan: dict,
 
             if v.vision_ctx is None:
                 continue
-            n_k = v.vision_ctx // 1000
             on_view = model.view_for(True)
+            v_flags = served_flags(on_view, True, v.tools_demoted)
+            v_tail, v_disp = id_and_suffix(v, v.vision_ctx, v_flags,
+                                           usage=v.vision_usage)
+            v_tail = unique_tail(model.stem, v_tail, v.vision_ctx)
             vision_id, vision_entry = _build_entry(
                 on_view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, on_view.design_context,
                 v.vision_ctx,
                 include_mmproj=True,
-                name_suffix=f" [vision {n_k}k]",
+                name_suffix=v_disp,
                 tools_demoted=v.tools_demoted,
+                usage=v.vision_usage,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
                 mem_vram_mib=v.mem_vision_vram_mib,
                 mem_ram_mib=v.mem_vision_ram_mib,
             )
-            vision_id += f"-vision-{n_k}k"
+            vision_id += f".{v_tail}"
             if vision_id in entries:
                 raise ValueError(
                     f"duplicate entry id {vision_id!r}: model {model.stem!r} "
                     f"collides with {owner[vision_id]!r} — rename one of them")
             entries[vision_id] = vision_entry
             owner[vision_id] = model.stem
+            ids_by_stem.setdefault(model.stem, []).append(vision_id)
 
     set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
@@ -2798,7 +2975,8 @@ class EmittedConfig(dict):
 
     def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
                  coload_stems: list[str] | None = None,
-                 set_admission: dict[str, set[str]] | None = None, **kwargs):
+                 set_admission: dict[str, set[str]] | None = None,
+                 set_overheads: dict[str, int] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
         self.coload_stems: list[str] = coload_stems or []
@@ -2806,6 +2984,10 @@ class EmittedConfig(dict):
         # for models carrying a usage tag; an untagged model appears in every
         # set, which is the pre-existing behaviour.
         self.set_admission: dict[str, set[str]] = set_admission or {}
+        # set name -> MiB allocated to that set's co-resident models (emb/rnk
+        # and any fixed categories).  Emitted as a comment above each `sets:`
+        # entry so the config documents its own memory split.
+        self.set_overheads: dict[str, int] = set_overheads or {}
 
     def plain(self) -> dict:
         return dict(self)
@@ -2851,9 +3033,9 @@ def build_config(
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
-            projection is dropped from the main entry, which is renamed
-            ``<id>-text`` (a ``vision-<N>k`` variant is emitted alongside,
-            still exposing vision at best-effort context).  Pass
+            projection is dropped from the main entry, which then carries no
+            ``i``/``v`` id flag (a vision companion entry is emitted
+            alongside, still exposing vision at best-effort context).  Pass
             ``min_context_explicit=True`` when the value came from an
             explicit ``--min-context`` flag (as opposed to the default): the
             explicit flag overrides the per-model floor cascade's default
@@ -2878,7 +3060,9 @@ def build_config(
         llama_args=template_vars.get("llama_args", ""),
         progress_cb=progress_cb,
     )
-    return emit_config(supported, planner.plan(), profiles, template_vars)
+    config = emit_config(supported, planner.plan(), profiles, template_vars)
+    config.set_overheads = dict(planner.set_overheads)
+    return config
 
 
 class _LiteralDumper(yaml.Dumper):
@@ -2901,14 +3085,66 @@ def _literal_str_representer(dumper, data):
 _LiteralDumper.add_representer(str, _literal_str_representer)
 
 
-def dump_yaml(payload: dict) -> str:
-    """Serialize *payload* to a YAML string, preserving embedded newlines."""
-    return yaml.dump(payload, default_flow_style=False, sort_keys=False,
+def annotate_set_memory(yaml_text: str, set_overheads: Mapping[str, int],
+                        ) -> str:
+    """Insert a ``# <set>: N MiB`` comment above each matrix set.
+
+    PyYAML cannot emit comments, so the already-serialized text is walked:
+    only direct children of the ``sets:`` mapping are annotated (matched by
+    indentation), so a model id or var that happens to share a set's name is
+    never touched.  No-op when there are no priced sets.
+    """
+    if not set_overheads:
+        return yaml_text
+    lines = yaml_text.splitlines()
+    out: list[str] = []
+    in_sets = False
+    sets_indent = -1
+    for line in lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if stripped == "sets:":
+            in_sets = True
+            sets_indent = indent
+            out.append(line)
+            continue
+        if in_sets:
+            if stripped and indent <= sets_indent:
+                in_sets = False
+            elif stripped and ":" in stripped:
+                key = stripped.split(":", 1)[0].strip().strip("\"'")
+                mb = set_overheads.get(key)
+                if mb is not None:
+                    pad = " " * indent
+                    out.append(f"{pad}# {key}: {mb} MiB allocated to its "
+                               f"co-resident models ({mb / 1024:.2f} GiB)")
+        out.append(line)
+    text = "\n".join(out)
+    return text + "\n" if yaml_text.endswith("\n") else text
+
+
+def dump_yaml(payload: dict, set_overheads: Mapping[str, int] | None = None,
+              ) -> str:
+    """Serialize *payload* to a YAML string, preserving embedded newlines.
+
+    When *set_overheads* is given, each matrix set gains a comment recording
+    the VRAM allocated to its co-resident models.
+    """
+    text = yaml.dump(payload, default_flow_style=False, sort_keys=False,
                      allow_unicode=True, Dumper=_LiteralDumper)
+    return annotate_set_memory(text, set_overheads or {})
 
 
-def write_yaml(config: dict, path: Path | str) -> None:
-    """Write config to YAML file."""
+def write_yaml(config: dict, path: Path | str,
+               set_overheads: Mapping[str, int] | None = None) -> None:
+    """Write config to YAML file.
+
+    *set_overheads* defaults to ``config.set_overheads`` when *config* is an
+    :class:`EmittedConfig`, so callers get the matrix-set memory comments
+    without threading the planner result through by hand.
+    """
+    if set_overheads is None:
+        set_overheads = getattr(config, "set_overheads", None)
     payload = config.plain() if isinstance(config, EmittedConfig) else config
     with open(path, "w") as f:
-        f.write(dump_yaml(payload))
+        f.write(dump_yaml(payload, set_overheads))

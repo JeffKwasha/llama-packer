@@ -151,20 +151,21 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     assert v.vision_ctx == 65536
 
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    # Auto-dropped main entry is the text-only one; ids carry the context.
+    # Auto-dropped main entry is the text-only one; the vision companion
+    # carries the image flag and its reduced context in the display name.
     ids = set(config["models"])
     assert len(ids) == 2
-    text_id = next(i for i in ids if "-text-" in i)
-    vis_id = next(i for i in ids if "-vision-65k" in i)
-    assert text_id == "vis-text-195k", text_id
+    text_id = "vis.195k"
+    vis_id = "vis.64k.i"
+    assert ids == {text_id, vis_id}, ids
     main = config["models"][text_id]
     vision = config["models"][vis_id]
     assert "--mmproj" not in main["cmd"]
-    assert main["name"].endswith("[text]")
+    assert main["name"].endswith("195k")
     assert main["metadata"]["mmproj_skipped"] is True
     assert main["capabilities"]["in"] == ["text"]
     assert "--mmproj" in vision["cmd"]
-    assert vision["name"].endswith("[vision 65k]")
+    assert vision["name"].endswith("64k [i]")
 
 
 def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path):
@@ -241,12 +242,13 @@ def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
     ids = set(config["models"])
     assert len(ids) == 2
-    vis_id = next(i for i in ids if "-text-" not in i)
-    text_id = next(i for i in ids if "-text-" in i)
+    vis_id = "vis.128k.i"
+    text_id = "vis.156k"
+    assert ids == {vis_id, text_id}, ids
     assert "--mmproj" in config["models"][vis_id]["cmd"]
     text = config["models"][text_id]
     assert "--mmproj" not in text["cmd"]
-    assert text["name"].endswith("[text]")
+    assert text["name"].endswith("156k")
     assert text["metadata"]["mmproj_skipped"] is True
     assert text["metadata"]["ctx_size"] == 160000
     assert text["capabilities"]["in"] == ["text"]
@@ -548,7 +550,7 @@ def test_plan_vision_companion_over_budget_suppressed(tmp_path, make_model,
                for r in caplog.records)
     # And no vision entry is emitted alongside.
     config = emit_config([m], {"vc": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vc-text-128k"}
+    assert set(config["models"]) == {"vc.128k"}
 
 
 def test_plan_vision_and_text_both_over_budget_disables(tmp_path, make_model,

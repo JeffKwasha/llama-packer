@@ -278,7 +278,8 @@ def test_planner_text_variant_tag_differs(make_model, tmp_path):
 
     config = emit_config([m], {"vis": variants}, _profiles(), TVARS)
     main = entry_for(config, "vis")["description"]
-    text = [e for i, e in config["models"].items() if "-text-" in i][0]["description"]
+    text = [e for e in config["models"].values()
+            if "--mmproj" not in e["cmd"]][0]["description"]
     assert main.endswith("[VRAM 232MB RAM 1MB]")
     assert text.endswith("[VRAM 241MB RAM 0MB]"), text[-40:]
     assert main != text

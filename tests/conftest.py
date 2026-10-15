@@ -85,10 +85,9 @@ def _hf_tree(tmp_path, repo="org/repo", revs=("abc123",),
 
 # ── entry-id helpers ────────────────────────────────────────────────────────
 #
-# Entry ids now carry the served context (``vis-256k``, ``vis-text-160k``),
-# so a test that wants "the text-only entry" must not hardcode the number.
-# These locate entries by shape instead, which keeps the assertions about
-# behaviour rather than about arithmetic that changes with the budget.
+# Entry ids are ``<template_id>.<category|ctx>.<flags>`` and deliberately do
+# not carry the exact context, so a test that wants "the vision entry" or
+# "the text-only entry" locates it by the capability block, not the id.
 
 
 def entries(config) -> dict:
@@ -111,8 +110,7 @@ def entry_id(config, predicate) -> str:
 
 def vision_entry(config) -> dict:
     return entries(config)[entry_id(
-        config, lambda i, e: "-vision-" not in i and not i.endswith("-text-256k")
-        and "image" in (e.get("capabilities", {}).get("in") or []))]
+        config, lambda i, e: "image" in (e.get("capabilities", {}).get("in") or []))]
 
 
 def text_entry(config) -> dict:
@@ -122,11 +120,7 @@ def text_entry(config) -> dict:
         and "image" not in (e.get("capabilities", {}).get("in") or []))]
 
 
-def is_text_id(entry_id_: str) -> bool:
-    return "-text-" in entry_id_
-
-
 def entry_for(config, stem: str, which: int = 0) -> dict:
-    """The entry *config* emitted for a model stem (ids carry context now)."""
+    """The entry *config* emitted for a model stem (ids are namespaced)."""
     ids = config.entry_ids_by_stem[stem]
     return config["models"][ids[which]]
