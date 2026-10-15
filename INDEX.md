@@ -53,6 +53,7 @@ Engines and transports are independent axes: each engine declares the transports
 - [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
 - [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel, audio-roles: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins)
 - [docs/reference.md](docs/reference.md) — external links
+- [docs/install.md](docs/install.md) — deploying under systemd from a run directory: service account, group-writable config, GPU-node discovery ([extras/install.py](extras/install.py))
 
 ## Data dirs
 
@@ -61,4 +62,5 @@ Engines and transports are independent axes: each engine declares the transports
 - `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
 - [`extras/update.py`](extras/update.py) — llama.cpp + llama-swap updater (installs into CWD; stdlib-only Python)
+- [`extras/install.py`](extras/install.py) — systemd deployer: service account, binaries, config, hardened unit from [`extras/llama-swap.service.in`](extras/llama-swap.service.in) ([docs/install.md](docs/install.md))
 - [`extras/llamaswap.ts`](extras/llamaswap.ts) — opencode llama-swap plugin (setup: [`extras/README.md`](extras/README.md))

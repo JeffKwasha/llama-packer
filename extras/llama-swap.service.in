@@ -1,0 +1,89 @@
+# llama-swap.service -- hardened unit template for llama-packer's install.py.
+#
+# Substituted by `extras/install.py`; @PLACEHOLDER@ tokens are replaced:
+#   @USER@ @GROUP@ @DIR@ @LISTEN@
+#
+# The hardening block is the point of this file and is copied verbatim into
+# the installed unit -- do not weaken it to make an install succeed. Two
+# properties depend on choices install.py makes, not on this file:
+#
+#   * The service user is created --system --no-create-home. Everything
+#     below assumes it has no home to reach: ProtectHome plus
+#     InaccessiblePaths hide /home and /var/lib outright, so a user whose
+#     home lives there would find it invisible.
+#   * DeviceAllow lines name the GPU nodes that actually exist on this
+#     host. A pinned /dev/dri/renderD128 is wrong after a card reorder.
+#   * @GPU_ENV@ carries the vendor's device-selection variables, chosen by
+#     what /dev/kfd or /dev/nvidia* says is present.
+#
+# Note the unit runs read-only: the service never writes to @DIR@. The
+# directory is group-writable so a member of @GROUP@ can re-run
+# llama-packer and have -watch-config pick the new config up in place.
+#
+# Validated on every change: `systemd-analyze verify` and
+# `llama-swap -config <dir>/config.yaml -validate`.
+
+[Unit]
+Description=llama-swap
+After=network.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@DIR@
+ExecStart=@DIR@/llama-swap --listen @LISTEN@ --config @DIR@/config.yaml -watch-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+@GPU_ENV@
+EnvironmentFile=-@DIR@/config.env
+
+# --- Memory limits
+# Trailing comments are NOT allowed here: systemd reads the whole rest of
+# the line as the value, so `MemoryHigh=32G  # cap` is an invalid limit and
+# the directive is dropped without an error. Keep the prose on its own line.
+#   MemoryHigh    soft cap: kernel reclaims aggressively above this
+#   MemoryMax     hard cap: cgroup OOM killer fires, kills llama-server
+#   MemorySwapMax limit the swap escape hatch (prevents swap thrash)
+MemoryHigh=@MEM_HIGH@
+MemoryMax=@MEM_MAX@
+MemorySwapMax=@SWAP_MAX@
+
+# --- Filesystem: everything read-only except what's needed ---
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/tmp
+InaccessiblePaths=/root /home /boot /efi /srv /var/lib /var/spool
+
+# --- Devices: block all, allow only the GPU nodes this host actually has ---
+PrivateDevices=true
+@DEVICE_ALLOW@
+
+# --- Privilege & kernel lockdown ---
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+
+# --- Namespace & syscall restrictions ---
+RestrictNamespaces=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictFileSystems=
+
+# --- Misc ---
+ProtectProc=invisible
+ProcSubset=pid
+MemoryDenyWriteExecute=false
+OOMScoreAdjust=1000

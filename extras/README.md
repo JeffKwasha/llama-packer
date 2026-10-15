@@ -16,6 +16,12 @@ llama-packer Python package.
   as `_HASH_FAIL_*` and leaves the current binary alone). Rewritten from bash in
   2026-10: `--help` now exits 0 instead of 1, and `. extras/update.py --help`
   (sourcing) can no longer kill your shell the way the bash version did.
+- [`install.py`](install.py) — deploys llama-swap under systemd from a run
+  directory (`/opt/llama` by default), running as a chosen system user:
+  creates the account, installs the binaries, regenerates `config.yaml` with
+  llama-packer, writes the hardened [`llama-swap.service.in`](llama-swap.service.in)
+  unit, enables and starts it. See [docs/install.md](../docs/install.md).
+  Run `./extras/install.py --help`; `--dry-run` prints every change first.
 - [`fit-sweep`](fit-sweep) — llama-fit-params VRAM data points for the affine
   law `VRAM(C, p) = fixed + c·C + D·p`. Header-only (~0.6 s/run, no tensor
   data, no server, no meaningful VRAM use): safe on platter storage and
