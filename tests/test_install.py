@@ -9,6 +9,7 @@ file under /opt or /etc is created and no service is started.
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ EXTRAS = Path(__file__).resolve().parents[1] / "extras"
 
 _spec = importlib.util.spec_from_file_location("install", EXTRAS / "install.py")
 ins = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = ins  # dataclass resolves annotations via sys.modules
 _spec.loader.exec_module(ins)
 
 

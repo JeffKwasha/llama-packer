@@ -3,14 +3,31 @@
 Helper scripts that live next to this repo but aren't part of the
 llama-packer Python package.
 
-- [`update.py`](update.py) — downloads/installs prebuilt `llama.cpp` + `llama-swap`
-  binaries into the **current working directory**. Run `./extras/update.py --help`
-  for options. Pure stdlib Python (no venv/deps), so it runs on a bare box too.
-  The CPU architecture is auto-detected for both downloads
-  (llama.cpp `x64`/`arm64`; llama-swap `linux_amd64`/`linux_arm64`); `--arch`
-  overrides it. Run it from wherever you want the binaries installed. Superseded
-  versions are pruned after each install — the newest 3 `llama-b*/` dirs and the
-  newest 2 `llama-swap-v*` binaries (`--keep-swap N`); anything a symlink still
+- [`update.py`](update.py) — downloads/installs prebuilt server binaries into
+  the **current working directory**. Run `./extras/update.py --help` for options.
+  Pure stdlib Python (no venv/deps), so it runs on a bare box too.
+  **Targets are positional selectors** — `llama`/`ll`, `cpp`, `swap`, `audio`/`a`,
+  `whisper`/`w`, `sd`/`stable`, and `all` for everything. Globs work (`s*`), and an
+  ambiguous prefix is an error rather than a guess. `all` is matched in full only,
+  because `a` is an alias for audio.cpp — otherwise the one-letter shorthand would
+  be ambiguous. A bare `./extras/update.py` still updates only **llama.cpp +
+  llama-swap**, the two that publish `checksums.txt`; `all` adds the other three,
+  which print an unverified warning rather than pretending to a sha256 check they
+  cannot do.
+  Backends are positional too (`vulkan`, `rocm`, `cpu`); llama.cpp takes them as
+  part of its legacy version token. Per-project quirks are handled: audio.cpp
+  follows llama.cpp's asset naming and ships binaries on its semver tag; whisper.cpp
+  publishes a semver tag *and* an asset-less build tag per release (only `bNNNN`
+  carries binaries) and ships a **bundle** whose `.so` files travel with the binary
+  via `RUNPATH=$ORIGIN`; stable-diffusion.cpp versions as `master-N-<sha>`, ships
+  **zips** rather than tarballs, spells the arch `x86_64`, is also a bundle, and
+  has both Vulkan and ROCm Linux builds.
+  The CPU architecture is auto-detected for all downloads
+  (llama.cpp/audio.cpp/whisper `x64`/`arm64`, stable-diffusion `x86_64`/`aarch64`;
+  llama-swap `linux_amd64`/`linux_arm64`); `--arch` overrides it. Run it from
+  wherever you want the binaries installed. Superseded versions are pruned after
+  each install — the newest 3 `llama-b*/` dirs and the newest 2 versioned entries
+  per engine (`--keep-swap N`, `--keep-engine-versions N`); anything a symlink still
   points at is kept. Downloads are sha256-verified against the release
   `checksums.txt` before anything is installed (a mismatch quarantines the file
   as `_HASH_FAIL_*` and leaves the current binary alone). Rewritten from bash in

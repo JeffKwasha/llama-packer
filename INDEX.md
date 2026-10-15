@@ -61,6 +61,6 @@ Engines and transports are independent axes: each engine declares the transports
 - configured model roots (`models_dirs:`) — same layout (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); `dirs:` maps directories to roles, `hf_home:` sets the HF cache root
 - `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
-- [`extras/update.py`](extras/update.py) — llama.cpp + llama-swap updater (installs into CWD; stdlib-only Python)
+- [`extras/update.py`](extras/update.py) — prebuilt server binaries into the CWD; positional target selectors (`llama`/`ll`, `cpp`, `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, `all`) + backends; default = llama.cpp + llama-swap, `all` adds the three with no upstream checksums; stdlib-only Python
 - [`extras/install.py`](extras/install.py) — systemd deployer: service account, binaries, config, hardened unit from [`extras/llama-swap.service.in`](extras/llama-swap.service.in) ([docs/install.md](docs/install.md))
 - [`extras/llamaswap.ts`](extras/llamaswap.ts) — opencode llama-swap plugin (setup: [`extras/README.md`](extras/README.md))

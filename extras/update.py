@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""update — download and install prebuilt llama.cpp + llama-swap binaries.
+"""update — download and install prebuilt server binaries.
 
 Python port of the ``extras/update`` bash script (same CLI, same messages,
 same install layout). Binaries install into the **current working directory**,
@@ -20,6 +20,10 @@ Examples:
     ./extras/update.py --cpp-only   # Only update llama.cpp
     ./extras/update.py --swap-only v252  # Specific llama-swap version
     ./extras/update.py --skip-swap  # Skip llama-swap update
+    ./extras/update.py --audio-cpp --whisper   # Also update the audio engines
+
+The audio engines are opt-in and off by default, because unlike llama.cpp
+and llama-swap **neither publishes a ``checksums.txt``** (see ENGINES).
 
 Standard library only — no venv, no third-party deps.
 exit 1
@@ -39,12 +43,16 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
+from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 
 RELEASES_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
 LLAMA_SWAP_REPO = "https://api.github.com/repos/mostlygeek/llama-swap"
 KEEP_VERSIONS = 3  # Keep current + N-1 previous llama.cpp build dirs
 DEFAULT_KEEP_SWAP_VERSIONS = 2  # Keep current + previous llama-swap binaries
+DEFAULT_KEEP_ENGINE_VERSIONS = 2  # Same, for the single-binary engines
 DEFAULT_VERSION = "latest-vulkan"
 
 
@@ -245,6 +253,27 @@ def extract_tar_gz(archive: Path, dest: Path) -> None:
             tf.extractall(dest, filter="data")  # Python >= 3.11.4, 3.12+
         except TypeError:  # pragma: no cover - older interpreters
             tf.extractall(dest)
+
+
+def extract_zip(archive: Path, dest: Path) -> None:
+    """Extract a zip release (stable-diffusion.cpp ships these, not tarballs).
+
+    ``filter="data"`` is zipfile's equivalent of tarfile's: it rejects
+    absolute paths and ``..`` traversal from the archive, which a
+    third-party release artifact is exactly the wrong place to trust.
+    """
+    with zipfile.ZipFile(archive) as zf:
+        try:
+            zf.extractall(dest, filter="data")
+        except TypeError:  # pragma: no cover - Python < 3.12
+            zf.extractall(dest)
+
+
+def extract_archive(archive: Path, dest: Path, fmt: str = "tar.gz") -> None:
+    if fmt == "zip":
+        extract_zip(archive, dest)
+    else:
+        extract_tar_gz(archive, dest)
 
 
 def download(url: str, dest: Path, *, quiet: bool = True) -> None:
@@ -663,6 +692,513 @@ def update_llama_swap(
     return True
 
 
+# --- single-binary engines -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Engine:
+    """A prebuilt *server* released as one archive.
+
+    llama.cpp keeps its own code path (its release unpacks a whole build
+    directory and is versioned by build number), so it is not an Engine.
+
+    Fields
+      tag_re    which tags carry assets. Not all of them do: whisper.cpp
+                publishes a semver tag *and* a build tag on the same day,
+                and only the build tag has binaries. stable-diffusion.cpp
+                versions as ``master-<n>-<sha>``. Matching the tag shape
+                rather than taking "latest" is what stops this picking a
+                release with zero assets.
+      backends  backend name -> regex over the download URL, with
+                ``{arch}`` substituted. A single-entry mapping is an engine
+                that ships one Linux build and has nothing to choose.
+      names     candidate paths for the binary inside the archive.
+      fmt       "tar.gz" or "zip" — stable-diffusion.cpp ships zips.
+      arch      which architecture vocabulary the asset names use:
+                "cpp" (x64/arm64) or "sd" (x86_64/aarch64).
+      bundle    True when the archive's directory must be installed whole.
+                whisper.cpp's and stable-diffusion's prebuilt servers link
+                against sibling ``.so`` files and find them via
+                ``RUNPATH=$ORIGIN``, so copying out the binary alone yields
+                something that dies with "libwhisper.so.1: cannot open
+                shared object file".
+      checksum  "required" or "warn" — see ENGINES.
+    """
+    key: str
+    label: str
+    repo: str
+    primary: str
+    versioned: str
+    backup: str
+    backends: dict[str, str]
+    tag_re: str
+    names: tuple[str, ...]
+    checksum: str
+    fmt: str = "tar.gz"
+    arch: str = "cpp"
+    keep: int = DEFAULT_KEEP_ENGINE_VERSIONS
+    bundle: bool = False
+
+    @property
+    def api(self) -> str:
+        return f"https://api.github.com/repos/{self.repo}"
+
+    @property
+    def single_backend(self) -> str:
+        """The one backend name, when there is only one."""
+        return next(iter(self.backends))
+
+    def asset_pattern(self, backend: str) -> str:
+        """Pattern for *backend*, falling back to the only one there is."""
+        if backend in self.backends:
+            return self.backends[backend]
+        if len(self.backends) == 1:
+            return self.single_backend_pattern()
+        return ""
+
+    def single_backend_pattern(self) -> str:
+        return next(iter(self.backends.values()))
+
+
+#: audio.cpp follows llama.cpp's naming almost exactly
+#: (``audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz``) and ships binaries on its
+#: semver tag, so it needs nothing special. There is no ROCm/HIP build — the
+#: AMD path is the Vulkan one, which is what this fleet already runs.
+#: Verified against v0.9.2: the binary sits at the tarball root, carries no
+#: RUNPATH, and runs standalone (it links only libvulkan/libgomp/libstdc++).
+#: The tarball also holds a source tree, which is not worth installing.
+AUDIO_CPP = Engine(
+    key="audio",
+    label="audio.cpp",
+    repo="0xShug0/audio.cpp",
+    primary="audiocpp_server",
+    versioned="audiocpp_server-{tag}",
+    backup="audiocpp_server.bak",
+    # anchored so the "-portable" variant does not win
+    backends={"vulkan": r"ubuntu-{arch}-vulkan\.tar\.gz$"},
+    tag_re=r"v[0-9]+(\.[0-9]+)*",
+    names=("audiocpp_server", "bin/audiocpp_server", "build/bin/audiocpp_server"),
+    checksum="warn",
+)
+
+#: whisper.cpp publishes two tags per release: a semver one with no assets and
+#: a ``bNNNN`` build one that has them, both on the same day. tag_re selects
+#: the build line, and the asset scan then skips any build that is missing
+#: our platform. bundle=True because of the $ORIGIN libraries.
+WHISPER = Engine(
+    key="whisper",
+    label="whisper.cpp",
+    repo="ggml-org/whisper.cpp",
+    primary="whisper-server",
+    versioned="whisper-server-{tag}",
+    backup="whisper-server.bak",
+    backends={"default": r"whisper-bin-ubuntu-{arch}\.tar\.gz$"},
+    tag_re=r"b[0-9]+",
+    names=("whisper-server", "main", "bin/whisper-server", "build/bin/whisper-server"),
+    checksum="warn",
+    bundle=True,
+)
+
+#: stable-diffusion.cpp versions as ``master-<build>-<sha>``, ships zips, uses
+#: the ``x86_64`` spelling, and — like the other two — publishes no checksums.
+#: Both Linux builds are bundles; verified against master-968 that sd-server
+#: carries RUNPATH=$ORIGIN and needs ~35 sibling .so files beside it. The ROCm
+#: build is 285 MB against Vulkan's 37 MB, so vulkan is the default.
+STABLE_DIFFUSION = Engine(
+    key="sd",
+    label="stable-diffusion.cpp",
+    repo="leejet/stable-diffusion.cpp",
+    primary="sd-server",
+    versioned="sd-server-{tag}",
+    backup="sd-server.bak",
+    backends={
+        "vulkan": r"Linux-Ubuntu-[0-9.]+-{arch}-vulkan\.zip$",
+        "rocm": r"Linux-Ubuntu-[0-9.]+-{arch}-rocm-[0-9.]+\.zip$",
+        "cpu": r"Linux-Ubuntu-[0-9.]+-{arch}\.zip$",
+    },
+    tag_re=r"master-[0-9]+-[0-9a-f]+",
+    names=("sd-server", "bin/sd-server", "build/bin/sd-server"),
+    checksum="warn",
+    fmt="zip",
+    arch="sd",
+    bundle=True,
+)
+
+ENGINES = {e.key: e for e in (AUDIO_CPP, WHISPER, STABLE_DIFFUSION)}
+
+#: Backends the CLI accepts as a bare positional. Engines that ship only one
+#: Linux build ignore this and take what they have.
+KNOWN_BACKENDS = ("vulkan", "rocm", "hip", "cuda", "cpu")
+
+
+def get_sd_arch(override: str = "") -> str:
+    """stable-diffusion.cpp spells the architecture ``x86_64`` / ``aarch64``."""
+    if override:
+        return _normalize(override, {
+            "linux_amd64": "x86_64", "x86_64": "x86_64",
+            "x86-64": "x86_64", "amd64": "x86_64", "x64": "x86_64",
+            "linux_arm64": "aarch64", "aarch64": "aarch64",
+            "arm64": "aarch64",
+        }) or override
+    machine = platform.machine()
+    if machine in ("aarch64", "arm64"):
+        return "aarch64"
+    return "x86_64"
+
+
+ARCH_RESOLVERS = {"cpp": get_llama_cpp_arch, "sd": get_sd_arch}
+
+
+def engine_arch(engine: Engine, override: str = "") -> str:
+    return ARCH_RESOLVERS[engine.arch](override)
+
+
+# --- target selection ------------------------------------------------------
+
+#: What a target name resolves to. The llama.cpp pair is one entry because
+#: they are the two halves of the same serving stack — ``ll`` should mean
+#: "the llama bits", not "whisper, oddly".
+TARGET_GROUPS: dict[str, tuple[str, ...]] = {
+    "llama": ("cpp", "swap"),
+    "cpp": ("cpp",),
+    "swap": ("swap",),
+    "audio": ("audio",),
+    "whisper": ("whisper",),
+    "sd": ("sd",),
+}
+
+#: Accepted spellings per group. The first is canonical.
+TARGET_ALIASES: dict[str, tuple[str, ...]] = {
+    "llama": ("llama", "ll"),
+    "cpp": ("cpp", "llama.cpp"),
+    "swap": ("swap", "llama-swap"),
+    "audio": ("audio", "a", "audio.cpp"),
+    "whisper": ("whisper", "w", "whisper.cpp"),
+    "sd": ("sd", "stable", "stable-diffusion", "sams", "stable-diffusion.cpp"),
+}
+
+#: ``all`` is deliberately NOT in TARGET_ALIASES. It is matched in full or
+#: not at all: ``a`` is an alias for audio.cpp, so any prefix or glob
+#: expansion that could reach "all" would make that one-letter shorthand
+#: ambiguous. Its members are already covered by the individual groups, so
+#: excluding it costs nothing.
+ALL_ALIASES = ("all",)
+
+#: Every updatable target, in the order they are installed.
+ALL_TARGETS = ("cpp", "swap", "audio", "whisper", "sd")
+
+#: What a bare invocation updates: the two verified ones. ``all`` is a
+#: separate, explicit word because the other three install binaries that no
+#: upstream publishes a sha256 for.
+DEFAULT_TARGETS = ("cpp", "swap")
+
+
+class TargetError(ValueError):
+    """A target selector matched nothing, or matched too much."""
+
+
+def _alias_index() -> dict[str, str]:
+    """Every accepted spelling -> canonical group name."""
+    index: dict[str, str] = {}
+    for group, names in TARGET_ALIASES.items():
+        for name in names:
+            index[name] = group
+    return index
+
+
+def resolve_target(token: str, index: dict[str, str]) -> tuple[str, ...] | None:
+    """Target names a selector token, or None if it is not a selector.
+
+    Three tiers, in order:
+
+      1. exact alias (this is the only tier ``all`` answers to)
+      2. glob, so ``s*`` or ``*w*`` select a set
+      3. unique prefix, so ``sd`` and ``sd``-prefixes stay short
+
+    Prefix matching is last precisely because it is the loosest: an
+    ambiguous prefix is an error rather than a guess, since guessing wrong
+    here means installing the wrong engine's binary.
+    """
+    low = token.lower()
+    if low in index:
+        return TARGET_GROUPS[index[low]]
+    if low in ALL_ALIASES:
+        return ALL_TARGETS
+    if any(ch in low for ch in "*?["):
+        hits = sorted({index[name] for name in index if fnmatch(name, low)})
+        if hits:
+            return tuple(t for t in ALL_TARGETS if t in hits)
+        return None
+    prefix = sorted({index[name] for name in index if name.startswith(low)})
+    if len(prefix) == 1:
+        return TARGET_GROUPS[prefix[0]]
+    if len(prefix) > 1:
+        raise TargetError(
+            f"{token!r} is ambiguous: matches {', '.join(prefix)} "
+            "(be more specific, or use a glob like 'sd*')")
+    return None
+
+
+def resolve_targets(tokens: list[str]) -> tuple[str, ...]:
+    """Turn positional target selectors into a deduplicated target list."""
+    index = _alias_index()
+    chosen: list[str] = []
+    for token in tokens:
+        targets = resolve_target(token, index)
+        if targets is None:
+            continue  # not a selector: caller treats it as a version
+        for target in targets:
+            if target not in chosen:
+                chosen.append(target)
+    return tuple(t for t in ALL_TARGETS if t in chosen)
+
+
+def resolve_engine_tag(engine: Engine, arch: str, requested: str = "",
+                       backend: str = "") -> str:
+    """Newest tag matching ``tag_re`` that actually carries our asset.
+
+    Reading the *release list* rather than ``/releases/latest`` is the point:
+    ``latest`` on whisper.cpp is the asset-less semver tag, so "latest" is
+    exactly the wrong answer. The list payload carries each release's
+    ``assets``, so this costs one API call.
+    """
+    if requested:
+        return requested if requested.startswith(("v", "b")) else f"v{requested}"
+    for release in _releases(gh_api(f"{engine.api}/releases")):
+        tag = release.get("tag_name") or ""
+        if not re.fullmatch(engine.tag_re, tag):
+            continue
+        if find_asset(release, engine.asset_pattern(backend).format(arch=arch)):
+            return tag
+    return ""
+
+
+def verify_archive(archive: Path, archive_name: str, payload, policy: str,
+                   install_dir: Path) -> bool:
+    """Check the archive against ``checksums.txt`` when one is published.
+
+    ``required`` — the one llama.cpp and llama-swap use. A missing manifest
+    is an error, because the install would otherwise be a silent downgrade
+    of the guarantee.
+
+    ``warn`` — for projects that publish no manifest at all. The download is
+    still pinned to an immutable tag URL over TLS, but there is nothing to
+    verify it against, so that limit is stated out loud rather than implied
+    away. Quarantining still happens on a real mismatch: if a manifest turns
+    up one day, the failure path is already there.
+    """
+    checksums_url = find_asset(payload, "checksums.txt")
+    if not checksums_url:
+        if policy == "required":
+            eprint("Error: Could not find checksums.txt (this project is "
+                   "expected to publish one; refusing to install unverified)")
+            return False
+        eprint(f"  !! {archive_name}: UNVERIFIED — upstream publishes no "
+               "checksums.txt, so this binary is authenticated by TLS and "
+               "its tag URL only.")
+        eprint("     Anything less than a pinned tag download. Pin the "
+               "version with --*-version if that matters to you.")
+        return True
+    try:
+        checksums_path = archive.parent / "checksums.txt"
+        download(checksums_url, checksums_path)
+    except subprocess.CalledProcessError:
+        eprint(f"Error: Failed to download checksums {checksums_url}")
+        return False
+    expected = expected_sha256(checksums_path, archive_name)
+    if not expected:
+        eprint(f"Error: Could not find hash for {archive_name} in checksums.txt")
+        return False
+    print("Verifying sha256...")
+    actual = sha256_file(archive)
+    if actual != expected:
+        eprint(f"Error: sha256 mismatch for {archive_name}")
+        eprint(f"  expected: {expected}")
+        eprint(f"  actual:   {actual}")
+        fail_path = install_dir / f"_HASH_FAIL_{archive_name}"
+        eprint(f"Hash verification failed — saving downloaded file as {fail_path} "
+               "(no execute bit, symlink not updated)")
+        shutil.copyfile(archive, fail_path)
+        _no_exec(fail_path)
+        return False
+    print(f"Checksum verified: {actual}")
+    return True
+
+
+def find_extracted(root: Path, names: tuple[str, ...]) -> Path | None:
+    """Locate the server binary in an extracted tree.
+
+    These projects disagree on layout, so look for each candidate and,
+    failing that, for the primary name anywhere in the tree.
+    """
+    for name in names:
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    primary = Path(names[0]).name
+    matches = sorted(p for p in root.rglob(primary) if p.is_file())
+    return matches[0] if matches else None
+
+
+def bundle_root(root: Path) -> Path:
+    """The directory to install whole for a ``bundle`` engine.
+
+    Release tarballs wrap their contents in a single directory named after
+    the build; unwrap it so the versioned directory holds the binary and
+    its libraries rather than one more level of nesting.
+    """
+    entries = list(root.iterdir())
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return root
+
+
+def cleanup_engine_versions(engine: Engine, install_dir: Path,
+                            keep: int, referenced: set[str]) -> None:
+    """Drop superseded ``<primary>-<tag>`` entries, newest ``keep`` kept.
+
+    Handles both shapes: a versioned file for a solo binary, a versioned
+    directory for a bundle. An entry any symlink still points at is never
+    removed — deleting it would leave a dangling link, and the ``.bak``
+    depends on the previous release staying readable for rollback.
+    """
+    if not _owned_by_current_user(install_dir):
+        return
+    keep = keep if isinstance(keep, int) and keep >= 1 else 1
+    pattern = re.escape(engine.primary) + r"-[vb][0-9][0-9A-Za-z.+-]*"
+    entries = sorted(
+        (e for e in install_dir.iterdir()
+         if not e.is_symlink() and re.fullmatch(pattern, e.name)
+         and (e.is_file() or e.is_dir())),
+        reverse=True,
+    )
+    if len(entries) <= keep:
+        return
+    for entry in entries[keep:]:
+        if entry.name in referenced:
+            continue
+        print(f"Removing old {engine.primary}: {entry.name}")
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
+def update_engine(engine: Engine, install_dir: Path, arch: str,
+                  keep: int, requested_tag: str = "",
+                  backend: str = "") -> bool:
+    """Fetch, verify and install one engine."""
+    pattern = engine.asset_pattern(backend)
+    if not pattern:
+        eprint(f"Error: {engine.label} has no {backend!r} build "
+               f"(offers: {', '.join(engine.backends)})")
+        return False
+    tag = resolve_engine_tag(engine, arch, requested_tag, backend)
+    if not tag:
+        eprint(f"Error: Could not fetch a {engine.label} tag carrying a "
+               f"{arch} build (tags matching {engine.tag_re})")
+        return False
+
+    installed_path = install_dir / engine.versioned.format(tag=tag)
+    if installed_path.exists():
+        print(f"{engine.label} {tag} already installed at {installed_path.name}")
+        return True
+
+    payload = release_assets(f"{engine.api}/releases/tags/{tag}")
+    if _is_error_payload(payload):
+        eprint(f"Error: {engine.label} version {tag} not found")
+        return False
+    url = find_asset(payload, pattern.format(arch=arch))
+    if not url:
+        eprint(f"Error: Could not find a {engine.label} {arch} "
+               f"{backend} asset for {tag}")
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        archive_name = url.rsplit("/", 1)[-1]
+        archive = tmp / archive_name
+        print(f"Downloading {engine.label} {tag} ({arch})...")
+        try:
+            download(url, archive)
+        except subprocess.CalledProcessError:
+            eprint(f"Error: Failed to download {url}")
+            return False
+        if not verify_archive(archive, archive_name, payload, engine.checksum,
+                              install_dir):
+            return False
+
+        print("Extracting...")
+        tree = tmp / "tree"
+        try:
+            extract_archive(archive, tree, engine.fmt)
+        except (tarfile.TarError, OSError) as exc:
+            eprint(f"Error: Failed to extract {archive_name}: {exc}")
+            return False
+
+        if engine.bundle:
+            # Install the whole directory: the server resolves its shared
+            # libraries through RUNPATH=$ORIGIN, so they have to travel
+            # with it. Copying out the binary alone yields a file that dies
+            # with "libwhisper.so.1: cannot open shared object file".
+            bundle = bundle_root(tree)
+            binary = find_extracted(bundle, engine.names)
+            if binary is None:
+                eprint(f"Error: {archive_name} contains no {engine.primary} "
+                       f"binary (looked for {', '.join(engine.names)})")
+                return False
+            os.chmod(binary, 0o755)
+            install_as = bundle
+            # Point at wherever the binary actually landed inside the bundle,
+            # rather than assuming it sits at the top — the libraries it
+            # needs must come along either way.
+            link_target = installed_path.name / binary.relative_to(bundle)
+        else:
+            binary = find_extracted(tree, engine.names)
+            if binary is None:
+                eprint(f"Error: {archive_name} contains no {engine.primary} "
+                       f"binary (looked for {', '.join(engine.names)})")
+                return False
+            os.chmod(binary, 0o755)      # execute bit only after verification
+            install_as = binary
+            link_target = installed_path.name
+
+        try:
+            shutil.move(str(install_as), str(installed_path))
+        except OSError as exc:
+            eprint(f"Error: Failed to move verified files to "
+                   f"{installed_path}: {exc}")
+            return False
+
+    target = install_dir / engine.primary
+    backup = install_dir / engine.backup
+    # Back up before replacing, and refuse to destroy the old binary when
+    # the backup could not be written.
+    if target.is_symlink():
+        real = target.resolve()
+        if real.is_file():
+            shutil.copyfile(real, backup)
+        else:
+            shutil.copyfile(target, backup, follow_symlinks=False)
+        print(f"Backing up {target} -> {link_target}")
+    elif target.is_file():
+        try:
+            shutil.copyfile(target, backup)
+        except OSError as exc:
+            eprint(f"Error: could not back up {target} to {backup}: {exc}")
+            return False
+        target.unlink()
+        print(f"Backing up old {engine.primary} to {backup.name}")
+    replace_symlink(target, str(link_target))
+    print(f"{engine.primary} -> {link_target}")
+
+    referenced = {os.readlink(e) for e in install_dir.iterdir() if e.is_symlink()}
+    cleanup_engine_versions(engine, install_dir, keep, referenced)
+    print(f"Installed {engine.label} {tag} to {installed_path} "
+          f"(symlink {target})")
+    return True
+
+
 # --- argument parsing ------------------------------------------------------
 
 
@@ -685,15 +1221,34 @@ def keep_swap_default() -> int:
 
 def resolve_positionals(
     args: list[str], swap_version: str, cpp_only: bool, swap_only: bool
-) -> tuple[str, str, list[str]]:
-    """Split positional args into llama.cpp version and (heuristic) swap tag.
+) -> tuple[list[str], str, str, str, list[str]]:
+    """Split positionals into (target tokens, backend, version, swap tag, notes).
 
-    A bare ``v<NNN>`` positional is taken as a llama-swap version when no
-    --swap-version was given and --cpp-only is not in play.
+    A positional is a target selector first, then a backend name, and only
+    then a version — so ``update.py sd rocm`` reads the way it looks. The
+    legacy ``v<NNN>`` heuristic for llama-swap is unchanged.
     """
     version = DEFAULT_VERSION
+    backend = ""
     notes: list[str] = []
+    index = _alias_index()
+    rest: list[str] = []
     for arg in args:
+        try:
+            targets = resolve_target(arg, index)
+        except TargetError as exc:
+            notes.append(f"Error: {exc}")
+            continue
+        if targets is not None:
+            rest.append(arg)          # collected below, order-independent
+            continue
+        low = arg.lower()
+        if low in ("vulkan", "rocm", "hip", "cuda", "cpu"):
+            if backend and backend != low:
+                notes.append(f"Note: {backend} given after {low}; using {backend}")
+            else:
+                backend = backend or low
+            continue
         if re.fullmatch(r"v[0-9]+", arg) and not swap_version and not cpp_only:
             swap_version = arg
             if not swap_only:
@@ -703,30 +1258,43 @@ def resolve_positionals(
                 )
         else:
             version = arg
-    return version, swap_version, notes
+    return rest, backend, version, swap_version, notes
 
 
 def build_parser() -> argparse.ArgumentParser:
+    alias_lines = []
+    for group, names in TARGET_ALIASES.items():
+        alias_lines.append(f"  {group:<9} {' '.join(names)}")
     parser = argparse.ArgumentParser(
         description=(
-            "Download and install llama.cpp and llama-swap prebuilt binaries. "
+            "Download and install prebuilt server binaries. "
             "Install location is the current working directory."
         ),
         epilog=(
+            "Targets (positional, first match wins; 'all' must be typed in full):\n"
+            + "\n".join(alias_lines)
+            + f"\n  {'all':<9} {' '.join(ALL_ALIASES)}   # everything\n"
+            "  (a glob works too: 's*' selects swap and sd)\n"
+            "With no target, llama.cpp and llama-swap are updated -- the two\n"
+            "that publish checksums.txt. 'all' adds the three that do not.\n"
+            "\n"
+            "Backends (positional): " + ", ".join(KNOWN_BACKENDS)
+            + "\n"
             "Environment:\n"
             "  GITHUB_TOKEN            Optional. GitHub personal access token for\n"
             "                          higher API rate limits (5000 req/hr vs 60).\n"
             "                          Also reads GITHUB_PERSONAL_ACCESS_TOKEN.\n"
             "  KEEP_SWAP_VERSIONS      Optional. Same as --keep-swap.\n"
+            "  KEEP_ENGINE_VERSIONS    Optional. Same as --keep-engine-versions.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "args",
         nargs="*",
-        metavar="version",
-        help="Specific llama.cpp version tag (e.g., b8913, b8902), or "
-        "vulkan (default) / rocm",
+        metavar="target|version",
+        help="Targets (llama/ll, cpp, swap, audio/a, whisper/w, sd/stable, "
+        "all), a backend (vulkan, rocm, cpu), or a version tag (b8913).",
     )
     parser.add_argument(
         "--swap-only",
@@ -765,6 +1333,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the detected CPU architecture for both downloads "
         "(x64/amd64/linux_amd64 or arm64/aarch64/linux_arm64)",
     )
+    parser.add_argument(
+        "--audio-cpp-version",
+        metavar="TAG",
+        default="",
+        help="Specific audio.cpp release tag (e.g. v0.9.2)",
+    )
+    parser.add_argument(
+        "--whisper-version",
+        metavar="TAG",
+        default="",
+        help="Specific whisper.cpp release tag (build tags look like b5454)",
+    )
+    parser.add_argument(
+        "--sd-version",
+        metavar="TAG",
+        default="",
+        help="Specific stable-diffusion.cpp release tag (e.g. master-968-8cd731e)",
+    )
+    parser.add_argument(
+        "--keep-engine-versions",
+        metavar="N",
+        type=positive_int,
+        default=DEFAULT_KEEP_ENGINE_VERSIONS,
+        help="How many old versions of each audio engine to keep "
+        f"(default {DEFAULT_KEEP_ENGINE_VERSIONS}). Or KEEP_ENGINE_VERSIONS.",
+    )
     return parser
 
 
@@ -776,45 +1370,105 @@ def main(argv: list[str] | None = None) -> int:
         eprint("Error: --swap-only and --cpp-only are mutually exclusive")
         return 1
 
-    version, swap_version, notes = resolve_positionals(
+    target_tokens, backend, version, swap_version, notes = resolve_positionals(
         args.args, args.swap_version, args.cpp_only, args.swap_only
     )
+    targets = resolve_targets(target_tokens)
+
+    # Explicit selectors win; the legacy --*-only flags narrow the default;
+    # nothing selected at all means the two verified targets.
+    if targets:
+        if args.cpp_only or args.swap_only:
+            eprint("Error: target selectors and --cpp-only/--swap-only are "
+                   "alternatives; pass one or the other")
+            return 1
+        selected = targets
+    elif args.swap_only:
+        selected = ("swap",)
+    elif args.cpp_only:
+        selected = ("cpp",)
+    elif args.skip_swap:
+        selected = ("cpp",)
+    else:
+        selected = DEFAULT_TARGETS
+
     for note in notes:
         eprint(note)
+    print("Targets: " + ", ".join(selected))
 
     keep_swap = (
         args.keep_swap
         if args.keep_swap is not None
         else keep_swap_default()
     )
+    keep_engines = args.keep_engine_versions
+    if not keep_engines and os.environ.get("KEEP_ENGINE_VERSIONS", "").isdigit():
+        keep_engines = int(os.environ["KEEP_ENGINE_VERSIONS"])
+    pinned = {
+        "audio": args.audio_cpp_version,
+        "whisper": args.whisper_version,
+        "sd": args.sd_version,
+    }
 
-    # Main: llama.cpp
-    if not args.swap_only:
-        ok, installed_tag = update_llama_cpp(install_dir, version, args.arch)
+    # Each target is independent: one failing must not abandon the rest, and
+    # llama.cpp/llama-swap keep their historical non-zero exit because that
+    # is the serving stack this tool exists to keep working.
+    status = 0
+    if "cpp" in selected:
+        cpp_version = _backend_version(version, backend)
+        ok, installed_tag = update_llama_cpp(install_dir, cpp_version,
+                                             args.arch)
         if not ok:
-            return 1
-        if installed_tag is not None:
+            status = 1
+        elif installed_tag is not None:
             # Cleanup old versions after successful install and re-point any
             # symlinks that target an old llama-b* dir at the new one.
             cleanup_old_versions(install_dir)
             update_llama_cpp_symlinks(install_dir, installed_tag)
 
-    # Main: llama-swap (unless skipped)
-    if args.swap_only:
-        skip_swap = False
-    elif args.cpp_only:
-        skip_swap = True
-    else:
-        skip_swap = args.skip_swap
-
-    if not skip_swap:
+    if "swap" in selected:
         if swap_version:
-            if not update_llama_swap(install_dir, keep_swap, swap_version):
-                return 1
-        elif not update_llama_swap(install_dir, keep_swap):
+            ok = update_llama_swap(install_dir, keep_swap, swap_version)
+        else:
+            ok = update_llama_swap(install_dir, keep_swap)
+        if not ok:
             eprint("Warning: llama-swap update failed")
+            status = 1
 
-    return 0
+    for key in ("audio", "whisper", "sd"):
+        if key not in selected:
+            continue
+        engine = ENGINES[key]
+        print(f"\n=== {engine.label} ===")
+        try:
+            ok = update_engine(engine, install_dir, engine_arch(engine,
+                                                               args.arch),
+                               keep_engines, pinned[key],
+                               backend or engine.single_backend)
+        except ApiError as exc:
+            eprint(f"Warning: {engine.label} update failed: {exc}")
+            ok = False
+        if not ok:
+            eprint(f"Warning: {engine.label} update failed")
+            status = 1
+
+    return status
+
+
+def _backend_version(version: str, backend: str) -> str:
+    """Fold a bare backend positional into llama.cpp's version token.
+
+    llama.cpp predates the shared backend vocabulary and takes it as part of
+    the version string ("latest-vulkan"), so keep that shape rather than
+    changing its signature.
+    """
+    if not backend:
+        return version
+    if backend in ("rocm", "hip") and "rocm" not in version:
+        return "rocm" if version == DEFAULT_VERSION else version
+    if "vulkan" in version or "rocm" in version:
+        return version
+    return f"{version}-{backend}"
 
 
 if __name__ == "__main__":

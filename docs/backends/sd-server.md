@@ -10,6 +10,26 @@ Image (and video) generation via stable-diffusion.cpp's `sd-server`.
   `sd-server` on `PATH`.
 - **Opt-in:** `dirs: {img: image}` (the `img/` directory is otherwise ignored).
 
+## Build / install
+
+llama-packer does not build stable-diffusion.cpp, but `extras/update.py sd`
+downloads the official prebuilt server:
+
+```sh
+./extras/update.py sd                   # -> ./sd-server
+./extras/update.py sd rocm              # native ROCm build (285 MB vs 37 MB)
+./extras/update.py sd --sd-version master-968-8cd731e
+```
+
+Upstream versions as `master-<build>-<sha>` rather than semver, ships **zip**
+archives rather than tarballs, spells the architecture `x86_64`, and publishes no
+`checksums.txt` — so the install is unverified and says so. The archive is a
+**bundle**: `sd-server` carries `RUNPATH=$ORIGIN` and needs ~35 sibling `.so`
+files, which the updater installs alongside it.
+
+Both Linux builds exist for x86_64: `vulkan` (the default here, portable and
+small) and `rocm` (larger, but native on AMD).
+
 ## Command shape
 
 ```

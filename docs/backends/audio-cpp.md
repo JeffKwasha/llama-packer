@@ -163,20 +163,34 @@ alongside chat and RAG while the chat context stays at/above the co-load floor.
 
 ## Build / install
 
-**llama-packer does not build audio.cpp** — obtaining the binary is out of
-scope, as with the other engines (`extras/update.py` only downloads llama.cpp and
-llama-swap). Point the backend at an `audiocpp_server` you built or obtained;
-resolution is `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
+**llama-packer does not build audio.cpp** — but `extras/update.py audio`
+downloads the official prebuilt binary, so obtaining one is a command rather
+than a build. Point the backend at whichever you end up with; resolution is
+`--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
 `$AUDIOCPP_BIN_DIR` > `audiocpp_server` on `PATH`.
+
+```sh
+./extras/update.py audio                          # -> ./audiocpp_server
+./extras/update.py audio --audio-cpp-version v0.9.2
+```
+
+It is **opt-in** because upstream publishes no `checksums.txt`: the install
+prints an unverified warning rather than pretending to a sha256 check it
+cannot do. The asset naming follows llama.cpp's
+(`audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz`), and there is **no ROCm/HIP
+build** — the AMD path is the Vulkan one, which is what this box runs. The
+release tarball also carries a source tree; only the binary is installed, and
+it is self-contained (no `RUNPATH`, links only system libraries).
 
 - **Source build (operator-managed):** upstream `docs/build/linux.md` — GCC 13+,
   CMake; `-DENGINE_ENABLE_CUDA=ON` (NVIDIA), `-DENGINE_ENABLE_VULKAN=ON`
   (portable AMD path), `-DENGINE_ENABLE_HIP=ON` (ROCm, mutually exclusive
   with CUDA), CPU always on. On GB10, pin `CUDAToolkit_ROOT` +
   `CMAKE_CUDA_COMPILER` to avoid a mixed-toolkit build.
-- **Prebuilt:** the llama-swap unified image (`unified-cuda13`, `unified-cuda`,
-  `unified-vulkan`) bundles it; official ubuntu-x64 packages ship CPU+Vulkan
-  (the 0.8.0 one on this box reports `cpu,vulkan`).
+- **Prebuilt:** `./extras/update.py audio`, or the llama-swap unified
+  image (`unified-cuda13`, `unified-cuda`, `unified-vulkan`) which bundles
+  it; official ubuntu-x64 packages ship CPU+Vulkan (the 0.8.0 one on this
+  box reports `cpu,vulkan`).
 
 A container transport (podman/docker) may be added later; it is not part of the
 current host-only support.

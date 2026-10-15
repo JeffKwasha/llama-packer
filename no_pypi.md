@@ -434,7 +434,13 @@ Installs the package in **editable** mode. The console script `llama-packer` is 
 
 ### `./extras/update.py`
 
-Downloads and installs prebuilt `llama.cpp` and `llama-swap` binaries from GitHub releases into the **directory you run it from** as `llama-b*/` directories. Required for `llama-packer` to find the `llama-server` binary (via `find_bin_dir`). Stdlib-only Python. Uses `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` environment variables for higher API rate limits. Supports `--cpp-only`, `--swap-only`, `--skip-swap`, `--swap-version TAG`, `--keep-swap N`, `--arch`, plus `vulkan` (default), `rocm`, `latest`, and specific version tags. Both sides are pruned after a successful install: the newest `KEEP_VERSIONS` (3) `llama-b*/` directories and the newest `--keep-swap N` / `KEEP_SWAP_VERSIONS` (2) `llama-swap-v*` binaries; a versioned file that a symlink still points at is never removed. Downloads are sha256-verified before install; a mismatch leaves the current install untouched.
+Downloads and installs prebuilt server binaries from GitHub releases into the **directory you run it from**. Required for `llama-packer` to find the `llama-server` binary (via `find_bin_dir`). Stdlib-only Python. Uses `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` environment variables for higher API rate limits.
+
+**Targets are positional selectors**: `llama`/`ll` (llama.cpp + llama-swap), `cpp`, `swap`, `audio`/`a` (audio.cpp → `audiocpp_server`), `whisper`/`w` (whisper.cpp → `whisper-server`), `sd`/`stable` (stable-diffusion.cpp → `sd-server`), and `all` for everything. Globs work (`s*`), an ambiguous prefix is an error rather than a guess, and `all` must be typed in full (otherwise `a` would be ambiguous with it). A bare `./extras/update.py` updates only llama.cpp + llama-swap. Backends are positional too: `vulkan`, `rocm`, `cpu`. Version tags (`b8913`, `v252`) are still accepted.
+
+Also supports `--cpp-only`, `--swap-only`, `--skip-swap`, `--swap-version TAG`, `--keep-swap N`, `--arch`, `--audio-cpp-version`, `--whisper-version`, `--sd-version`, `--keep-engine-versions N`. Superseded versions are pruned after a successful install: the newest `KEEP_VERSIONS` (3) `llama-b*/` directories and the newest `--keep-swap N` / `KEEP_SWAP_VERSIONS` (2) `llama-swap-v*` binaries; a versioned entry that a symlink still points at is never removed.
+
+llama.cpp and llama-swap downloads are sha256-verified against the release `checksums.txt` before install; a mismatch leaves the current install untouched. audio.cpp, whisper.cpp and stable-diffusion.cpp publish **no** checksums file, so those installs are unverified and print a warning saying so.
 
 ### `llama-packer --dry-run`
 

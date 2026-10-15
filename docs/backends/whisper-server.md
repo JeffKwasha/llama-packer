@@ -14,6 +14,33 @@ Speech-to-text via whisper.cpp's `examples/server` (the long-lived analog of
   sidecar (e.g. `ggml-large-v3.md` beside `ggml-large-v3.bin`). Exposes
   OpenAI-compatible `POST /v1/audio/transcriptions`.
 
+## Build / install
+
+llama-packer does not build whisper.cpp, but `extras/update.py whisper`
+downloads the official prebuilt server:
+
+```sh
+./extras/update.py whisper                       # -> ./whisper-server
+./extras/update.py whisper --whisper-version b5454
+```
+
+Two things about that are not obvious from the release page:
+
+- **Binaries are on the `bNNNN` tags, not the `v1.9.x` ones.** Each release
+  publishes both, and only the build tag carries assets, so "latest" is the
+  wrong answer. The updater scans for a tag matching `^b[0-9]+$` that has an
+  asset for this arch.
+- **The tarball is a bundle, not a single file.** The prebuilt server is
+  linked against ~40 sibling `.so` files and locates them through
+  `RUNPATH=$ORIGIN`, so copying out the binary alone yields one that dies
+  with `libwhisper.so.1: cannot open shared object file`. The updater
+  installs the whole directory as `whisper-server-<tag>/` and symlinks
+  `whisper-server` into it.
+
+As with audio.cpp, upstream publishes no `checksums.txt`, so the install is
+**unverified** — opt-in for that reason, and the warning is printed rather
+than swallowed.
+
 ## Command shape
 
 ```

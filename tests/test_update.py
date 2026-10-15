@@ -13,6 +13,7 @@ import io
 import os
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -22,6 +23,7 @@ EXTRAS = Path(__file__).resolve().parents[1] / "extras"
 
 _spec = importlib.util.spec_from_file_location("update", EXTRAS / "update.py")
 upd = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = upd  # dataclass resolves annotations via sys.modules
 _spec.loader.exec_module(upd)
 
 SWAP_URL = "https://example.com/llama-swap-v262-linux_amd64.tar.gz"
@@ -248,34 +250,44 @@ def test_keep_swap_rejects_non_positive():
         upd.build_parser().parse_args(["--keep-swap", "abc"])
 
 
+def _positional(args, **kw):
+    """Unpack resolve_positionals' five outputs."""
+    tokens, backend, version, swap, notes = upd.resolve_positionals(
+        args, kw.get("swap_version", ""),
+        cpp_only=kw.get("cpp_only", False),
+        swap_only=kw.get("swap_only", False))
+    return tokens, backend, version, swap, notes
+
+
 def test_positional_v_number_becomes_swap_version():
-    version, swap, notes = upd.resolve_positionals(
-        ["v252"], "", cpp_only=False, swap_only=False
-    )
+    _, _, version, swap, notes = _positional(["v252"])
     assert (version, swap) == (upd.DEFAULT_VERSION, "v252")
     assert len(notes) == 1  # ambiguity note
 
 
 def test_positional_v_number_with_swap_only_is_silent():
-    _, swap, notes = upd.resolve_positionals(
-        ["v252"], "", cpp_only=False, swap_only=True
-    )
+    _, _, _, swap, notes = _positional(["v252"], swap_only=True)
     assert swap == "v252"
     assert notes == []
 
 
 def test_positional_cpp_only_ignores_v_number():
-    version, swap, _ = upd.resolve_positionals(
-        ["v252"], "", cpp_only=True, swap_only=False
-    )
+    _, _, version, swap, _ = _positional(["v252"], cpp_only=True)
     assert (version, swap) == ("v252", "")
 
 
 def test_positional_last_build_wins():
-    version, swap, _ = upd.resolve_positionals(
-        ["b8913", "v252", "b8902"], "", cpp_only=False, swap_only=False
-    )
+    _, _, version, swap, _ = _positional(["b8913", "v252", "b8902"])
     assert (version, swap) == ("b8902", "v252")
+
+
+def test_positional_backend_is_separate_from_version():
+    # `sd rocm` has to read as "the sd target, the rocm backend" rather than
+    # swallowing rocm as a version string.
+    tokens, backend, version, _, _ = _positional(["sd", "rocm"])
+    assert upd.resolve_targets(tokens) == ("sd",)
+    assert backend == "rocm"
+    assert version == upd.DEFAULT_VERSION
 
 
 def test_main_rejects_mutually_exclusive(tmp_path, monkeypatch, capsys):
@@ -679,3 +691,377 @@ def test_swap_arch_override_aliases():
     ]:
         assert upd.get_llama_swap_arch(override) == expected
 
+
+
+# --- single-binary engines (audio.cpp, whisper.cpp) -------------------------
+
+
+AUDIO_URL = "https://example.com/audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz"
+WHISPER_URL = "https://example.com/whisper-bin-ubuntu-x64.tar.gz"
+
+
+def make_engine_tarball(name: str = "audiocpp_server", subdir: str = "",
+                        wrap: str = "",
+                        extra: tuple[tuple[str, bytes], ...] = ()) -> bytes:
+    """A gzip tarball holding one executable.
+
+    *wrap* reproduces the real whisper.cpp layout (everything under one
+    directory named after the build); *subdir* nests the binary deeper;
+    *extra* adds sibling files such as the .so files a $ORIGIN binary needs.
+    """
+    buf = io.BytesIO()
+    payload = b"#!/bin/sh\necho engine\n"
+    members: list[tuple[str, bytes]] = [
+        (f"{subdir}/{name}" if subdir else name, payload)]
+    members.extend(extra)
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for path, data in members:
+            info = tarfile.TarInfo(f"{wrap}/{path}" if wrap else path)
+            info.size = len(data)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def engine_api(releases, assets_by_tag=None):
+    """gh_api stand-in taking the *release list* shape used by the new path."""
+    def _api(url: str):
+        if url.endswith("/releases"):
+            return releases
+        if "/tags/" in url:
+            tag = url.rsplit("/", 1)[-1]
+            return {"assets": (assets_by_tag or {}).get(tag, []),
+                    "tag_name": tag}
+        return []
+    return _api
+
+
+def test_resolve_engine_tag_skips_assetless_semver_tag(monkeypatch):
+    # whisper.cpp publishes v1.9.5 (no assets) and b5454 (assets) on the
+    # same day. Taking "latest" would find a release with nothing to
+    # download; matching the tag shape is what makes this correct.
+    releases = [
+        {"tag_name": "v1.9.5", "assets": []},
+        {"tag_name": "b5454",
+         "assets": [{"browser_download_url": WHISPER_URL}]},
+        {"tag_name": "v1.9.4", "assets": []},
+    ]
+    monkeypatch.setattr(upd, "gh_api", engine_api(releases))
+    assert upd.resolve_engine_tag(upd.WHISPER, "x64") == "b5454"
+
+
+def test_resolve_engine_tag_skips_build_without_our_arch(monkeypatch):
+    # b5130 exists but only carries arm64 assets, so it cannot serve here.
+    releases = [
+        {"tag_name": "b5454",
+         "assets": [{"browser_download_url": WHISPER_URL}]},
+        {"tag_name": "b5130",
+         "assets": [{"browser_download_url":
+                     "https://example.com/whisper-bin-ubuntu-arm64.tar.gz"}]},
+    ]
+    monkeypatch.setattr(upd, "gh_api", engine_api(releases))
+    assert upd.resolve_engine_tag(upd.WHISPER, "x64") == "b5454"
+
+
+def test_resolve_engine_tag_audio_cpp_uses_semver(monkeypatch):
+    # audio.cpp ships binaries on its semver tag, unlike whisper.
+    releases = [
+        {"tag_name": "v0.9.2",
+         "assets": [{"browser_download_url": AUDIO_URL}]},
+    ]
+    monkeypatch.setattr(upd, "gh_api", engine_api(releases))
+    assert upd.resolve_engine_tag(upd.AUDIO_CPP, "x64") == "v0.9.2"
+
+
+def test_resolve_engine_tag_no_match_returns_empty(monkeypatch):
+    monkeypatch.setattr(upd, "gh_api", engine_api([{"tag_name": "v1.9.5",
+                                                    "assets": []}]))
+    assert upd.resolve_engine_tag(upd.WHISPER, "x64") == ""
+
+
+def test_audio_cpp_asset_pattern_skips_portable():
+    # audio.cpp publishes both a plain and a "-portable" Vulkan build; the
+    # pattern is anchored so the wrong one cannot win by sort order.
+    payload = {"assets": [
+        {"browser_download_url":
+         "https://x/audio-v0.9.2-bin-ubuntu-x64-vulkan-portable.tar.gz"},
+        {"browser_download_url": AUDIO_URL},
+    ]}
+    assert upd.find_asset(payload, upd.AUDIO_CPP.asset_pattern("").format(
+        arch="x64")) == AUDIO_URL
+
+
+def test_verify_archive_warns_when_upstream_has_no_checksums(tmp_path,
+                                                             capsys):
+    # The chosen policy: install anyway, but say plainly that there was
+    # nothing to verify against.
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(b"x")
+    assert upd.verify_archive(archive, "a.tar.gz", {"assets": []},
+                              "warn", tmp_path) is True
+    err = capsys.readouterr().err
+    assert "UNVERIFIED" in err
+    assert "no checksums.txt" in err
+
+
+def test_verify_archive_required_refuses_without_checksums(tmp_path):
+    archive = tmp_path / "a.tar.gz"
+    archive.write_bytes(b"x")
+    assert upd.verify_archive(archive, "a.tar.gz", {"assets": []},
+                              "required", tmp_path) is False
+
+
+def test_verify_archive_quarantines_mismatch_in_install_dir(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    # The quarantined file must land where it survives the temp dir that
+    # holds the download, and without the execute bit.
+    blob = b"not what checksums.txt says"
+    archive = tmp_path / "dl" / "a.tar.gz"
+    archive.parent.mkdir()
+    archive.write_bytes(blob)
+    payload = {"assets": [
+        {"browser_download_url": "https://example.com/a.tar.gz"},
+        {"browser_download_url": CHECKSUMS_URL},
+    ]}
+    monkeypatch.setattr(
+        upd, "download",
+        lambda url, dest, **kw: dest.write_text(checksums_line("a.tar.gz",
+                                                              b"different")))
+    assert upd.verify_archive(archive, "a.tar.gz", payload, "required",
+                              tmp_path) is False
+    assert "sha256 mismatch" in capsys.readouterr().err
+    quarantined = tmp_path / "_HASH_FAIL_a.tar.gz"
+    assert quarantined.read_bytes() == blob
+    assert not quarantined.stat().st_mode & 0o111
+
+
+def test_update_engine_installs_and_symlinks(tmp_path, monkeypatch):
+    blob = make_engine_tarball("audiocpp_server")
+    releases = [{"tag_name": "v0.9.2",
+                 "assets": [{"browser_download_url": AUDIO_URL}]}]
+    monkeypatch.setattr(upd, "gh_api",
+                        engine_api(releases, {"v0.9.2": releases[0]["assets"]}))
+    monkeypatch.setattr(upd, "download",
+                        lambda url, dest, **kw: dest.write_bytes(blob))
+    assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2) is True
+    primary = tmp_path / "audiocpp_server"
+    assert primary.is_symlink()
+    assert os.readlink(primary) == "audiocpp_server-v0.9.2"
+    assert (tmp_path / "audiocpp_server-v0.9.2").is_file()
+
+
+def test_update_engine_installs_bundle_with_its_libraries(tmp_path, monkeypatch):
+    # whisper.cpp's prebuilt server links against sibling .so files and
+    # finds them via RUNPATH=$ORIGIN, so a copy of the binary alone is a
+    # broken install. The whole directory has to land, and the symlink has
+    # to point into it.
+    blob = make_engine_tarball(
+        "whisper-server", wrap="whisper-bin-ubuntu-x64",
+        extra=(("libwhisper.so.1", b"\x7fELF fake"),))
+    releases = [{"tag_name": "b5454",
+                 "assets": [{"browser_download_url": WHISPER_URL}]}]
+    monkeypatch.setattr(upd, "gh_api",
+                        engine_api(releases, {"b5454": releases[0]["assets"]}))
+    monkeypatch.setattr(upd, "download",
+                        lambda url, dest, **kw: dest.write_bytes(blob))
+    assert upd.update_engine(upd.WHISPER, tmp_path, "x64", 2) is True
+    bundle = tmp_path / "whisper-server-b5454"
+    assert bundle.is_dir(), "the bundle directory must be installed whole"
+    assert (bundle / "libwhisper.so.1").is_file(), "libraries must travel with it"
+    primary = tmp_path / "whisper-server"
+    assert primary.is_symlink()
+    assert os.readlink(primary) == "whisper-server-b5454/whisper-server"
+    assert primary.resolve().is_file(), "symlink must not dangle"
+    # The wrapping build directory must not survive as extra nesting.
+    assert not (bundle / "whisper-bin-ubuntu-x64").exists()
+
+
+def test_update_engine_backs_up_the_replaced_binary(tmp_path, monkeypatch):
+    make_binary(tmp_path / "audiocpp_server", "old build")
+    blob = make_engine_tarball("audiocpp_server")
+    releases = [{"tag_name": "v0.9.2",
+                 "assets": [{"browser_download_url": AUDIO_URL}]}]
+    monkeypatch.setattr(upd, "gh_api",
+                        engine_api(releases, {"v0.9.2": releases[0]["assets"]}))
+    monkeypatch.setattr(upd, "download",
+                        lambda url, dest, **kw: dest.write_bytes(blob))
+    assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2) is True
+    assert "old build" in (tmp_path / "audiocpp_server.bak").read_text()
+
+
+def test_update_engine_is_a_noop_when_already_present(tmp_path, monkeypatch):
+    make_binary(tmp_path / "audiocpp_server-v0.9.2", "engine")
+    called = []
+    monkeypatch.setattr(upd, "gh_api",
+                        lambda url: called.append(url) or [])
+    assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2, "v0.9.2") is True
+    assert called == [], "must not hit the API when the version is already there"
+
+
+def test_cleanup_engine_versions_keeps_referenced(tmp_path):
+    for tag in ("v2", "v3"):
+        make_binary(tmp_path / f"audiocpp_server-{tag}", tag)
+    # A stale symlink still pointing at v3: pruning must not dangle it.
+    (tmp_path / "audiocpp_server-v1").symlink_to("audiocpp_server-v3")
+    referenced = {"audiocpp_server-v3", "audiocpp_server-v1"}
+    upd.cleanup_engine_versions(upd.AUDIO_CPP, tmp_path, 1, referenced)
+    assert (tmp_path / "audiocpp_server-v3").exists()
+    assert (tmp_path / "audiocpp_server-v1").is_symlink()
+    assert not (tmp_path / "audiocpp_server-v2").exists()
+
+
+def test_engines_are_opt_in(monkeypatch, tmp_path):
+    # A plain run must not touch the audio engines: they install unverified.
+    monkeypatch.setattr(upd.sys, "argv", ["update.py"])
+    seen = []
+    monkeypatch.setattr(upd, "update_engine",
+                        lambda *a, **k: seen.append(a[0].key))
+    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a: (True, None))
+    monkeypatch.setattr(upd, "update_llama_swap", lambda *a: True)
+    assert upd.main([]) == 0
+    assert seen == []
+
+
+# --- target selection ------------------------------------------------------
+
+
+def _sel(token):
+    return upd.resolve_target(token, upd._alias_index())
+
+
+def test_target_prefix_shorthands():
+    # The one-letter forms the CLI advertises.
+    assert _sel("ll") == ("cpp", "swap")
+    assert _sel("llama") == ("cpp", "swap")
+    assert _sel("a") == ("audio",)
+    assert _sel("w") == ("whisper",)
+    assert _sel("sd") == ("sd",)
+    assert _sel("stable") == ("sd",)
+
+
+def test_all_needs_a_full_match():
+    # `a` is an alias for audio.cpp, so `all` must not be reachable by
+    # prefix or glob -- otherwise the one-letter shorthand is ambiguous.
+    assert _sel("all") == upd.ALL_TARGETS
+    for token in ("al", "alls", "a*", "*l*l*"):
+        assert _sel(token) != upd.ALL_TARGETS, token
+    # and 'a' still means audio, unambiguously
+    assert _sel("a") == ("audio",)
+
+
+def test_target_glob_selects_a_set():
+    assert _sel("s*") == ("swap", "sd")
+    assert _sel("*") == upd.ALL_TARGETS
+
+
+def test_ambiguous_prefix_is_an_error_not_a_guess():
+    # Guessing wrong here installs the wrong engine's binary.
+    with pytest.raises(upd.TargetError, match="ambiguous"):
+        _sel("s")
+
+
+def test_non_target_positional_is_left_for_the_version_parser():
+    for token in ("b8913", "v252", "rocm", "vulkan", "latest"):
+        assert _sel(token) is None, token
+
+
+def test_resolve_targets_dedupes_and_keeps_install_order():
+    assert upd.resolve_targets(["whisper", "ll", "w"]) == (
+        "cpp", "swap", "whisper")
+
+
+def test_every_target_is_selectable_and_named():
+    # No orphan engine: each one must be reachable, or it is unreachable.
+    reachable = set()
+    for token in list(upd.TARGET_ALIASES) + list(upd.ALL_ALIASES):
+        reachable.update(_sel(token) or ())
+    assert reachable == set(upd.ALL_TARGETS)
+
+
+def test_main_selects_only_named_targets(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: calls.append("cpp") or (True, None))
+    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: calls.append("swap") or True)
+    monkeypatch.setattr(upd, "update_engine",
+                        lambda eng, *a, **k: calls.append(eng.key) or True)
+    assert upd.main(["audio"]) == 0
+    assert calls == ["audio"]
+    assert "audio.cpp" in capsys.readouterr().out
+
+
+def test_bare_run_still_defaults_to_the_verified_pair(tmp_path, monkeypatch,
+                                                      capsys):
+    # The other three publish no checksums.txt, so a routine bare run must
+    # not start installing them.
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: calls.append("cpp") or (True, None))
+    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: calls.append("swap") or True)
+    monkeypatch.setattr(upd, "update_engine",
+                        lambda eng, *a, **k: calls.append(eng.key) or True)
+    assert upd.main([]) == 0
+    assert calls == ["cpp", "swap"]
+
+
+def test_main_all_selects_every_target(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: calls.append("cpp") or (True, None))
+    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: calls.append("swap") or True)
+    monkeypatch.setattr(upd, "update_engine",
+                        lambda eng, *a, **k: calls.append(eng.key) or True)
+    assert upd.main(["all"]) == 0
+    assert set(calls) == set(upd.ALL_TARGETS)
+
+
+def test_main_rejects_selector_plus_legacy_only_flag(tmp_path, monkeypatch,
+                                                    capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: (True, None))
+    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: True)
+    assert upd.main(["audio", "--cpp-only"]) == 1
+    assert "alternatives" in capsys.readouterr().err
+
+
+# --- stable-diffusion specifics --------------------------------------------
+
+
+def test_sd_asset_patterns_are_backend_specific():
+    sd = upd.STABLE_DIFFUSION
+    vulkan = sd.asset_pattern("vulkan").format(arch="x86_64")
+    rocm = sd.asset_pattern("rocm").format(arch="x86_64")
+    assert "vulkan" in vulkan and "rocm" not in vulkan
+    assert "rocm" in rocm
+    # an unknown backend must not silently fall through to some other one
+    assert sd.asset_pattern("metal") == ""
+
+
+def test_sd_uses_x86_64_not_x64():
+    # stable-diffusion.cpp spells it differently from every other project.
+    assert upd.engine_arch(upd.STABLE_DIFFUSION, "x64") == "x86_64"
+    assert upd.engine_arch(upd.WHISPER, "x64") == "x64"
+
+
+def test_sd_is_a_zip_bundle():
+    sd = upd.STABLE_DIFFUSION
+    assert sd.fmt == "zip"
+    assert sd.bundle, "sd-server links against sibling .so via RUNPATH=$ORIGIN"
+
+
+def test_zip_extraction_roundtrip(tmp_path):
+    import zipfile as _zip
+    archive = tmp_path / "rel.zip"
+    with _zip.ZipFile(archive, "w") as zf:
+        zf.writestr("sd-server", "#!/bin/sh\n")
+    dest = tmp_path / "out"
+    upd.extract_archive(archive, dest, "zip")
+    assert (dest / "sd-server").is_file()
+
+
+def test_sd_tag_pattern_matches_and_rejects():
+    import re as _re
+    assert _re.fullmatch(upd.STABLE_DIFFUSION.tag_re, "master-968-8cd731e")
+    assert not _re.fullmatch(upd.STABLE_DIFFUSION.tag_re, "v1.9.5")
+    assert not _re.fullmatch(upd.STABLE_DIFFUSION.tag_re, "b5454")
