@@ -147,9 +147,18 @@ def find_asset(payload, pattern: str) -> str:
     return ""
 
 
-def latest_llama_cpp_tag() -> str:
+def latest_llama_cpp_tag(asset_pattern: str = "") -> str:
+    """Newest llama.cpp tag that actually carries a prebuilt Linux asset.
+
+    llama.cpp publishes two tags per release: a semver one (``v0.7.0``) holding
+    source only, and a build one (``b11669``) holding the tarballs — both on
+    the same day. Taking the newest tag outright returns the semver one, and
+    the asset lookup then fails with "Could not find Vulkan asset" against a
+    perfectly good release sitting directly below it.
+    """
+    probe = asset_pattern or r"bin-ubuntu-[^-]*\.tar\.gz$"
     for release in _releases(gh_api(RELEASES_URL)):
-        if release.get("tag_name"):
+        if release.get("tag_name") and find_asset(release, probe):
             return release["tag_name"]
     return ""
 
@@ -386,7 +395,7 @@ def update_llama_cpp(
 
     tag = None
     if "vulkan" in version or version == "latest":
-        tag = latest_llama_cpp_tag()
+        tag = latest_llama_cpp_tag(f"ubuntu-vulkan-{arch}")
         if not tag:
             eprint("Error: Could not fetch latest llama.cpp release tag")
             return False, None
@@ -403,16 +412,16 @@ def update_llama_cpp(
 
     if "rocm" in version:
         # Note: the Linux ROCm builds upstream ships are x64-only.
-        tag = latest_llama_cpp_tag()
+        if arch != "x64":
+            eprint(f"Error: ROCm builds are Linux x64 only (detected {arch})")
+            return False, None
+        tag = latest_llama_cpp_tag(r"ubuntu-rocm-[^-]*-x64")
         if not tag:
             eprint("Error: Could not fetch latest llama.cpp release tag")
             return False, None
         if (build := cpp_build_number(tag)) is not None and highest > build:
             print(f"Already have version b{highest}, which is newer than {tag}")
             return True, None
-        if arch != "x64":
-            eprint(f"Error: ROCm builds are Linux x64 only (detected {arch})")
-            return False, None
         payload = release_assets(f"{RELEASES_URL}/tags/{tag}")
         url = find_asset(payload, r"ubuntu-rocm-[^-]*-x64")
         if not url:
@@ -513,7 +522,8 @@ def cleanup_old_llama_swap_versions(install_dir: Path, keep: int) -> None:
 
 
 def update_llama_swap(
-    install_dir: Path, keep_swap: int, requested_tag: str = ""
+    install_dir: Path, keep_swap: int, requested_tag: str = "",
+    arch_override: str = "",
 ) -> bool:
     """Check latest (or requested) release, verify sha256, atomically replace."""
     if requested_tag and requested_tag != "latest":
@@ -545,7 +555,7 @@ def update_llama_swap(
         print(f"llama-swap {tag} already installed")
         return True
 
-    arch = get_llama_swap_arch()
+    arch = get_llama_swap_arch(arch_override)
     payload = release_assets(f"{LLAMA_SWAP_REPO}/releases/tags/{tag}")
     if _is_error_payload(payload):
         eprint(f"Error: llama-swap version {tag} not found")
@@ -753,6 +763,12 @@ class Engine:
         if backend in self.backends:
             return self.backends[backend]
         if len(self.backends) == 1:
+            # Only one build exists, so a request for another is being
+            # ignored rather than satisfied -- say so, because "sd rocm"
+            # quietly installing Vulkan is not what was asked for.
+            if backend and backend != self.single_backend:
+                print(f"  Note: no {backend} build published; using "
+                      f"{self.single_backend}")
             return self.single_backend_pattern()
         return ""
 
@@ -1428,9 +1444,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if "swap" in selected:
         if swap_version:
-            ok = update_llama_swap(install_dir, keep_swap, swap_version)
+            ok = update_llama_swap(install_dir, keep_swap, swap_version,
+                                   args.arch)
         else:
-            ok = update_llama_swap(install_dir, keep_swap)
+            ok = update_llama_swap(install_dir, keep_swap, "", args.arch)
         if not ok:
             eprint("Warning: llama-swap update failed")
             status = 1

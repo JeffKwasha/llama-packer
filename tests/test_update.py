@@ -1065,3 +1065,48 @@ def test_sd_tag_pattern_matches_and_rejects():
     assert _re.fullmatch(upd.STABLE_DIFFUSION.tag_re, "master-968-8cd731e")
     assert not _re.fullmatch(upd.STABLE_DIFFUSION.tag_re, "v1.9.5")
     assert not _re.fullmatch(upd.STABLE_DIFFUSION.tag_re, "b5454")
+
+
+def test_llama_swap_honours_arch_override(tmp_path, monkeypatch):
+    # --arch used to be silently dropped here, while every other target
+    # honoured it -- so `update.py all --arch arm64` installed an x86
+    # llama-swap next to arm64 everything else.
+    seen = {}
+    monkeypatch.setattr(upd, "get_llama_swap_arch",
+                        lambda override="": seen.setdefault("arch", override) or "linux_arm64")
+    monkeypatch.setattr(upd, "installed_llama_swap_version", lambda p: 0)
+    monkeypatch.setattr(upd, "latest_llama_swap_tag", lambda: "v999")
+    monkeypatch.setattr(upd, "release_assets", lambda url: {"assets": []})
+    assert upd.update_llama_swap(tmp_path, 2, "v999", "arm64") is False
+    assert seen["arch"] == "arm64"
+
+
+def test_single_backend_engine_says_it_ignored_the_request(capsys):
+    # whisper.cpp publishes one Linux build; asking for rocm must not look
+    # like it was honoured.
+    pattern = upd.WHISPER.asset_pattern("rocm")
+    assert pattern, "there is exactly one build, so one is used"
+    assert "Note:" in capsys.readouterr().out
+
+
+def test_latest_cpp_tag_skips_the_assetless_semver_tag(monkeypatch):
+    # llama.cpp publishes v0.7.0 (source only) and b11669 (36 assets) on the
+    # same day. Taking the newest tag outright returned v0.7.0 and then
+    # failed with "Could not find Vulkan asset" — so `update.py` was unable
+    # to update llama.cpp at all.
+    releases = [
+        {"tag_name": "v0.7.0",
+         "assets": [{"browser_download_url": "https://x/source.tar.gz"}]},
+        {"tag_name": "b11669",
+         "assets": [{"browser_download_url":
+                     "https://x/llama-b11669-bin-ubuntu-vulkan-x64.tar.gz"}]},
+        {"tag_name": "v0.6.9", "assets": []},
+    ]
+    monkeypatch.setattr(upd, "gh_api", lambda url: releases)
+    assert upd.latest_llama_cpp_tag("ubuntu-vulkan-x64") == "b11669"
+
+
+def test_latest_cpp_tag_returns_empty_when_nothing_matches(monkeypatch):
+    monkeypatch.setattr(upd, "gh_api",
+                        lambda url: [{"tag_name": "v0.7.0", "assets": []}])
+    assert upd.latest_llama_cpp_tag("ubuntu-vulkan-x64") == ""
