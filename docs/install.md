@@ -18,7 +18,7 @@ never recreates the user and never drops an existing config.
 | Preflight | root, systemd, at least one GPU device node |
 | Account | `useradd --system --no-create-home --shell /usr/sbin/nologin` if absent; added to `render`, `video` and `--group` |
 | Run directory | `<dir>` as `root:<group>` mode `2775` |
-| Binaries | `extras/update.py` run with `<dir>` as its cwd |
+| Binaries | `extras/update.py all` run with `<dir>` as its cwd |
 | Config | llama-packer run **as the service user** from `<dir>`, writing `<dir>/config.yaml` and the sibling `config.env` |
 | Unit | [`extras/llama-swap.service.in`](../extras/llama-swap.service.in) rendered, `systemd-analyze verify`-ed, written to `/etc/systemd/system/llama-swap.service` |
 | Start | `llama-swap -validate` first, then `systemctl enable --now`, then a `/v1/models` probe |
@@ -30,6 +30,28 @@ is no other way back.
 Useful flags: `--dir` (run directory), `--listen` (default
 `127.0.0.1:8123`), `--spare`/`--vram` (passed to llama-packer), `--dry-run`,
 `--no-start`, `--memory-high/--memory-max/--swap-max`.
+
+## No per-engine configuration is needed
+
+llama-packer resolves **every** host binary — `llama-server` and
+`audiocpp_server`, `whisper-server`, `sd-server` alike — by the same chain,
+highest first:
+
+1. `--<engine>-server`
+2. `profiles.yaml <engine>.bin`
+3. `$SD_BIN_DIR` / `$WHISPER_BIN_DIR` / `$AUDIOCPP_BIN_DIR` / `$VLLM_BIN_DIR`
+4. **the run directory** — the directory llama-packer is invoked from
+5. `PATH`
+
+Because the installer runs llama-packer *with the run directory as its cwd*,
+step 4 resolves everything placed there by `update.py all`. No `profiles.yaml`
+edit, no environment variable, no PATH change.
+
+That step exists because llama.cpp has always been found by scanning the cwd
+for `llama-b[0-9]*`, while the other engines fell back to `shutil.which()`,
+which never looks at the cwd. One chain closes the gap in the direction
+llama.cpp already worked, rather than giving each deployment its own
+`*_BIN_DIR`. See SPEC.md "Host binary resolution".
 
 ## Two orderings that are load-bearing
 

@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from llama_packer.__main__ import _apply_env_subst, _health_check_timeout
+from llama_packer.__main__ import (resolve_host_binary,
+                                 _apply_env_subst,
+                                 _health_check_timeout)
 from llama_packer.utils import make_subst
 
 
@@ -321,3 +324,89 @@ def test_parse_args_spare_and_baseline():
     assert args.spare == "20G"
     assert args.baseline == "10G"
 
+
+
+# --- host binary resolution ------------------------------------------------
+
+
+def _bin(path, name="engine", text="#!/bin/sh\n"):
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+def test_host_binary_found_in_run_directory(tmp_path, monkeypatch):
+    # The standard: binaries live beside the config, so no profiles.yaml
+    # entry, no env var, and no PATH edit is needed. llama.cpp has always
+    # worked this way (a cwd scan for llama-b[0-9]*); every other backend
+    # used to require its own *_BIN_DIR to match.
+    monkeypatch.delenv("AUDIOCPP_BIN_DIR", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "audiocpp_server")
+    got = resolve_host_binary(None, None, "AUDIOCPP_BIN_DIR", "audiocpp_server",
+                              run_dir=tmp_path)
+    assert got == str(tmp_path / "audiocpp_server")
+    assert Path(got).is_file()
+
+
+def test_host_binary_precedence_cli_then_profiles_then_env_then_run_dir(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIOCPP_BIN_DIR", str(tmp_path / "from-env"))
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "audiocpp_server")
+    _bin(tmp_path / "from-env")
+    _bin(tmp_path / "from-profiles")
+    args = ("AUDIOCPP_BIN_DIR", "audiocpp_server")
+    # CLI wins over everything
+    assert resolve_host_binary(str(tmp_path / "from-cli"), None, *args,
+                               run_dir=tmp_path) == str(tmp_path / "from-cli")
+    # then profiles.yaml
+    assert resolve_host_binary(None, str(tmp_path / "from-profiles"), *args,
+                               run_dir=tmp_path) == str(tmp_path / "from-profiles")
+    # then the env var
+    assert resolve_host_binary(None, None, *args,
+                               run_dir=tmp_path) == str(tmp_path / "from-env")
+    # and only then the run directory
+    monkeypatch.delenv("AUDIOCPP_BIN_DIR")
+    assert resolve_host_binary(None, None, *args,
+                               run_dir=tmp_path) == str(tmp_path / "audiocpp_server")
+
+
+def test_host_binary_env_var_may_name_a_directory(tmp_path, monkeypatch):
+    # Mirrors LLAMA_BIN_DIR: a directory expands to <dir>/<name>.
+    monkeypatch.setenv("WHISPER_BIN_DIR", str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "whisper-server")
+    assert resolve_host_binary(None, None, "WHISPER_BIN_DIR", "whisper-server",
+                               run_dir=Path("/nonexistent")) == str(
+        tmp_path / "whisper-server")
+
+
+def test_host_binary_path_used_when_nothing_resolves(tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    got = resolve_host_binary(None, None, "SD_BIN_DIR", "sd-server",
+                              run_dir=tmp_path)
+    assert got is None
+    # ...unless a fallback was supplied (vLLM keeps its built-in default)
+    assert resolve_host_binary(None, None, "SD_BIN_DIR", "sd-server",
+                              fallback="sd", run_dir=tmp_path) == "sd"
+
+
+def test_host_binary_stale_explicit_path_is_not_silently_replaced(
+        tmp_path, monkeypatch):
+    # A stale `bin:` must keep pointing there: is_available then reports
+    # False and the operator gets a message naming what is wrong, rather
+    # than a different binary being used without their knowledge.
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "sd-server")
+    got = resolve_host_binary(None, str(tmp_path / "gone"), "SD_BIN_DIR",
+                              "sd-server", run_dir=tmp_path)
+    assert got == str(tmp_path / "gone")
+
+
+def test_every_backend_uses_the_same_chain():
+    # The point of the helper: one rule, not three copies of it.
+    import inspect
+    src = inspect.getsource(resolve_host_binary)
+    for tier in ("run_dir", "shutil.which", "env_var"):
+        assert tier in src

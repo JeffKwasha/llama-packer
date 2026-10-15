@@ -8,7 +8,7 @@ Text-to-speech (`t2s`) and speech-to-text (`s2t`) via the native ggml
 - **Formats:** `.gguf`, `.safetensors`, `hf_repo`.
 - **Proxied:** yes — `proxy` + `checkEndpoint: /health`.
 - **Binary:** `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
-  `$AUDIOCPP_BIN_DIR` > `audiocpp_server` on `PATH`.
+  `$AUDIOCPP_BIN_DIR` > the run directory > `audiocpp_server` on `PATH`.
 
 audio.cpp is a pure-C++ ggml engine for audio models — TTS, ASR, VAD, voice
 conversion, music, separation — spanning 80+ families / 120+ variants
@@ -167,7 +167,7 @@ alongside chat and RAG while the chat context stays at/above the co-load floor.
 downloads the official prebuilt binary, so obtaining one is a command rather
 than a build. Point the backend at whichever you end up with; resolution is
 `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >
-`$AUDIOCPP_BIN_DIR` > `audiocpp_server` on `PATH`.
+`$AUDIOCPP_BIN_DIR` > the run directory > `audiocpp_server` on `PATH`.
 
 ```sh
 ./extras/update.py audio                          # -> ./audiocpp_server

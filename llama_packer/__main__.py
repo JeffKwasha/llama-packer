@@ -484,6 +484,60 @@ def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
     return expanded
 
 
+def resolve_host_binary(
+    cli: str | None,
+    section: str | None,
+    env_var: str,
+    default_name: str,
+    fallback: str = "",
+    run_dir: Path | None = None,
+) -> str | None:
+    """Resolve one host-only server binary, by the same rule for every backend.
+
+    One chain, so "where does llama-packer look for sd-server?" has a single
+    answer:
+
+        ``--<x>-server`` > ``profiles.yaml <section>.bin`` > ``$<ENV_VAR>``
+        > the run directory > ``PATH``
+
+    The run-directory tier is what makes llama.cpp and the rest agree.
+    llama.cpp has always been found by scanning the working directory for
+    ``llama-b[0-9]*``; every other engine fell back to ``shutil.which()``,
+    which never looks at the cwd — so an ``audiocpp_server`` sitting beside
+    the build it was installed with was invisible, and every deployment had
+    to paper over that with its own ``*_BIN_DIR``. Scanning the run
+    directory closes the gap in the direction llama.cpp already worked.
+
+    ``$*_BIN_DIR`` and ``profiles.yaml`` may name a *directory* (mirroring
+    ``LLAMA_BIN_DIR``); a directory expands to ``<dir>/<default_name>``.
+
+    ``fallback`` is returned when nothing resolves — vLLM keeps its built-in
+    default rather than going unresolved. An explicit setting that does not
+    exist is returned as given rather than dropped, so a stale ``bin:``
+    disables the backend with a clear message instead of quietly resolving
+    to something else.
+    """
+    candidates: list[str] = []
+    if cli:
+        candidates.append(str(cli))
+    if section:
+        candidates.append(str(section))
+    if env_value := os.environ.get(env_var):
+        candidates.append(env_value)
+    if default_name:
+        base = Path(run_dir) if run_dir is not None else Path.cwd()
+        if (in_run_dir := base / default_name).is_file():
+            candidates.append(str(in_run_dir))
+        if (on_path := shutil.which(default_name)) is not None:
+            candidates.append(on_path)
+    for raw in candidates:
+        cand = Path(raw)
+        if cand.is_dir():
+            cand = cand / default_name
+        return str(cand)
+    return fallback or None
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     setup_logging(args.verbose)
@@ -582,52 +636,29 @@ def main(argv: list[str] | None = None) -> None:
     vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
     vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
 
-    # sd-server resource configuration (CLI > profiles.yaml `sd:` section >
-    # $SD_BIN_DIR > sd-server on PATH).  Single host binary for now (docker follow-up).
-    sd_cfg = profiles_cfg.get("sd") or {}
-    sd_bin_raw = args.sd_server or sd_cfg.get("bin") or os.environ.get("SD_BIN_DIR") or shutil.which("sd-server")
-    sd_bin = None
-    if sd_bin_raw:
-        raw = str(sd_bin_raw)
-        # SD_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR); expand to binary inside.
-        cand = Path(raw)
-        if cand.is_dir():
-            cand = cand / "sd-server"
-        sd_bin = str(cand) if cand else None
-        # When the explicit path doesn't exist, fall back to which() so a
-        # stale profile bin doesn't disable inference entirely.
-        if sd_bin and not Path(sd_bin).is_file() and not shutil.which(str(sd_bin)):
-            # Keep the raw value — is_available will be False, inference won't pick it,
-            # but an explicit `backend: sd-server` still reports a clear error.
-            pass
+    # Host binaries. All four resolve by the same chain (see
+    # resolve_host_binary): CLI > profiles.yaml > $<ENV_VAR> > run directory >
+    # PATH.  Resolved before discovery so backend inference knows whether a
+    # backend can actually run.
+    vllm_cfg = profiles_cfg.get("vllm") or {}
+    vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
+    vllm_bin = str(resolve_host_binary(
+        args.vllm_server, vllm_cfg.get("bin"), "VLLM_BIN_DIR", "vllm",
+        fallback=VLLM_DEFAULT_BIN) or VLLM_DEFAULT_BIN)
 
-    # whisper-server resource configuration (CLI > profiles.yaml `whisper:` section >
-    # $WHISPER_BIN_DIR > whisper-server on PATH).  Single host binary.
-    whisper_cfg = profiles_cfg.get("whisper") or {}
-    whisper_bin_raw = (args.whisper_server or whisper_cfg.get("bin")
-                       or os.environ.get("WHISPER_BIN_DIR") or shutil.which("whisper-server"))
-    whisper_bin = None
-    if whisper_bin_raw:
-        cand = Path(str(whisper_bin_raw))
-        if cand.is_dir():  # WHISPER_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR)
-            cand = cand / "whisper-server"
-        whisper_bin = str(cand)
-
-    # audio-cpp (audio.cpp) resource configuration (CLI > profiles.yaml
-    # `audio_cpp:` section > $AUDIOCPP_BIN_DIR > audiocpp_server on PATH).
-    # Backend layering (resolved in AudioCppBackend.build_cmd): sidecar
-    # `audio_cpp.backend` > explicit (this block: CLI > profiles.yaml) >
-    # vendor auto (NVIDIA→cuda, AMD→vulkan, else cpu) > cpu.
+    # audio-cpp backend layering (resolved in AudioCppBackend.build_cmd):
+    # sidecar `audio_cpp.backend` > explicit (this chain) > vendor auto
+    # (NVIDIA->cuda, AMD->vulkan, else cpu) > cpu.
     audio_cpp_cfg = profiles_cfg.get("audio_cpp") or {}
-    audio_cpp_bin_raw = (args.audio_cpp_server or audio_cpp_cfg.get("bin")
-                         or os.environ.get("AUDIOCPP_BIN_DIR")
-                         or shutil.which("audiocpp_server"))
-    audio_cpp_bin = None
-    if audio_cpp_bin_raw:
-        cand = Path(str(audio_cpp_bin_raw))
-        if cand.is_dir():  # AUDIOCPP_BIN_DIR may be a directory
-            cand = cand / "audiocpp_server"
-        audio_cpp_bin = str(cand)
+    audio_cpp_bin = resolve_host_binary(
+        args.audio_cpp_server, audio_cpp_cfg.get("bin"), "AUDIOCPP_BIN_DIR",
+        "audiocpp_server")
+    whisper_bin = resolve_host_binary(
+        args.whisper_server, (profiles_cfg.get("whisper") or {}).get("bin"),
+        "WHISPER_BIN_DIR", "whisper-server")
+    sd_bin = resolve_host_binary(
+        args.sd_server, (profiles_cfg.get("sd") or {}).get("bin"),
+        "SD_BIN_DIR", "sd-server")
     audio_cpp_backend = str(args.audio_cpp_backend
                             or audio_cpp_cfg.get("backend") or "").lower()
     if audio_cpp_backend in ("auto",):

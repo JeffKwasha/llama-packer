@@ -347,8 +347,6 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
     }
     res = r.run(["runuser", "-u", user, "--", *cmd], cwd=dir_, env=env,
                 capture=True)
-    if res.stdout:
-        print(res.stdout.rstrip())
     for path in ("config.yaml", "config.env"):
         if not (dir_ / path).is_file():
             raise InstallError(f"llama-packer did not produce {dir_ / path}")

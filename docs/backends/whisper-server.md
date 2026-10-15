@@ -9,7 +9,7 @@ Speech-to-text via whisper.cpp's `examples/server` (the long-lived analog of
   directory is authoritative.
 - **Proxied:** yes — `proxy` + `checkEndpoint: "/"`.
 - **Binary:** `--whisper-server` > `profiles.yaml whisper.bin` >
-  `$WHISPER_BIN_DIR` > `whisper-server` on `PATH`.
+  `$WHISPER_BIN_DIR` > the run directory > `whisper-server` on `PATH`.
 - **Opt-in:** `dirs: {s2t: s2t}`; each model needs an authored same-stem
   sidecar (e.g. `ggml-large-v3.md` beside `ggml-large-v3.bin`). Exposes
   OpenAI-compatible `POST /v1/audio/transcriptions`.

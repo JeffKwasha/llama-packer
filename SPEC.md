@@ -716,7 +716,12 @@ The binary (`vllm`) is resolved, highest to lowest:
 
 1. `--vllm-server` CLI flag
 2. `vllm.bin` in `profiles.yaml`
-3. Built-in default (`vllm` on PATH)
+3. `$VLLM_BIN_DIR`
+4. the run directory
+5. Built-in default (`vllm` on PATH)
+
+See [Host binary resolution](#host-binary-resolution) — steps 1-4 are the
+chain every host backend shares.
 
 `profiles.yaml` `vllm:` also configures `container_args` (legacy `docker_args` /
 `podman_args`), `container_port`, `container_vendor` and `hf_cache` for the
@@ -825,7 +830,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Binary precedence
 
-`sd-server` is resolved: `--sd-server` CLI flag > `sd.bin` in `profiles.yaml` > `$SD_BIN_DIR` (file or directory containing `sd-server`) > `sd-server` on `PATH`. Absent binary disables format-based inference; an explicit `backend: sd-server` pin to a disabled setup is an error that skips the model. Docker variant is future work (tracked in `docs/plans/comfyui-sd.md`).
+`sd-server` is resolved: `--sd-server` CLI flag > `sd.bin` in `profiles.yaml` > `$SD_BIN_DIR` (file or directory containing `sd-server`) > the run directory > `sd-server` on `PATH`. Absent binary disables format-based inference; an explicit `backend: sd-server` pin to a disabled setup is an error that skips the model. Docker variant is future work (tracked in `docs/plans/comfyui-sd.md`).
 
 ### Capabilities
 
@@ -884,7 +889,7 @@ whisper-large-v3:
 
 `--whisper-server` CLI flag > `whisper.bin` in `profiles.yaml` `whisper:` section >
 `$WHISPER_BIN_DIR` (file or directory containing `whisper-server`) >
-`whisper-server` on `PATH`. Absent binary disables format-based inference;
+the run directory > `whisper-server` on `PATH`. Absent binary disables format-based inference;
 an explicit `backend: whisper-server` pin to a disabled setup is an error that
 skips the model. Docker variant is future work.
 
@@ -1386,6 +1391,33 @@ human-readable names). An orphan discovered there gets its stub beside the
 human-named snapshot entry that points at the blob; if none resolves, discovery
 creates its own symlink named after the repo in the category directory and puts
 the stub next to it.
+
+## Host binary resolution
+
+Every backend whose engine is a single host binary resolves it by one chain,
+highest first:
+
+1. `--<engine>-server` (`--sd-server`, `--whisper-server`,
+   `--audio-cpp-server`, `--vllm-server`)
+2. `profiles.yaml <engine>.bin` (`sd:`, `whisper:`, `audio_cpp:`, `vllm:`)
+3. `$SD_BIN_DIR` / `$WHISPER_BIN_DIR` / `$AUDIOCPP_BIN_DIR` / `$VLLM_BIN_DIR`
+4. the **run directory** — the directory llama-packer is invoked from
+5. `PATH`
+
+Steps 2-3 accept a *file or a directory*; a directory expands to
+`<dir>/<engine>`, mirroring `LLAMA_BIN_DIR`.
+
+Step 4 is what makes llama.cpp and the rest agree. llama.cpp is found by
+scanning the working directory for `llama-b[0-9]*` (`find_bin_dir`), so a
+deploy that installs every binary beside one config already resolved
+llama.cpp while the other engines went unseen — `shutil.which()` never
+looks at the cwd. Each deployment then needed its own `*_BIN_DIR`. One
+chain removes the special case rather than adding a mechanism.
+
+An explicit setting that does not exist is **kept as given**, not replaced
+by a lower-precedence hit: a stale `bin:` should leave the backend
+disabled so `is_available` reports False and the operator gets a message
+naming the real problem, rather than silently running a different binary.
 
 ## Path macros and HF_HOME
 

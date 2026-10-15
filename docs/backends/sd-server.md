@@ -7,7 +7,7 @@ Image (and video) generation via stable-diffusion.cpp's `sd-server`.
 - **Formats:** `.gguf`, `.safetensors`, `hf_repo`.
 - **Proxied:** yes — `proxy` + `checkEndpoint: "/"`.
 - **Binary:** `--sd-server` > `profiles.yaml sd.bin` > `$SD_BIN_DIR` >
-  `sd-server` on `PATH`.
+  the run directory > `sd-server` on `PATH`.
 - **Opt-in:** `dirs: {img: image}` (the `img/` directory is otherwise ignored).
 
 ## Build / install
