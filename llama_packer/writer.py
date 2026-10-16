@@ -1261,17 +1261,32 @@ def parallel_value(ctx: int, floor: int, slots: int, power: float) -> float:
 def resolve_min_ctx(view, *, pin_ctx: int | None = None,
                     tools_min_ctx: int = 131072,
                     fallback_min_ctx: int = _MIN_AGENTIC_CTX,
-                    fallback_explicit: bool = False) -> int:
+                    fallback_explicit: bool = False,
+                    category_floor: int | None = None) -> int:
     """Per-model minimum useful context: the hard floor of the (ctx, slots)
     search and the context-ratio normalizer in :func:`parallel_value`.
 
-    Cascade, first match wins: explicit sidecar ``min_context:`` → pinned
-    serving ctx (a fixed ctx is its own floor) → tool callers get the
-    agentic floor → everyone else gets half their max context (two slots are
-    then only considered when nearly two full windows fit).  The global
-    ``--min-context`` flag overrides the last two rows when explicitly set,
-    never an explicit sidecar key or a hard pin.  A pin below an explicit
-    floor warns (the pin is honoured; the floor is reported unmet).
+    Cascade, first match wins: explicit sidecar ``min_context:`` → a pinned
+    serving ctx (``--max-context``; a fixed ctx is its own floor) →
+    ``category_floor`` → tool callers get the agentic floor → everyone else
+    gets half their design context (two slots are then only considered when
+    nearly two full windows fit).  The global ``--min-context`` flag
+    overrides the last two rows when explicitly set, never an explicit
+    sidecar key or a hard pin.  A pin below an explicit floor warns (the pin
+    is honoured; the floor is reported unmet).
+
+    ``category_floor`` is the strongest demand the model declares with
+    ``usage:``, and it outranks the two heuristics below it because they are
+    guesses about undeclared models while a category is the operator saying
+    what the model is *for*. Without that, a model tagged ``aux`` (80k) that
+    also lists the ``tools`` capability was still floored at 131072 by the
+    tools heuristic -- an unreachable floor, so it fell back to one slot and
+    then failed its own category's ``min_parallel``. Declaring the work was
+    making the model *less* satisfiable.
+
+    ``context_length:`` appears nowhere in this cascade. It is the model's
+    design maximum -- a ceiling applied when serving (see
+    :meth:`VramBudget._sidecar_ceiling`), never a floor.
     """
     fm = view.frontmatter or {}
     explicit = fm.get("min_context")
@@ -1291,6 +1306,8 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
             return floor
     if pin_ctx is not None:
         return pin_ctx
+    if category_floor is not None:
+        return category_floor
     if "tools" in [c.lower() for c in (view.capabilities or [])]:
         return fallback_min_ctx if fallback_explicit else tools_min_ctx
     if fallback_explicit:
@@ -1657,21 +1674,21 @@ class Planner:
     def _serving_pin(self, view) -> int | None:
         """Explicitly pinned serving ctx, or None.
 
-        A sidecar/block ``context_length:`` or the CLI ``--max-context``
-        fixes the per-slot size (cascade row 2: a fixed ctx is its own
-        floor).  Returns the tighter of the two when both are present.
+        Only ``--max-context`` pins. A sidecar ``context_length:`` does
+        *not*: it declares what the model was **designed** for -- the ceiling
+        on what may be served -- while the served size is worked out from the
+        VRAM budget, the usage category and the parallel/context bias.
+
+        Treating it as a pin instead made the two indistinguishable, and the
+        cost was concrete: a 262144 design max became an unreachable floor,
+        so the solve fell back to parallel 1 and a model tagged for two
+        slots could never satisfy its own category. Worse, the only way to
+        fix it was to edit the sidecar -- rewriting a capability claim about
+        the model in order to express an operating decision. `min_context:`
+        is the key that means "serve at least this", and it was already
+        separate.
         """
         pins = []
-        sidecar_ctx = (view.frontmatter or {}).get("context_length")
-        if sidecar_ctx is not None:
-            try:
-                pin = int(sidecar_ctx)
-                assert pin > 0
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("context_length=%r on %s is not a positive "
-                               "integer; ignoring pin", sidecar_ctx, view.stem)
-            else:
-                pins.append(pin)
         if self.max_context is not None:
             if self.max_context > 0:
                 pins.append(self.max_context)
@@ -2251,29 +2268,24 @@ class Planner:
                     ctx_size = self._unestimated_ctx(view)
                 elif auto:
                     pin_ctx = self._serving_pin(view)
+                    # A usage demand is the floor the value function may not
+                    # trade below: `coding`'s 128k is the reason the model is
+                    # tagged, so auto-parallel optimising *past* it is fine
+                    # and trading under it is not. It sets the floor rather
+                    # than only raising it -- see resolve_min_ctx.
+                    demands = self.demands_for(model)
+                    want = max((d.min_context for d in demands), default=None)
                     floor = resolve_min_ctx(
                         view, pin_ctx=pin_ctx,
                         tools_min_ctx=self.knobs.tools_min_ctx,
                         fallback_min_ctx=self.min_context,
-                        fallback_explicit=self.min_context_explicit)
+                        fallback_explicit=self.min_context_explicit,
+                        category_floor=want)
                     cap_ctx = context_length
                     if self.max_context is not None:
                         cap_ctx = min(cap_ctx, self.max_context)
-                    # A usage demand is a floor the value function may not
-                    # trade below: `coding`'s 128k is the reason the model is
-                    # tagged, so auto-parallel optimising *past* it is fine
-                    # and trading under it is not.
-                    demands = self.demands_for(model)
                     min_parallel = max((d.min_parallel for d in demands),
                                        default=1)
-                    if demands:
-                        want = max(d.min_context for d in demands)
-                        if want > floor:
-                            logger.info(
-                                "auto-parallel: %s usage demand raises the "
-                                "context floor %d -> %d",
-                                view.stem, floor, want)
-                            floor = want
                     parallel, ctx_size = self._auto_parallel(
                         view, cache_type=cache_type, spare_mb=spare_eff,
                         include_mmproj=include_mmproj, cap_ctx=cap_ctx,
@@ -2330,7 +2342,11 @@ class Planner:
                                     view, pin_ctx=pin_ctx,
                                     tools_min_ctx=self.knobs.tools_min_ctx,
                                     fallback_min_ctx=self.min_context,
-                                    fallback_explicit=self.min_context_explicit)
+                                    fallback_explicit=self.min_context_explicit,
+                                    category_floor=max(
+                                        (d.min_context
+                                         for d in self.demands_for(model)),
+                                        default=None))
                                 cap_ctx = context_length
                                 if self.max_context is not None:
                                     cap_ctx = min(cap_ctx, self.max_context)

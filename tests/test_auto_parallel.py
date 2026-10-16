@@ -192,10 +192,29 @@ def test_plan_pinned_ctx_searches_slots_only(make_model):
     assert variants[0].ctx_size == 32768
 
 
-def test_plan_pinned_ctx_unaffordable_at_two_stays_one(make_model):
+def test_design_max_is_a_ceiling_not_a_floor(make_model):
+    """context_length: is what the model was built for, not what to serve.
+
+    It used to be read as a pin, so a 32768 design max became a 32768 floor,
+    the 16384 the second slot would afford fell below it, and the model was
+    locked to parallel 1 -- because a capability claim about the model was
+    being read as an operating decision about the fleet. The floor is now
+    half the design context, and two slots win on score.
+    """
     m = make_model("ap", backend="llama-server", role="chat")
     _scripted_by_parallel(m, {1: 32768, 2: 16384})
     variants = _planner(m).plan()["ap"]
+    assert variants[0].parallel == 2
+    assert variants[0].ctx_size == 16384
+
+
+def test_explicit_max_context_still_pins_and_floors(make_model):
+    """--max-context is a real pin, so the old behaviour survives there."""
+    m = make_model("ap", backend="llama-server", role="chat")
+    _scripted_by_parallel(m, {1: 32768, 2: 16384})
+    planner = _planner(m)
+    planner.max_context = 32768
+    variants = planner.plan()["ap"]
     assert variants[0].parallel == 1
     assert variants[0].ctx_size == 32768
 
@@ -412,7 +431,49 @@ def test_serving_pin_rejects_non_positive():
     assert p._serving_pin(_view()) is None
 
 
-def test_serving_pin_positive_sidecar_survives_zero_cli():
+def test_serving_pin_ignores_the_design_max():
+    """context_length is a ceiling; --max-context is the pin.
+
+    Reading the sidecar as a pin meant the only way to give a model back its
+    slots was to edit context_length -- rewriting what the model can do in
+    order to express how we want it served. min_context: is that key, and it
+    was already separate.
+    """
     p = Planner.__new__(Planner)
     p.max_context = 0
-    assert p._serving_pin(_view(context_length=8192)) == 8192
+    assert p._serving_pin(_view(context_length=8192)) is None
+    p.max_context = 8192
+    assert p._serving_pin(_view(context_length=4096)) == 8192
+
+
+# ── a declared category outranks the heuristics below it ──────────────────
+
+
+def test_category_floor_beats_the_tools_heuristic():
+    """Declaring the work must not make the model less satisfiable.
+
+    `resolve_min_ctx` fell back to tools_min_ctx (131072) for any model
+    listing the `tools` capability, and a usage demand could only *raise*
+    that floor. So a model tagged `aux` (80k) that also lists `tools` was
+    floored at an unreachable 131072, fell back to one slot, and then failed
+    its own category's min_parallel of 2 -- declaring it aux made it strictly
+    harder to serve.
+    """
+    view = _view(capabilities=["tools", "image"])
+    assert resolve_min_ctx(view) == 131072          # untagged: unchanged
+    assert resolve_min_ctx(view, category_floor=81920) == 81920
+
+
+def test_category_floor_never_overrides_the_operator():
+    """`min_context:` and --max-context are the operator's, not a guess."""
+    view = _view(capabilities=["tools"], min_context=200000)
+    assert resolve_min_ctx(view, category_floor=81920) == 200000
+    pinned = _view(capabilities=["tools"])
+    assert resolve_min_ctx(pinned, pin_ctx=131072,
+                           category_floor=81920) == 131072
+
+
+def test_multi_category_takes_the_heaviest():
+    """`usage: [coding, chat]` serves at coding's window, not chat's."""
+    view = _view(capabilities=["tools"])
+    assert resolve_min_ctx(view, category_floor=133120) == 133120

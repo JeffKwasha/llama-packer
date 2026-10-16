@@ -43,9 +43,18 @@ usage:
     min_parallel: 2
     sacrifice: [draft, vision]
   qa:
+    # QA means question answering. Whether a serving can also see is a
+    # capability the model has or lacks, orthogonal to the kind of work --
+    # so it is `capabilities: [image]` on the sidecar, not a `require` here.
     min_context: 32k
     min_parallel: 2
-    require: [vision]
+  aux:
+    # One-off work: describe a picture, summarise a document. Not agentic, so
+    # it does not need an agentic window, and a slot is worth more than
+    # context -- the opposite trade from `coding`.
+    min_context: 80k
+    min_parallel: 2
+    sacrifice: [draft]
 
 # Model roots (CLI --models-dir overrides this). Role is selected by the
 # first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →
