@@ -492,3 +492,59 @@ def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
     text = out.read_text()
     assert yaml.safe_load(text)["models"]["m"]["cmd"] == cmd
 
+
+def test_overallocation_guard_catches_an_injected_violation(make_model,
+                                                           monkeypatch, caplog):
+    """The guard must fire on a planner that misbehaves, not just agree.
+
+    Everything upstream honours "never emit an entry that cannot load", so
+    on a healthy planner this check has nothing to do. That is exactly why
+    it needs a test that *breaks* the planner deliberately: otherwise it
+    passes vacuously forever and protects nothing.
+
+    Here calc_ctx is made to report a comfortable context while the quad
+    says the model needs more than the card has -- the shape of the bug it
+    was written for.
+    """
+    import logging
+    from llama_packer.writer import build_config
+
+    m = make_model("liar", backend="llama-server", context_length=32768)
+    # Reports a fine context for any request...
+    monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 32768)
+    # ...while the numbers say 90 GB of weights on a 48 GB card.
+    monkeypatch.setattr(m.vram, "effective_static",
+                        lambda *a, **k: (90000, 0.5, 0.0, 100))
+    monkeypatch.setattr(
+        m.vram, "fit_params_static",
+        lambda *a, **k: type("FP", (), {
+            "model_mib": 90000, "kv_per_token_mib": 0.5,
+            "slot_mib": 0.0, "compute_mib": 100, "source": "fit-params"})())
+
+    profiles = {"defaults": {"cache_type": "q8_0", "parallel": 1},
+                "profiles": {"default": {}}}
+    with caplog.at_level(logging.ERROR):
+        config = build_config(
+            [m], profiles, {"llama_bin": "/opt/llama-server"},
+            fit_bin="unused", vram_total=48 * 1024,
+        )
+    assert "invariant violated" in caplog.text
+    assert "planner bug" in caplog.text
+    assert config["models"] == {}, "the impossible entry survived"
+
+
+def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,
+                                                             monkeypatch, caplog):
+    import logging
+    from llama_packer.writer import build_config
+
+    m = make_model("ok", backend="llama-server", context_length=32768)
+    profiles = {"defaults": {"cache_type": "q8_0", "parallel": 1},
+                "profiles": {"default": {}}}
+    with caplog.at_level(logging.ERROR):
+        config = build_config(
+            [m], profiles, {"llama_bin": "/opt/llama-server"},
+            fit_bin="unused", vram_total=48 * 1024,
+        )
+    assert "invariant violated" not in caplog.text
+    assert config["models"], "a sane model was dropped"

@@ -3058,6 +3058,75 @@ class EmittedConfig(dict):
         return dict(self)
 
 
+def _verify_no_overallocation(config: EmittedConfig, plan: dict,
+                              models: list[Model], planner: "Planner") -> None:
+    """Re-derive every emitted entry's VRAM; drop any that cannot fit.
+
+    The invariant this tool exists to keep: no emitted entry asks for more
+    VRAM than the card has. Every solve upstream honours it, but there are
+    several passes and several clamps, and one edit to any of them could
+    reopen the hole without anything noticing. So the last step recomputes
+    each entry's footprint from the numbers actually written out -- its own
+    ctx_size and parallel, under the same affine law -- and compares that
+    against the budget the planner was given.
+
+    A violation here is a bug, not an operator condition: a model that simply
+    does not fit is handled upstream by omission, which is the contract. So
+    it is logged at ERROR, the entry is removed, and the pack still emits
+    everything that does fit -- impossible to miss, not fatal.
+    """
+    from llama_packer.vram import _RESERVE_SYSTEM, _RESERVE_VIDEO
+
+    reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, planner.baseline_mb)
+    spare_mb = planner.profiles.global_spare_mb(planner.spare, planner.vram_total)
+    available = int((planner.vram_total - reserve - spare_mb)
+                    / (1.0 + planner.memory_margin))
+
+    by_stem = {m.stem: m for m in models}
+    # entry_ids_by_stem is the emitter's own answer to "which model produced
+    # this id" -- the same mapping __main__ uses to build matrix vars.
+    owner = {eid: stem for stem, ids in config.entry_ids_by_stem.items()
+             for eid in ids}
+    removed: list[str] = []
+    for entry_id, entry in list(config.get("models", {}).items()):
+        model = by_stem.get(owner.get(entry_id, ""))
+        if model is None:
+            continue
+        served = entry.get("metadata", {}).get("ctx_size")
+        for variant in plan.get(model.stem, ()):
+            if variant.ctx_size != served:
+                continue
+            profile = (variant.profiles_group[0][1]
+                       if variant.profiles_group else None)
+            quad = _static_params(
+                model, planner.fit_bin, variant.cache_type,
+                measurement_args(planner.profiles, model, planner.llama_args,
+                                 profile))
+            if quad is None:
+                break
+            model_mib, kv, slot_mib, compute_mib = quad
+            parallel = max(1, variant.parallel)
+            need = int(model_mib + compute_mib
+                       + kv * variant.ctx_size * parallel
+                       + slot_mib * parallel)
+            if need > available:
+                logger.error(
+                    "invariant violated: %s needs %d MiB at ctx=%d p=%d but "
+                    "only %d MiB is available — dropped. This is a planner "
+                    "bug, not an operator condition.", entry_id, need,
+                    variant.ctx_size, parallel, available)
+                removed.append(entry_id)
+            break
+
+    if not removed:
+        return
+    for entry_id in removed:
+        config["models"].pop(entry_id, None)
+    config.entry_ids_by_stem = {
+        stem: [i for i in ids if i not in removed]
+        for stem, ids in config.entry_ids_by_stem.items()}
+
+
 def build_config(
     models: list[Model],
     profiles_cfg: dict | Profiles,
@@ -3125,7 +3194,9 @@ def build_config(
         llama_args=template_vars.get("llama_args", ""),
         progress_cb=progress_cb,
     )
-    config = emit_config(supported, planner.plan(), profiles, template_vars)
+    plan = planner.plan()
+    config = emit_config(supported, plan, profiles, template_vars)
+    _verify_no_overallocation(config, plan, supported, planner)
     config.set_overheads = dict(planner.set_overheads)
     return config
 
