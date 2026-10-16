@@ -231,20 +231,53 @@ def _normalize(override: str, mapping: dict[str, str]) -> str:
             + ", ".join(sorted(mapping))) from None
 
 
+#: Alias -> asset spelling, one table per upstream naming convention. They
+#: genuinely differ (llama.cpp says x64, llama-swap says linux_amd64,
+#: stable-diffusion.cpp says x86_64), so they stay separate — but they are
+#: named so :func:`arch_arg` can validate against all of them at parse time
+#: rather than each resolver rediscovering a bad value later.
+ARCH_SWAP = {
+    "linux_amd64": "linux_amd64", "x86_64": "linux_amd64",
+    "amd64": "linux_amd64", "x64": "linux_amd64",
+    "linux_arm64": "linux_arm64", "aarch64": "linux_arm64",
+    "arm64": "linux_arm64",
+}
+
+#: llama.cpp assets use x64 / arm64 / s390x, e.g.
+#: llama-b<int>-bin-ubuntu-vulkan-arm64.tar.gz
+ARCH_CPP = {
+    "linux_amd64": "x64", "x86_64": "x64", "amd64": "x64", "x64": "x64",
+    "linux_arm64": "arm64", "aarch64": "arm64", "arm64": "arm64",
+    "s390x": "s390x",
+}
+
+#: stable-diffusion.cpp spells it x86_64 / aarch64.
+ARCH_SD = {
+    "linux_amd64": "x86_64", "x86_64": "x86_64", "x86-64": "x86_64",
+    "amd64": "x86_64", "x64": "x86_64", "linux_arm64": "aarch64",
+    "aarch64": "aarch64", "arm64": "aarch64",
+}
+
+
+def arch_arg(value: str) -> str:
+    """argparse type for --arch: accepted only if some resolver knows it.
+
+    Validating at parse time is the point. A bad --arch used to survive
+    every early return and only surface much later -- or, worse, not at all,
+    because the version was already current.
+    """
+    if not value:
+        return value          # "" means detect from this machine
+    if value in ARCH_CPP or value in ARCH_SWAP or value in ARCH_SD:
+        return value
+    raise argparse.ArgumentTypeError(
+        f"unknown arch {value!r}; expected one of: "
+        + ", ".join(sorted(set(ARCH_CPP) | set(ARCH_SWAP) | set(ARCH_SD))))
+
+
 def get_llama_swap_arch(override: str = "") -> str:
     if override:
-        return _normalize(
-            override,
-            {
-                "linux_amd64": "linux_amd64",
-                "x86_64": "linux_amd64",
-                "amd64": "linux_amd64",
-                "x64": "linux_amd64",
-                "linux_arm64": "linux_arm64",
-                "aarch64": "linux_arm64",
-                "arm64": "linux_arm64",
-            },
-        )
+        return _normalize(override, ARCH_SWAP)
     machine = platform.machine()
     if machine in ("x86_64", "amd64"):
         return "linux_amd64"
@@ -255,20 +288,7 @@ def get_llama_swap_arch(override: str = "") -> str:
 
 def get_llama_cpp_arch(override: str = "") -> str:
     if override:
-        # llama.cpp assets use x64 / arm64 / s390x (e.g. llama-b<int>-bin-ubuntu-vulkan-arm64.tar.gz)
-        return _normalize(
-            override,
-            {
-                "linux_amd64": "x64",
-                "x86_64": "x64",
-                "amd64": "x64",
-                "x64": "x64",
-                "linux_arm64": "arm64",
-                "aarch64": "arm64",
-                "arm64": "arm64",
-                "s390x": "s390x",
-            },
-        )
+        return _normalize(override, ARCH_CPP)
     machine = platform.machine()
     if machine in ("x86_64", "amd64"):
         return "x64"
@@ -924,12 +944,7 @@ KNOWN_BACKENDS = ("vulkan", "rocm", "hip", "cuda", "cpu")
 def get_sd_arch(override: str = "") -> str:
     """stable-diffusion.cpp spells the architecture ``x86_64`` / ``aarch64``."""
     if override:
-        return _normalize(override, {
-            "linux_amd64": "x86_64", "x86_64": "x86_64",
-            "x86-64": "x86_64", "amd64": "x86_64", "x64": "x86_64",
-            "linux_arm64": "aarch64", "aarch64": "aarch64",
-            "arm64": "aarch64",
-        })
+        return _normalize(override, ARCH_SD)
     machine = platform.machine()
     if machine in ("aarch64", "arm64"):
         return "aarch64"
@@ -1455,9 +1470,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arch",
         metavar="ARCH",
+        type=arch_arg,        # refuse a bad one here, not three layers down
         default="",
         help="Override the detected CPU architecture for both downloads "
-        "(x64/amd64/linux_amd64 or arm64/aarch64/linux_arm64)",
+        "(x64/amd64/linux_amd64, arm64/aarch64/linux_arm64, s390x)",
     )
     parser.add_argument(
         "--audio-cpp-version",

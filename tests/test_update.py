@@ -1304,3 +1304,24 @@ def test_keep_engine_versions_env_var_is_reachable(monkeypatch):
     monkeypatch.setenv("KEEP_ENGINE_VERSIONS", "7")
     resolved = upd.resolve_keeps(upd.build_parser().parse_args([]))
     assert resolved == 7
+
+
+def test_bad_arch_is_rejected_at_parse_time():
+    """It used to survive every early return.
+
+    `update.py swap --arch 'x64.*'` against a current version printed
+    "already up-to-date" and exited 0 — the value was never looked at,
+    because the download it would have poisoned had been skipped.
+    """
+    with pytest.raises(SystemExit):
+        upd.build_parser().parse_args(["--arch", "x64.*"])
+    assert upd.build_parser().parse_args(["--arch", "aarch64"]).arch == "aarch64"
+    assert upd.build_parser().parse_args([]).arch == ""   # detect
+
+
+def test_arch_tables_are_consistent():
+    """Each upstream spells the arch its own way; the union validates all."""
+    assert upd.get_llama_cpp_arch("amd64") == "x64"
+    assert upd.get_llama_swap_arch("amd64") == "linux_amd64"
+    assert upd.get_sd_arch("amd64") == "x86_64"
+    assert upd.get_sd_arch("arm64") == "aarch64"
