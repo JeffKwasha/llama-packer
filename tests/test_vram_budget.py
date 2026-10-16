@@ -230,6 +230,48 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
     assert model.vram.vram_squeezed is False
 
 
+def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
+                                                           caplog):
+    """The invariant: an emitted entry must never need more VRAM than exists.
+
+    The window this covers is narrow and was a real hole — the model loads,
+    so ``remaining > 0`` and no over-budget fires, but the honest context
+    left is below the minimum. ``ctx = max(ctx, _MIN_CTX_SIZE)`` clamped
+    *upward* over that, and ``_auto_parallel`` infers feasibility from
+    ``ctx >= floor``, so the fabricated value was accepted as a real slot
+    count. GLM47's c with qwen35's corrected D made that reachable:
+    2000 MiB left, 4 slots bought 1863 tokens, reported as 4096.
+    """
+    import logging
+    from llama_packer.vram import _MIN_CTX_SIZE
+
+    fm = {"model_mib": 20471, "kv_per_token_mib": 0.02743133544921875,
+          "slot_mib": 448.87, "compute_mib": 1174, "source": "llama-server",
+          "cache_type": "q8_0", "shape": ""}
+    model = make_model("tight", **{"derived": fm})
+
+    # 24576 - reserve(2048) - weights(20471) - compute(1174) leaves ~883 MiB.
+    with caplog.at_level(logging.WARNING):
+        ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+                                  parallel=4, design_ctx=202752)
+    assert ctx < _MIN_CTX_SIZE, "reported a servable context"
+    assert model.vram.over_budget_reason is not None
+    assert "below the" in model.vram.over_budget_reason
+
+
+def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
+    """One MiB more budget and the same model serves -- so the guard above
+    is a threshold, not a blanket refusal."""
+    fm = {"model_mib": 20471, "kv_per_token_mib": 0.02743133544921875,
+          "slot_mib": 448.87, "compute_mib": 1174, "source": "llama-server",
+          "cache_type": "q8_0", "shape": ""}
+    model = make_model("roomy", **{"derived": fm})
+    ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+                              parallel=1, design_ctx=202752)
+    assert ctx >= 4096
+    assert model.vram.over_budget_reason is None
+
+
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
     model = make_model("d", **{"derived": fit_params_block})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=3072)

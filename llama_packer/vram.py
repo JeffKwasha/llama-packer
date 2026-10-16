@@ -1346,6 +1346,23 @@ class VramBudget:
             return _MIN_CTX_SIZE
         max_ctx = int((remaining - slot_mib * parallel)
                       / (kv_per_token * parallel))
+        if max_ctx < _MIN_CTX_SIZE:
+            # It loads, but not at a context worth serving. Clamping *up* to
+            # _MIN_CTX_SIZE emits an entry asking for more VRAM than
+            # remains -- the one failure this tool exists to prevent -- and
+            # _auto_parallel reads that clamped value as feasible, so the
+            # flaw propagates into slot choice. Overbudget instead: the
+            # planner retries text-only, then omits the stem. A model not
+            # fitting is ordinary (--spare 24G leaves most of the fleet
+            # unable to run, and emitting what fits is the whole point);
+            # emitting a config that cannot load is not.
+            self.over_budget_reason = (
+                f"weights + {parallel} slot(s) leave {int(remaining)} MiB, "
+                f"which buys {max_ctx} context tokens — below the "
+                f"{_MIN_CTX_SIZE} minimum")
+            logger.warning("%s: cannot serve — %s", self.model.stem,
+                           self.over_budget_reason)
+            return 0
         ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)
         return self._raise_to_image_floor(ctx, img_floor,
@@ -1491,6 +1508,18 @@ def solve_matrix_ctx(
             continue
         ctx = int((chat_budget - slot_mib * parallel)
                   / (kv_factor * parallel))
+        if ctx < _MIN_CTX_SIZE:
+            # Skip rather than clamp up. This loop keeps the *maximum* over
+            # chat models, so one model clamped to a context it cannot afford
+            # would raise the shared bar for every other chat model, pushing
+            # them into their own squeeze. They are alternatives that evict
+            # each other; the shared context is what the fleet can actually
+            # afford, never what the most desperate participant wishes for.
+            logger.warning(
+                "matrix: %s skipped — weights + %d slot(s) leave %d MiB, "
+                "below the %d-token minimum", model.stem, parallel,
+                int(chat_budget), _MIN_CTX_SIZE)
+            continue
         # The image token floor is raise-to-fit only when it was already
         # affordable; a larger floor cannot buy VRAM it doesn't have.
         if img_floor > ctx:
@@ -1499,7 +1528,6 @@ def solve_matrix_ctx(
                 "the solved chat ctx %d; large images may not fit",
                 model.stem, img_floor, ctx)
         ctx = (ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
-        ctx = max(ctx, _MIN_CTX_SIZE)
         arch_max = model.design_context
         ctx = min(ctx, arch_max)
         best_ctx = max(best_ctx, ctx)
