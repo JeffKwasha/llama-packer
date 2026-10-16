@@ -208,8 +208,27 @@ def release_assets(url: str):
 # --- architecture ----------------------------------------------------------
 
 
-def _normalize(override: str, mapping: dict[str, str]) -> str | None:
-    return mapping.get(override)
+class ArchError(ValueError):
+    """An --arch spelling that is not in the table."""
+
+
+def _normalize(override: str, mapping: dict[str, str]) -> str:
+    """Map an arch alias to its asset spelling, or refuse the input.
+
+    Returning the input unchanged on a miss looked harmless -- the arch is
+    operator-supplied, so nothing untrusted reaches it -- but the value goes
+    straight into ``re.search``, where ``--arch 'x64.*'`` matches the first
+    asset of any name and a pathological pattern can hang the lookup. Worse,
+    it failed open: an unrecognised spelling became a *successful* lookup of
+    the wrong tarball, which is the one outcome a wrong --arch must never
+    have.
+    """
+    try:
+        return mapping[override]
+    except KeyError:
+        raise ArchError(
+            f"unknown arch {override!r}; expected one of: "
+            + ", ".join(sorted(mapping))) from None
 
 
 def get_llama_swap_arch(override: str = "") -> str:
@@ -225,7 +244,7 @@ def get_llama_swap_arch(override: str = "") -> str:
                 "aarch64": "linux_arm64",
                 "arm64": "linux_arm64",
             },
-        ) or override
+        )
     machine = platform.machine()
     if machine in ("x86_64", "amd64"):
         return "linux_amd64"
@@ -249,7 +268,7 @@ def get_llama_cpp_arch(override: str = "") -> str:
                 "arm64": "arm64",
                 "s390x": "s390x",
             },
-        ) or override
+        )
     machine = platform.machine()
     if machine in ("x86_64", "amd64"):
         return "x64"
@@ -910,7 +929,7 @@ def get_sd_arch(override: str = "") -> str:
             "x86-64": "x86_64", "amd64": "x86_64", "x64": "x86_64",
             "linux_arm64": "aarch64", "aarch64": "aarch64",
             "arm64": "aarch64",
-        }) or override
+        })
     machine = platform.machine()
     if machine in ("aarch64", "arm64"):
         return "aarch64"
@@ -1300,6 +1319,19 @@ def positive_int(value: str) -> int:
     return number
 
 
+def resolve_keeps(args: argparse.Namespace) -> int:
+    """Engine-version keep count: flag, then env, then the default.
+
+    argparse defaults to ``None`` rather than the constant so that the
+    environment variable can still win; a non-zero default made the
+    ``if not keep_engines`` test below permanently false.
+    """
+    if args.keep_engine_versions is not None:
+        return args.keep_engine_versions
+    env = os.environ.get("KEEP_ENGINE_VERSIONS", "")
+    return int(env) if env.isdigit() else DEFAULT_KEEP_ENGINE_VERSIONS
+
+
 def keep_swap_default() -> int:
     raw = os.environ.get("KEEP_SWAP_VERSIONS", "")
     if raw.isdigit() and int(raw) >= 1:
@@ -1449,7 +1481,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-engine-versions",
         metavar="N",
         type=positive_int,
-        default=DEFAULT_KEEP_ENGINE_VERSIONS,
+        default=None,   # None so KEEP_ENGINE_VERSIONS below can still apply
         help="How many old versions of each audio engine to keep "
         f"(default {DEFAULT_KEEP_ENGINE_VERSIONS}). Or KEEP_ENGINE_VERSIONS.",
     )
@@ -1500,9 +1532,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.keep_swap is not None
         else keep_swap_default()
     )
-    keep_engines = args.keep_engine_versions
-    if not keep_engines and os.environ.get("KEEP_ENGINE_VERSIONS", "").isdigit():
-        keep_engines = int(os.environ["KEEP_ENGINE_VERSIONS"])
+    keep_engines = resolve_keeps(args)
     pinned = {
         "audio": args.audio_cpp_version,
         "whisper": args.whisper_version,
@@ -1588,5 +1618,8 @@ if __name__ == "__main__":
     except ApiError as exc:
         eprint(str(exc))
         sys.exit(1)
+    except ArchError as exc:
+        eprint(f"Error: {exc}")
+        sys.exit(2)
     except KeyboardInterrupt:
         sys.exit(130)

@@ -206,6 +206,14 @@ def ensure_user(r: Runner, user: str, group: str) -> None:
         r.run(["useradd", "--system", "--no-create-home",
                "--shell", "/usr/sbin/nologin", "--comment",
                "llama-swap service account", user])
+    if not group_exists(group):
+        # Fatal, not a warning: prepare_dir chowns the run directory to this
+        # group, so a typo left the directory created as root:root 2775 --
+        # setgid and group-writable, by root -- and then died on KeyError
+        # from grp.getgrnam. Refuse before anything is created.
+        raise InstallError(
+            f"group {group!r} does not exist; create it first "
+            f"(groupadd {group}) or pass an existing --group")
     for g in (*_GPU_GROUPS, group):
         if not group_exists(g):
             logger.warning("group %s does not exist; skipping", g)

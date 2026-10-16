@@ -1266,3 +1266,41 @@ def test_already_latest_does_not_claim_an_install(tmp_path, monkeypatch):
     ok, installed = upd.update_llama_cpp(tmp_path, "latest-vulkan", "")
     assert ok is True
     assert installed is None, "claimed an install it did not perform"
+
+
+# --- a bad --arch is refused, not interpolated into a regex ----------------
+
+
+@pytest.mark.parametrize("bad", ["x64.*", "(a+)+$", "nonsense"])
+def test_unknown_arch_is_refused(bad):
+    """It used to flow verbatim into re.search.
+
+    Not a trust boundary -- the operator supplies it -- but it failed open:
+    an unrecognised spelling became a successful lookup of a different
+    tarball, which is the one outcome a wrong --arch must never have.
+    """
+    for fn in (upd.get_llama_cpp_arch, upd.get_llama_swap_arch):
+        with pytest.raises(upd.ArchError) as exc:
+            fn(bad)
+        assert "expected one of" in str(exc.value)
+
+
+def test_known_arch_aliases_still_resolve():
+    assert upd.get_llama_cpp_arch("amd64") == "x64"
+    assert upd.get_llama_cpp_arch("aarch64") == "arm64"
+    assert upd.get_llama_swap_arch("x86_64") == "linux_amd64"
+    # empty means "detect from this machine", never an error
+    assert upd.get_llama_cpp_arch("") in ("x64", "arm64", "s390x")
+
+
+def test_keep_engine_versions_env_var_is_reachable(monkeypatch):
+    """default=2 made `if not keep_engines` permanently False.
+
+    So KEEP_ENGINE_VERSIONS was documented in --help and never read.
+    """
+    p = upd.build_parser()
+    assert p.parse_args([]).keep_engine_versions is None
+    assert p.parse_args(["--keep-engine-versions", "4"]).keep_engine_versions == 4
+    monkeypatch.setenv("KEEP_ENGINE_VERSIONS", "7")
+    resolved = upd.resolve_keeps(upd.build_parser().parse_args([]))
+    assert resolved == 7

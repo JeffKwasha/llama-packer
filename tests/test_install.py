@@ -428,3 +428,39 @@ def test_repack_does_not_repoint_home(tmp_path, monkeypatch):
     # it to the run directory is the defect.
     assert env.get("HOME") != str(tmp_path), env.get("HOME")
     assert env.get("HOME") == os.environ.get("HOME")
+
+
+# --- a typo'd group must stop before anything is created -------------------
+
+
+def test_missing_group_is_fatal_and_creates_nothing(tmp_path, monkeypatch):
+    """It used to be a warning.
+
+    prepare_dir chowns the run directory to that group, so the run created
+    it as root:root 2775 -- setgid and group-writable by root -- and then
+    died on KeyError from grp.getgrnam, i.e. a traceback after the damage
+    rather than before it.
+    """
+    ran = []
+    monkeypatch.setattr(ins, "group_exists", lambda g: g != "typo")
+    monkeypatch.setattr(ins, "user_exists", lambda u: True)
+    r = ins.Runner(dry_run=False)
+    monkeypatch.setattr(r, "run", lambda cmd, **kw: ran.append(cmd))
+    with pytest.raises(ins.InstallError) as exc:
+        ins.ensure_user(r, "svc", "typo")
+    assert "does not exist" in str(exc.value)
+    assert ran == [], ran
+
+
+def test_existing_group_proceeds(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(ins, "group_exists", lambda _g: True)
+    monkeypatch.setattr(ins, "user_exists", lambda _u: True)
+    monkeypatch.setattr(ins, "user_supplementary", lambda _u: {"grp"})
+    r = ins.Runner(dry_run=False)
+    monkeypatch.setattr(r, "run", lambda cmd, **kw: ran.append(cmd))
+    ins.ensure_user(r, "svc", "grp")
+    # The GPU groups are genuinely missing here and get added; grp is not.
+    added = [c[2] for c in ran if c[:2] == ["usermod", "-aG"]]
+    assert "grp" not in added, added
+    assert set(added) == set(ins._GPU_GROUPS), added
