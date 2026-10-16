@@ -31,8 +31,9 @@ matches the model file next to it. The directory sets the role:
 | (any) `<name>.safetensors` | by dir or `role:` | vLLM |
 | (any) `<name>.md` | — | sidecar for the model file above |
 
-Orphan files under `embed/`/`rerank`/`doc/` get empty stub sidecars automatically
-(the role comes from the directory, not the stub). Whisper `.bin` models are
+Orphan files under `embed/`/`rerank`/`doc/` are served with built-in defaults
+(the role comes from the directory, not any stub). Pass `--create-stubs` to
+`llama-packer` if you want an empty stub written beside each one to fill in. Whisper `.bin` models are
 never stubbed — write the sidecar yourself. Other subdirs (`misc/`, `tmp/`,
 `hf_hub/`, … — and `img/`, `s2t/`, `t2s/` when not opted in) are not served —
 extend via profiles.yaml `dirs:` (skipped dirs are listed in the run log). A

@@ -25,11 +25,13 @@ the real binary.
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 import pytest
 
 from llama_packer import model as _modelmod
+from llama_packer import discover, utils
 from llama_packer.model import Model
 
 # module attributes rather than re-exports: the counter is internal state
@@ -40,10 +42,10 @@ persisted_sidecars_reset = _modelmod.persisted_sidecars_reset
 @pytest.fixture(autouse=True)
 def _restore_cache():
     """Never let one test's switch leak into the next."""
-    Model.persist_cache = True
+    utils.set_dry_run(False)
     persisted_sidecars_reset()
     yield
-    Model.persist_cache = True
+    utils.set_dry_run(False)
     persisted_sidecars_reset()
 
 
@@ -105,7 +107,7 @@ def test_discovery_writes_no_file_fingerprint_when_cache_disabled(tmp_path):
     md = _sidecar(tmp_path)
     before = md.read_bytes()
 
-    Model.persist_cache = False
+    utils.set_dry_run(True)
     Model.from_dir([tmp_path], generate_stubs=False)
 
     assert md.read_bytes() == before, "discovery wrote the file: fingerprint"
@@ -125,7 +127,7 @@ def test_persist_measured_skips_the_write_when_cache_disabled(tmp_path):
     persisted_sidecars_reset()   # construction writes the file: fingerprint
     before = m.md_path.read_bytes()
 
-    m.persist_cache = False
+    utils.set_dry_run(True)
     m.persist_measured({"model_mib": 4800, "source": "fit-estimate"})
 
     assert m.md_path.read_bytes() == before, "sidecar was rewritten"
@@ -145,7 +147,7 @@ def test_dry_run_creates_no_stub_via_the_cli_gate(tmp_path):
     # What main() does for --dry-run.
     from llama_packer.__main__ import parse_args
     assert parse_args(["llama-packer", "--dry-run"]).dry_run is True
-    Model.persist_cache = False
+    utils.set_dry_run(True)
     Model.from_dir([tmp_path],
                    generate_stubs=not (False or parse_args(
                        ["llama-packer", "--dry-run"]).dry_run))
@@ -157,23 +159,68 @@ def test_dry_run_creates_no_stub_via_the_cli_gate(tmp_path):
 # --- 3. the CLI's own switches ---------------------------------------------
 
 
-def test_dry_run_and_agents_is_refused(tmp_path, monkeypatch, capsys):
-    # One says "write nothing", the other exists to write a file. Guessing
-    # either way is a footgun.
+def test_dry_run_previews_agents_instead_of_writing_it(tmp_path, caplog):
+    """--agents previews too. "Show me what you would write" is the point of
+    a dry run, so the combination is answerable rather than refused."""
+    from llama_packer.__main__ import write_agents_md
     models = tmp_path / "models"
-    (models / "chat").mkdir(parents=True)
-    (models / "chat" / "lonely.gguf").write_bytes(b"x")
-    monkeypatch.chdir(tmp_path)
-
-    from llama_packer.__main__ import main
-    with pytest.raises(SystemExit):
-        main(["llama-packer", "--dry-run", "--agents",
-              "--models-dir", str(models),
-              "--output", str(tmp_path / "config.yaml")])
-    assert "contradict" in capsys.readouterr().err
+    models.mkdir()
+    with caplog.at_level(logging.INFO, logger="llama_packer.utils"):
+        utils.set_dry_run(True)
+        write_agents_md(models)
+    reported = [r.getMessage() for r in caplog.records if "would " in r.getMessage()]
+    assert any("AGENTS.md guide" in m for m in reported), reported
+    assert not (models / "AGENTS.md").exists()
 
 
 def test_dry_run_parses_and_defaults_off():
     from llama_packer.__main__ import parse_args
     assert parse_args(["llama-packer", "--dry-run"]).dry_run is True
     assert parse_args(["llama-packer"]).dry_run is False
+
+
+# --- 4. the preview reports what it withheld -------------------------------
+
+
+def test_dry_run_reports_each_withheld_write(tmp_path, caplog):
+    """A preview that says nothing is indistinguishable from a clean run.
+
+    That silence is what hid the three writers in the first place, so the
+    report is part of the contract, not a nicety.
+    """
+    md = _sidecar(tmp_path)
+    chat = tmp_path / "chat"
+    chat.mkdir()
+    (chat / "lonely.gguf").write_bytes(b"x")
+
+    with caplog.at_level(logging.INFO, logger="llama_packer.utils"):
+        utils.set_dry_run(True)
+        discover._write_stub(chat / "lonely.md")
+        model = next(m for m in Model.from_dir([tmp_path], generate_stubs=False)
+                     if m.md_path is not None)
+        model.persist_measured({"model_mib": 4800})
+
+    reported = [r.getMessage() for r in caplog.records if "would " in r.getMessage()]
+    assert any("lonely.md" in m for m in reported), reported
+    assert any(str(md) in m for m in reported), reported
+    assert not (chat / "lonely.md").exists(), "but nothing was written"
+    assert "derived:" not in md.read_text(), "nor the sidecar"
+
+
+def test_note_fs_op_carries_the_detail(caplog):
+    with caplog.at_level(logging.INFO, logger="llama_packer.utils"):
+        utils.note_fs_op("update derived: in", "/m.md", "stem")
+    (msg,) = [r.getMessage() for r in caplog.records if "would " in r.getMessage()]
+    assert msg == "would update derived: in: /m.md (stem)"
+
+
+def test_dry_run_lifts_the_log_floor_to_info():
+    """The report goes to the log, so a preview must not need -v to show it."""
+    from llama_packer.__main__ import setup_logging
+    import logging as _logging
+    setup_logging(0, floor=_logging.INFO)
+    try:
+        assert _logging.getLogger().getEffectiveLevel() == _logging.INFO
+    finally:
+        setup_logging(0)
+    assert _logging.getLogger().getEffectiveLevel() == _logging.WARNING

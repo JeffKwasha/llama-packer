@@ -315,18 +315,6 @@ class Model:
     _file: Model | None = None  # canonical file delegate (self when sidecar-less)
     _header: object = None  # lazy parsed header (subclass fills on demand)
 
-    #: Whether :meth:`persist_measured` may write back to the sidecar.
-    #: Set False by ``--dry-run``. A sidecar is a hand-authored file in the
-    #: user's model tree, and a preview that rewrites 44 of them is a
-    #: footgun — but the cache is the *point* of persisting, so this is
-    #: opt-out per run rather than opt-in. Costs nothing to skip: a
-    #: re-measure is a subprocess, "seconds per model, never a server".
-    #: A class attribute rather than a threaded argument because one pack
-    #: runs per process, so the flag is constant for its whole lifetime and
-    #: carrying it through writer -> planner -> budget -> model would touch
-    #: every layer to move an invariant.
-    persist_cache: bool = True
-
     # Global registry: claimed weight files → owning Model. The key is the
     # weight's realpath (and dev:ino for hardlinks) so a sidecar with an
     # explicit `model:` that strips quant/version still claims the file.
@@ -1231,12 +1219,11 @@ class Model:
         # In-memory state first: callers (saved_for, measured_file_valid)
         # must see the values even when the file cannot be written.
         self.frontmatter[MEASURED_KEY] = copy.deepcopy(block)
-        if not self.persist_cache:
-            # --dry-run. The measurement is still used for this run; only
-            # the write-back is withheld, because the sidecar is a
-            # hand-authored file in the user's model tree.
-            logger.debug("dry run: derived block for %s not written back",
-                         self.stem)
+        if utils.DRY_RUN:
+            # --dry-run. The measurement still drives this run; only the
+            # write-back is withheld, because the sidecar is a hand-authored
+            # file in the user's model tree. Reported, not silent.
+            utils.note_fs_op("update derived: in", self.md_path, self.stem)
             return
         if self.md_path is None:
             logger.debug("no sidecar for %s; measured block is memory-only",

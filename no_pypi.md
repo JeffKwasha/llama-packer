@@ -593,4 +593,4 @@ uv pip install git+https://github.com/ashishkamra/vllm-memory-estimator.git
 
 ### No models found
 
-Ensure `models/` exists and contains `.gguf` files with `.md` sidecar files, or create sidecar stubs with `llama-packer` (stubs are auto-generated unless `--no-stubs` is passed).
+Ensure `models/` exists and contains `.gguf` files with `.md` sidecar files, or pass `--create-stubs` to have `llama-packer` create an empty sidecar beside each model file that lacks one. Stubs are **not** created by default — a pack does not write into the models tree unless asked. Models without a sidecar are still discovered and served with built-in defaults.

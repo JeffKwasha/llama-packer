@@ -1334,3 +1334,31 @@ def make_subst(prefix_to_var: dict[str, str]):
         return p
 
     return sub
+
+
+# --- dry-run: preview without touching, but say what would happen ----------
+#
+# One flag and one reporting function for the whole package. `--dry-run` is
+# contractually read-only -- it creates, modifies and deletes nothing -- and
+# every filesystem operation that is withheld reports itself here instead, so
+# a preview is evidence rather than silence. Silence is what made the three
+# writers this replaced invisible: they wrote, two of them at DEBUG, and a
+# preview looked identical to a clean one.
+
+DRY_RUN = False
+
+
+def set_dry_run(value: bool) -> None:
+    """Set the process-wide read-only flag (once per run, at startup)."""
+    global DRY_RUN
+    DRY_RUN = value
+
+
+def note_fs_op(action: str, path, detail: str = "") -> None:
+    """Record a filesystem operation withheld by ``--dry-run``.
+
+    Called instead of performing the write, so the call site reads as "this
+    is what touches disk" and cannot be bypassed by accident.
+    """
+    suffix = f" ({detail})" if detail else ""
+    logger.info("would %s: %s%s", action, path, suffix)

@@ -1383,8 +1383,14 @@ Identity falls back to the file stem, context to the built-in default, role to
 the model's directory, so a stub and an authored sidecar behave identically;
 the empty file exists purely as the human's editing surface ("drop in a gguf,
 get a placeholder to fill in"). This makes a directory of bare models and any
-new `embed/`/`rerank`/`doc/` orphans work on first run; `--no-stubs` skips
-generation.
+new `embed/`/`rerank`/`doc/` orphans work on first run.
+
+Stub generation is **opt-in** (`--create-stubs`). A pack does not write into
+the models tree unless asked to: a stub is a file in someone's hand-curated
+collection, and creating one beside every orphan is a change to that
+collection, not a read of it. Models without a sidecar are still discovered
+and served with built-in defaults either way — the stub is an editing
+surface, not a requirement.
 
 Sidecars are never written inside an HF hub `blobs/` tree (blob hashes are not
 human-readable names). An orphan discovered there gets its stub beside the
@@ -1573,7 +1579,26 @@ rewritten as `derived` on next persist).
 **no** files. Discovery would otherwise write a `derived: file:` fingerprint
 into every sidecar it merely looked at, and stub sidecars beside every
 orphan model file, so both are gated behind the same flag as the config
-output. `--dry-run --agents` is refused rather than guessed at.
+output.
+
+Every withheld operation is then **reported**, so a preview is evidence
+rather than silence — silence being what made the three writers invisible in
+the first place:
+
+```
+$ llama-packer --dry-run --agents --create-stubs ...
+would write: /mnt/ai/models/AGENTS.md (AGENTS.md guide)
+would update derived: in: /mnt/ai/models/chat/qwen3-30b.md (qwen3-30b)
+would create stub sidecar: /mnt/ai/models/chat/orphan.gguf
+would write: config.yaml
+would write: config.env
+```
+
+One flag (`utils.DRY_RUN`) and one reporting function
+(`utils.note_fs_op`) serve all of it, so a new writer cannot silently bypass
+the report. `--dry-run` lifts the log floor to INFO, since the report is the
+point of the run. It also composes with `--agents` and `--create-stubs`:
+those previews report what they would write rather than being refused.
 
 ```yaml
 derived:

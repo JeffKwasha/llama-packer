@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from llama_packer import Model, __version__, find_bin_dir
+from llama_packer import Model, __version__, find_bin_dir, utils
 from llama_packer import model as _modelmod
 from llama_packer.hardware import GpuProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
@@ -46,10 +46,14 @@ from llama_packer.backends.audio_cpp import (AUDIO_CPP_DEFAULT_BIN,
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbosity: int = 0) -> None:
+def setup_logging(verbosity: int = 0, floor: int | None = None) -> None:
     # Each -v drops LOGLEVEL by 10 from the WARNING default (-v: INFO,
     # -vv: DEBUG, -vvv: 0/NOTSET); never negative.
     level = max(0, logging.WARNING - 10 * max(0, verbosity))
+    if floor is not None:
+        # A dry run's whole output is in the log: every withheld write is
+        # reported there, so it has to be visible without extra flags.
+        level = min(level, floor)
     logging.basicConfig(
         level=level,
         format="%(levelname).1s | %(message)s",
@@ -133,7 +137,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-home", help="HF_HOME root (the dir containing hub/) for hub snapshot "
                         "resolution and path grouping (overrides profiles.yaml hf_home / $HF_HOME)")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
-    parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
+    parser.add_argument("--create-stubs", action="store_true",
+                        help="Create an empty stub .md beside every model "
+                             "file that has no sidecar, as an editing surface. "
+                             "Off by default: a pack never writes into the "
+                             "models tree unless asked. Models without a "
+                             "sidecar are still discovered and served with "
+                             "built-in defaults either way.")
     parser.add_argument("--agents", action="store_true",
                         help="Write the AGENTS.md model guide to the models directory if missing "
                              "(never overwrites an existing file; bundled template)")
@@ -187,7 +197,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv[1:] if argv else None)
 
 
-def write_agents_md(models_dir: Path) -> None:
+def write_agents_md(models_dir: Path) -> None:  # noqa: D401 - see body
     """Write the bundled AGENTS.md guide into ``models_dir`` if missing.
 
     The canonical guide ships inside the package
@@ -204,6 +214,9 @@ def write_agents_md(models_dir: Path) -> None:
         src = importlib.resources.files("llama_packer").joinpath("templates", "models_AGENTS.md")
         if not src.is_file():
             logger.warning("bundled AGENTS.md template missing: %s", src)
+            return
+        if utils.DRY_RUN:
+            utils.note_fs_op("write", dest, "AGENTS.md guide")
             return
         shutil.copyfile(str(src), dest)
         try:
@@ -553,11 +566,12 @@ def main(argv: list[str] | None = None) -> None:
     written back into every sidecar it measures.
     """
     args = parse_args(argv)
-    setup_logging(args.verbose)
+    setup_logging(args.verbose,
+                  floor=logging.INFO if args.dry_run else None)
 
     # One pack per process, so this is the whole lifetime of the setting.
     # Must happen before discovery and measurement, both of which write.
-    Model.persist_cache = not args.dry_run
+    utils.set_dry_run(args.dry_run)
     _modelmod.persisted_sidecars_reset()
     logger = logging.getLogger(__name__)
     if args.verbose:
@@ -592,12 +606,6 @@ def main(argv: list[str] | None = None) -> None:
     if missing:
         for d in missing:
             fatal("models directory not found: %s", d)
-
-    if args.dry_run and args.agents:
-        # Contradictory: one says "print instead of writing", the other says
-        # "write this file". Guessing either way is a footgun, so say so.
-        fatal("--dry-run and --agents contradict each other: the first "
-              "writes nothing, the second's whole job is to write AGENTS.md")
 
     if args.agents:
         for d in models_dirs:
@@ -733,7 +741,7 @@ def main(argv: list[str] | None = None) -> None:
     stack.push({"overrides": profiles_cfg.get("overrides")},
                origin=str(profiles_path))
     models = discover(models_dirs, stack=stack,
-                      generate_stubs=not (args.no_stubs or args.dry_run),
+                      generate_stubs=args.create_stubs,
                       extra_dirs=args.extra_dirs, dir_roles=dir_roles,
                       hf_home=hf_home)
     if not models:
@@ -1061,8 +1069,13 @@ def main(argv: list[str] | None = None) -> None:
             payload, getattr(config, "set_overheads", None)))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
-        logger.info("dry run: no files written (config, sidecar stubs and "
-                    "derived: measurement cache all left untouched)")
+        utils.note_fs_op("write", output_path)
+        utils.note_fs_op("write", output_path.with_name("config.env"))
+        # Report what was withheld, so a preview is evidence. The count is
+        # the headline: a reader should not have to grep the log to learn
+        # that nothing was touched.
+        logger.info("dry run: nothing was written — config, config.env, stub "
+                    "sidecars and derived: caches all withheld")
     else:
         write_yaml(config, output_path)
         logger.info("written: %s", output_path)

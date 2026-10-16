@@ -25,7 +25,7 @@ run never starts a server**.
 The models directories are walked depth-first; the *role* comes from the
 first-level directory (`chat/`, `embed/`, `rerank/`, plus the `dirs:` opt-ins
 like `vision/`, `s2t/`, `image/`). A GGUF is paired with the same-stem
-sidecar `.md` (a stub is generated when missing). HF-hub models resolve
+sidecar `.md` (pass `--create-stubs` to have one generated when missing). HF-hub models resolve
 through `hf_repo:` + `model:` to a concrete snapshot file. The sidecar
 frontmatter is folded by the ScopeStack: profiles defaults → directory
 `models.yaml` → override rules → sidecar block, then the backend is inferred
