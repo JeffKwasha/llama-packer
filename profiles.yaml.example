@@ -305,7 +305,12 @@ profiles:
 #                               # fleet-wide (a sidecar parallel: pin opts one
 #                               # model out)
 #   auto_parallel_max: 8        # hard cap on auto slots
-#   parallel_power: 0.75        # slot exponent: what each extra chat is worth
+#   parallel_power: 0.75        # slot exponent: how much context one extra
+#                               # slot may cost. Raise to protect context,
+#                               # lower to buy concurrency; the neutral point
+#                               # is 0.5*log2(context lost per doubling of
+#                               # slots), so no single value suits every
+#                               # model. See SPEC.md
 #
 # ── VRAM pools (optional) ───────────────────────────────────
 # One shared ledger per pool: per-pool spare override, unmodelled residents,

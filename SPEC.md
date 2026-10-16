@@ -375,7 +375,47 @@ matrix:
 | `estimate_headroom` | 1.25 | Padding applied to *estimated* (not measured/pinned) co-load overheads |
 | `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins. Set `false` to disable fleet-wide; a sidecar `parallel:` pin opts a single model out |
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
-| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth |
+| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth. See "What `parallel_power` actually controls" below — the neutral point is model-dependent, so a fleet-wide value is a *bias*, not a target |
+
+### What `parallel_power` actually controls
+
+The score is `(ctx/floor)^0.5 × slots^B`. The context exponent is fixed; `B`
+is the single knob, and it decides **when to trade context for concurrency.**
+
+Slots and context compete for the same KV pool, so doubling the slot count
+costs context in proportion to how expensive that model's slots are. Writing
+`r = ctx(p)/ctx(2p)` for that loss, a slot count only wins when:
+
+```
+2^B > r^0.5     ⟺     B > 0.5 · log2(r)
+```
+
+So the neutral point is a property of the model, not a constant:
+
+| slots cost | context lost per doubling | neutral `B` | at the default 0.75 |
+|---|---|---|---|
+| nearly free | ×2 | 0.50 | always takes more slots |
+| moderate | ×4 | 1.00 | stops around 2 slots |
+| expensive | ×8 | 1.50 | strongly prefers context |
+
+That is the intended shape, and it lines up with how the fleet is used. A
+large agentic model carries both a high `floor` and an expensive per-slot
+cost, so it is pushed to `parallel: 1` — its `floor` is `tools_min_ctx`
+(128k), and any second slot would drop it below a window that cannot drive a
+tool call. A small quick model has a low floor and cheap slots, so the same
+`0.75` walks it up to the cap. `floor` does most of the work; `B` sets the
+rate at which the other side gives way.
+
+Two consequences worth knowing before turning it:
+
+- **Raise `B` to protect context**, lower it to buy concurrency. There is
+  no value of `B` that is correct for every model at once — that is the
+  price of one fleet-wide knob.
+- **The floor gates first.** A candidate below `floor` is rejected outright,
+  so `B` only arbitrates between candidates that already clear it. On a
+  model whose floor is unreachable at any slot count, the solve falls back
+  to the group parallel and logs `auto-parallel: <stem> floor <n>
+  unreachable`.
 
 Invalid values warn and fall back to the default; the solve never fails on a bad knob.
 

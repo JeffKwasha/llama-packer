@@ -40,7 +40,7 @@ either way it should not be used in a commit message until it is.
 | Term | Means | Code |
 |---|---|---|
 | **rung** | One point on the ladder: a set of capabilities deliberately given up, plus the `(ctx, parallel)` the budget affords there. | `writer.py:Rung` |
-| **the ladder** (`plan_ladder`) | Enumerates every subset of sheddable capabilities and keeps the rungs worth emitting. The sheddable axes are `vision` and `draft`. | `writer.py` |
+| **the ladder** (`plan_ladder`) | Enumerates every subset of sheddable capabilities and keeps the rungs worth emitting. The sheddable axes are `vision` and `draft`. **Currently unreachable from production** — `require:`/`sacrifice:` are declared but not acted on. See [plans/one-rung-search.md](plans/one-rung-search.md). | `writer.py` |
 | **`full`** | The rung label when nothing is shed. | `Rung.label` |
 | **`sacrifice`** | A *preference* order for what to give up first, not a cost order — shedding something may buy nothing, which is why every subset is tried rather than a fixed walk. | `DEFAULT_SACRIFICE_ORDER` |
 | **require** | A capability a demand will not give up. Never shed. | `UsageDemand.require` |
