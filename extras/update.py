@@ -49,6 +49,7 @@ exit 1
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -71,6 +72,19 @@ KEEP_VERSIONS = 3  # Keep current + N-1 previous llama.cpp build dirs
 DEFAULT_KEEP_SWAP_VERSIONS = 2  # Keep current + previous llama-swap binaries
 DEFAULT_KEEP_ENGINE_VERSIONS = 2  # Same, for the single-binary engines
 DEFAULT_VERSION = "latest-vulkan"
+
+# One prebuilt per backend, and the asset name is the only thing that
+# differs between them -- so one table replaces a branch per backend. Taken
+# from the b11658 release: the CPU build carries no backend word at all
+# ("bin-ubuntu-x64"), which is why "cpu" has to be spelled out here rather
+# than derived from the other three. It does not collide with them:
+# "ubuntu-vulkan-x64" does not contain "ubuntu-x64".
+CPP_BACKENDS = {
+    "vulkan": "ubuntu-vulkan-{arch}",
+    "rocm": r"ubuntu-rocm-[^-]*-x64",
+    "cuda": r"ubuntu-cuda-[^-]*-{arch}",
+    "cpu": "ubuntu-{arch}",
+}
 
 
 def eprint(*args) -> None:
@@ -273,26 +287,114 @@ def cpp_build_number(tag: str) -> int | None:
     return int(tag) if tag.isdigit() else None
 
 
+@contextlib.contextmanager
+def staging(install_dir: Path, label: str):
+    """Scratch space *on the destination filesystem*, removed on exit.
+
+    Every install builds in one of these and is then promoted by a rename.
+    Two reasons, both load-bearing:
+
+    * Atomicity. ``os.rename`` within one filesystem is atomic; a copy
+      across filesystems is not. Staging under install_dir is what makes
+      promotion a rename rather than a tree-copy, so a versioned name is
+      never observed half-populated -- which is what let an interrupted
+      extraction be mistaken for a finished install.
+    * Ownership. The pruners only delete what the current uid owns, so a
+      /tmp leftover from an interrupted run is not ours to reclaim.
+    """
+    path = Path(tempfile.mkdtemp(dir=install_dir, prefix=f".stage-{label}-"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def promote(src: Path, target: Path, trash: Path) -> None:
+    """Move a fully-built path into its final name, atomically.
+
+    All three paths come from a :func:`staging` block under the same
+    install_dir, so they share one filesystem. An existing destination is
+    renamed aside rather than deleted here: the final name must not be
+    absent-and-unpopulated across a window anyone can observe, and the
+    staging block's cleanup disposes of it.
+    """
+    if target.exists() or target.is_symlink():
+        # A distinct name: ``src`` is itself inside ``trash`` under its own
+        # final name, and renaming a directory onto a non-empty one fails.
+        aside, n = trash / f".superseded-{target.name}", 0
+        while aside.exists():
+            n += 1
+            aside = trash / f".superseded-{target.name}-{n}"
+        os.rename(target, aside)
+    os.rename(src, target)
+
+
+def swap_symlink(target: Path, link_target: str, backup: Path) -> bool:
+    """Back up whatever ``target`` currently is, then point it somewhere new.
+
+    Handles the three shapes found in the wild -- a symlink, a regular
+    file left by the bash version, or nothing yet -- so the callers do not
+    each reimplement it. Refuses to destroy the old binary when the backup
+    cannot be written: a rollback path that does not exist is not a
+    rollback path.
+    """
+    if target.is_symlink():
+        real = target.resolve()
+        source, follow = (real, True) if real.is_file() else (target, False)
+        print(f"Backing up {target.name} -> {backup.name}")
+        try:
+            shutil.copyfile(source, backup, follow_symlinks=follow)
+        except OSError as exc:
+            eprint(f"Error: could not back up {target.name} to {backup}: {exc}")
+            return False
+    elif target.is_file():
+        print(f"Backing up old {target.name} to {backup.name}")
+        try:
+            shutil.copyfile(target, backup)
+        except OSError as exc:
+            eprint(f"Error: could not back up {target.name} to {backup}: {exc}")
+            return False
+        target.unlink()
+        print(f"Migrated {target.name} to a symlink")
+    replace_symlink(target, link_target)
+    print(f"{target.name} -> {link_target}")
+    return True
+
+
+def is_real_file(path: Path) -> bool:
+    """True for a regular file, false for a symlink -- even a valid one.
+
+    tarfile's ``data`` filter vets a member's *name* and drops setuid bits,
+    but it does not inspect a symlink's linkname. So ``llama-swap ->
+    /etc/shadow`` extracts cleanly, and the code that then calls
+    ``Path.is_file()`` (which follows links), chmods and execs the result
+    would touch and run the target. Refusing links here closes that first.
+    """
+    return path.is_file() and not path.is_symlink()
+
+
 def extract_tar_gz(archive: Path, dest: Path) -> None:
     with tarfile.open(archive, "r:gz") as tf:
-        try:
-            tf.extractall(dest, filter="data")  # Python >= 3.11.4, 3.12+
-        except TypeError:  # pragma: no cover - older interpreters
-            tf.extractall(dest)
+        # No try/except fallback: on an interpreter without `filter` the
+        # unfiltered call is full CVE-2007-4559 traversal, and silently
+        # dropping a security control is worse than refusing to run.
+        tf.extractall(dest, filter="data")  # Python >= 3.11.4, 3.12+
 
 
 def extract_zip(archive: Path, dest: Path) -> None:
     """Extract a zip release (stable-diffusion.cpp ships these, not tarballs).
 
-    ``filter="data"`` is zipfile's equivalent of tarfile's: it rejects
-    absolute paths and ``..`` traversal from the archive, which a
-    third-party release artifact is exactly the wrong place to trust.
+    zipfile has no ``filter=`` argument -- it was proposed and never
+    landed -- so the ``try/except TypeError`` this used to carry always
+    fell through to the unfiltered call while its comment claimed
+    otherwise. Check the names instead, rather than leaning on zipfile's
+    incidental mangling of them.
     """
     with zipfile.ZipFile(archive) as zf:
-        try:
-            zf.extractall(dest, filter="data")
-        except TypeError:  # pragma: no cover - Python < 3.12
-            zf.extractall(dest)
+        for name in zf.namelist():
+            if os.path.isabs(name) or ".." in Path(name).parts:
+                raise ValueError(f"unsafe path in archive: {name}")
+        zf.extractall(dest)
 
 
 def extract_archive(archive: Path, dest: Path, fmt: str = "tar.gz") -> None:
@@ -340,13 +442,17 @@ def install_llama_cpp(url: str, tag: str, install_dir: Path) -> tuple[bool, bool
     (True, False); a real install gives (True, True).
     """
     target_dir = install_dir / f"llama-{tag}"
-    if target_dir.is_dir():
+    # Gate on content, never on the name. The gate used to be is_dir(), so
+    # an extraction cut short by a full disk or a Ctrl-C left a half-tree
+    # that every later run reported as "already installed" -- and that
+    # install.py then wrote into config.yaml as LLAMA_DIR.
+    if is_real_file(target_dir / "llama-server"):
         print(f"llama.cpp {tag} already installed at {target_dir}")
         return True, False
 
     print(f"Downloading llama.cpp {tag}...")
-    with tempfile.TemporaryDirectory(dir=install_dir) as tmp:
-        archive = Path(tmp) / url.rsplit("/", 1)[-1]
+    with staging(install_dir, tag) as stage:
+        archive = stage / url.rsplit("/", 1)[-1]
         try:
             download(url, archive, quiet=False)
         except subprocess.CalledProcessError:
@@ -354,10 +460,24 @@ def install_llama_cpp(url: str, tag: str, install_dir: Path) -> tuple[bool, bool
             return False, False
         print("Extracting...")
         try:
-            extract_tar_gz(archive, install_dir)
+            extract_tar_gz(archive, stage)
         except (tarfile.TarError, OSError) as exc:
             eprint(f"Error: extraction failed for {url}: {exc}")
             return False, False
+
+        staged = stage / target_dir.name
+        if not staged.is_dir():
+            # The tarball names its top-level directory after the release,
+            # but that is an assumption about a third-party artifact.
+            found = [d for d in stage.iterdir() if d.is_dir()]
+            if len(found) != 1:
+                eprint(f"Error: {url} did not contain {target_dir.name}")
+                return False, False
+            staged = found[0]
+        if not is_real_file(staged / "llama-server"):
+            eprint(f"Error: {url} contains no llama-server binary")
+            return False, False
+        promote(staged, target_dir, stage)
 
     print(f"Installed to: {target_dir}")
     print(f"Run: {target_dir}/llama-server --help")
@@ -404,62 +524,48 @@ def update_llama_cpp(
     """llama.cpp half of the run.
 
     Returns (ok, installed_tag): installed_tag is the release tag that was
-    actually unpacked (so the caller can prune old builds and re-point
-    symlinks), or None when nothing new landed.
+    actually unpacked, so the caller knows to prune old builds and re-point
+    symlinks. None when nothing new landed -- including when the latest
+    build is already present, which used to report the tag anyway and so
+    made a no-op run prune and rewire as a side effect.
     """
     arch = get_llama_cpp_arch(arch_override)
-    highest = highest_installed(install_dir)
+    backend = next((b for b in CPP_BACKENDS if b in version), "vulkan")
+    pattern = CPP_BACKENDS[backend]
+    if "{arch}" in pattern:
+        pattern = pattern.format(arch=arch)
+    elif arch != "x64":
+        # Upstream ships these backends x64-only.
+        eprint(f"Error: {backend} builds are Linux x64 only (detected {arch})")
+        return False, None
 
-    tag = None
-    if "vulkan" in version or version == "latest":
-        tag = latest_llama_cpp_tag(f"ubuntu-vulkan-{arch}")
+    latest = "latest" in version
+    if latest:
+        tag = latest_llama_cpp_tag(pattern)
         if not tag:
             eprint("Error: Could not fetch latest llama.cpp release tag")
             return False, None
-        if (build := cpp_build_number(tag)) is not None and highest > build:
-            print(f"Already have version b{highest}, which is newer than {tag}")
-            return True, None
-        payload = release_assets(f"{RELEASES_URL}/tags/{tag}")
-        url = find_asset(payload, f"ubuntu-vulkan-{arch}")
-        if not url:
-            eprint(f"Error: Could not find Vulkan ({arch}) asset for {tag}")
-            return False, None
-        ok, _installed = install_llama_cpp(url, tag, install_dir)
-        return (ok, tag) if ok else (False, None)
+    else:
+        tag = version
 
-    if "rocm" in version:
-        # Note: the Linux ROCm builds upstream ships are x64-only.
-        if arch != "x64":
-            eprint(f"Error: ROCm builds are Linux x64 only (detected {arch})")
-            return False, None
-        tag = latest_llama_cpp_tag(r"ubuntu-rocm-[^-]*-x64")
-        if not tag:
-            eprint("Error: Could not fetch latest llama.cpp release tag")
-            return False, None
-        if (build := cpp_build_number(tag)) is not None and highest > build:
-            print(f"Already have version b{highest}, which is newer than {tag}")
-            return True, None
-        payload = release_assets(f"{RELEASES_URL}/tags/{tag}")
-        url = find_asset(payload, r"ubuntu-rocm-[^-]*-x64")
-        if not url:
-            eprint(f"Error: Could not find ROCm asset for {tag}")
-            return False, None
-        ok, _installed = install_llama_cpp(url, tag, install_dir)
-        return (ok, tag) if ok else (False, None)
-
-    # Specific version tag
-    payload = release_assets(f"{RELEASES_URL}/tags/{version}")
+    payload = release_assets(f"{RELEASES_URL}/tags/{tag}")
     if _is_error_payload(payload):
-        eprint(f"Error: Version {version} not found")
+        eprint(f"Error: Version {tag} not found")
         return False, None
-    url = find_asset(payload, f"ubuntu-vulkan-{arch}")
-    if not url and arch == "x64":
-        url = find_asset(payload, r"ubuntu-rocm-[^-]*-x64")
+    if latest and (build := cpp_build_number(tag)) is not None \
+            and build < highest_installed(install_dir):
+        print(f"Already have version b{highest_installed(install_dir)}, "
+              f"which is newer than {tag}")
+        return True, None
+
+    url = find_asset(payload, pattern)
     if not url:
-        eprint(f"Error: Could not find Linux ({arch}) asset for {version}")
+        eprint(f"Error: Could not find {backend} ({arch}) asset for {tag}")
         return False, None
-    ok, installed = install_llama_cpp(url, version, install_dir)
-    return (ok, version if installed else None)
+    ok, installed = install_llama_cpp(url, tag, install_dir)
+    if not ok:
+        return False, None
+    return True, tag if installed else None
 
 
 # --- llama-swap ------------------------------------------------------------
@@ -587,11 +693,9 @@ def update_llama_swap(
         eprint(f"Error: Could not find checksums.txt for {tag}")
         return False
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
+    with staging(install_dir, "llama-swap") as tmpdir:
         archive_name = url.rsplit("/", 1)[-1]
         archive_path = tmpdir / archive_name
-        checksums_path = tmpdir / "checksums.txt"
 
         print(f"Downloading llama-swap {tag} ({arch})...")
         try:
@@ -599,32 +703,9 @@ def update_llama_swap(
         except subprocess.CalledProcessError:
             eprint(f"Error: Failed to download {url}")
             return False
-        try:
-            download(checksums_url, checksums_path)
-        except subprocess.CalledProcessError:
-            eprint(f"Error: Failed to download checksums {checksums_url}")
+        if not verify_archive(archive_path, archive_name, payload, "required",
+                              install_dir):
             return False
-
-        expected = expected_sha256(checksums_path, archive_name)
-        if not expected:
-            eprint(f"Error: Could not find hash for {archive_name} in checksums.txt")
-            return False
-
-        print("Verifying sha256...")
-        actual = sha256_file(archive_path)
-        if actual != expected:
-            eprint(f"Error: sha256 mismatch for {archive_name}")
-            eprint(f"  expected: {expected}")
-            eprint(f"  actual:   {actual}")
-            fail_path = install_dir / f"_HASH_FAIL_{archive_name}"
-            eprint(
-                f"Hash verification failed — saving downloaded file as {fail_path} "
-                "(no execute bit, symlink not updated)"
-            )
-            shutil.copyfile(archive_path, fail_path)
-            _no_exec(fail_path)
-            return False
-        print(f"Checksum verified: {actual}")
 
         # PGP signature check: not implemented — upstream (mostlygeek/llama-swap)
         # publishes no .asc/.sig files and the goreleaser config has no
@@ -640,67 +721,24 @@ def update_llama_swap(
             eprint(f"Error: Failed to extract {archive_path}: {exc}")
             return False
         extracted = tmpdir / "llama-swap"
-        if not extracted.is_file():
-            eprint("Error: Extracted archive does not contain llama-swap binary")
+        if not is_real_file(extracted):
+            eprint("Error: Extracted archive does not contain a "
+                   "llama-swap binary")
             return False
         # hash verified above; only set exec after successful verification
         os.chmod(extracted, 0o755)
 
         versioned = install_dir / f"llama-swap-{tag}"  # e.g. llama-swap-v252
-        backup = install_dir / "llama-swap.bak"  # single backup file (overwrite)
-        try:
-            shutil.move(str(extracted), str(versioned))
-        except OSError as exc:
-            eprint(f"Error: Failed to move verified binary to {versioned}: {exc}")
-            return False
-        os.chmod(versioned, 0o755)
+        promote(extracted, versioned, tmpdir)
 
-        # Ownership check before touching symlink/file
-        if (target.exists() or target.is_symlink()) and not os.access(
-            install_dir, os.W_OK
-        ):
-            eprint(f"Warning: not owner/writable of {target}, skipping replace")
-            return False
+    if not swap_symlink(target, versioned.name,
+                        install_dir / "llama-swap.bak"):   # single, overwritten
+        return False
 
-        if target.is_symlink():
-            current_target = os.readlink(target)
-            real_path = target.resolve()  # handles relative links
-            if real_path.is_file():
-                print(f"Backing up old symlink target {current_target} to {backup}")
-                try:
-                    shutil.copyfile(real_path, backup)
-                except OSError:
-                    eprint(f"Warning: could not back up {real_path} to {backup}")
-                    return False
-            else:
-                print(f"Backing up old symlink {target} -> {current_target} to {backup}")
-                try:
-                    shutil.copyfile(target, backup, follow_symlinks=False)
-                except OSError:
-                    eprint(f"Warning: could not back up {target} to {backup}")
-                    return False
-            replace_symlink(target, versioned.name)
-            print(f"Updated symlink {target} -> {versioned.name}")
-        elif target.is_file():
-            print(f"Backing up old binary to {backup} (single file, overwriting)")
-            try:
-                shutil.copyfile(target, backup)
-            except OSError as exc:
-                # Unlike the bash version, refuse to destroy the old binary
-                # when the backup could not be written.
-                eprint(f"Error: could not back up {target} to {backup}: {exc}")
-                return False
-            target.unlink()
-            replace_symlink(target, versioned.name)
-            print(f"Migrated {target} to symlink -> {versioned.name} (was regular file)")
-        else:
-            replace_symlink(target, versioned.name)
-            print(f"Created symlink {target} -> {versioned.name}")
-
-        # Update any other symlinks in install_dir that point to old
-        # llama-swap-* binaries, then drop superseded versioned binaries.
-        update_llama_swap_symlinks(install_dir, versioned.name)
-        cleanup_old_llama_swap_versions(install_dir, keep_swap)
+    # Update any other symlinks in install_dir that point to old
+    # llama-swap-* binaries, then drop superseded versioned binaries.
+    update_llama_swap_symlinks(install_dir, versioned.name)
+    cleanup_old_llama_swap_versions(install_dir, keep_swap)
 
     try:
         result = subprocess.run(
@@ -1066,10 +1104,10 @@ def find_extracted(root: Path, names: tuple[str, ...]) -> Path | None:
     """
     for name in names:
         candidate = root / name
-        if candidate.is_file():
+        if is_real_file(candidate):
             return candidate
     primary = Path(names[0]).name
-    matches = sorted(p for p in root.rglob(primary) if p.is_file())
+    matches = sorted(p for p in root.rglob(primary) if is_real_file(p))
     return matches[0] if matches else None
 
 
@@ -1086,6 +1124,40 @@ def bundle_root(root: Path) -> Path:
     return root
 
 
+def _engine_is_intact(engine: Engine, path: Path) -> bool:
+    """Whether ``path`` looks like a finished install of ``engine``.
+
+    Promotion is atomic, so anything installed from here on is whole. This
+    check exists for directories the pre-atomic code left behind, where a
+    name alone was enough to be believed -- and believing one wired a
+    truncated engine into the serving config.
+
+    A bundle is checked for content rather than for its binary by name:
+    where the binary sits inside a bundle is whatever the release author
+    chose, and is not known until after extraction.
+    """
+    if engine.bundle:
+        if not path.is_dir() or path.is_symlink():
+            return False
+        return any(is_real_file(p) for p in path.rglob("*"))
+    return is_real_file(path)
+
+
+def version_sort_key(name: str) -> tuple[tuple[int, ...], str]:
+    """Order versioned names by their numbers, not their letters.
+
+    One rule for every engine, because the names disagree: llama.cpp sorts
+    on ``b5454``, stable-diffusion.cpp on ``master-1000-bbb``, whisper.cpp
+    on a semver. Sorting those as text puts ``master-999`` *above*
+    ``master-1000``, which makes the pruner drop the newest build and keep
+    an older one. Taking every digit run, in order, compares all three
+    correctly -- ``(5454,) > (1000,) > (999,)``, and ``v0.9.2`` becomes
+    ``(0, 9, 2)`` so semvers order among themselves too.
+    """
+    digits = tuple(int(d) for d in re.findall(r"[0-9]+", name))
+    return digits, name
+
+
 def cleanup_engine_versions(engine: Engine, install_dir: Path,
                             keep: int, referenced: set[str]) -> None:
     """Drop superseded ``<primary>-<tag>`` entries, newest ``keep`` kept.
@@ -1094,6 +1166,11 @@ def cleanup_engine_versions(engine: Engine, install_dir: Path,
     directory for a bundle. An entry any symlink still points at is never
     removed — deleting it would leave a dangling link, and the ``.bak``
     depends on the previous release staying readable for rollback.
+
+    ``referenced`` holds whole symlink targets, which for a bundle are
+    ``<dir>/<binary>``. Comparing those against a bare directory name never
+    matches, so the guard silently did nothing for exactly the engines with
+    the most to lose. Compare the first component instead.
     """
     if not _owned_by_current_user(install_dir):
         return
@@ -1103,12 +1180,14 @@ def cleanup_engine_versions(engine: Engine, install_dir: Path,
         (e for e in install_dir.iterdir()
          if not e.is_symlink() and re.fullmatch(pattern, e.name)
          and (e.is_file() or e.is_dir())),
+        key=lambda e: version_sort_key(e.name),
         reverse=True,
     )
     if len(entries) <= keep:
         return
+    roots = {t.split("/", 1)[0] for t in referenced}
     for entry in entries[keep:]:
-        if entry.name in referenced:
+        if entry.name in roots:
             continue
         print(f"Removing old {engine.primary}: {entry.name}")
         if entry.is_dir():
@@ -1133,7 +1212,7 @@ def update_engine(engine: Engine, install_dir: Path, arch: str,
         return False
 
     installed_path = install_dir / engine.versioned.format(tag=tag)
-    if installed_path.exists():
+    if _engine_is_intact(engine, installed_path):
         print(f"{engine.label} {tag} already installed at {installed_path.name}")
         return True
 
@@ -1147,8 +1226,7 @@ def update_engine(engine: Engine, install_dir: Path, arch: str,
                f"{backend} asset for {tag}")
         return False
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
+    with staging(install_dir, engine.primary) as tmp:
         archive_name = url.rsplit("/", 1)[-1]
         archive = tmp / archive_name
         print(f"Downloading {engine.label} {tag} ({arch})...")
@@ -1165,7 +1243,8 @@ def update_engine(engine: Engine, install_dir: Path, arch: str,
         tree = tmp / "tree"
         try:
             extract_archive(archive, tree, engine.fmt)
-        except (tarfile.TarError, OSError) as exc:
+        except (tarfile.TarError, zipfile.BadZipFile, ValueError,
+                OSError) as exc:
             eprint(f"Error: Failed to extract {archive_name}: {exc}")
             return False
 
@@ -1196,39 +1275,15 @@ def update_engine(engine: Engine, install_dir: Path, arch: str,
             install_as = binary
             link_target = installed_path.name
 
-        try:
-            shutil.move(str(install_as), str(installed_path))
-        except OSError as exc:
-            eprint(f"Error: Failed to move verified files to "
-                   f"{installed_path}: {exc}")
-            return False
+        promote(install_as, installed_path, tmp)
 
-    target = install_dir / engine.primary
-    backup = install_dir / engine.backup
-    # Back up before replacing, and refuse to destroy the old binary when
-    # the backup could not be written.
-    if target.is_symlink():
-        real = target.resolve()
-        if real.is_file():
-            shutil.copyfile(real, backup)
-        else:
-            shutil.copyfile(target, backup, follow_symlinks=False)
-        print(f"Backing up {target} -> {link_target}")
-    elif target.is_file():
-        try:
-            shutil.copyfile(target, backup)
-        except OSError as exc:
-            eprint(f"Error: could not back up {target} to {backup}: {exc}")
-            return False
-        target.unlink()
-        print(f"Backing up old {engine.primary} to {backup.name}")
-    replace_symlink(target, str(link_target))
-    print(f"{engine.primary} -> {link_target}")
+    if not swap_symlink(install_dir / engine.primary, str(link_target),
+                        install_dir / engine.backup):
+        return False
 
     referenced = {os.readlink(e) for e in install_dir.iterdir() if e.is_symlink()}
     cleanup_engine_versions(engine, install_dir, keep, referenced)
-    print(f"Installed {engine.label} {tag} to {installed_path} "
-          f"(symlink {target})")
+    print(f"Installed {engine.label} {tag} to {installed_path}")
     return True
 
 
@@ -1260,6 +1315,13 @@ def resolve_positionals(
     A positional is a target selector first, then a backend name, and only
     then a version — so ``update.py sd rocm`` reads the way it looks. The
     legacy ``v<NNN>`` heuristic for llama-swap is unchanged.
+
+    Raises :class:`TargetError` on a selector that matches nothing or
+    several things. That used to be appended to ``notes`` and printed, which
+    left ``selected`` empty and fell through to the default targets — so
+    ``update.py s`` printed "ambiguous: matches sd, swap" and then went
+    ahead and installed several gigabytes, exiting 0. A selector the user
+    typed and we could not resolve must stop the run.
     """
     version = DEFAULT_VERSION
     backend = ""
@@ -1269,9 +1331,8 @@ def resolve_positionals(
     for arg in args:
         try:
             targets = resolve_target(arg, index)
-        except TargetError as exc:
-            notes.append(f"Error: {exc}")
-            continue
+        except TargetError:
+            raise
         if targets is not None:
             rest.append(arg)          # collected below, order-independent
             continue
@@ -1403,9 +1464,14 @@ def main(argv: list[str] | None = None) -> int:
         eprint("Error: --swap-only and --cpp-only are mutually exclusive")
         return 1
 
-    target_tokens, backend, version, swap_version, notes = resolve_positionals(
-        args.args, args.swap_version, args.cpp_only, args.swap_only
-    )
+    try:
+        target_tokens, backend, version, swap_version, notes = \
+            resolve_positionals(args.args, args.swap_version, args.cpp_only,
+                                args.swap_only)
+    except TargetError as exc:
+        eprint(f"Error: {exc}")
+        eprint("Nothing was installed. See --help for the target list.")
+        return 1
     targets = resolve_targets(target_tokens)
 
     # Explicit selectors win; the legacy --*-only flags narrow the default;
@@ -1495,13 +1561,24 @@ def _backend_version(version: str, backend: str) -> str:
     llama.cpp predates the shared backend vocabulary and takes it as part of
     the version string ("latest-vulkan"), so keep that shape rather than
     changing its signature.
+
+    A backend already named in ``version`` wins. That is what used to make
+    ``update.py cpu`` install Vulkan: DEFAULT_VERSION is "latest-vulkan",
+    the function returned it unchanged because it contained a backend word,
+    and the Vulkan branch claimed it.
     """
     if not backend:
         return version
-    if backend in ("rocm", "hip") and "rocm" not in version:
-        return "rocm" if version == DEFAULT_VERSION else version
-    if "vulkan" in version or "rocm" in version:
-        return version
+    if backend == "hip":
+        backend = "rocm"          # the two names for the same upstream build
+    if version == DEFAULT_VERSION:
+        # The Vulkan in the default is a default, not a choice. Treating it
+        # as an explicit backend is what made `update.py cpu` install
+        # Vulkan: the token already contained a backend word, so the
+        # requested one was discarded before anyone looked at it.
+        version = "latest"
+    if any(b in version for b in CPP_BACKENDS):
+        return version            # already explicit: it wins
     return f"{version}-{backend}"
 
 

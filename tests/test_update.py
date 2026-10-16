@@ -393,7 +393,7 @@ def test_swap_install_creates_symlink_and_verifies(tmp_path, monkeypatch, capsys
     assert install_swap(tmp_path, monkeypatch) is True
     out = capsys.readouterr().out
     assert "Checksum verified:" in out
-    assert "Created symlink" in out
+    assert "llama-swap -> llama-swap-v262" in out
     assert (tmp_path / "llama-swap-v262").is_file()
     assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
     assert not list(tmp_path.glob("_HASH_FAIL_*"))
@@ -422,8 +422,8 @@ def test_swap_install_hash_lookup_single_space_works(tmp_path, monkeypatch):
 def test_swap_install_backs_up_regular_file_then_symlinks(tmp_path, monkeypatch, capsys):
     assert install_swap(tmp_path, monkeypatch, existing="old") is True
     out = capsys.readouterr().out
-    assert "Backing up old binary" in out
-    assert "Migrated" in out
+    assert "Backing up old llama-swap to llama-swap.bak" in out
+    assert "Migrated llama-swap to a symlink" in out
     assert "echo 'old'" in (tmp_path / "llama-swap.bak").read_text()
     assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
 
@@ -434,8 +434,9 @@ def test_swap_install_symlink_branch_backs_up_target(tmp_path, monkeypatch, caps
 
     assert install_swap(tmp_path, monkeypatch) is True
     out = capsys.readouterr().out
-    assert "Backing up old symlink target" in out
-    assert "Updated symlink" in out
+    # One wording for every shape now that swap_symlink handles all three.
+    assert "Backing up llama-swap -> llama-swap.bak" in out
+    assert "llama-swap -> llama-swap-v262" in out
     assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
     assert "version: v261" in (tmp_path / "llama-swap.bak").read_text()
 
@@ -591,7 +592,8 @@ def test_cpp_install_prunes_and_rewires_links(tmp_path, monkeypatch):
 
 
 def test_cpp_already_present_is_noop_for_pruning(tmp_path, monkeypatch):
-    (tmp_path / "llama-b11539").mkdir()
+    (d := tmp_path / "llama-b11539").mkdir()
+    (d / "llama-server").write_bytes(b"bin")   # a real install, not a stub dir
     (tmp_path / "llama-b10000").mkdir()
     os.symlink("llama-b10000", tmp_path / "server")
 
@@ -599,6 +601,41 @@ def test_cpp_already_present_is_noop_for_pruning(tmp_path, monkeypatch):
     assert (ok, installed) == (True, None)  # nothing new landed
     assert (tmp_path / "llama-b10000").is_dir()
     assert os.readlink(tmp_path / "server") == "llama-b10000"
+
+
+def test_cpp_truncated_dir_is_not_certified_as_installed(tmp_path,
+                                                        monkeypatch, capsys):
+    """An interrupted extraction must not read as a good install.
+
+    The gate used to be ``is_dir()``, so a half-extracted tree -- the
+    90% that landed before the disk filled or the user hit Ctrl-C -- was
+    reported as "already installed" forever after, and install.py wrote
+    its path into config.yaml as LLAMA_DIR. Requiring the binary is what
+    makes a partial install invisible to both tools.
+    """
+    (d := tmp_path / "llama-b11539").mkdir()          # directory exists...
+    (d / "libggml.so").write_bytes(b"partial")        # ...but no llama-server
+
+    ok, installed = install_cpp(tmp_path, monkeypatch)
+    assert (ok, installed) == (True, "b11539"), "must reinstall over the stump"
+    assert (d / "llama-server").is_file()
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".stage-")]
+
+
+def test_cpp_tarball_without_llama_server_is_rejected(tmp_path, monkeypatch,
+                                                      capsys):
+    """A tarball that is not a llama.cpp release must not be installed."""
+    import io as _io
+    import tarfile as _tf
+    buf = _io.BytesIO()
+    with _tf.open(fileobj=buf, mode="w:gz") as tf:
+        info = _tf.TarInfo("llama-b11539/README.md")
+        info.size = 3
+        tf.addfile(info, _io.BytesIO(b"hi\n"))
+    ok, installed = install_cpp(tmp_path, monkeypatch, blob=buf.getvalue())
+    assert (ok, installed) == (False, None)
+    assert "contains no llama-server" in capsys.readouterr().err
+    assert not (tmp_path / "llama-b11539").exists()
 
 
 def test_cpp_unknown_version(tmp_path, monkeypatch, capsys):
@@ -616,14 +653,14 @@ def test_cpp_no_matching_asset(tmp_path, monkeypatch, capsys):
     )
     ok, _ = upd.update_llama_cpp(tmp_path, "b11539", "")
     assert ok is False
-    assert "Could not find Linux (x64) asset for b11539" in capsys.readouterr().err
+    assert "Could not find vulkan (x64) asset for b11539" in capsys.readouterr().err
 
 
 def test_cpp_rocm_non_x64_arch(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(upd, "gh_api", fake_api(cpp_tag="b11539"))
     ok, _ = upd.update_llama_cpp(tmp_path, "rocm", "arm64")
     assert ok is False
-    assert "ROCm builds are Linux x64 only" in capsys.readouterr().err
+    assert "rocm builds are Linux x64 only" in capsys.readouterr().err
 
 
 def test_cpp_download_failure_is_an_error(tmp_path, monkeypatch, capsys):
@@ -1110,3 +1147,122 @@ def test_latest_cpp_tag_returns_empty_when_nothing_matches(monkeypatch):
     monkeypatch.setattr(upd, "gh_api",
                         lambda url: [{"tag_name": "v0.7.0", "assets": []}])
     assert upd.latest_llama_cpp_tag("ubuntu-vulkan-x64") == ""
+
+
+# --- pruning: the guard that silently did nothing for bundles --------------
+
+
+def _bundle(install_dir, name):
+    d = install_dir / name
+    d.mkdir()
+    (d / "server").write_bytes(b"bin")
+    return d
+
+
+def test_prune_never_removes_the_bundle_a_symlink_points_at(tmp_path):
+    """A bundle symlink names ``<dir>/<binary>``, not ``<dir>``.
+
+    Comparing that against a bare directory name never matched, so the
+    "never delete what a symlink points at" guarantee was a no-op for
+    whisper.cpp and stable-diffusion.cpp -- and the engine just installed
+    was the one deleted, leaving a dangling link.
+    """
+    keep = _bundle(tmp_path, "sd-server-v1000")
+    _bundle(tmp_path, "sd-server-v999")
+    os.symlink("sd-server-v1000/sd-server", tmp_path / "sd-server")
+
+    upd.cleanup_engine_versions(upd.STABLE_DIFFUSION, tmp_path, 1,
+                                {"sd-server-v1000/sd-server"})
+    assert keep.is_dir(), "the referenced bundle was deleted"
+    assert os.readlink(tmp_path / "sd-server") == "sd-server-v1000/sd-server"
+
+
+def test_prune_keeps_the_newest_by_number_not_by_spelling(tmp_path):
+    """master-999 must not outrank master-1000.
+
+    Sorted as text, '9' > '1', so the pruner kept the older build and
+    deleted the newer one.
+    """
+    for tag in ("sd-server-v9", "sd-server-v10", "sd-server-v11"):
+        _bundle(tmp_path, tag)
+    os.symlink("sd-server-v11/sd-server", tmp_path / "sd-server")
+
+    upd.cleanup_engine_versions(upd.STABLE_DIFFUSION, tmp_path, 1, {"sd-server-v11/sd-server"})
+    assert (tmp_path / "sd-server-v11").is_dir(), "newest build was pruned"
+    assert not (tmp_path / "sd-server-v9").exists()
+
+
+def test_version_sort_key_orders_mixed_naming_schemes():
+    names = ["whisper-server-b999", "sd-server-master-1000-bbb",
+             "audiocpp_server-v0.9.2", "audiocpp_server-v0.10.0",
+             "llama-b5454"]
+    ordered = sorted(names, key=upd.version_sort_key, reverse=True)
+    assert ordered.index("llama-b5454") == 0
+    assert ordered.index("audiocpp_server-v0.10.0") < ordered.index("audiocpp_server-v0.9.2")
+
+
+# --- one backend table, and no silent fallback to Vulkan -------------------
+
+
+def test_cpu_backend_does_not_install_vulkan():
+    """`update.py cpu` used to fetch the Vulkan tarball and say nothing.
+
+    DEFAULT_VERSION is "latest-vulkan", and the old folding saw a backend
+    word already present and returned it untouched, so the Vulkan branch
+    claimed the request. An operator on a box without Vulkan silently got
+    a build they did not ask for.
+    """
+    assert upd._backend_version(upd.DEFAULT_VERSION, "cpu") == "latest-cpu"
+    assert upd._backend_version(upd.DEFAULT_VERSION, "cuda") == "latest-cuda"
+    assert upd._backend_version(upd.DEFAULT_VERSION, "rocm") == "latest-rocm"
+    # An explicit backend already in the token still wins.
+    assert upd._backend_version("latest-cuda", "cpu") == "latest-cuda"
+    assert upd._backend_version("b11658", "rocm") == "b11658-rocm"
+
+
+@pytest.mark.parametrize("backend,expected", [
+    ("latest-cpu", "ubuntu-x64"),
+    ("latest-cuda", r"ubuntu-cuda-[^-]*-x64"),
+    ("latest-vulkan", "ubuntu-vulkan-x64"),
+    ("latest-rocm", r"ubuntu-rocm-[^-]*-x64"),
+])
+def test_each_backend_matches_its_own_asset(backend, expected):
+    """The CPU build carries no backend word; the others do.
+
+    Patterns come from the b11658 release listing, so this is the one place
+    a rename upstream shows up as a failing test rather than a wrong build.
+    """
+    pattern = upd.CPP_BACKENDS[
+        next(b for b in upd.CPP_BACKENDS if b in backend)]
+    pattern = pattern.format(arch="x64")
+    assert pattern == expected
+
+
+def test_cpu_pattern_does_not_match_a_vulkan_asset():
+    """The whole point of spelling cpu out: no overlap with vulkan/rocm."""
+    vulkan = "https://x/llama-b11658-bin-ubuntu-vulkan-x64.tar.gz"
+    rocm = "https://x/llama-b11658-bin-ubuntu-rocm-10.0-x64.tar.gz"
+    plain = "https://x/llama-b11658-bin-ubuntu-x64.tar.gz"
+    import re as _re
+    cpu = upd.CPP_BACKENDS["cpu"].format(arch="x64")
+    assert not _re.search(cpu, vulkan)
+    assert not _re.search(cpu, rocm)
+    assert _re.search(cpu, plain)
+
+
+def test_already_latest_does_not_claim_an_install(tmp_path, monkeypatch):
+    """A no-op run must not report a tag, or main prunes and rewires anyway.
+
+    The latest-build path used to discard install_llama_cpp's "installed"
+    flag and return the tag regardless, so a run that found b11539 already
+    present still counted as an install.
+    """
+    d = tmp_path / "llama-b11539"
+    d.mkdir()
+    (d / "llama-server").write_bytes(b"bin")
+    monkeypatch.setattr(upd, "latest_llama_cpp_tag", lambda _p: "b11539")
+    monkeypatch.setattr(upd, "release_assets", lambda _u: {"assets": [
+        {"browser_download_url": CPP_URL}]})
+    ok, installed = upd.update_llama_cpp(tmp_path, "latest-vulkan", "")
+    assert ok is True
+    assert installed is None, "claimed an install it did not perform"
