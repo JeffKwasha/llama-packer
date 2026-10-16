@@ -52,6 +52,7 @@ Engines and transports are independent axes: each engine declares the transports
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
 - [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
 - [docs/plans/](docs/plans/) — design proposals (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel, audio-roles: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins)
+- [docs/glossary.md](docs/glossary.md) — **one name per concept**: sidecar, spare, derived:, rung, demand, blessed, coload, entry id, and the rest, each tied to the identifier that implements it
 - [docs/reference.md](docs/reference.md) — external links
 - [docs/install.md](docs/install.md) — deploying under systemd from a run directory: service account, group-writable config, GPU-node discovery ([extras/install.py](extras/install.py))
 

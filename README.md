@@ -194,6 +194,7 @@ DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM dete
 
 ## See also
 
+- [docs/glossary.md](docs/glossary.md) — the vocabulary, if a word in a commit message or a PR does not mean what you think it means
 - [SPEC.md](SPEC.md) — detailed configuration specification
 - [docs/architecture.md](docs/architecture.md) — component map, invariants, extension points
 - [docs/install.md](docs/install.md) — systemd deployment from a run directory ([extras/install.py](extras/install.py))
