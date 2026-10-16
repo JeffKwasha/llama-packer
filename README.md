@@ -46,6 +46,19 @@ first two, the only ones that publish a `checksums.txt`. See
 you get a warning saying so. Copy `profiles.yaml.example` to `profiles.yaml`
 next (see [Profiles](#profiles-profilesyaml)) to start tuning.
 
+For development, `uv pip install -e .` puts `llama-packer` on `PATH` and tracks
+your edits. To pin an older tree, clone with `--branch v0.3.0`, or install
+without cloning via
+`uv pip install git+https://github.com/JeffKwasha/llama-packer.git@v0.3.0`.
+There is no PyPI package — `uvx llama-packer` will not resolve; use the
+clone-and-`uv run` path above.
+
+If a run exits with `no llama-b#### directory found`, it needs `llama-server`
+and `llama-fit-params`: run `./extras/update.py`, set `LLAMA_BIN_DIR`, or pass
+`--llama-server /path/to/llama-server`. A "no models found" pack means the
+directory has no `.gguf` files — pass `--models-dir`, or `--create-stubs` if
+you also want empty sidecars written beside the ones that have none.
+
 ## Running it as a service
 
 The Quickstart leaves you with a foreground process. For a persistent,
