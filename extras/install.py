@@ -341,7 +341,7 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
     if r.dry_run:
         return
     backup(dir_ / "config.yaml", r.dry_run)
-    env = {**os.environ, "HOME": str(dir_)}
+    env = dict(os.environ)
     # HF_HOME is deliberately NOT synthesized here. llama-packer resolves it
     # itself (`--hf-home` > profiles.yaml `hf_home` > `$HF_HOME` >
     # `~/.cache/huggingface`); inventing a value would be a fourth mechanism
@@ -444,9 +444,24 @@ def install_unit(r: Runner, args: argparse.Namespace, dir_: Path) -> Path:
         return unit
     backup(unit, r.dry_run)
     unit.parent.mkdir(parents=True, exist_ok=True)
-    unit.write_text(body)
-    os.chmod(unit, 0o644)
-    verify_unit(unit)
+    # Verify the candidate before it becomes the unit systemd reads. The
+    # previous order wrote in place and then verified, so a rejected unit
+    # was left on disk: not running, but re-read on the next daemon-reload
+    # or reboot. A tmp file in the same directory makes the swap the rename
+    # it should be, and keeps the failure mode "old unit still installed".
+    # A valid unit name, not "x.service.tmp": systemd-analyze refuses to
+    # even parse anything else ("Failed to prepare filename: Invalid
+    # argument") and exits 0, so a broken unit would sail through
+    # verification and then be renamed into place.
+    tmp = unit.with_name(f"{unit.stem}-candidate{unit.suffix}")
+    try:
+        tmp.write_text(body)
+        os.chmod(tmp, 0o644)
+        verify_unit(tmp)
+        os.replace(tmp, unit)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     logger.info("installed unit %s", unit)
     return unit
 
@@ -477,7 +492,7 @@ def verify_unit(unit: Path) -> None:
                        "(ignored): %s", len(ignored), ignored[0])
 
 
-def start(r: Runner, unit: Path, dir_: Path, listen: str) -> None:
+def start(r: Runner, unit: Path, dir_: Path, listen: str, user: str) -> None:
     """Validate the config, then enable and start the unit.
 
     Validation comes first on purpose: llama-swap rejects a config with an
@@ -488,8 +503,13 @@ def start(r: Runner, unit: Path, dir_: Path, listen: str) -> None:
     swap = dir_ / "llama-swap"
     config = dir_ / "config.yaml"
     if not r.dry_run and swap.is_file():
-        res = r.run([str(swap), "-config", str(config), "-validate"],
-                    capture=True, check=False)
+        # As the service user, for the same reason the repack is: the run
+        # directory is group-writable by design, so root executing a binary
+        # out of it lets any member of --group plant one and have root run
+        # it. Unlink+rename needs only directory write permission, not
+        # ownership of the file being replaced.
+        res = r.run(["runuser", "-u", user, "--", str(swap), "-config",
+                     str(config), "-validate"], capture=True, check=False)
         if res.returncode:
             raise InstallError(
                 f"llama-swap rejected {config}:\n{(res.stderr or res.stdout).strip()}")
@@ -632,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_start:
             print("  --no-start: not enabling or starting")
         else:
-            start(r, unit, dir_, args.listen)
+            start(r, unit, dir_, args.listen, args.user)
     except InstallError as exc:
         logger.error("%s", exc)
         return 1

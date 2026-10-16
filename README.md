@@ -39,7 +39,8 @@ uv run llama-packer --models-dir ~/models --output ~/llama-swap-config.yaml
 
 Targets are positional: `update.py all` fetches llama.cpp, llama-swap,
 audio.cpp, whisper.cpp and stable-diffusion.cpp; a bare run fetches only the
-first two, the only ones that publish a `checksums.txt`. See
+first two. Of the five, only llama-swap publishes a `checksums.txt`, so it is
+the only one that gets a real sha256 check — see
 [extras/README.md](extras/README.md).
 
 `profiles.yaml` is optional at this stage — the bundled defaults are used and

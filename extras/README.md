@@ -11,9 +11,9 @@ llama-packer Python package.
   ambiguous prefix is an error rather than a guess. `all` is matched in full only,
   because `a` is an alias for audio.cpp — otherwise the one-letter shorthand would
   be ambiguous. A bare `./extras/update.py` still updates only **llama.cpp +
-  llama-swap**, the two that publish `checksums.txt`; `all` adds the other three,
-  which print an unverified warning rather than pretending to a sha256 check they
-  cannot do.
+  llama-swap**; `all` adds the other three. Only llama-swap publishes a
+  `checksums.txt`, so it is the only one of the five that gets a real sha256
+  check.
   Backends are positional too (`vulkan`, `rocm`, `cpu`); llama.cpp takes them as
   part of its legacy version token. Per-project quirks are handled: audio.cpp
   follows llama.cpp's asset naming and ships binaries on its semver tag; whisper.cpp
@@ -28,9 +28,13 @@ llama-packer Python package.
   wherever you want the binaries installed. Superseded versions are pruned after
   each install — the newest 3 `llama-b*/` dirs and the newest 2 versioned entries
   per engine (`--keep-swap N`, `--keep-engine-versions N`); anything a symlink still
-  points at is kept. Downloads are sha256-verified against the release
-  `checksums.txt` before anything is installed (a mismatch quarantines the file
-  as `_HASH_FAIL_*` and leaves the current binary alone). Rewritten from bash in
+  points at is kept. **llama-swap downloads are sha256-verified against the
+  release `checksums.txt`** before anything is installed, and a mismatch
+  quarantines the file as `_HASH_FAIL_*` and leaves the current binary alone.
+  No other target publishes a manifest — checked against the b11658 llama.cpp
+  release, whose 36 assets are all binaries — so the rest are pinned to an
+  immutable tag URL over TLS and nothing more. That is a real limit, and it is
+  stated rather than papered over. Rewritten from bash in
   2026-10: `--help` now exits 0 instead of 1, and `. extras/update.py --help`
   (sourcing) can no longer kill your shell the way the bash version did.
 - [`install.py`](install.py) — deploys llama-swap under systemd from a run

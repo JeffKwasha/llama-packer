@@ -9,6 +9,7 @@ file under /opt or /etc is created and no service is started.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -27,7 +28,9 @@ def _args(**kw):
     parser would supply."""
     base = dict(user="svc", group="grp", dir=Path("/opt/llama"),
                 listen="127.0.0.1:8123", memory_high="32G", memory_max="40G",
-                swap_max="1G")
+                swap_max="1G", spare=None, vram=None, profiles=Path("p.yaml"),
+                hf_home=None, agents=False, create_stubs=False,
+                dry_run=False)
     base.update(kw)
     return type("Args", (), base)
 
@@ -330,3 +333,98 @@ def test_report_resolved_quiet_when_hf_home_exists(tmp_path, caplog):
     (tmp_path / "config.env").write_text(f"HF_HOME={existing}\n")
     ins.report_resolved(tmp_path)
     assert not caplog.records, [r.message for r in caplog.records]
+
+
+# --- the unit is verified before it becomes the unit systemd reads --------
+
+
+def _install_unit(monkeypatch, unit, dir_, verify):
+    """Drive install_unit with the parser-shaped args main() supplies."""
+    seen = {}
+    monkeypatch.setattr(ins, "verify_unit", lambda p: (seen.update(p=p), verify(p))[1])
+    args = _args(unit=unit, no_start=True, models_dir=[str(dir_)])
+    out = ins.install_unit(ins.Runner(dry_run=False), args, dir_)
+    return out, seen.get("p")
+
+
+def test_rejected_unit_leaves_the_previous_one_installed(tmp_path, monkeypatch):
+    """Write-then-verify left a broken unit on disk for the next reload.
+
+    systemd re-reads the unit directory on any daemon-reload or at boot, so
+    a unit that failed verification would become the one that starts -- not
+    running now, but silently wrong once reloaded.
+    """
+    unit = tmp_path / "llama-swap.service"
+    unit.write_text("[Unit]\nDescription=old-good\n")
+
+    def reject(_path):
+        raise ins.InstallError("llama-swap.service: bogus directive")
+
+    with pytest.raises(ins.InstallError):
+        _install_unit(monkeypatch, unit, tmp_path, reject)
+
+    assert unit.read_text() == "[Unit]\nDescription=old-good\n", "overwritten"
+    assert not list(tmp_path.glob("*candidate*")), "candidate left behind"
+
+
+def test_candidate_name_is_a_valid_unit_name(tmp_path, monkeypatch):
+    """systemd-analyze cannot parse "x.service.tmp".
+
+    It prints "Failed to prepare filename: Invalid argument" and exits 0
+    without inspecting anything, which would make the verify step a no-op
+    that approves any unit at all.
+    """
+    unit = tmp_path / "llama-swap.service"
+    _, candidate = _install_unit(monkeypatch, unit, tmp_path, lambda _p: None)
+    assert candidate.suffix == ".service", candidate
+    assert candidate != unit
+    assert unit.is_file()
+
+
+def test_validate_runs_as_the_service_user(tmp_path, monkeypatch):
+    """The run directory is group-writable on purpose.
+
+    Unlink+rename there needs only directory write permission, not ownership
+    of the entry, so running llama-swap as root out of it lets any member
+    of --group swap in a binary and have root execute it on the next
+    install.
+    """
+    commands = []
+    r = ins.Runner(dry_run=False)
+    monkeypatch.setattr(r, "run", lambda cmd, **kw: commands.append(cmd) or
+                        type("R", (), {"returncode": 0, "stderr": "",
+                                      "stdout": ""})())
+    (tmp_path / "llama-swap").write_bytes(b"bin")
+    (tmp_path / "config.yaml").write_text("models: {}\n")
+    monkeypatch.setattr(ins, "probe", lambda *a, **k: None)   # no live server
+    ins.start(r, tmp_path / "llama-swap.service", tmp_path, "127.0.0.1:1",
+              "lemonade")
+    validate = [c for c in commands if "-validate" in c]
+    assert validate, commands
+    assert validate[0][:4] == ["runuser", "-u", "lemonade", "--"], validate[0]
+
+
+def test_repack_does_not_repoint_home(tmp_path, monkeypatch):
+    """HOME=dir_ made the HF cache fallback resolve under the run dir.
+
+    Path.home() honours HOME, so with no --hf-home the fallback became
+    /opt/llama/.cache/huggingface, which does not exist: no HF_HOME was
+    emitted, nothing warned, and every hf_repo entry silently stopped
+    resolving. The exact failure the "invent nothing" note above it
+    describes, relocated.
+    """
+    seen = {}
+    r = ins.Runner(dry_run=False)
+    monkeypatch.setattr(r, "run", lambda cmd, **kw: seen.update(env=kw.get("env"))
+                        or type("R", (), {"returncode": 0, "stdout": ""})())
+    (tmp_path / "config.yaml").write_text("models: {}\n")
+    (tmp_path / "config.env").write_text("")
+    monkeypatch.setattr(ins, "report_resolved", lambda _d: None)
+    args = _args(models_dir=[str(tmp_path)],
+                 profiles=str(tmp_path / "profiles.yaml"))
+    ins.generate_config(r, "lemonade", tmp_path, args, "llama-packer")
+    env = seen["env"]
+    # Inheriting the operator's real HOME is fine and intended; overriding
+    # it to the run directory is the defect.
+    assert env.get("HOME") != str(tmp_path), env.get("HOME")
+    assert env.get("HOME") == os.environ.get("HOME")
