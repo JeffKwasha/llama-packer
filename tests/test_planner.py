@@ -1165,3 +1165,19 @@ def test_set_admission_keeps_every_group_when_they_agree(make_model):
     Planner._coresident_charge(planner, model, "rag")
     Planner._coresident_charge(planner, model, "rag")
     assert planner.set_admission["a"] == {"rag", "voice"}
+
+
+def test_cpu_resident_chat_gets_no_auto_parallel(make_model, profiles):
+    """Host-RAM KV is in an arena no VRAM ledger budgets.
+
+    calc_ctx returns the design context regardless of the slot count for a
+    CPU-resident model, so every candidate looks equally affordable and the
+    score reduces to p**power -- walking straight to the cap. 8 slots on a
+    model declared for one is an 8x KV over-commit that nothing accounts for.
+    """
+    model = make_model("cpu-chat", role="chat", device="cpu")
+    planner = Planner([model], profiles, fit_bin="unused",
+                      vram_total=64 * 1024)
+    planner._bounded_ctx = lambda *a, **k: 131072
+    plan = planner.plan()
+    assert [v.parallel for v in plan["cpu-chat"]] == [1]

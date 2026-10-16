@@ -2218,6 +2218,14 @@ class Planner:
                     self.knobs.auto_parallel
                     and view.role == "chat"
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
+                    # A CPU-resident model's KV pool lives in host RAM, which
+                    # no VRAM ledger sees or budgets, and calc_ctx returns
+                    # the design context regardless of the slot count. So
+                    # every candidate looks equally affordable and the score
+                    # reduces to p**power, which walks straight to the cap:
+                    # 8 slots on a model declared for one is an 8x KV
+                    # over-commit in an arena nothing accounts for.
+                    and not getattr(view, "on_cpu", False)
                     and "parallel" not in (view.frontmatter or {})
                     and not any("parallel" in resolved
                                 for _, resolved in group))
@@ -2894,14 +2902,25 @@ def emit_config(models: list[Model], plan: dict,
     # their context label (deterministic given the plan's iteration order).
     used_tails: dict[str, set[str]] = {}
 
-    def unique_tail(stem: str, tail: str, ctx: int) -> str:
+    def unique_tail(stem: str, tail: str, key: str) -> str:
+        """Disambiguate two servings of one stem that share a tail.
+
+        *key* must describe the serving, never the solve. It used to be the
+        context label, which this module's own docstring rules out: a
+        context-derived suffix changes whenever VRAM changes, and
+        opencode/hermes cache entry ids at startup, so a repack silently
+        repoints a cached id at a different physical serving -- and where
+        two entries of a stem can swap emission order between packs, the
+        bare tail changes which serving it names. Cache type and whether the
+        mmproj is attached are operator-declared and do not move with the
+        solve, which is exactly the property an id needs.
+        """
         taken = used_tails.setdefault(stem, set())
         cand = tail
         n = 1
         while cand in taken:
             n += 1
-            cand = (f"{tail}-{ctx_label(ctx)}" if n == 2
-                    else f"{tail}-{ctx_label(ctx)}-{n}")
+            cand = f"{tail}-{key}" if n == 2 else f"{tail}-{key}-{n}"
         taken.add(cand)
         return cand
 
@@ -2938,7 +2957,9 @@ def emit_config(models: list[Model], plan: dict,
                 coload_stems.add(model.stem)
             flags = served_flags(view, v.include_mmproj, v.tools_demoted)
             tail, disp = id_and_suffix(v, v.ctx_size, flags)
-            tail = unique_tail(model.stem, tail, v.ctx_size)
+            tail = unique_tail(model.stem, tail,
+                                f"{v.cache_type}"
+                                f"{'-vis' if v.include_mmproj else ''}")
             entry_id, entry = _build_entry(
                 view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
@@ -2966,7 +2987,8 @@ def emit_config(models: list[Model], plan: dict,
             v_flags = served_flags(on_view, True, v.tools_demoted)
             v_tail, v_disp = id_and_suffix(v, v.vision_ctx, v_flags,
                                            usage=v.vision_usage)
-            v_tail = unique_tail(model.stem, v_tail, v.vision_ctx)
+            v_tail = unique_tail(model.stem, v_tail,
+                                 f"{v.cache_type}-vis")
             vision_id, vision_entry = _build_entry(
                 on_view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, on_view.design_context,

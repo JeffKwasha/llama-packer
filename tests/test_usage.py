@@ -547,9 +547,9 @@ def test_untagged_falls_back_to_context_label(make_model):
 
 
 def test_same_model_two_groups_disambiguated(make_model):
-    # Two profile groups (e.g. different cache_type) can land on the same
-    # category+flags; the first keeps the stable name, the duplicate appends
-    # its context rather than colliding into a fatal error.
+    # Two profile groups can land on the same category+flags; the first keeps
+    # the stable name, the duplicate appends a discriminator rather than
+    # colliding into a fatal error.
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
@@ -558,7 +558,28 @@ def test_same_model_two_groups_disambiguated(make_model):
     variants = [_variant(150000, usage), _variant(140000, usage)]
     config = emit_config([m], {"qwen38": variants}, profiles, TVARS)
     assert list(config["models"]) == ["qwen38.coding.ti",
-                                      "qwen38.coding.ti-136k"]
+                                      "qwen38.coding.ti-q8_0-vis"]
+
+
+def test_duplicate_ids_do_not_move_when_context_moves(make_model):
+    """The suffix must survive a repack that only changes VRAM.
+
+    It used to be the context label, which emit_config's own docstring rules
+    out: opencode/hermes cache ids at startup, so a context-derived suffix
+    repoints a cached id at a different serving on every repack.
+    """
+    m = make_model("qwen38", context_length=262144,
+                   capabilities=["tools", "image"])
+    profiles = _profiles_with_usage()
+    usage = (UsageCatalogue.from_cfg(profiles.usage_cfg).get("coding"),)
+    first = emit_config([m], {"qwen38": [_variant(150000, usage),
+                                         _variant(140000, usage)]},
+                        profiles, TVARS)
+    # Same two servings, both re-solved against a different budget.
+    second = emit_config([m], {"qwen38": [_variant(300000, usage),
+                                          _variant(280000, usage)]},
+                         profiles, TVARS)
+    assert list(first["models"]) == list(second["models"])
 
 
 def test_category_slugged_for_the_id(make_model):
