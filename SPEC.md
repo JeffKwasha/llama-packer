@@ -1564,10 +1564,16 @@ weaknesses:
 ## Measured-Block Persistence
 
 Machine-written values live in the sidecar `.md` file under a single
-`derived` nested block — the only dynamically generated branch
+`derived` nested block — and `--dry-run` writes none of them — the only dynamically generated branch
 (llama-packer's own calculation cache: never hand-edit, delete to force
 re-evaluation; legacy `fit-params`/`measured` blocks are located but
-rewritten as `derived` on next persist):
+rewritten as `derived` on next persist).
+
+`--dry-run` is contractually read-only: it creates, modifies and deletes
+**no** files. Discovery would otherwise write a `derived: file:` fingerprint
+into every sidecar it merely looked at, and stub sidecars beside every
+orphan model file, so both are gated behind the same flag as the config
+output. `--dry-run --agents` is refused rather than guessed at.
 
 ```yaml
 derived:

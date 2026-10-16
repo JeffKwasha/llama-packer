@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 from llama_packer import Model, __version__, find_bin_dir
+from llama_packer import model as _modelmod
 from llama_packer.hardware import GpuProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
@@ -103,7 +104,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
               llama-packer --output /etc/ls/config.yaml
         """),
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print config to stdout instead of writing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print config to stdout and touch nothing on disk: "
+                             "no config.yaml, no config.env, no stub sidecars, "
+                             "no derived: measurement write-back")
     parser.add_argument("--remeasure", action="store_true",
                         help="Ignore saved VRAM measurements (sidecar `derived:` "
                              "blocks) and re-run the fast fit-params trio for "
@@ -539,8 +543,22 @@ def resolve_host_binary(
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Emit config.yaml for llama-swap.
+
+    ``--dry-run`` is contractually read-only: it prints the config and
+    creates, modifies and deletes **nothing**.  Three things would otherwise
+    write, so all three are gated here rather than deep in the pipeline:
+    the config and its ``config.env``, the stub sidecars discovery creates
+    beside orphan model files, and the ``derived:`` measurement cache
+    written back into every sidecar it measures.
+    """
     args = parse_args(argv)
     setup_logging(args.verbose)
+
+    # One pack per process, so this is the whole lifetime of the setting.
+    # Must happen before discovery and measurement, both of which write.
+    Model.persist_cache = not args.dry_run
+    _modelmod.persisted_sidecars_reset()
     logger = logging.getLogger(__name__)
     if args.verbose:
         logger.info("llama-packer %s", __version__)
@@ -574,6 +592,12 @@ def main(argv: list[str] | None = None) -> None:
     if missing:
         for d in missing:
             fatal("models directory not found: %s", d)
+
+    if args.dry_run and args.agents:
+        # Contradictory: one says "print instead of writing", the other says
+        # "write this file". Guessing either way is a footgun, so say so.
+        fatal("--dry-run and --agents contradict each other: the first "
+              "writes nothing, the second's whole job is to write AGENTS.md")
 
     if args.agents:
         for d in models_dirs:
@@ -709,7 +733,7 @@ def main(argv: list[str] | None = None) -> None:
     stack.push({"overrides": profiles_cfg.get("overrides")},
                origin=str(profiles_path))
     models = discover(models_dirs, stack=stack,
-                      generate_stubs=not args.no_stubs,
+                      generate_stubs=not (args.no_stubs or args.dry_run),
                       extra_dirs=args.extra_dirs, dir_roles=dir_roles,
                       hf_home=hf_home)
     if not models:
@@ -821,8 +845,8 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["hf_cache"] = str(vllm_cfg.get("hf_cache")
                                     or profiles_cfg.get("hf_home") or "")
     template_vars["vllm_args"] = backend_args(vllm_cfg, "vllm")
-    template_vars["sd_args"] = backend_args(sd_cfg, "sd")
-    template_vars["whisper_args"] = backend_args(whisper_cfg, "whisper")
+    template_vars["sd_args"] = backend_args(profiles_cfg.get("sd"), "sd")
+    template_vars["whisper_args"] = backend_args(profiles_cfg.get("whisper"), "whisper")
     template_vars["llama_args"] = backend_args(profiles_cfg.get("llama_server"), "llama_server")
     # The named batch/ubatch keys render after the global args and win per
     # flag: args -b/-ub would be silently shadowed — point at the keys.
@@ -1037,6 +1061,8 @@ def main(argv: list[str] | None = None) -> None:
             payload, getattr(config, "set_overheads", None)))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
+        logger.info("dry run: no files written (config, sidecar stubs and "
+                    "derived: measurement cache all left untouched)")
     else:
         write_yaml(config, output_path)
         logger.info("written: %s", output_path)
