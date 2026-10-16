@@ -889,9 +889,33 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
     assert config.coload_stems == ["s2t"]
 
 
-def test_plan_no_matrix_undemoted(profiles):
+def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
+    """Served at 32768 against a 131072 tools threshold, it must be demoted.
+
+    This asserted the opposite. Demotion keyed off ``self.chat_ctx``, which
+    is None whenever no ``matrix:`` section exists -- the default -- so
+    demotion could never fire, and an entry advertised tool calling an order
+    of magnitude below the window it needs. The verdict now comes from the
+    context this entry actually serves.
+    """
     chat = make("chat", role="chat", capabilities=["tools"])
     chat.vram.calc_ctx = lambda *a, **k: 32768
+    planner = Planner([chat], profiles, fit_bin="unused", vram_total=64 * 1024)
+    plan = planner.plan()
+    assert plan["chat"][0].tools_demoted is True
+    config = emit_config([chat], plan, profiles, TVARS)
+    entry = only_entry(config)
+    assert entry["capabilities"]["tools"] is False
+    assert entry["metadata"]["tools_demoted"] is True
+
+
+def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
+    """The other direction, so the fix is not simply "always demote"."""
+    # make() seeds context_length 32768, which would cap the served ctx
+    # below the threshold and demote regardless of what calc_ctx returns.
+    chat = make("chat", role="chat", capabilities=["tools"],
+                context_length=262144)
+    chat.vram.calc_ctx = lambda *a, **k: 131072
     planner = Planner([chat], profiles, fit_bin="unused", vram_total=64 * 1024)
     plan = planner.plan()
     assert plan["chat"][0].tools_demoted is False
@@ -1081,3 +1105,63 @@ def _quiet_logger():
     log = logging.getLogger("test-vars")
     log.addHandler(logging.NullHandler())
     return log
+
+
+# ── set admission across profile groups ──────────────────────────────────
+
+
+def test_set_admission_intersects_across_groups(make_model):
+    """A stem may sit in a set only if EVERY group was charged for it.
+
+    plan() calls _coresident_charge once per profile group and __main__
+    places every entry id of the stem into whichever sets survive here. The
+    assignment used to be a plain overwrite, so the last group spoke for all
+    of them -- and the entry sized for the cheapest group landed in the most
+    expensive set, which OOMs at load. There was no test on this path at
+    all: grep for _coresident_charge in tests/ returned nothing.
+    """
+    model = make_model("a")
+    planner = _planner_for_sets(model)
+    planner.set_overheads = {"rag": 1751, "voice": 1898}
+
+    # Group 1 (cheap cache) clears both demands; group 2 (fatter cache) only
+    # the cheaper one.
+    planner.probes = {1751: (131072, 1), 1898: (131072, 1)}
+    Planner._coresident_charge(planner, model, "rag")
+    assert planner.set_admission["a"] == {"rag", "voice"}
+
+    # The fatter-cache group only clears the cheaper set's demand.
+    planner.probes = {1751: (131072, 1), 1898: (65536, 1)}
+    Planner._coresident_charge(planner, model, "rag")
+    assert planner.set_admission["a"] == {"rag"}, "a later group widened it"
+
+
+def _planner_for_sets(model):
+    """A Planner stub with just enough state for _coresident_charge."""
+    from types import SimpleNamespace
+
+    from llama_packer.writer import Planner
+
+    p = SimpleNamespace()
+    p.profiles = SimpleNamespace(default_cache_type="q8_0")
+    p.set_overheads = {}
+    p.set_admission = {}
+    p.ledger = SimpleNamespace(extra_reserve_mb=lambda _pool: 0)
+    p.knobs = SimpleNamespace()
+
+    def demands_for(_m):
+        return (SimpleNamespace(satisfied_by=lambda ctx, par: ctx >= 131072),)
+
+    p.demands_for = demands_for
+    p._bounded_ctx = lambda view, **kw: p.probes[kw["spare_mb"]][0]
+    return p
+
+
+def test_set_admission_keeps_every_group_when_they_agree(make_model):
+    model = make_model("a")
+    planner = _planner_for_sets(model)
+    planner.set_overheads = {"rag": 1751, "voice": 1898}
+    planner.probes = {1751: (131072, 1), 1898: (131072, 1)}
+    Planner._coresident_charge(planner, model, "rag")
+    Planner._coresident_charge(planner, model, "rag")
+    assert planner.set_admission["a"] == {"rag", "voice"}

@@ -1641,6 +1641,19 @@ class Planner:
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
+    def _tools_demoted(self, view, ctx: int) -> bool:
+        """Whether this serving must drop its ``tools`` capability.
+
+        Tool calling needs a real window; below ``matrix.tools_min_ctx`` the
+        entry cannot honour it, and advertising the capability anyway
+        misleads clients about what they will get. Decided per serving
+        because the main entry, its text-only twin and its vision companion
+        each serve a different context.
+        """
+        return (view.role == "chat"
+                and ctx < self.knobs.tools_min_ctx
+                and "tools" in [c.lower() for c in view.capabilities])
+
     def _serving_pin(self, view) -> int | None:
         """Explicitly pinned serving ctx, or None.
 
@@ -1959,6 +1972,20 @@ class Planner:
             # and let the caller drop it from every set.
             worst = max(self.set_overheads.values())
             admitted = set(self.set_overheads)
+        # Intersect across profile groups, never overwrite. plan() calls this
+        # once per group, and __main__ places *every* entry id of the stem
+        # into whichever sets survive here — so the last group to run used to
+        # speak for all of them, and an entry sized for the cheapest group
+        # landed in the most expensive set. That is a load-time OOM in the
+        # exact class this tool exists to prevent: admitted must mean *this
+        # group was charged for that set's residents*, for every group.
+        prev = self.set_admission.get(model.stem)
+        if prev is not None:
+            dropped_now = prev - admitted
+            if dropped_now:
+                logger.info("usage: %s leaves %s under a later profile group",
+                            model.stem, ", ".join(sorted(dropped_now)))
+            admitted = prev & admitted
         self.set_admission[model.stem] = admitted
         charge = max(base, worst)
         logger.info(
@@ -2148,11 +2175,12 @@ class Planner:
             elif view.role == "rerank" and self.matrix_result:
                 context_length = min(context_length,
                                      self.matrix_result.rerank_ctx)
-            tools_demoted = (
-                view.role == "chat"
-                and self.chat_ctx is not None
-                and self.chat_ctx < self.knobs.tools_min_ctx
-                and "tools" in [c.lower() for c in view.capabilities])
+            # Per-serving, decided from the context this entry will actually
+            # serve -- not from the fleet's matrix target. The old test keyed
+            # off self.chat_ctx, which is (a) None whenever no matrix: section
+            # exists (the default), so demotion could never fire at all, and
+            # (b) the fleet-wide goal rather than this entry's own ctx, so a
+            # model that squeezed below the threshold kept advertising tools.
             is_coload = model.stem in coload_stems
 
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
@@ -2378,6 +2406,7 @@ class Planner:
                 # a slot count is what satisfies a category, and 0 would
                 # silently drop every demand from the id.
                 demand_parallel = parallel
+                tools_demoted = self._tools_demoted(view, ctx_size)
                 rung_usage = () if est_error is not None else self.met_demands(
                     model, ctx_size, parallel, include_mmproj, tools_demoted)
                 if uncapped:
@@ -2441,7 +2470,10 @@ class Planner:
                             ctx_size=text_ctx,
                             include_mmproj=False, batch=batch, ubatch=ubatch,
                             coload=is_coload,
-                            tools_demoted=tools_demoted,
+                            # Its own context: the text-only twin exists to
+                            # buy context, so it is often the rung that
+                            # clears the threshold the main entry misses.
+                            tools_demoted=self._tools_demoted(view, text_ctx),
                             usage=text_usage,
                             estimate_error=est_error,
                             mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))

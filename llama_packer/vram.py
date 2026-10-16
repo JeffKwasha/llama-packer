@@ -1329,11 +1329,8 @@ class VramBudget:
         # If design context fits, use it (capped by sidecar context_length)
         design_cost = (kv_per_token * design + slot_mib) * parallel
         if design_cost <= remaining:
-            sidecar_ctx = self.model.frontmatter.get("context_length")
-            if sidecar_ctx is not None:
-                ctx = min(design, sidecar_ctx)
-            else:
-                ctx = design
+            sidecar_ctx = self._sidecar_ceiling()
+            ctx = min(design, sidecar_ctx) if sidecar_ctx is not None else design
             return self._raise_to_image_floor(ctx, img_floor, cap=ctx,
                                               affordable=ctx)
 
@@ -1365,8 +1362,36 @@ class VramBudget:
             return 0
         ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)
+        # The sidecar's context_length is an operator ceiling, and it binds
+        # here exactly as it does when the design context fits. Without this
+        # the two branches disagree: the same model with the same sidecar
+        # got 32768 when it fit and 98304 when VRAM forced the squeeze, and
+        # _bounded_ctx's own clamp could not recover it because the caller
+        # passes design_context (the GGUF architectural max, which prefers
+        # the header over the sidecar) as the cap.
+        sidecar_ctx = self._sidecar_ceiling()
+        if sidecar_ctx is not None:
+            ctx = min(ctx, sidecar_ctx)
         return self._raise_to_image_floor(ctx, img_floor,
                                           cap=max_ctx, affordable=max_ctx)
+
+    def _sidecar_ceiling(self) -> int | None:
+        """The sidecar's declared ``context_length``, if it declares one.
+
+        Read from frontmatter rather than :attr:`design_context` on purpose:
+        design_context prefers the GGUF header's architectural maximum, which
+        is a capability ceiling, not an operator decision. These differ --
+        a model trained at 128k and shipped with ``context_length: 32768``
+        in its sidecar means it.
+        """
+        value = self.model.frontmatter.get("context_length")
+        if value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
     def _image_floor_tokens(self, include_mmproj: bool) -> int:
         """Per-slot token floor that must stay reservable for image tokens.

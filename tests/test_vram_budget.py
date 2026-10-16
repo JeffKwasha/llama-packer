@@ -761,3 +761,45 @@ def test_correction_keys_on_baked_in_draft_not_companion(
     fp2 = m2.vram._fit_params_serve("unused", "q8_0")
     assert fp2 is not None
     assert fp2.slot_mib == pytest.approx(10.0 + 448.9)
+
+
+def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
+    """The operator's pin must bind whether or not the design context fits.
+
+    The ceiling was only applied in the design-fits branch, so the same model
+    and sidecar produced two different answers depending on which branch the
+    budget happened to select: 32768 when it fit, 98304 when VRAM forced the
+    squeeze. SPEC spells out both clamps, and the caller cannot recover it --
+    _bounded_ctx passes design_context, which prefers the GGUF header over
+    the sidecar.
+    """
+    fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
+          "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
+          "shape": ""}
+    model = make_model("pinned", context_length=32768, **{"derived": fm})
+
+    roomy = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+                               design_ctx=131072)
+    assert roomy == 32768
+
+    tight = model.vram.calc_ctx(16384, fit_bin="unused", parallel=1,
+                               design_ctx=131072)
+    assert tight <= 32768, f"squeeze ignored the sidecar pin: {tight}"
+    assert model.vram.vram_squeezed is True
+
+
+def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
+    """The ceiling must only ever lower the ceiling, never impose one.
+
+    Worth asserting explicitly because make_model seeds every sidecar with
+    ``context_length: 32768`` -- so a loose pin has to be able to raise the
+    served context above that, or "no pin" and "pinned at 32k" look
+    identical in the fixtures.
+    """
+    fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
+          "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
+          "shape": ""}
+    model = make_model("unpinned", context_length=131072, **{"derived": fm})
+    ctx = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+                              design_ctx=131072)
+    assert ctx == 131072
