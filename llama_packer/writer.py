@@ -26,6 +26,8 @@ from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
 from llama_packer.consts import (
+    DEFAULT_SACRIFICE_ORDER,
+    KNOWN_CAPABILITIES,
     _DIFFUSION_ARCH_RES,
     _KV_CACHE_BYTES,
     _LLAMA_CPP_DEFAULT_UBATCH,
@@ -763,25 +765,8 @@ def _parse_capability_list(v: object) -> tuple[str, ...] | None:
     return tuple(out)
 
 
-#: Capabilities the ladder knows how to shed or require.  Keeping this
-#: explicit means a typo is a warning rather than a silently inert demand.
-KNOWN_CAPABILITIES = frozenset({"vision", "draft"})
-
-#: Default preference order when a category declares no ``sacrifice:``.
-#: Vision goes first because the demanding use cases (coding, long-context
-#: reasoning) rarely need it, while an MTP draft roughly doubles generation
-#: speed — giving that up is the expensive trade, so it is last.
-DEFAULT_SACRIFICE_ORDER: tuple[str, ...] = ("vision", "draft")
-
-#: Capabilities a category may ask to have shed, in the order to try them.
-#: The ladder walks prefixes of a category's own ``sacrifice:`` list — not a
-#: global order — so "cut vision first" is a property of the category the
-#: operator declared, not a fleet-wide threshold applied to every model.
-SHEDDABLE: frozenset[str] = frozenset(DEFAULT_SACRIFICE_ORDER)
-
-
 def shed_levels(sacrifice: tuple[str, ...] | None,
-                sheddable: frozenset[str] = SHEDDABLE,
+                default_order: tuple[str, ...] = DEFAULT_SACRIFICE_ORDER,
                 required: frozenset[str] = frozenset(),
                 kept: frozenset[str] = frozenset(),
                 ) -> tuple[frozenset[str], ...]:
@@ -790,8 +775,9 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
     One level per prefix of the declared order: ``[]``, ``{vision}``,
     ``{vision, draft}``. Cumulative because each step is a further
     concession — but bounded by the prefix, so a capability the category
-    never named is only reached once the named ones are gone, and anything
-    in ``required`` is never shed at all.
+    never named is only reached once the named ones are gone. Anything in
+    ``required`` (must have it) or ``keep`` (do not drop what this model has)
+    is never shed at any level.
 
     ``None`` means *never degrade* and yields the single empty rung: that is
     the null category, which has no goals to protect and so keeps mmproj and
@@ -805,9 +791,10 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
     if sacrifice is None:
         return (frozenset(),)
     protected = required | kept
-    order = [c for c in sacrifice if c in sheddable and c not in protected]
-    order += [c for c in DEFAULT_SACRIFICE_ORDER
-              if c in sheddable and c not in protected and c not in order]
+    order = [c for c in sacrifice
+             if c in KNOWN_CAPABILITIES and c not in protected]
+    order += [c for c in default_order
+              if c in KNOWN_CAPABILITIES and c not in protected and c not in order]
     levels = [frozenset()]
     for cap in order:
         levels.append(levels[-1] | {cap})
@@ -1666,6 +1653,7 @@ class Planner:
         cache_type: str,
         spare_mb: int,
         include_mmproj: bool,
+        include_draft: bool = True,
         design_ctx: int | None = None,
         context_length: int | None = None,
         profile: dict | None = None,
@@ -1680,6 +1668,7 @@ class Planner:
             parallel=parallel,
             spare_mb=spare_mb,
             include_mmproj=include_mmproj,
+            include_draft=include_draft,
             baseline_mb=self.baseline_mb,
             cache_type=cache_type,
             design_ctx=design_ctx,
@@ -1744,11 +1733,15 @@ class Planner:
         parallel solve, which runs afterwards and may squeeze further.
         """
         best: Rung | None = None
-        for shed in shed_levels(demand.sacrifice, required=demand.require,
+        for shed in shed_levels(demand.sacrifice,
+                                default_order=self.profiles.shed_order,
+                                required=demand.require,
                                 kept=demand.keep):
             ctx = self._bounded_ctx(
                 view, parallel=max(1, parallel), cache_type=cache_type,
-                spare_mb=spare_mb, include_mmproj="vision" not in shed,
+                spare_mb=spare_mb,
+                include_mmproj="vision" not in shed,
+                include_draft="draft" not in shed,
                 design_ctx=design_ctx, context_length=context_length,
                 profile=profile)
             if ctx <= 0 or ctx < demand.min_context:

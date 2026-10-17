@@ -1141,6 +1141,7 @@ class VramBudget:
         cache_type: str = "q8_0",
         design_ctx: int | None = None,
         include_mmproj: bool = True,
+        include_draft: bool = True,
         llama_args: str = "",
         allow_cpu: bool = False,
     ) -> tuple[int, float, float, int] | None:
@@ -1154,8 +1155,13 @@ class VramBudget:
         draft running and already carry it.  ``allow_cpu`` is passed
         through to :meth:`fit_params_static` (host-RAM constants for the
         emitted memory tag on CPU-resident models).
+
+        *include_draft* is the ladder's ``draft`` axis: a category may keep
+        an MTP companion or give it up to buy context. A draft baked into
+        the main block is not separable and stays counted either way.
         """
-        cache_key = ("effective", cache_type, include_mmproj, llama_args)
+        cache_key = ("effective", cache_type, include_mmproj, include_draft,
+                     llama_args)
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
@@ -1208,7 +1214,7 @@ class VramBudget:
         slot_mib = main.slot_mib
         compute_mib = main.compute_mib
 
-        if main.source != "llama-server" and self.model.mtp \
+        if include_draft and main.source != "llama-server" and self.model.mtp \
                 and self.model.mtp.gguf_path:
             draft = self._companion_fit(self.model.mtp, main,
                                         cache_type=cache_type)
@@ -1241,6 +1247,7 @@ class VramBudget:
         parallel: int = 1,
         spare_mb: int = 0,
         include_mmproj: bool = True,
+        include_draft: bool = True,
         baseline_mb: int = 0,
         cache_type: str = "q8_0",
         design_ctx: int | None = None,
@@ -1290,6 +1297,7 @@ class VramBudget:
         static = self.effective_static(
             fit_bin, cache_type=cache_type,
             design_ctx=design, include_mmproj=include_mmproj,
+            include_draft=include_draft,
             llama_args=llama_args,
         )
 

@@ -1143,7 +1143,8 @@ def _planner_for_sets(model):
     from llama_packer.writer import Planner
 
     p = SimpleNamespace()
-    p.profiles = SimpleNamespace(default_cache_type="q8_0")
+    p.profiles = SimpleNamespace(default_cache_type="q8_0",
+                                 shed_order=("vision", "draft"))
     p.set_overheads = {}
     p.set_admission = {}
     p.ledger = SimpleNamespace(extra_reserve_mb=lambda _pool: 0)
@@ -1202,7 +1203,8 @@ def _single_planner(model):
     p.fit_bin = "unused"
     p.baseline_mb = 0
     p.memory_margin = 0.0
-    p.profiles = SimpleNamespace(default_cache_type="q8_0")
+    p.profiles = SimpleNamespace(default_cache_type="q8_0",
+                                 shed_order=("vision", "draft"))
     p.llama_args = ""
     p.max_context = None
     p.min_context = 65536
@@ -1273,3 +1275,34 @@ def test_fallback_never_degrades(make_model):
     generous = _affording(m, {True: 262144, False: 262144})
     assert generous.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
                                spare_mb=0).ctx == 262144
+
+
+def test_keep_draft_is_enforced_now_that_the_axis_exists(make_model):
+    """Dropping the draft must buy context, and `keep` must prevent it.
+
+    Until the draft axis existed this was unfalsifiable: MTP was always
+    costed and never shed, so `keep: [draft]` was correct by accident rather
+    than by design. With the axis real, a category without `keep` has to be
+    able to shed it -- otherwise there is nothing for `keep` to protect.
+    """
+    m = make_model("c", backend="llama-server", context_length=262144)
+    seen = []
+
+    def fake(view, *, parallel, include_mmproj, include_draft=True, **_kw):
+        seen.append((bool(include_mmproj), bool(include_draft)))
+        return 90000 if (include_mmproj and include_draft) else 200000
+
+    p = _single_planner(m)
+    p._bounded_ctx = fake
+    p.solve_rung(m, _demand(min_context=131072), parallel=1,
+                 cache_type="q8_0", spare_mb=0)
+    # Draft offered up: (vision, draft) -> (no vision, draft) -> ... -> neither
+    assert (False, False) in seen, seen
+
+    seen.clear()
+    rung = p.solve_rung(m, _demand(min_context=131072,
+                                   keep=frozenset({"draft"})),
+                        parallel=1, cache_type="q8_0", spare_mb=0)
+    assert all(draft for _, draft in seen), "keep: [draft] still shed it"
+    assert "draft" not in rung.shed
+    assert rung.shed == frozenset({"vision"})

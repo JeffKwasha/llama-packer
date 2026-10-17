@@ -10,10 +10,12 @@ grouping, and spare-VRAM parsing.  Nothing else should reach into the raw
 
 from __future__ import annotations
 
+
 import logging
 import re
 
 from llama_packer import utils
+from llama_packer.consts import DEFAULT_SACRIFICE_ORDER
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,11 @@ class Profiles:
         self.defaults: dict = self._cfg.get("defaults", {}) or {}
         self.profile_list: dict = self._cfg.get("profiles", {}) or {}
         self.usage_list: dict = self._cfg.get("usage", {}) or {}
+        #: Order in which capabilities a category did not name are shed.
+        #: Configuration, not code: what "unnamed" means is the operator's
+        #: call, and every category describes itself completely.
+        self.shed_order: tuple[str, ...] = tuple(
+            self._cfg.get("shed") or ()) or DEFAULT_SACRIFICE_ORDER
 
     @property
     def usage_cfg(self) -> dict:

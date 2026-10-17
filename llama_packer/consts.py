@@ -213,3 +213,19 @@ _NON_CHAT_ROLES = frozenset({"embeddings", "rerank", "image", "s2t", "t2s"})
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 _WEIGHT_SUFFIXES = frozenset({".gguf", ".safetensors", ".bin", ".onnx"})
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Capability shedding
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+#: The capabilities a category can protect or give up.  Explicit so a typo is
+#: a warning rather than a silently inert demand.
+KNOWN_CAPABILITIES = frozenset({"vision", "draft"})
+
+#: Fallback shed order, for a category that names none.  Overridable in
+#: profiles.yaml under ``shed:`` -- a category is expected to describe itself
+#: completely, but what one does *not* mention still has to go somewhere, so
+#: the tail exists; it is configuration, not code, so an operator can change
+#: what "unnamed" means.
+DEFAULT_SACRIFICE_ORDER: tuple[str, ...] = ("vision", "draft")
