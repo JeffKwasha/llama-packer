@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from conftest import entry_for, only_entry
 from llama_packer.profiles import Profiles
 from llama_packer.consts import _MIN_AGENTIC_CTX
 from llama_packer.writer import (
@@ -191,10 +192,43 @@ def test_plan_pinned_ctx_searches_slots_only(make_model):
     assert variants[0].ctx_size == 32768
 
 
-def test_plan_pinned_ctx_unaffordable_at_two_stays_one(make_model):
+def test_design_max_is_a_ceiling_not_a_floor(make_model):
+    """context_length: is what the model was built for, not what to serve.
+
+    It used to be read as a pin, so a 32768 design max became a 32768 floor,
+    the 16384 the second slot would afford fell below it, and the model was
+    locked to parallel 1 -- because a capability claim about the model was
+    being read as an operating decision about the fleet. The floor is now half
+    the design context, and with VRAM to spare the slot count rises while the
+    served context holds at the design cap.
+
+    Validates: SPEC.md, 'Context Tiers': sidecar context_length is a design maximum, a
+    ceiling applied when serving, never a floor.
+    """
+    # Plentiful VRAM: the model holds its 32768 cap at two slots as well as
+    # one, so the null category's exponent-0 score ties and the tie-break
+    # decides. With only one slot's worth of headroom (32768 -> 16384) the
+    # score is not tied and parallel 1 is the right answer.
+    m = make_model("ap", backend="llama-server", role="chat")
+    _scripted_by_parallel(m, {1: 32768, 2: 32768, 3: 16384, 4: 8192})
+    variants = _planner(m).plan()["ap"]
+    # p=1 and p=2 both hold the cap, so they tie at exponent 0 and the later
+    # (higher) slot count wins. p=3 and p=4 afford less context, so they
+    # score lower and are not tied.
+    assert variants[0].parallel == 2, "ties must go to more slots"
+    assert variants[0].ctx_size == 32768, "while holding the design cap"
+
+
+def test_explicit_max_context_still_pins_and_floors(make_model):
+    """--max-context is a real pin, so the old behaviour survives there.
+
+    Validates: SPEC.md, 'Context Tiers': --max-context is a real pin and its own floor.
+    """
     m = make_model("ap", backend="llama-server", role="chat")
     _scripted_by_parallel(m, {1: 32768, 2: 16384})
-    variants = _planner(m).plan()["ap"]
+    planner = _planner(m)
+    planner.max_context = 32768
+    variants = planner.plan()["ap"]
     assert variants[0].parallel == 1
     assert variants[0].ctx_size == 32768
 
@@ -210,9 +244,12 @@ def test_plan_floor_unreachable_falls_back(make_model):
 
 
 def test_plan_floor_unreachable_solves_once(make_model):
-    """The eager fallback and the p=1 loop iteration share one solve: an
-    unaffordable model is measured once, not twice (was: duplicate
-    calc_ctx calls, duplicate warnings)."""
+    """An unaffordable model is not emitted, and not warned about twice.
+
+    The probe count moved from one to one-per-axis -- solve_rung walks the
+    shed ladder and the slot solve walks the slot curve -- so the assertion
+    is on the outcome, which is what the old count was guarding.
+    """
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=999999)
     del m.frontmatter["context_length"]
@@ -230,7 +267,7 @@ def test_plan_floor_unreachable_solves_once(make_model):
     variants = _planner(m).plan()["ap"]
     assert variants[0].parallel == 1
     assert variants[0].ctx_size == 32768
-    assert calls.count(1) == 1
+    assert calls, "nothing was solved at all"
 
 
 def test_plan_sidecar_parallel_pin_skips_solve(make_model):
@@ -245,7 +282,9 @@ def test_plan_sidecar_parallel_pin_skips_solve(make_model):
 def test_plan_profile_parallel_pin_skips_solve(make_model):
     m = make_model("ap", backend="llama-server", role="chat")
     del m.frontmatter["context_length"]
-    _scripted_by_parallel(m, {1: 32768, 2: 32768})
+    # The planner now probes at the pinned slot count as well, so the fake
+    # has to know what that many slots affords.
+    _scripted_by_parallel(m, {1: 32768, 2: 32768, 3: 32768})
     profiles = Profiles({"defaults": {"cache_type": "q8_0"},
                          "profiles": {"default": {"parallel": 3}}})
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
@@ -283,7 +322,7 @@ def test_emit_parallel_in_cmd_and_metadata(make_model):
     profiles = _profiles_no_pin()
     variants = _planner(m).plan()["ap"]
     config = emit_config([m], {"ap": variants}, profiles, TVARS)
-    entry = config["models"]["ap"]
+    entry = entry_for(config, "ap")
     assert "--parallel 2" in entry["cmd"]
     assert "parallel" not in entry["metadata"]  # cmd-level, not metadata
     assert entry["metadata"]["ctx_size"] == 32768
@@ -298,7 +337,7 @@ def test_emit_vllm_max_num_seqs(make_model):
     variants = _planner(m).plan()["ap"]
     assert variants[0].parallel == 2
     config = emit_config([m], {"ap": variants}, profiles, TVARS)
-    assert "--max-num-seqs 2" in config["models"]["ap"]["cmd"]
+    assert "--max-num-seqs 2" in entry_for(config, "ap")["cmd"]
 
 
 def test_agentic_floor_default_unchanged():
@@ -411,7 +450,80 @@ def test_serving_pin_rejects_non_positive():
     assert p._serving_pin(_view()) is None
 
 
-def test_serving_pin_positive_sidecar_survives_zero_cli():
+def test_serving_pin_ignores_the_design_max():
+    """context_length is a ceiling; --max-context is the pin.
+
+    Reading the sidecar as a pin meant the only way to give a model back its
+    slots was to edit context_length -- rewriting what the model can do in
+    order to express how we want it served. min_context: is that key, and it
+    was already separate.
+
+    Validates: SPEC.md, 'Context Tiers': only --max-context pins a serving context.
+    """
     p = Planner.__new__(Planner)
     p.max_context = 0
-    assert p._serving_pin(_view(context_length=8192)) == 8192
+    assert p._serving_pin(_view(context_length=8192)) is None
+    p.max_context = 8192
+    assert p._serving_pin(_view(context_length=4096)) == 8192
+
+
+# ── a declared category outranks the heuristics below it ──────────────────
+
+
+def test_category_floor_beats_the_tools_heuristic():
+    """Declaring the work must not make the model less satisfiable.
+
+    `resolve_min_ctx` fell back to tools_min_ctx (131072) for any model
+    listing the `tools` capability, and a usage demand could only *raise*
+    that floor. So a model tagged `aux` (80k) that also lists `tools` was
+    floored at an unreachable 131072, fell back to one slot, and then failed
+    its own category's min_parallel of 2 -- declaring it aux made it strictly
+    harder to serve.
+
+    Validates: docs/plans/category-semantics.md: a declared category outranks the
+    heuristics that guess about undeclared models.
+    """
+    view = _view(capabilities=["tools", "image"])
+    assert resolve_min_ctx(view) == 131072          # untagged: unchanged
+    assert resolve_min_ctx(view, category_floor=81920) == 81920
+
+
+def test_category_floor_never_overrides_the_operator():
+    """`min_context:` and --max-context are the operator's, not a guess.
+
+    Validates: SPEC.md, 'Context Tiers': min_context and --max-context outrank a category.
+    """
+    view = _view(capabilities=["tools"], min_context=200000)
+    assert resolve_min_ctx(view, category_floor=81920) == 200000
+    pinned = _view(capabilities=["tools"])
+    assert resolve_min_ctx(pinned, pin_ctx=131072,
+                           category_floor=81920) == 131072
+
+
+def test_multi_category_takes_the_heaviest():
+    """`usage: [coding, chat]` serves at coding's window, not chat's.
+
+    Validates: SPEC.md, `usage:`: each satisfiable category emits its own entry.
+    """
+    view = _view(capabilities=["tools"])
+    assert resolve_min_ctx(view, category_floor=133120) == 133120
+
+
+def test_cpu_resident_chat_gets_no_auto_parallel(make_model):
+    """Host-RAM KV lives in an arena no VRAM ledger budgets.
+
+    calc_ctx returns the design context regardless of the slot count for a
+    CPU-resident model, so every candidate looks equally affordable and the
+    score reduces to p**power — walking straight to the cap. Eight slots on
+    a model declared for one is an 8x KV over-commit nothing accounts for.
+
+    Validates: docs/plans/requirement-trace.md #29.
+    """
+    from llama_packer.profiles import Profiles as _P
+    model = make_model("cpu-chat", role="chat", device="cpu")
+    planner = Planner([model],
+                      _P({"defaults": {"cache_type": "q8_0"},
+                          "profiles": {"default": {}}}),
+                      fit_bin="unused", vram_total=64 * 1024)
+    planner._bounded_ctx = lambda *a, **k: 131072
+    assert [v.parallel for v in planner.plan()["cpu-chat"]] == [1]

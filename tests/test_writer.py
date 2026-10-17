@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 
+from conftest import entry_for, only_entry
 from llama_packer.writer import _build_entry, _filter_supported
 
 
@@ -170,8 +171,10 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
         fit_bin="unused", vram_total=48 * 1024, spare=None, max_context=None,
     )
     ids = list(config["models"])
-    assert "chat" in ids
-    assert "bad" not in ids
+    # ids are <stem>[.<category>][.<flags>]; with no usage: tag and no
+    # served flags an entry is just the stem.
+    assert "chat" in ids, ids
+    assert not any(i.startswith("bad") for i in ids), ids
 
 
 def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
@@ -200,6 +203,30 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     assert config["models"] == {}
 
 
+def test_build_config_disables_over_budget_model(make_model, monkeypatch):
+    """A model whose weights exceed the budget must not be emitted —
+    it would be a load-time OOM landmine."""
+    from llama_packer.writer import build_config
+
+    huge = make_model("huge", backend="llama-server", context_length=8192,
+                      base_model="llama3")
+    # 50G weights on a 48G card: remaining < 0 in calc_ctx.
+    monkeypatch.setattr(
+        huge.vram, "effective_static",
+        lambda *a, **k: (50000, 0.5, 0.0, 100),
+    )
+    profiles = {
+        "defaults": {"cache_type": "q8_0", "parallel": 1},
+        "profiles": {"default": {}},
+    }
+    config = build_config(
+        [huge], profiles,
+        {"llama_bin": "/opt/llama-server"},
+        fit_bin="unused", vram_total=48 * 1024,
+    )
+    assert config["models"] == {}
+
+
 def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
     # A sidecar cache_type overrides the profile default for both the emitted
     # flags and the VRAM calc (which the grouped cache_type threads through).
@@ -216,7 +243,7 @@ def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
         [m], profiles, {"llama_bin": "/opt/llama-server"},
         fit_bin="unused", vram_total=48 * 1024,
     )
-    cmd = config["models"]["chat"]["cmd"]
+    cmd = entry_for(config, "chat")["cmd"]
     assert "--cache-type-k f16 --cache-type-v f16" in cmd
 
 
@@ -382,7 +409,7 @@ def test_chat_models_still_have_no_proxy_fields(make_model):
     assert "checkEndpoint" not in entry
 
 
-# ── t2s (kokoro-podman) role ─────────────────────────────────────────────
+# ── t2s role capabilities (serving backend: audio-cpp) ───────────────────
 
 def test_t2s_role_is_text_in_audio_out(make_model):
     model = make_model("k", role="t2s")
@@ -391,8 +418,142 @@ def test_t2s_role_is_text_in_audio_out(make_model):
     assert caps["out"] == ["audio"]
 
 
-def test_t2s_entry_gets_proxy_fields(make_model):
-    model = make_model("k", role="t2s", backend="kokoro-podman")
-    entry = _entry_of(model)
+def test_audio_cpp_entry_proxy_and_health(make_model):
+    # audio.cpp is a proxied HTTP service: llama-swap needs proxy + its own
+    # health path (/health), unlike sd-server/whisper-server which answer "/".
+    model = make_model("a", role="t2s", backend="audio-cpp")
+    _, entry = _build_entry(
+        model, parallel=1, cache_type="q8_0",
+        profiles_group=[("default", {})], profiles_defaults={},
+        template_vars={"audio_cpp_bin": "/opt/audiocpp_server"},
+        context_length=0, ctx_size=0,
+    )
     assert entry["proxy"] == "http://127.0.0.1:${PORT}"
-    assert entry["checkEndpoint"] == "/"
+    assert entry["checkEndpoint"] == "/health"
+    assert entry["capabilities"]["in"] == ["text"]
+    assert entry["capabilities"]["out"] == ["audio"]
+    assert entry["cmd"].startswith("sh -c ")
+    assert "\n" in entry["cmd"]  # heredoc newlines survive emit (_strip_repeat_ws)
+
+
+# ── config serialization contract ─────────────────────────────────────────
+
+def test_emitted_config_plain_is_a_plain_dict():
+    from llama_packer.writer import EmittedConfig
+
+    ec = EmittedConfig({"models": {"m": {"cmd": "x"}}},
+                       entry_ids_by_stem={"m": ["m"]}, coload_stems=["e"])
+    plain = ec.plain()
+    assert type(plain) is dict
+    assert plain == {"models": {"m": {"cmd": "x"}}}
+    # Build-time metadata is not part of the serialized document.
+    assert ec.entry_ids_by_stem == {"m": ["m"]}
+
+
+def test_write_yaml_round_trips_without_python_tags(tmp_path):
+    import yaml
+
+    from llama_packer.writer import EmittedConfig, write_yaml
+
+    ec = EmittedConfig({"models": {"m": {"cmd": "x"}},
+                        "macros": {"A": "--a 1"}},
+                       entry_ids_by_stem={"m": ["m"]})
+    out = tmp_path / "config.yaml"
+    write_yaml(ec, out)
+    text = out.read_text()
+    assert yaml.safe_load(text) == ec.plain()
+    assert "python/object" not in text
+
+
+def test_write_yaml_accepts_plain_dict(tmp_path):
+    import yaml
+
+    from llama_packer.writer import write_yaml
+
+    cfg = {"models": {}, "macros": {}}
+    out = tmp_path / "config.yaml"
+    write_yaml(cfg, out)
+    assert yaml.safe_load(out.read_text()) == cfg
+
+
+def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
+    # Regression: multi-line cmd (audio-cpp heredoc) must round-trip with
+    # newlines intact — PyYAML's default folded style collapses them.
+    import yaml
+
+    from llama_packer.backends import get_backend
+    from llama_packer.writer import write_yaml
+
+    model = make_model("chatterbox", role="t2s", backend="audio-cpp")
+    cmd, _ = get_backend("audio-cpp").build_cmd(
+        model, 0, 1, "q8_0", {"audio_cpp_bin": "/opt/audiocpp_server"})
+    assert "\n" in cmd
+    out = tmp_path / "config.yaml"
+    write_yaml({"models": {"m": {"cmd": cmd}}}, out)
+    text = out.read_text()
+    assert yaml.safe_load(text)["models"]["m"]["cmd"] == cmd
+
+
+def test_overallocation_guard_catches_an_injected_violation(make_model,
+                                                           monkeypatch, caplog):
+    """The guard must fire on a planner that misbehaves, not just agree.
+
+    Validates: docs/plans/requirement-trace.md #27 -- the emit-time guard is
+    the backstop for "no emitted entry may need more VRAM than exists", so it
+    has to be shown to fire rather than merely agree with a healthy planner.
+
+    Everything upstream honours "never emit an entry that cannot load", so
+    on a healthy planner this check has nothing to do. That is exactly why
+    it needs a test that *breaks* the planner deliberately: otherwise it
+    passes vacuously forever and protects nothing.
+
+    Here calc_ctx is made to report a comfortable context while the quad
+    says the model needs more than the card has -- the shape of the bug it
+    was written for.
+    """
+    import logging
+    from llama_packer.writer import build_config
+
+    m = make_model("liar", backend="llama-server", context_length=32768)
+    # Reports a fine context for any request...
+    monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 32768)
+    # ...while the numbers say 90 GB of weights on a 48 GB card.
+    monkeypatch.setattr(m.vram, "effective_static",
+                        lambda *a, **k: (90000, 0.5, 0.0, 100))
+    monkeypatch.setattr(
+        m.vram, "fit_params_static",
+        lambda *a, **k: type("FP", (), {
+            "model_mib": 90000, "kv_per_token_mib": 0.5,
+            "slot_mib": 0.0, "compute_mib": 100, "source": "fit-params"})())
+
+    profiles = {"defaults": {"cache_type": "q8_0", "parallel": 1},
+                "profiles": {"default": {}}}
+    with caplog.at_level(logging.ERROR):
+        config = build_config(
+            [m], profiles, {"llama_bin": "/opt/llama-server"},
+            fit_bin="unused", vram_total=48 * 1024,
+        )
+    assert "invariant violated" in caplog.text
+    assert "planner bug" in caplog.text
+    assert config["models"] == {}, "the impossible entry survived"
+
+
+def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,
+                                                             monkeypatch, caplog):
+    """The other half: silence when the plan is fine.
+
+    Validates: docs/plans/requirement-trace.md #28.
+    """
+    import logging
+    from llama_packer.writer import build_config
+
+    m = make_model("ok", backend="llama-server", context_length=32768)
+    profiles = {"defaults": {"cache_type": "q8_0", "parallel": 1},
+                "profiles": {"default": {}}}
+    with caplog.at_level(logging.ERROR):
+        config = build_config(
+            [m], profiles, {"llama_bin": "/opt/llama-server"},
+            fit_bin="unused", vram_total=48 * 1024,
+        )
+    assert "invariant violated" not in caplog.text
+    assert config["models"], "a sane model was dropped"

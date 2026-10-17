@@ -53,14 +53,6 @@ vllm:
 # whisper:
 #   bin: whisper-server
 
-# ── kokoro-podman backend (optional, text-to-speech) ───
-# Opt-in via profiles.yaml `dirs: {t2s: t2s}`; weights/voices are baked into
-# the image (sidecar only needs `hf_repo: hexgrad/Kokoro-82M`).  Vendor is
-# auto-detected; `vendor:` / `image:` / `podman_args:` / `voices_dir:` override
-# (see profiles.yaml.example for all options).
-# t2s:
-#   image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
-
 # ── Hardware ───────────────────────────────────────────
 # VRAM detection lives in llama_packer/hardware.py. Optional overrides:
 #   hardware:
@@ -88,3 +80,36 @@ vllm:
 #   #   loras: [shared-uncensored.gguf]  # appended to each model's loras
 #   # - when: {name: 'tiny-.*'}
 #   #   cache_type: None                 # delete: fall back to built-in q8_0
+
+# Usage categories a model can declare with `usage:` in its sidecar. Only
+# declared categories count -- an undeclared tag warns and is ignored, which
+# is what keeps the vocabulary honest.
+#
+#   min_context   the window the category needs to be useful; a model that
+#                 cannot serve it at any rung is dropped from the set
+#   min_parallel  slots the category wants, as a preference: the context
+#                 floor wins, since the id advertises the context
+#   require       capabilities this category will not give up
+#   sacrifice     preference order for what to shed first, not a cost order
+usage:
+  coding:
+    min_context: 130k
+    min_parallel: 1
+    sacrifice: [vision]
+    # Refuses to drop the MTP draft, but a coding model with no draft
+    # companion is still coding -- `require` would gate it out entirely.
+    keep: [draft]
+  chat:
+    min_context: 64k
+    min_parallel: 2
+    sacrifice: [draft, vision]
+  qa:
+    min_context: 32k
+    min_parallel: 2
+  # One-off work: describe a picture, summarise a document. Not agentic, so
+  # it does not need an agentic window, and a slot is worth more than
+  # context -- which is the opposite trade from `coding`.
+  aux:
+    min_context: 80k
+    min_parallel: 2
+    sacrifice: [draft]

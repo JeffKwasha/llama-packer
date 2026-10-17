@@ -8,7 +8,7 @@ Discovery is a preorder DFS over each models dir.  At every level:
 2. build authored sidecars — every ``.md`` becomes a ``Model`` and registers
    its weight claim in ``Model._by_gguf``;
 3. remember candidate weight files (``.gguf``/``.safetensors``) without
-   creating stubs;
+   creating stubs (opt-in);
 4. recurse into children; pop.
 
 Only after the walk is globally complete are orphans scanned: a remembered
@@ -52,7 +52,7 @@ def discover(
     models_dirs,
     *,
     stack: ScopeStack | None = None,
-    generate_stubs: bool = True,
+    generate_stubs: bool = False,
     extra_dirs: list[str] | None = None,
     dir_roles: dict | None = None,
     hf_home=None,
@@ -336,6 +336,9 @@ def _model_from_orphan(gguf: Path, root: Path, role: str | None,
 
 def _write_stub(md_path: Path) -> None:
     if md_path.exists():
+        return
+    if utils.DRY_RUN:
+        utils.note_fs_op("create stub sidecar", md_path)
         return
     try:
         md_path.parent.mkdir(parents=True, exist_ok=True)

@@ -32,33 +32,34 @@ class LlamaServerBackend(BaseBackend):
         "reasoning-format", "reasoning-preserve",
         "batch", "ubatch",
     })
+    host_requires = frozenset({"llama_bin"})
 
     # Per-role server-mode flags, appended after the shared core arguments.
-    # The batch half moved to first-class ``batch:``/``ubatch:`` planning
-    # keys (:meth:`default_batch_ubatch` holds the role defaults): ``-ub``
-    # sets the per-pass activation/logits buffer (~6 MiB per token on
-    # Vulkan, dominated by the vocab-sized logits rows) — -ub 4096 cost
-    # ~2.9 GiB of compute buffer per model where 512 (the llama.cpp default)
-    # costs ~0.3 GiB with no measurable throughput difference (2026-09-08).
+    # The batch half is first-class planning (``batch:``/``ubatch:``; see
+    # :meth:`default_batch_ubatch`): ``-ub`` sets the per-pass
+    # activation/logits buffer (~6 MiB per token on Vulkan, dominated by the
+    # vocab-sized logits rows) — -ub 4096 cost ~2.9 GiB of compute buffer per
+    # model where 512 costs ~0.3 GiB with no measurable throughput difference
+    # (2026-09-08).
     _ROLE_FLAGS = {
         "embeddings": "--embedding --embd-normalize 2",
         "rerank": "--rerank --pooling rank",
     }
 
-    # (batch, ubatch) per role — the llama.cpp builtins for chat, tuned
-    # depth for embed/rerank.  Consulted by the Planner's resolution
-    # cascade (sidecar > profile > fleet > role).
-    _ROLE_BATCH = {
-        "chat": (2048, 512),
-        "embeddings": (4096, 512),
-        "rerank": (4096, 512),
+    # (batch, ubatch) per role when nothing is configured.  ``None`` renders
+    # nothing, so llama.cpp's own builtin stands (verified against the local
+    # build: ``-b`` 2048, ``-ub`` 512) and a future upstream default change
+    # is picked up for free.  embed/rerank keep their tuned batch depth —
+    # ``batch`` is throughput-only and does not move the VRAM estimate, so
+    # declaring it costs nothing and stays out of the measurement shape.
+    _ROLE_BATCH: dict[str, tuple[int | None, int | None]] = {
+        "chat": (None, None),
+        "embeddings": (4096, None),
+        "rerank": (4096, None),
     }
 
-    def default_batch_ubatch(self, role: str) -> tuple[int, int]:
-        return self._ROLE_BATCH.get(role, (2048, 512))
-
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("llama_bin"))
+    def default_batch_ubatch(self, role: str) -> tuple[int | None, int | None]:
+        return self._ROLE_BATCH.get(role, (None, None))
 
     def _mtp_args(self, model: "Model") -> tuple[list[str], dict]:
         """Speculative-decoding flags plus metadata contributions."""
@@ -66,14 +67,17 @@ class LlamaServerBackend(BaseBackend):
         if not mtp_on:
             return [], {"mtp_enabled": False}
         spec_type = model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
-        args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max)]
+        p_min = model.mtp_draft_p_min
+        args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max),
+                "--draft-p-min", str(p_min)]
         if model.mtp and model.mtp.gguf_path:
             args += ["--spec-draft-model", str(model.mtp.gguf_path)]
         elif model.frontmatter.get("speculative"):
             logger.warning("mtp: companion %s missing for %s",
                            model.frontmatter["speculative"], model.stem)
             return [], {"mtp_enabled": False}
-        return args, {"mtp_enabled": True, "mtp_draft_max": n_max}
+        return args, {"mtp_enabled": True, "mtp_draft_max": n_max,
+                      "mtp_draft_p_min": p_min}
 
     def _image_token_args(self, model: "Model", include_mmproj: bool) -> list[str]:
         """--image-min/max-tokens flags from sidecar declarations.
@@ -122,11 +126,14 @@ class LlamaServerBackend(BaseBackend):
     ) -> tuple[str, dict]:
         # First-class batch keys render explicitly in the per-role slot
         # (named flags win over conflicting fleet args, lose to cli_args —
-        # which is why cli_args -b/-ub is warned about).
+        # which is why cli_args -b/-ub is warned about).  Each half renders
+        # independently and only when set: an unset key means "use llama.cpp's
+        # own default", so the flag is left off the command entirely.
         role_flags = self._ROLE_FLAGS.get(model.role, "")
-        if batch is not None or ubatch is not None:
-            default_batch, default_ubatch = self.default_batch_ubatch(model.role)
-            role_flags += f" -b {batch or default_batch} -ub {ubatch or default_ubatch}"
+        if batch is not None:
+            role_flags += f" -b {batch}"
+        if ubatch is not None:
+            role_flags += f" -ub {ubatch}"
         cli = (model.frontmatter.get("cli_args") or "").strip()
         if any(tok in ("-b", "-ub") for tok in cli.split()):
             msg = (f"{model.stem}: cli_args carries -b/-ub — shadowed by the "

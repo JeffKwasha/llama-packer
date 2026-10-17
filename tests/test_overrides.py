@@ -107,11 +107,13 @@ def test_infer_backend_gguf_defaults_llama_server(make_model, tmp_path):
     assert m.frontmatter["backend"] == "llama-server"
 
 
-def test_infer_backend_safetensors_prefers_docker(make_model, tmp_path):
+def test_infer_backend_safetensors_prefers_podman(make_model, tmp_path):
+    # Transport preference host > podman > docker: with only an image
+    # configured, podman wins (no runtime probed in this unit avail).
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".safetensors")
     _run([m], avail={"vllm_image": "img:1"})
-    assert m.backend == "vllm-docker"
+    assert m.backend == "vllm-podman"
 
 
 def test_infer_backend_safetensors_falls_back_to_host(make_model, tmp_path):

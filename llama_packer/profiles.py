@@ -10,10 +10,12 @@ grouping, and spare-VRAM parsing.  Nothing else should reach into the raw
 
 from __future__ import annotations
 
+
 import logging
 import re
 
 from llama_packer import utils
+from llama_packer.consts import DEFAULT_SACRIFICE_ORDER
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,22 @@ class Profiles:
         self._cfg = cfg or {}
         self.defaults: dict = self._cfg.get("defaults", {}) or {}
         self.profile_list: dict = self._cfg.get("profiles", {}) or {}
+        self.usage_list: dict = self._cfg.get("usage", {}) or {}
+        #: Order in which capabilities a category did not name are shed.
+        #: Configuration, not code: what "unnamed" means is the operator's
+        #: call, and every category describes itself completely.
+        self.shed_order: tuple[str, ...] = tuple(
+            self._cfg.get("shed") or ()) or DEFAULT_SACRIFICE_ORDER
+
+    @property
+    def usage_cfg(self) -> dict:
+        """Raw ``usage:`` section — the blessed usage categories.
+
+        Declared here (not per sidecar) so the vocabulary of minimum
+        contexts is written down exactly once.  See
+        :class:`llama_packer.writer.UsageCatalogue`.
+        """
+        return self.usage_list
 
     # ── fleet-wide defaults ──
 
@@ -120,7 +138,8 @@ class Profiles:
         names within a group become ``setParamsByID`` keys.  ``batch``/``ubatch``
         are part of the key so per-profile values cannot collide inside one
         entry's command (they render per entry and stamp the measurement
-        shape).  When no profile matches, a single group derived from
+        shape); ``None`` is a group key like any other and means "no flag
+        rendered".  When no profile matches, a single group derived from
         ``defaults`` is returned.
 
         Embed/rerank always serve single-slot: their parallel is pinned to 1
@@ -131,7 +150,7 @@ class Profiles:
             from llama_packer.backends import get_backend
             role_defaults = get_backend(model.backend).default_batch_ubatch(model.role)
         except Exception:
-            role_defaults = (2048, 512)
+            role_defaults = (None, None)
         rag_role = model.role in ("embeddings", "rerank")
         groups: dict[tuple, list] = {}
         for pname, resolved in self.matched_for(model):

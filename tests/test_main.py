@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from llama_packer.__main__ import _apply_env_subst, _health_check_timeout
+from llama_packer.__main__ import (resolve_host_binary,
+                                 _apply_env_subst,
+                                 _health_check_timeout)
 from llama_packer.utils import make_subst
 
 
@@ -118,12 +121,14 @@ def test_build_matrix_vars_includes_text_variants():
               m("rerank", "rnk-1")]
     # Only emitted entries become vars: alpha kept vision (has -text), beta
     # was auto-dropped (its main entry IS beta-text), ghost never emitted.
-    entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"], "beta": ["beta-text"]}
+    entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"],
+                         "beta": ["beta-text"],
+                         "emb-1": ["emb-1-4k"], "rnk-1": ["rnk-1-4k"]}
     vars_, coload_vars = _build_matrix_vars(
-        models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), [],
-        entry_ids_by_stem, logging.getLogger("test"))
+        models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), {},
+        [], entry_ids_by_stem, logging.getLogger("test"))
     assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
-                     "emb": "emb-1", "rnk": "rnk-1"}
+                     "emb": "emb-1-4k", "rnk": "rnk-1-4k"}
     assert coload_vars == []
 
 
@@ -136,13 +141,16 @@ def test_build_matrix_vars_includes_coloads():
 
     models = [m("chat", "alpha"), m("s2t", "parakeet"), m("image", "flux"),
               m("image", "flux2")]
+    # co-load vars resolve to emitted entry ids too
+    ids = {"alpha": ["alpha-128k"], "parakeet": ["parakeet-32k"],
+           "flux": ["flux-64k"], "flux2": ["flux2-64k"]}
     vars_, coload_vars = _build_matrix_vars(
-        models, None, None, ["parakeet", "flux", "flux2"],
-        {"alpha": ["alpha"]}, logging.getLogger("test"))
-    assert vars_["c1"] == "alpha"
-    assert vars_["s2t"] == "parakeet"
-    assert vars_["img"] == "flux"
-    assert vars_["img2"] == "flux2"
+        models, None, None, {}, ["parakeet", "flux", "flux2"],
+        ids, logging.getLogger("test"))
+    assert vars_["c1"] == "alpha-128k"
+    assert vars_["s2t"] == "parakeet-32k"
+    assert vars_["img"] == "flux-64k"
+    assert vars_["img2"] == "flux2-64k"
     assert coload_vars == ["s2t", "img", "img2"]
 
 
@@ -190,8 +198,8 @@ def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
               _stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk = _detect_matrix({}, models, args,
-                                       logging.getLogger("test"))
+        cfg, emb, rnk, cats, fixed = _detect_matrix({}, models, args,
+                                                    logging.getLogger("test"))
     assert cfg is None and emb is None and rnk is None
     assert "matrix: disabled" in caplog.text
     assert "emb1" in caplog.text and "rnk1" in caplog.text
@@ -206,8 +214,8 @@ def test_detect_matrix_silent_without_rag_models(caplog):
     models = [_stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, _, _ = _detect_matrix({}, models, args,
-                                   logging.getLogger("test"))
+        cfg, _, _, cats, fixed = _detect_matrix({}, models, args,
+                                                logging.getLogger("test"))
     assert cfg is None
     assert "matrix: disabled" not in caplog.text
 
@@ -223,8 +231,182 @@ def test_detect_matrix_selects_when_section_present(caplog):
     args = SimpleNamespace(embed=None, rerank=None)
     matrix_cfg = {"sets": {"rag": "__CHAT_VARS__ & emb & rnk"}}
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk = _detect_matrix({"matrix": matrix_cfg}, models, args,
-                                       logging.getLogger("test"))
+        cfg, emb, rnk, cats, fixed = _detect_matrix({"matrix": matrix_cfg},
+                                                    models, args,
+                                                    logging.getLogger("test"))
     assert cfg is matrix_cfg
     assert emb.stem == "emb1" and rnk.stem == "rnk1"
+    assert cats == {"emb": emb, "rnk": rnk}
+    assert fixed == []
     assert "matrix: disabled" not in caplog.text
+
+
+def test_detect_matrix_custom_categories(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
+              _stub_model("tts1", "t2s"), _stub_model("stt1", "s2t"),
+              _stub_model("c1", "chat")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    matrix_cfg = {
+        "categories": {"emb": {"role": "embeddings"},
+                       "rnk": {"role": "rerank"},
+                       "tts": {"role": "t2s"},
+                       "stt": {"role": "s2t"}},
+        "evict_costs": {"emb": 100, "tts": 50},
+        "sets": {"voice": "__CHAT_VARS__ & (tts | stt)"},
+    }
+    with caplog.at_level(logging.WARNING):
+        cfg, emb, rnk, cats, fixed = _detect_matrix(
+            {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
+    assert cfg is matrix_cfg
+    assert set(cats) == {"emb", "rnk", "tts", "stt"}
+    assert cats["tts"].stem == "tts1" and cats["stt"].stem == "stt1"
+    # Non-RAG categories are fixed-overhead residents, in declaration order.
+    assert [n for n, _ in fixed] == ["tts", "stt"]
+    assert "evict_costs key" not in caplog.text
+
+
+def test_detect_matrix_warns_unknown_evict_cost(caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank")]
+    args = SimpleNamespace(embed=None, rerank=None)
+    with caplog.at_level(logging.WARNING):
+        _detect_matrix({"matrix": {"evict_costs": {"nope": 5}}}, models, args,
+                       logging.getLogger("test"))
+    assert "evict_costs key" in caplog.text
+
+
+def test_build_matrix_vars_includes_categories():
+    import logging
+
+    from llama_packer.__main__ import _build_matrix_vars
+
+    def m(role, tid):
+        return SimpleNamespace(role=role, template_id=tid, stem=tid)
+
+    emb, rnk, tts = (m("embeddings", "emb-1"), m("rerank", "rnk-1"),
+                     m("t2s", "tts-1"))
+    models = [m("chat", "alpha"), emb, rnk, tts]
+    cats = {"emb": emb, "rnk": rnk, "tts": tts}
+    # Category vars resolve through the emitted entry ids, which carry the
+    # served context -- template_id is not an entry name.
+    ids = {"alpha": ["alpha-128k"], "emb-1": ["emb-1-4k"],
+           "rnk-1": ["rnk-1-4k"], "tts-1": ["tts-1-32k"]}
+    vars_, coload_vars = _build_matrix_vars(
+        models, emb, rnk, cats, [], ids, logging.getLogger("test"))
+    assert vars_ == {"c1": "alpha-128k", "emb": "emb-1-4k",
+                     "rnk": "rnk-1-4k", "tts": "tts-1-32k"}
+    assert coload_vars == []
+
+
+def test_parse_args_idle_unload():
+    from llama_packer.__main__ import parse_args
+
+    args = parse_args(["prog", "--idle-unload", "600"])
+    assert args.idle_unload == 600
+    # Off by default: no globalTTL key is emitted.
+    args = parse_args(["prog"])
+    assert args.idle_unload is None
+
+
+def test_parse_args_spare_and_baseline():
+    from llama_packer.__main__ import parse_args
+
+    args = parse_args(["prog", "--spare", "20G", "--baseline", "10G"])
+    assert args.spare == "20G"
+    assert args.baseline == "10G"
+
+
+
+# --- host binary resolution ------------------------------------------------
+
+
+def _bin(path, name="engine", text="#!/bin/sh\n"):
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+def test_host_binary_found_in_run_directory(tmp_path, monkeypatch):
+    # The standard: binaries live beside the config, so no profiles.yaml
+    # entry, no env var, and no PATH edit is needed. llama.cpp has always
+    # worked this way (a cwd scan for llama-b[0-9]*); every other backend
+    # used to require its own *_BIN_DIR to match.
+    monkeypatch.delenv("AUDIOCPP_BIN_DIR", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "audiocpp_server")
+    got = resolve_host_binary(None, None, "AUDIOCPP_BIN_DIR", "audiocpp_server",
+                              run_dir=tmp_path)
+    assert got == str(tmp_path / "audiocpp_server")
+    assert Path(got).is_file()
+
+
+def test_host_binary_precedence_cli_then_profiles_then_env_then_run_dir(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AUDIOCPP_BIN_DIR", str(tmp_path / "from-env"))
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "audiocpp_server")
+    _bin(tmp_path / "from-env")
+    _bin(tmp_path / "from-profiles")
+    args = ("AUDIOCPP_BIN_DIR", "audiocpp_server")
+    # CLI wins over everything
+    assert resolve_host_binary(str(tmp_path / "from-cli"), None, *args,
+                               run_dir=tmp_path) == str(tmp_path / "from-cli")
+    # then profiles.yaml
+    assert resolve_host_binary(None, str(tmp_path / "from-profiles"), *args,
+                               run_dir=tmp_path) == str(tmp_path / "from-profiles")
+    # then the env var
+    assert resolve_host_binary(None, None, *args,
+                               run_dir=tmp_path) == str(tmp_path / "from-env")
+    # and only then the run directory
+    monkeypatch.delenv("AUDIOCPP_BIN_DIR")
+    assert resolve_host_binary(None, None, *args,
+                               run_dir=tmp_path) == str(tmp_path / "audiocpp_server")
+
+
+def test_host_binary_env_var_may_name_a_directory(tmp_path, monkeypatch):
+    # Mirrors LLAMA_BIN_DIR: a directory expands to <dir>/<name>.
+    monkeypatch.setenv("WHISPER_BIN_DIR", str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "whisper-server")
+    assert resolve_host_binary(None, None, "WHISPER_BIN_DIR", "whisper-server",
+                               run_dir=Path("/nonexistent")) == str(
+        tmp_path / "whisper-server")
+
+
+def test_host_binary_path_used_when_nothing_resolves(tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    got = resolve_host_binary(None, None, "SD_BIN_DIR", "sd-server",
+                              run_dir=tmp_path)
+    assert got is None
+    # ...unless a fallback was supplied (vLLM keeps its built-in default)
+    assert resolve_host_binary(None, None, "SD_BIN_DIR", "sd-server",
+                              fallback="sd", run_dir=tmp_path) == "sd"
+
+
+def test_host_binary_stale_explicit_path_is_not_silently_replaced(
+        tmp_path, monkeypatch):
+    # A stale `bin:` must keep pointing there: is_available then reports
+    # False and the operator gets a message naming what is wrong, rather
+    # than a different binary being used without their knowledge.
+    monkeypatch.setattr(shutil, "which", lambda n: None)
+    _bin(tmp_path / "sd-server")
+    got = resolve_host_binary(None, str(tmp_path / "gone"), "SD_BIN_DIR",
+                              "sd-server", run_dir=tmp_path)
+    assert got == str(tmp_path / "gone")
+
+
+def test_every_backend_uses_the_same_chain():
+    # The point of the helper: one rule, not three copies of it.
+    import inspect
+    src = inspect.getsource(resolve_host_binary)
+    for tier in ("run_dir", "shutil.which", "env_var"):
+        assert tier in src

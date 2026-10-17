@@ -29,9 +29,7 @@ class WhisperServerBackend(BaseBackend):
     roles = frozenset({"s2t"})
     handles = frozenset({"cli_args"})  # --language, --threads, etc.
     proxied = True
-
-    def is_available(self, avail: dict) -> bool:
-        return bool(avail.get("whisper_bin"))
+    host_requires = frozenset({"whisper_bin"})
 
     def build_cmd(
         self,

@@ -55,3 +55,72 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LLAMA_PACKER_CORRECTIONS",
                        str(tmp_path / "cache" / "serve-corrections.yaml"))
+
+
+def _hf_tree(tmp_path, repo="org/repo", revs=("abc123",),
+             files=("model.gguf",), ref: str | None = "first", contents=None):
+    """Fake HF hub cache: every rev in *revs* holds *files*, plus an
+    optional ``refs/main`` pointer (``ref="first"`` points at ``revs[0]``,
+    ``ref=None`` writes no pointer). *contents* maps ``(rev, file)`` to
+    bytes. Returns the HF_HOME root (``tmp_path / "hf"``)."""
+    if isinstance(revs, str):
+        revs = (revs,)
+    hub = tmp_path / "hf" / "hub"
+    repo_dir = hub / f"models--{repo.replace('/', '--')}"
+    for rev in revs:
+        snap = repo_dir / "snapshots" / rev
+        snap.mkdir(parents=True)
+        for f in files:
+            p = snap / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes((contents or {}).get((rev, f), b"x"))
+    if ref == "first":
+        ref = revs[0]
+    if ref is not None:
+        refs = repo_dir / "refs"
+        refs.mkdir(parents=True, exist_ok=True)
+        (refs / "main").write_text(ref)
+    return tmp_path / "hf"
+
+
+# ── entry-id helpers ────────────────────────────────────────────────────────
+#
+# Entry ids are ``<template_id>.<category|ctx>.<flags>`` and deliberately do
+# not carry the exact context, so a test that wants "the vision entry" or
+# "the text-only entry" locates it by the capability block, not the id.
+
+
+def entries(config) -> dict:
+    return config["models"]
+
+
+def only_entry(config) -> dict:
+    """The single emitted entry."""
+    got = entries(config)
+    assert len(got) == 1, f"expected one entry, got {sorted(got)}"
+    return next(iter(got.values()))
+
+
+def entry_id(config, predicate) -> str:
+    """The id of the one entry matching *predicate* (id, entry)."""
+    hits = [eid for eid, e in entries(config).items() if predicate(eid, e)]
+    assert len(hits) == 1, f"expected one match for {hits} among {sorted(entries(config))}"
+    return hits[0]
+
+
+def vision_entry(config) -> dict:
+    return entries(config)[entry_id(
+        config, lambda i, e: "image" in (e.get("capabilities", {}).get("in") or []))]
+
+
+def text_entry(config) -> dict:
+    """The text-only entry: capability block says text in, nothing else."""
+    return entries(config)[entry_id(
+        config, lambda i, e: (e.get("capabilities", {}).get("in") or []) == ["text"]
+        and "image" not in (e.get("capabilities", {}).get("in") or []))]
+
+
+def entry_for(config, stem: str, which: int = 0) -> dict:
+    """The entry *config* emitted for a model stem (ids are namespaced)."""
+    ids = config.entry_ids_by_stem[stem]
+    return config["models"][ids[which]]

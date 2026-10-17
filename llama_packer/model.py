@@ -13,12 +13,16 @@ from typing import TYPE_CHECKING, ClassVar
 
 import yaml
 
-from llama_packer import utils
+from llama_packer import ggufmeta, utils
 from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
+    _DEFAULT_IMAGE_OUTPUT_RESERVE,
     _DIFFUSION_ARCH_RES,
     _MIN_CTX_SIZE,
     _MTP_DRAFT_N_MAX,
+    _MTP_DRAFT_P_MIN,
+    _PIXELS_PER_MEGAPIXEL,
+    _WEIGHT_SUFFIXES,
 )
 from llama_packer.backends import DEFAULT_BACKEND
 
@@ -32,6 +36,26 @@ _warned_sub4k: set[str] = set()
 
 logger = logging.getLogger(__name__)
 
+
+def _is_file_ref(ref) -> bool:
+    """True for a usable file ref: a non-empty string, or a mapping with a
+    non-empty string ``file`` (``{file:}`` ≡ the bare string; ``{hf_repo:,
+    file:[, pick:]}`` names a hub file)."""
+    if isinstance(ref, str):
+        return bool(ref)
+    if isinstance(ref, dict):
+        name = ref.get("file")
+        return isinstance(name, str) and bool(name)
+    return False
+
+
+def _ref_name(ref) -> str:
+    """Display name of a file ref (for logs and filename stem checks)."""
+    if isinstance(ref, dict):
+        name = ref.get("file")
+        return str(name) if isinstance(name, str) else str(ref)
+    return str(ref)
+
 # Frontmatter keys that are computed/derived rather than declared
 _CL_RE = re.compile(r"^context_limit_\d+G$")
 
@@ -40,23 +64,45 @@ _CL_RE = re.compile(r"^context_limit_\d+G$")
 # everything else in the sidecar is authored. ``fit-params`` is the legacy
 # name, still read as a fallback but never written.
 MEASURED_KEY = "derived"
+
+#: Stems whose ``derived:`` block was written back this run, so the CLI can
+#: report that it touched the model tree rather than leaving it to a
+#: per-model debug line nobody sees at default verbosity.
+_PERSISTED: list[str] = []
+
+
+def persisted_sidecars() -> list[str]:
+    """Stems whose measurement cache was written during this run."""
+    return list(_PERSISTED)
+
+
+def persisted_sidecars_reset() -> None:
+    """Clear the run counter (called once at the top of each pack)."""
+    _PERSISTED.clear()
 # Older names for the same auto-generated branch, migrated on write.
 _LEGACY_MEASURED_KEYS = ("fit-params", "measured")
 
 
 class WeightFinder:
-    """Resolves weight-file references against local dirs + the HF hub cache.
+    """Resolves file references against local dirs + the HF hub cache.
 
-    The small dir-level helper behind :meth:`Model.from_ref`: exact lookups
-    in anchor directories, snapshot selection, and snapshot filename
-    matching. Snapshot listings are cached per directory mtime, so N models
-    sharing one snapshot readdir it once. Tests replace this with a stub —
-    callers take an optional ``finder`` parameter defaulting to the global
-    instance rather than touching the filesystem or ``utils`` directly.
+    The small dir-level helper behind :meth:`Model.from_ref` and the
+    template/LoRA resolvers: exact lookups in anchor directories, snapshot
+    selection, and snapshot filename matching. Snapshot listings are cached
+    per directory mtime, so N models sharing one snapshot readdir it once.
+    Tests replace this with a stub — callers take an optional ``finder``
+    parameter defaulting to the global instance rather than touching the
+    filesystem or ``utils`` directly.
+
+    Two listings exist — weights-only and any-file — selected by the
+    ``weights_only`` flag on the resolve methods. All matching funnels
+    through :func:`utils.match_snapshot_paths`, so weight and template
+    refs share selection semantics (single hit wins, ambiguity warns).
     """
 
     def __init__(self) -> None:
         self._snap_files: dict[str, tuple[int, list[str]]] = {}
+        self._snap_all_files: dict[str, tuple[int, list[str]]] = {}
 
     def find_local(self, name: str, dirs: list[Path]) -> Path | None:
         """Exact *name* inside the first anchor dir holding it."""
@@ -69,46 +115,181 @@ class WeightFinder:
                 continue
         return None
 
-    def snapshot(self, repo: str, hf_home=None) -> Path | None:
-        """Snapshot dir for *repo*, or None when not cached locally."""
-        return utils.hf_snapshot_dir(repo, hf_home)
+    def snapshot_dir(self, repo: str, hf_home=None, mode: str | None = None) -> Path | None:
+        """Snapshot dir for *repo* (None when not cached locally).
 
-    def snapshot_files(self, repo: str, hf_home=None) -> tuple[Path | None, list[str]]:
-        """(snapshot dir, sorted file names), listing cached by dir mtime."""
-        snap = self.snapshot(repo, hf_home)
+        *mode* selects the revision: None = legacy refs/main-first
+        behavior, ``"newest"`` / ``"oldest"`` by snapshot mtime.
+        """
+        if mode is None:
+            return utils.hf_snapshot_dir(repo, hf_home)
+        return utils.hf_snapshot_dir(repo, hf_home, mode=mode)
+
+    def _snapshot_listing(self, repo: str, hf_home, mode: str | None,
+                          cache: dict[str, tuple[int, list[str]]],
+                          list_fn) -> tuple[Path | None, list[str]]:
+        """(snapshot dir, sorted snapshot-relative paths), cached by mtime."""
+        snap = self.snapshot_dir(repo, hf_home, mode)
         if snap is None:
             return None, []
         try:
             mtime = os.stat(snap).st_mtime_ns
         except OSError:
             return snap, []
-        hit = self._snap_files.get(str(snap))
+        hit = cache.get(str(snap))
         if hit is not None and hit[0] == mtime:
             return snap, hit[1]
         try:
-            names = sorted(p.name for p in snap.iterdir() if p.is_file())
+            rels = list_fn(snap)
         except OSError:
             return snap, []
-        self._snap_files[str(snap)] = (mtime, names)
-        return snap, names
+        cache[str(snap)] = (mtime, rels)
+        return snap, rels
 
-    def snapshot_exact(self, repo: str, name: str, hf_home=None) -> Path | None:
-        """Exact *name* inside the repo snapshot, or None."""
-        snap, names = self.snapshot_files(repo, hf_home)
-        if snap is None or name not in names:
-            return None
-        candidate = snap / name
-        try:
-            return candidate if candidate.is_file() else None
-        except OSError:
-            return None
+    def snapshot_files(self, repo: str, hf_home=None,
+                       mode: str | None = None) -> tuple[Path | None, list[str]]:
+        """(snapshot dir, sorted snapshot-relative weight paths).
 
-    def match_snapshot(self, repo: str, pattern: str, hf_home=None) -> list[Path]:
-        """Snapshot files matching glob *pattern* (sorted)."""
-        snap, names = self.snapshot_files(repo, hf_home)
+        Relative paths span any depth (``model.gguf``,
+        ``Subdir/model.gguf``); see :func:`utils.snapshot_weight_paths`.
+        *mode* selects the snapshot revision (None = legacy refs/main-first).
+        """
+        return self._snapshot_listing(repo, hf_home, mode, self._snap_files,
+                                      utils.snapshot_weight_paths)
+
+    def snapshot_all_files(self, repo: str, hf_home=None,
+                           mode: str | None = None) -> tuple[Path | None, list[str]]:
+        """(snapshot dir, sorted snapshot-relative paths of *all* files).
+
+        Same selection/caching as :meth:`snapshot_files` but unfiltered by
+        suffix — templates, LoRAs, docs.
+        """
+        return self._snapshot_listing(repo, hf_home, mode,
+                                      self._snap_all_files,
+                                      utils.snapshot_all_paths)
+
+    def snapshot_exact(self, repo: str, name: str, hf_home=None,
+                       mode: str | None = None,
+                       top_only: bool = False) -> Path | None:
+        """Exact *name* inside the repo snapshot's weight index, or None.
+
+        *name* may be a snapshot-relative path or a bare basename (a single
+        hit wins; several warn and fail — ambiguity never resolves
+        silently). With ``top_only=True`` only snapshot-root files are
+        considered.
+        """
+        snap, rels = self.snapshot_files(repo, hf_home, mode)
+        if snap is None:
+            return None
+        hits = utils.match_snapshot_paths(snap, rels, name, top_only)
+        return utils.single_snapshot_hit(snap, hits, repo, name)
+
+    def match_snapshot(self, repo: str, pattern: str, hf_home=None,
+                       mode: str | None = None,
+                       top_only: bool = False) -> list[Path]:
+        """Weight-index files matching *pattern* (sorted).
+
+        Matched against basenames at any depth (plus the relative path, so
+        ``Subdir/*.gguf`` works). Callers decide ambiguity; most want a
+        single hit (see :func:`utils.single_snapshot_hit`).
+        """
+        snap, rels = self.snapshot_files(repo, hf_home, mode)
         if snap is None:
             return []
-        return [snap / n for n in names if fnmatch.fnmatchcase(n, pattern)]
+        return [snap / r for r in
+                utils.match_snapshot_paths(snap, rels, pattern, top_only)]
+
+    def resolve_hf_file(self, repo: str, filename: str, hf_home=None,
+                        mode: str | None = None,
+                        top_only: bool = False) -> Path | None:
+        """Resolve *filename* inside *repo*'s hub snapshot (any file kind).
+
+        *filename* may be a snapshot-relative path (names one place), a
+        bare basename, or a glob. With ``top_only=True`` only snapshot-root
+        files are considered (warns when that empties the index).
+        Ambiguity warns and returns None — never a silent first hit.
+        """
+        snap, rels = self.snapshot_all_files(repo, hf_home, mode)
+        if snap is None:
+            return None
+        if top_only and not utils._top_level(rels):
+            logger.warning("hf: %s in %s: no snapshot-root file matches "
+                           "(pick includes 'top')", filename, repo)
+            return None
+        hits = utils.match_snapshot_paths(snap, rels, filename, top_only)
+        return utils.single_snapshot_hit(snap, hits, repo, filename)
+
+    def resolve_path(self, ref: str | dict, *, anchors: list[Path] | None = None,
+                     repo: str | None = None, hf_home=None,
+                     pick=None, weights_only: bool = False) -> Path | None:
+        """Resolve any file ref to an absolute path, or None.
+
+        *ref* is a string (absolute path, anchor-relative path, bare local
+        name, ``hub:org/repo:file`` hub ref, or — when a repo is known — a
+        snapshot filename/glob) or a mapping (``{file:}`` ≡ the bare string;
+        ``{hf_repo:, file:[, pick:]}`` = hub file, where ``hf_repo`` falls
+        back to *repo* and ``pick`` overrides *pick*). Local files win over
+        hub files (an absolute ``file:`` with ``hf_repo:`` warns that the
+        repo is ignored). With ``weights_only=True`` hub matching uses the
+        weight index (model/companion files); otherwise the any-file index.
+        Never raises on user config — unresolvable is None.
+        """
+        anchors = list(anchors or [])
+        if isinstance(ref, dict):
+            keys = set(ref)
+            unknown = keys - {"file", "hf_repo", "pick"}
+            if unknown:
+                logger.warning("hf: ignoring unknown file-ref keys: %s",
+                               ", ".join(sorted(str(k) for k in unknown)))
+            name = ref.get("file")
+            if not isinstance(name, str) or not name:
+                logger.warning("hf: file ref mapping needs a 'file' name, got %r", ref)
+                return None
+            if Path(name).is_absolute() and ref.get("hf_repo"):
+                logger.warning("hf: ignoring hf_repo %r for absolute file %r",
+                               ref.get("hf_repo"), name)
+            return self.resolve_path(name, anchors=anchors,
+                                     repo=ref.get("hf_repo") or repo,
+                                     hf_home=hf_home,
+                                     pick=ref.get("pick") or pick,
+                                     weights_only=weights_only)
+        if not isinstance(ref, str) or not ref:
+            logger.warning("hf: ignoring malformed file ref %r", ref)
+            return None
+        hub = utils.parse_hub_ref(ref)
+        if hub is not None:
+            repo, ref = hub
+        candidate = Path(ref)
+        if candidate.is_absolute():
+            try:
+                return candidate if candidate.is_file() else None
+            except OSError:
+                return None
+        hit = self.find_local(ref, anchors)
+        if hit is not None:
+            return hit
+        if not repo:
+            return None
+        # Hub lookup (pick parsed lazily — pure-local refs never warn).
+        mode, top_only = utils.parse_pick(pick)
+        if weights_only:
+            if any(ch in ref for ch in "*?["):
+                matches = self.match_snapshot(repo, ref, hf_home, mode,
+                                              top_only)
+                return self._single_match(repo, ref, matches)
+            return self.snapshot_exact(repo, ref, hf_home, mode, top_only)
+        return self.resolve_hf_file(repo, ref, hf_home, mode, top_only)
+
+    def _single_match(self, repo: str, name: str,
+                      matches: list[Path]) -> Path | None:
+        """Single-or-none with ambiguity warning (weight-glob path)."""
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
+                           name, repo, len(matches),
+                           ", ".join(m.name for m in matches))
+        return None
 
 
 _DEFAULT_FINDER: WeightFinder | None = None
@@ -337,48 +518,21 @@ class Model:
         return inst
 
     @classmethod
-    def from_ref(cls, ref: str, *, anchors: list[Path] | None = None,
+    def from_ref(cls, ref: str | dict, *, anchors: list[Path] | None = None,
                  hf_repo: str | None = None, hf_home=None,
-                 finder: WeightFinder | None = None) -> "Model | None":
-        """Resolve a sidecar ``model:``/companion string to a Model.
+                 finder: WeightFinder | None = None,
+                 pick=None) -> "Model | None":
+        """Resolve a sidecar ``model:``/companion ref to a Model.
 
-        Absolute or anchor-relative paths, bare filenames in anchor dirs,
-        ``hub:<org>/<repo>:<file>`` forms, snapshot-exact names via
-        *hf_repo*, and globs (single match wins; ambiguous warns like the
-        legacy resolver). Returns the canonical registered instance, or
-        None when unresolvable. Directory scanning goes through *finder*
-        (mockable in tests).
+        Any file-ref form (see :meth:`WeightFinder.resolve_path`), matched
+        against the weight index. Returns the canonical registered
+        instance, or None when unresolvable. Directory scanning goes
+        through *finder* (mockable in tests).
         """
         f = finder or default_finder()
-        anchors = list(anchors or [])
-        repo = hf_repo
-        name = ref
-        if ref.startswith("hub:"):
-            rest = ref[len("hub:"):]
-            repo, _, name = rest.rpartition(":")
-            if not repo or not name:
-                logger.warning("hf: malformed %r (expected hub:org/repo:file)", ref)
-                return None
-        candidate = Path(name)
-        if candidate.is_absolute():
-            return cls.from_file(candidate) if candidate.is_file() else None
-        hit = f.find_local(name, anchors)
-        if hit is not None:
-            return cls.from_file(hit)
-        if repo:
-            if any(ch in name for ch in "*?["):
-                matches = f.match_snapshot(repo, name, hf_home)
-                if len(matches) == 1:
-                    return cls.from_file(matches[0])
-                if len(matches) > 1:
-                    logger.warning("hf: %s in %s is ambiguous (%d matches): %s",
-                                   name, repo, len(matches),
-                                   ", ".join(m.name for m in matches))
-                return None
-            hit = f.snapshot_exact(repo, name, hf_home)
-            if hit is not None:
-                return cls.from_file(hit)
-        return None
+        path = f.resolve_path(ref, anchors=anchors, repo=hf_repo,
+                              hf_home=hf_home, pick=pick, weights_only=True)
+        return cls.from_file(path) if path is not None else None
 
     @classmethod
     def is_claimed(cls, weight_path: Path) -> bool:
@@ -416,21 +570,31 @@ class Model:
         except OSError:
             return None
 
-    # Frontmatter keys this Model consumes (not passed through to metadata)
+    # Frontmatter keys this Model consumes (not passed through to metadata).
+    # Every entry here is read somewhere — accepted-but-unread keys were
+    # removed (2026-09-16: attention, kv_cache, tool_args, targets, and
+    # sidecar-level spare, which only ever lived in profiles/pools scope),
+    # so a sidecar using one warns instead of silently doing nothing.
     FIELDS: ClassVar[frozenset[str]] = frozenset({
         "name", "model_id", "id", "context_length", "description", "cli_args", "model",
         "backend", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
-        "attention", "kv_cache", "tool_args", "speculative", "mmproj",
+        "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "speculative_config",
-        "role", "targets", "allow_profiles", "spare", "capabilities",
+        "role", "allow_profiles", "capabilities",
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel", "min_context",
+        "usage", "allow_mtp_shed",
         "image_min_tokens", "image_max_tokens",
+        "min_image_megapixels", "image_output_reserve",
         # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
         "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
         "reasoning_parser",
+        # Fixed-overhead VRAM pin (consumed by vram.py / writer.py)
+        "vram_mb",
+        # audio-cpp engine block (consumed by AudioCppBackend.build_cmd)
+        "audio_cpp",
     })
 
     # Frontmatter keys a companion block may NOT set: identity, placement,
@@ -466,8 +630,8 @@ class Model:
         # where a file lives, not a file itself. Most sidecars resolve to a
         # concrete file (same-stem, explicit model:, or single non-mmproj file
         # in the snapshot). hf_repo-only (no local file) is allowed for
-        # backends that serve directly from a repo id (vLLM safetensors,
-        # kokoro-podman which is image-baked). Every other case needs a file.
+        # backends that serve directly from a repo id (vLLM safetensors).
+        # Every other case needs a file.
         self.gguf_path = self._resolve_gguf_path()
         if not self.gguf_path and self.hf_repo is None:
             tried_local = ", ".join(
@@ -557,9 +721,9 @@ class Model:
             file_val = block.pop("file", None)
             denied = [k for k in block if k in self.COMPANION_BLOCK_DENIED]
             unknown = [k for k in block if k not in self.FIELDS]
-            if not isinstance(file_val, str) or not file_val:
+            if not _is_file_ref(file_val):
                 msg = (f"sidecar {self.label}: mmproj block needs "
-                       f"a `file:` string")
+                        f"a `file:` string or file-ref mapping")
                 logger.error("%s", msg)
                 self._override_error = msg
             elif denied:
@@ -581,14 +745,16 @@ class Model:
                 self._override_error = msg
             else:
                 companion = Model.from_ref(
-                    str(file_val), anchors=search_dirs,
+                    file_val, anchors=search_dirs,
                     hf_repo=self.hf_repo, hf_home=self._hf_home,
                     finder=self._finder)
                 if companion is None and self.hf_repo:
                     companion = Model.from_ref(
                         "*mmproj*.gguf", anchors=[],
                         hf_repo=self.hf_repo, hf_home=self._hf_home,
-                        finder=self._finder)
+                        finder=self._finder,
+                        pick=file_val.get("pick")
+                        if isinstance(file_val, dict) else None)
                 if companion:
                     self.mmproj = companion
                     self.mmproj_overlay = block
@@ -653,11 +819,11 @@ class Model:
         # Check frontmatter flags
         has_mtp = self.frontmatter.get("mtp")
         speculative = self.frontmatter.get("speculative")
-        if has_mtp or (speculative and "mtp" in Path(speculative).stem.lower()):
+        if has_mtp or (speculative and "mtp" in Path(_ref_name(speculative)).stem.lower()):
             # Baked-in MTP or companion MTP
             if speculative:
                 companion = Model.from_ref(
-                    str(speculative), anchors=search_dirs,
+                    speculative, anchors=search_dirs,
                     hf_repo=self.hf_repo, hf_home=self._hf_home,
                     finder=self._finder)
                 if companion:
@@ -692,7 +858,7 @@ class Model:
         # 1. Check frontmatter `model` field
         file_ref = self.frontmatter.get("model")
         if file_ref:
-            hit = Model.from_ref(str(file_ref), anchors=anchors,
+            hit = Model.from_ref(file_ref, anchors=anchors,
                                  hf_repo=self.hf_repo, hf_home=self._hf_home,
                                  finder=self._finder)
             if hit is not None and hit.gguf_path is not None:
@@ -703,7 +869,7 @@ class Model:
             return None
 
         # 2. Convention: same stem, .gguf / .safetensors / whisper GGML .bin /
-        # kokoro ONNX (.bin and .onnx resolve only for their audio roles —
+        # .onnx (the .bin and .onnx forms resolve only for their audio roles —
         # discovery requires the s2t/t2s directory)
         for ext in (".gguf", ".safetensors", ".bin", ".onnx"):
             hit = Model.from_ref(f"{self.stem}{ext}", anchors=[parent],
@@ -712,19 +878,22 @@ class Model:
                 return hit.gguf_path
 
         # 3. No local file – try hf_repo snapshot auto (exactly one non-mmproj
-        # model → use it, several → error, none → give up for __init__ error)
+        # model → use it, several → error, none → give up for __init__ error).
+        # Top level wins: subdirectories only count when the snapshot top
+        # level holds no weight file.
         if self.hf_repo:
-            snap, names = self._finder.snapshot_files(
+            snap, rels = self._finder.snapshot_files(
                 self.hf_repo, self._hf_home)
             if snap is not None:
                 # Collect non-mmproj candidates (mmproj/mtp are companions, not
-                # main models). Also skip .msgpack etc – only real weight files.
-                candidates = [
-                    n for n in names
-                    if Path(n).suffix.lower() in
-                    {".gguf", ".safetensors", ".bin", ".onnx"}
-                    and "mmproj" not in Path(n).stem.lower()
-                ]
+                # main models).
+                def _is_candidate(r: str) -> bool:
+                    p = Path(r)
+                    return (p.suffix.lower() in _WEIGHT_SUFFIXES
+                            and "mmproj" not in p.stem.lower())
+                top = [r for r in rels if "/" not in r and _is_candidate(r)]
+                sub = [r for r in rels if "/" in r and _is_candidate(r)]
+                candidates = top if top else sub
                 if len(candidates) == 1:
                     hit = Model.from_file(snap / candidates[0])
                     if hit is not None:
@@ -735,14 +904,15 @@ class Model:
                         f"sidecar {self.label} (hf_repo {self.hf_repo!r}): "
                         f"several models in snapshot {snap}: {names_s} – "
                         f"set `model: <filename>` in the sidecar to choose one "
-                        f"(exact file in the snapshot, e.g. `ls {snap}`)"
+                        f"(exact file in the snapshot, or a `Subdir/file` "
+                        f"relative path, e.g. `ls {snap}`)"
                     )
                 # zero candidates – fall through to __init__ error (no file)
 
         # 4. No model file found by any method
         return None
 
-    def _resolve_ref(self, ref: str) -> Path | None:
+    def _resolve_ref(self, ref) -> Path | None:
         """Resolve a file reference: sidecar dir, its parent, then HF hub.
 
         Thin wrapper over :meth:`from_ref` (kept for compatibility).
@@ -754,7 +924,7 @@ class Model:
                              hf_repo=self.hf_repo, hf_home=self._hf_home)
         return hit.gguf_path if hit is not None else None
 
-    def _resolve_hub_ref(self, ref: str,
+    def _resolve_hub_ref(self, ref,
                          pattern_hint: str | None = None) -> Path | None:
         """Hub-aware resolution of *ref* with *pattern_hint* glob fallback.
 
@@ -1052,6 +1222,12 @@ class Model:
         # In-memory state first: callers (saved_for, measured_file_valid)
         # must see the values even when the file cannot be written.
         self.frontmatter[MEASURED_KEY] = copy.deepcopy(block)
+        if utils.DRY_RUN:
+            # --dry-run. The measurement still drives this run; only the
+            # write-back is withheld, because the sidecar is a hand-authored
+            # file in the user's model tree. Reported, not silent.
+            utils.note_fs_op("update derived: in", self.md_path, self.stem)
+            return
         if self.md_path is None:
             logger.debug("no sidecar for %s; measured block is memory-only",
                          self.stem)
@@ -1092,6 +1268,7 @@ class Model:
         new_content = "---\n" + buf.getvalue().rstrip("\n") + "\n---" + parts[2]
         try:
             self.md_path.write_text(new_content, encoding="utf-8")
+            _PERSISTED.append(self.stem)
             logger.debug("persisted measured block for %s", self.stem)
         except (OSError, PermissionError) as e:
             logger.debug("cannot write sidecar for measured persist (%s): %s",
@@ -1147,27 +1324,32 @@ class Model:
         self,
         profile: dict | None,
         fleet: dict | None,
-        role_defaults: tuple[int, int],
-    ) -> tuple[int, int]:
+        role_defaults: tuple[int | None, int | None],
+    ) -> tuple[int | None, int | None]:
         """Resolved ``(batch, ubatch)`` for the serve command and the VRAM
         measurement shape — sidecar ``batch:``/``ubatch:`` > profile keys >
-        fleet ``llama_server: batch:/ubatch:`` > role defaults (the llama.cpp
-        builtins).  Both render explicitly on every llama-server command;
+        fleet ``llama_server: batch:/ubatch:`` > role defaults.  Each half
+        resolves independently.  ``None`` means "nothing configured": the
+        backend renders no flag and the engine's own builtin applies.  A
+        malformed value is warned about and falls through to the next tier
+        (which may itself be ``None``) rather than to a magic number.
         ``ubatch`` also stamps the measurement shape (``-ub`` shapes the
         compute buffer, ``batch`` measurably does not)."""
-        def tier(value: object, fallback: int, key: str) -> int:
+        def tier(value: object, fallback: int | None, key: str) -> int | None:
             if value is None:
                 return fallback
             if isinstance(value, bool) or not isinstance(value, (int, str)):
-                logger.warning("%s: %s=%r is not a positive integer; using %d",
-                               self.stem, key, value, fallback)
+                logger.warning("%s: %s=%r is not a positive integer; using %s",
+                               self.stem, key, value, fallback if fallback is not None
+                               else "the engine default")
                 return fallback
             try:
                 parsed = int(value)
                 assert parsed > 0
             except (ValueError, AssertionError):
-                logger.warning("%s: %s=%r is not a positive integer; using %d",
-                               self.stem, key, value, fallback)
+                logger.warning("%s: %s=%r is not a positive integer; using %s",
+                               self.stem, key, value, fallback if fallback is not None
+                               else "the engine default")
                 return fallback
             return parsed
 
@@ -1209,6 +1391,35 @@ class Model:
     @property
     def allow_profiles(self) -> list[str] | None:
         return self.frontmatter.get("allow_profiles")
+
+    @property
+    def usage_tags(self) -> list[str] | None:
+        """Usage categories this model is *used for* (``usage:`` in the sidecar).
+
+        A tag is only a claim.  The planner honours it when an entry can
+        actually meet that category's minimums, and ignores it otherwise —
+        so declaring a category never guarantees it.  Tags must be blessed
+        in profiles.yaml ``usage:``; an unblessed tag is warned about and
+        dropped (see :func:`llama_packer.writer.resolve_usage`).
+        """
+        v = self.frontmatter.get("usage")
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, (list, tuple)):
+            return None
+        return [str(x).strip() for x in v if isinstance(x, str) and x.strip()]
+
+    @property
+    def allow_mtp_shed(self) -> bool:
+        """Opt-in to shedding the MTP draft companion to buy context.
+
+        Speculative decoding roughly doubles generation speed, so dropping
+        the draft is a real cost and is never done implicitly — a sidecar
+        must ask for it.  A model with no draft companion is unaffected.
+        """
+        return bool(self.frontmatter.get("allow_mtp_shed", False))
 
     @property
     def modes(self) -> dict[str, dict] | None:
@@ -1475,6 +1686,121 @@ class Model:
         """
         return self._image_token_value("image_max_tokens")
 
+    @property
+    def min_image_megapixels(self) -> float | None:
+        """Sidecar ``min_image_megapixels``: the resolution budget to serve.
+
+        The operator's knob for "how big an image must this model handle".
+        ``None`` (unset) means no resolution budget is declared. ``0`` is
+        meaningful and distinct: it says the model need not serve vision at
+        all, which lets the planner shed the projector.
+
+        Expressed in megapixels because that is the unit an operator thinks
+        in; the conversion to tokens needs the projector geometry and is
+        done by :attr:`min_image_tokens`.
+        """
+        v = self.frontmatter.get("min_image_megapixels")
+        if v is None or v == "":
+            return None
+        try:
+            mp = float(v)
+        except (TypeError, ValueError):
+            logger.warning("%s: min_image_megapixels: %r is not a number; "
+                           "ignoring", self.stem, v)
+            return None
+        if mp < 0:
+            logger.warning("%s: min_image_megapixels: %r is negative; "
+                           "ignoring", self.stem, v)
+            return None
+        return mp
+
+    @property
+    def vision_geometry(self) -> ggufmeta.VisionGeometry | None:
+        """Projector geometry read from the mmproj GGUF, if there is one."""
+        mm = self.mmproj
+        if mm is None or mm.gguf_path is None:
+            return None
+        return ggufmeta.vision_geometry(str(mm.gguf_path))
+
+    @property
+    def min_image_tokens(self) -> int | None:
+        """The megapixel budget converted to image tokens, or None.
+
+        None when no budget is declared, when it is zero, or when the
+        projector does not scale with pixels (resampler/fixed-size), in
+        which case the knob cannot be honoured and the caller warns.
+        """
+        mp = self.min_image_megapixels
+        if not mp:
+            return None
+        geo = self.vision_geometry
+        if geo is None or not geo.proportional:
+            return None
+        return round(mp * _PIXELS_PER_MEGAPIXEL / geo.pixels_per_token)
+
+    @property
+    def image_output_reserve_tokens(self) -> int:
+        """Tokens reserved for the answer once the image has been seen.
+
+        Sidecar ``image_output_reserve`` overrides the fleet default; a
+        non-positive or malformed value falls back to the default.
+        """
+        v = self.frontmatter.get("image_output_reserve")
+        if v is None or v == "":
+            return _DEFAULT_IMAGE_OUTPUT_RESERVE
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            logger.warning("%s: image_output_reserve: %r is not an integer; "
+                           "using %d", self.stem, v, _DEFAULT_IMAGE_OUTPUT_RESERVE)
+            return _DEFAULT_IMAGE_OUTPUT_RESERVE
+        if n < 0:
+            logger.warning("%s: image_output_reserve: %d is negative; using %d",
+                           self.stem, n, _DEFAULT_IMAGE_OUTPUT_RESERVE)
+            return _DEFAULT_IMAGE_OUTPUT_RESERVE
+        return n
+
+    def image_budget_warnings(self) -> None:
+        """Warn once about image-budget declarations that cannot take effect.
+
+        Called once per model from the planner. Three cases:
+
+        * a resolution budget on a projector that does not scale with
+          resolution — the knob is silently meaningless without this;
+        * a budget larger than the model's declared cap — clamped, but the
+          operator should know the two disagree;
+        * ``min_image_megapixels: 0`` on a vision model — vision stops being
+          required and may be shed, which is a real capability loss.
+        """
+        mp = self.min_image_megapixels
+        if mp is None:
+            return
+        if mp == 0:
+            if self.mmproj is not None or self.image_max_tokens:
+                logger.warning(
+                    "%s: min_image_megapixels=0 — vision is not required and "
+                    "may be shed", self.stem)
+            return
+        if self.mmproj is None:
+            logger.warning(
+                "%s: min_image_megapixels=%g ignored: no vision projector",
+                self.stem, mp)
+            return
+        geo = self.vision_geometry
+        if geo is None or not geo.proportional:
+            logger.warning(
+                "%s: min_image_megapixels=%g ignored: projector %s does not "
+                "scale with resolution (fixed/resampled token count)",
+                self.stem, mp, geo.projector_type if geo else "unknown")
+            return
+        tokens = self.min_image_tokens
+        cap = self.image_max_tokens
+        if tokens and cap is not None and tokens > cap:
+            logger.warning(
+                "%s: min_image_megapixels=%g needs %d image tokens, above "
+                "image_max_tokens=%d; the floor will be clamped",
+                self.stem, mp, tokens, cap)
+
     def pass_through_metadata(self) -> dict:
         """Frontmatter fields exposed to clients, minus builder-consumed keys.
 
@@ -1534,7 +1860,7 @@ class Model:
         has_mtp = self.frontmatter.get("mtp")
         speculative = self.frontmatter.get("speculative")
         if not has_mtp and not (speculative
-                                and "mtp" in str(speculative).lower()):
+                                and "mtp" in _ref_name(speculative).lower()):
             return False, 0
         n_max = int(self.frontmatter.get("mtp_draft_n_max", _MTP_DRAFT_N_MAX))
         # Baked-in MTP (no companion GGUF): the target must actually
@@ -1545,6 +1871,38 @@ class Model:
         if self.mtp is None and not self._gguf_has_real_mtp():
             return False, 0
         return True, n_max
+
+    @property
+    def mtp_baked_in(self) -> bool:
+        """True when speculative decoding uses nextn layers in the main GGUF.
+
+        The serve-correction table's ``mtp`` dimension means exactly this
+        shape.  A separate draft companion is costed from file size by
+        :meth:`vram.VramBudget.effective_static` at plan time, so a
+        companion witness's delta must never be filed under (or looked up
+        as) the baked-in row.  One predicate for both sides: the probe
+        that writes the row and the packer that reads it.
+        """
+        return self.mtp is None and self._mtp_info()[0]
+
+    @property
+    def mtp_draft_p_min(self) -> float:
+        """Min draft-token acceptance probability (`mtp_draft_p_min:`).
+
+        Sidecar value wins, else the server default. Out-of-range or
+        unreadable values warn and fall back to the default (never abort
+        the run on a tuning knob).
+        """
+        raw = self.frontmatter.get("mtp_draft_p_min", _MTP_DRAFT_P_MIN)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = -1.0
+        if not 0.0 <= value <= 1.0:
+            logger.warning("%s: mtp_draft_p_min=%r outside [0, 1]; using %s",
+                           self.stem, raw, _MTP_DRAFT_P_MIN)
+            return float(_MTP_DRAFT_P_MIN)
+        return value
 
     def _gguf_has_real_mtp(self) -> bool:
         """Header reality check for baked-in MTP; undecidable keeps intent."""
