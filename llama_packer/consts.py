@@ -18,6 +18,18 @@ _DEFAULT_CONTEXT_LENGTH = 32768
 _CTX_ROUND_TO = 8192
 _MIN_CTX_SIZE = 4096
 
+# Room reserved, in tokens, for the model to answer once it has seen an
+# image. The image floor only guarantees the image itself fits; without
+# this a vision entry could be sized to exactly image_max_tokens and have
+# nothing left to generate a description in. ~1024 covers a short
+# description with headroom; per-model ``image_output_reserve`` overrides
+# it for OCR/transcription, which need far more.
+_DEFAULT_IMAGE_OUTPUT_RESERVE = 1024
+
+# Pixels per megapixel, for converting an operator's resolution budget
+# (``min_image_megapixels``) into the image token floor.
+_PIXELS_PER_MEGAPIXEL = 1_000_000
+
 # Minimum context for a chat model to be useful for agentic work
 # (tool-call loops, long sessions). 128k.
 _MIN_AGENTIC_CTX = 131072

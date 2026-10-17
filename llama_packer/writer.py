@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Container, Iterable, Mapping
 
@@ -1842,7 +1842,16 @@ class Planner:
         """
         if not self.usage:
             return ()
-        return resolve_usage(model.usage_tags, self.usage, logger)
+        demands = resolve_usage(model.usage_tags, self.usage, logger)
+        # A declared resolution budget means vision must actually be served at
+        # that size, so it stops being shed-able for this model whatever the
+        # category's sacrifice order says. ``keep`` rather than ``require``:
+        # a text-only model is unaffected, and the image floor already fails
+        # the rung when the budget cannot accommodate the image.
+        mp = model.min_image_megapixels
+        if mp is not None and mp > 0 and model.mmproj is not None:
+            demands = tuple(replace(d, keep=d.keep | {"vision"}) for d in demands)
+        return demands
 
 
     def _price_sets(self) -> None:
@@ -2195,6 +2204,7 @@ class Planner:
         # values are Variant lists, except the reserved admission key
         plan: dict = {}
         for model in self.models:
+            model.image_budget_warnings()
             include_mmproj = True   # per-category now; see solve_rung
             view = model.view_for(include_mmproj)
             on_view = model.view_for(True)

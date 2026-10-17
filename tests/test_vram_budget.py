@@ -508,17 +508,18 @@ def _vision(make_model, tmp_path, stem, fit, **extra):
 
 
 def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
-    # A declared image_max_tokens must fit the solved context: the ctx is
-    # raised from the rounded-down value to the floor when affordable.
+    # A declared image budget plus the output reserve must fit the solved
+    # context: the ctx is raised from the rounded-down value to the floor
+    # when affordable.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
-    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9000)
+    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=7500)
     ctx = model.view_for(True).vram.calc_ctx(
         32768, fit_bin="unused", include_mmproj=True)
     # remaining = 30720 - 26000 - mmproj(0 + 150) = 4570; affordable 9140
-    # tokens; rounded ctx 8192 -> raised to the 9000 floor (affordable)
-    assert ctx == 9000
+    # tokens; rounded ctx 8192 -> raised to 7500 + 1024 reserve = 8524
+    assert ctx == 8524
 
 
 def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
@@ -561,6 +562,114 @@ def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9440)
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=False)
     assert ctx == 8192
+
+
+def _write_mmproj(path, *, patch=16, merge=2, projector="qwen3vl_merger"):
+    """Write a minimal but valid GGUF carrying clip vision geometry."""
+    import struct
+
+    def s(x: str) -> bytes:
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+
+    kv = {"clip.vision.patch_size": patch,
+          "clip.projector_type": projector}
+    if merge:
+        kv["clip.vision.spatial_merge_size"] = merge
+    body = b""
+    for k, v in kv.items():
+        body += s(k)
+        if isinstance(v, str):
+            body += struct.pack("<I", 8) + s(v)
+        else:
+            body += struct.pack("<I", 4) + struct.pack("<I", int(v))
+    header = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+              + struct.pack("<Q", len(kv)))
+    path.write_bytes(header + body)
+
+
+def _vision_geom(make_model, tmp_path, stem, fit, *, patch=16, merge=2,
+                 projector="qwen3vl_merger", **extra):
+    """Vision model whose mmproj carries real clip geometry."""
+    p = tmp_path / f"{stem}-mmproj.gguf"
+    _write_mmproj(p, patch=patch, merge=merge, projector=projector)
+    fm = {"derived": fit, "mmproj": {"file": p.name,
+                                     "capabilities": ["image"]}}
+    fm.update(extra)
+    return make_model(stem, **fm)
+
+
+_FIT = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+        "compute_mib": 1000, "cache_type": "q8_0",
+        "source": "llama-server", "shape": ""}
+
+
+def test_min_image_megapixels_converts_through_geometry(make_model, tmp_path):
+    """2 megapixels at 1024 pixels/token is 1953 image tokens.
+
+    Validates: docs/models/vision-context.md.
+    """
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=2)
+    assert model.vision_geometry.pixels_per_token == 1024
+    assert model.min_image_tokens == 1953
+    assert model.image_output_reserve_tokens == 1024
+
+
+def test_min_image_megapixels_floor_includes_output_reserve(make_model, tmp_path):
+    """The floor is image tokens plus room to answer, not the image alone.
+
+    Validates: docs/models/vision-context.md.
+    """
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=1, image_output_reserve=2048)
+    assert model.min_image_tokens == 977
+    assert model.view_for(True).vram._image_floor_tokens(True) == 977 + 2048
+
+
+def test_min_image_megapixels_ignored_on_non_proportional(make_model, tmp_path,
+                                                            caplog):
+    """A projector that does not scale with pixels cannot honour the knob.
+
+    Validates: docs/models/vision-context.md.
+    """
+    import logging
+    model = _vision_geom(make_model, tmp_path, "i", _FIT, patch=14, merge=1,
+                         projector="minicpmv4_6", min_image_megapixels=2)
+    assert model.min_image_tokens is None
+    with caplog.at_level(logging.WARNING):
+        model.image_budget_warnings()
+    assert any("does not scale with resolution" in r.message
+               for r in caplog.records)
+
+
+def test_min_image_megapixels_too_large_warns(make_model, tmp_path, caplog):
+    """A budget above the declared cap is reported, then clamped.
+
+    Validates: docs/models/vision-context.md.
+    """
+    import logging
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=20, image_max_tokens=16384)
+    assert model.min_image_tokens == 19531          # 20 MP at 1024 px/token
+    with caplog.at_level(logging.WARNING):
+        model.image_budget_warnings()
+    assert any("above image_max_tokens" in r.message for r in caplog.records)
+    assert model.view_for(True).vram._image_floor_tokens(True) == 16384 + 1024
+
+
+def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog):
+    """0 means vision is not required; it may be shed, and that warns.
+
+    Validates: docs/models/vision-context.md.
+    """
+    import logging
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=0)
+    assert model.min_image_tokens is None
+    with caplog.at_level(logging.WARNING):
+        model.image_budget_warnings()
+    assert any("vision is not required" in r.message for r in caplog.records)
 
 
 # ── solve_matrix_ctx ──────────────────────────────────────────────────────

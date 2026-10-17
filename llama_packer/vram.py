@@ -1402,17 +1402,29 @@ class VramBudget:
         return value if value > 0 else None
 
     def _image_floor_tokens(self, include_mmproj: bool) -> int:
-        """Per-slot token floor that must stay reservable for image tokens.
+        """Per-slot token floor that must stay reservable for image + answer.
 
-        ``image_max_tokens`` when vision is served and the sidecar declares a
-        cap; 0 otherwise. Applies to both mmproj and native vision models —
-        ``image_max_tokens`` being set is itself the indicator that the model
-        can process images, regardless of whether the projector is a separate
-        file or baked into the main weights.
+        The floor is the image's own token budget plus a reserve for the
+        model to answer in: an entry sized to exactly the image budget could
+        see the picture and then have nothing left to describe it with.
+
+        The image budget comes from ``min_image_megapixels`` — the operator's
+        resolution knob, converted through the projector geometry — when it
+        can be honoured, else from the legacy ``image_max_tokens`` cap.
+        Applies to both mmproj and native vision models: a declared image
+        budget is itself the indicator that the model processes images.
         """
         if not include_mmproj:
             return 0
-        return self.model.image_max_tokens or 0
+        image = self.model.min_image_tokens
+        if image is None:
+            image = self.model.image_max_tokens
+        if not image:
+            return 0
+        cap = self.model.image_max_tokens
+        if cap is not None and image > cap:
+            image = cap
+        return image + self.model.image_output_reserve_tokens
 
     def _raise_to_image_floor(
         self, ctx: int, floor: int, cap: int, affordable: int,

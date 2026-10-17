@@ -1490,3 +1490,56 @@ def test_resident_parallelism_is_ignored(make_model, profiles, caplog):
     with caplog.at_level(logging.INFO, logger="llama_packer.writer"):
         variants = planner.plan()["e"]
     assert [v.parallel for v in variants] == [1], "resident took 8 slots"
+
+
+# ── min_image_megapixels: resolution budget keeps vision ─────────────────
+
+def _mp_profiles():
+    return Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
+                     "usage": {"coding": {"min_context": 4096,
+                                          "sacrifice": ["vision"]}}})
+
+
+def test_min_image_megapixels_keeps_vision(make_model, tmp_path):
+    """A resolution budget must be served, so vision cannot be shed.
+
+    The category sacrifices vision; the model's declared budget overrides
+    that, because a budget that is never served is not a budget.
+
+    Validates: docs/models/vision-context.md.
+    """
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
+    m = make_model("v", usage=["coding"],
+                   mmproj={"file": "v-mmproj.gguf", "capabilities": ["image"]},
+                   min_image_megapixels=2)
+    demands = Planner([m], _mp_profiles(), fit_bin="unused",
+                      vram_total=64 * 1024).demands_for(m)
+    assert demands and all("vision" in d.keep for d in demands)
+    assert all("vision" not in d.require for d in demands)
+
+
+def test_no_budget_leaves_vision_shed_able(make_model, tmp_path):
+    """Without a budget the category's sacrifice order stands.
+
+    Validates: docs/models/vision-context.md.
+    """
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
+    m = make_model("v", usage=["coding"],
+                   mmproj={"file": "v-mmproj.gguf", "capabilities": ["image"]})
+    demands = Planner([m], _mp_profiles(), fit_bin="unused",
+                      vram_total=64 * 1024).demands_for(m)
+    assert demands and all("vision" not in d.keep for d in demands)
+
+
+def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
+    """min_image_megapixels: 0 means vision need not be served at all.
+
+    Validates: docs/models/vision-context.md.
+    """
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
+    m = make_model("v", usage=["coding"],
+                   mmproj={"file": "v-mmproj.gguf", "capabilities": ["image"]},
+                   min_image_megapixels=0)
+    demands = Planner([m], _mp_profiles(), fit_bin="unused",
+                      vram_total=64 * 1024).demands_for(m)
+    assert demands and all("vision" not in d.keep for d in demands)

@@ -28,7 +28,12 @@ MUTATIONS = {
     "test_fallback_keeps_capability_until_the_minimum_forces_it": ("llama_packer/writer.py", "                return best\n"),
     "test_require_gates_existence": ("llama_packer/writer.py", "def can_meet(self, model, demand"),
     "test_sidecar_ceiling_binds_in_the_squeeze_branch": ("llama_packer/vram.py", "    def _sidecar_ceiling(self) -> int | None:"),
-    "test_calc_ctx_image_floor_native_vision": ("llama_packer/vram.py", "        return self.model.image_max_tokens or 0\n"),
+    "test_calc_ctx_image_floor_native_vision": ("llama_packer/vram.py", "            image = self.model.image_max_tokens\n"),
+    "test_min_image_megapixels_converts_through_geometry": ("llama_packer/model.py", "        return round(mp * _PIXELS_PER_MEGAPIXEL / geo.pixels_per_token)\n"),
+    "test_min_image_megapixels_floor_includes_output_reserve": ("llama_packer/vram.py", "        return image + self.model.image_output_reserve_tokens\n"),
+    "test_min_image_megapixels_ignored_on_non_proportional": ("llama_packer/model.py", "        if geo is None or not geo.proportional:\n"),
+    "test_min_image_megapixels_too_large_warns": ("llama_packer/vram.py", "        if cap is not None and image > cap:\n"),
+    "test_min_image_megapixels_keeps_vision": ("llama_packer/writer.py", 'demands = tuple(replace(d, keep=d.keep | {"vision"}) for d in demands)\n'),
     "test_serving_pin_ignores_the_design_max": ("llama_packer/writer.py", "        return min(pins) if pins else None\n"),
     "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
     "test_set_admission_is_per_entry_not_per_stem": ("llama_packer/writer.py", "def record_admission(self, model, demand"),
@@ -89,8 +94,14 @@ def main() -> int:
                          "no:cacheprovider", *f, "-k", n],
                         cwd=work, capture_output=True, text=True,
                         check=False)
-                    out = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
-                    results.append((n, "failed" in out or "error" in out))
+                    # returncode is the reliable signal: 0 = passed, 5 = no
+                    # tests collected, anything else means the test (or its
+                    # collection) failed. Matching words in the last line
+                    # missed an IndentationError, whose usual summary line
+                    # never arrives -- the traceback is the last thing on
+                    # stdout, and "IndentationError" is not the string
+                    # "error".
+                    results.append((n, r.returncode not in (0, 5)))
                 # A requirement is held if *some* named test fails without
                 # the code. Naming several tests does not mean they share a
                 # code path -- --max-context, say, is read both through

@@ -13,13 +13,15 @@ from typing import TYPE_CHECKING, ClassVar
 
 import yaml
 
-from llama_packer import utils
+from llama_packer import ggufmeta, utils
 from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
+    _DEFAULT_IMAGE_OUTPUT_RESERVE,
     _DIFFUSION_ARCH_RES,
     _MIN_CTX_SIZE,
     _MTP_DRAFT_N_MAX,
     _MTP_DRAFT_P_MIN,
+    _PIXELS_PER_MEGAPIXEL,
     _WEIGHT_SUFFIXES,
 )
 from llama_packer.backends import DEFAULT_BACKEND
@@ -585,6 +587,7 @@ class Model:
         "cache_type", "parallel", "min_context",
         "usage", "allow_mtp_shed",
         "image_min_tokens", "image_max_tokens",
+        "min_image_megapixels", "image_output_reserve",
         # vLLM recipe keys (rendered by the vllm / vllm-docker backends)
         "vllm_quantization", "moe_backend", "mamba", "tool_call_parser",
         "reasoning_parser",
@@ -1682,6 +1685,121 @@ class Model:
         tokens/image), so an explicit cap is the normal way to bound VRAM.
         """
         return self._image_token_value("image_max_tokens")
+
+    @property
+    def min_image_megapixels(self) -> float | None:
+        """Sidecar ``min_image_megapixels``: the resolution budget to serve.
+
+        The operator's knob for "how big an image must this model handle".
+        ``None`` (unset) means no resolution budget is declared. ``0`` is
+        meaningful and distinct: it says the model need not serve vision at
+        all, which lets the planner shed the projector.
+
+        Expressed in megapixels because that is the unit an operator thinks
+        in; the conversion to tokens needs the projector geometry and is
+        done by :attr:`min_image_tokens`.
+        """
+        v = self.frontmatter.get("min_image_megapixels")
+        if v is None or v == "":
+            return None
+        try:
+            mp = float(v)
+        except (TypeError, ValueError):
+            logger.warning("%s: min_image_megapixels: %r is not a number; "
+                           "ignoring", self.stem, v)
+            return None
+        if mp < 0:
+            logger.warning("%s: min_image_megapixels: %r is negative; "
+                           "ignoring", self.stem, v)
+            return None
+        return mp
+
+    @property
+    def vision_geometry(self) -> ggufmeta.VisionGeometry | None:
+        """Projector geometry read from the mmproj GGUF, if there is one."""
+        mm = self.mmproj
+        if mm is None or mm.gguf_path is None:
+            return None
+        return ggufmeta.vision_geometry(str(mm.gguf_path))
+
+    @property
+    def min_image_tokens(self) -> int | None:
+        """The megapixel budget converted to image tokens, or None.
+
+        None when no budget is declared, when it is zero, or when the
+        projector does not scale with pixels (resampler/fixed-size), in
+        which case the knob cannot be honoured and the caller warns.
+        """
+        mp = self.min_image_megapixels
+        if not mp:
+            return None
+        geo = self.vision_geometry
+        if geo is None or not geo.proportional:
+            return None
+        return round(mp * _PIXELS_PER_MEGAPIXEL / geo.pixels_per_token)
+
+    @property
+    def image_output_reserve_tokens(self) -> int:
+        """Tokens reserved for the answer once the image has been seen.
+
+        Sidecar ``image_output_reserve`` overrides the fleet default; a
+        non-positive or malformed value falls back to the default.
+        """
+        v = self.frontmatter.get("image_output_reserve")
+        if v is None or v == "":
+            return _DEFAULT_IMAGE_OUTPUT_RESERVE
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            logger.warning("%s: image_output_reserve: %r is not an integer; "
+                           "using %d", self.stem, v, _DEFAULT_IMAGE_OUTPUT_RESERVE)
+            return _DEFAULT_IMAGE_OUTPUT_RESERVE
+        if n < 0:
+            logger.warning("%s: image_output_reserve: %d is negative; using %d",
+                           self.stem, n, _DEFAULT_IMAGE_OUTPUT_RESERVE)
+            return _DEFAULT_IMAGE_OUTPUT_RESERVE
+        return n
+
+    def image_budget_warnings(self) -> None:
+        """Warn once about image-budget declarations that cannot take effect.
+
+        Called once per model from the planner. Three cases:
+
+        * a resolution budget on a projector that does not scale with
+          resolution — the knob is silently meaningless without this;
+        * a budget larger than the model's declared cap — clamped, but the
+          operator should know the two disagree;
+        * ``min_image_megapixels: 0`` on a vision model — vision stops being
+          required and may be shed, which is a real capability loss.
+        """
+        mp = self.min_image_megapixels
+        if mp is None:
+            return
+        if mp == 0:
+            if self.mmproj is not None or self.image_max_tokens:
+                logger.warning(
+                    "%s: min_image_megapixels=0 — vision is not required and "
+                    "may be shed", self.stem)
+            return
+        if self.mmproj is None:
+            logger.warning(
+                "%s: min_image_megapixels=%g ignored: no vision projector",
+                self.stem, mp)
+            return
+        geo = self.vision_geometry
+        if geo is None or not geo.proportional:
+            logger.warning(
+                "%s: min_image_megapixels=%g ignored: projector %s does not "
+                "scale with resolution (fixed/resampled token count)",
+                self.stem, mp, geo.projector_type if geo else "unknown")
+            return
+        tokens = self.min_image_tokens
+        cap = self.image_max_tokens
+        if tokens and cap is not None and tokens > cap:
+            logger.warning(
+                "%s: min_image_megapixels=%g needs %d image tokens, above "
+                "image_max_tokens=%d; the floor will be clamped",
+                self.stem, mp, tokens, cap)
 
     def pass_through_metadata(self) -> dict:
         """Frontmatter fields exposed to clients, minus builder-consumed keys.

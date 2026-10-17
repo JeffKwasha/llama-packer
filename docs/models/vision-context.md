@@ -61,36 +61,107 @@ roughly `(1024/14)² ≈ 5329` tokens. A 4K image (3840×2160) produces roughly
 This is why AnyRes / dynamic-resolution tiling exists: it slices high-res
 images into smaller patches to keep the token count manageable.
 
-## The `image_max_tokens` floor
+## The resolution budget: `min_image_megapixels`
 
 Because image tokens count against context, a model that serves vision must
-have enough per-slot context to fit at least one maximum-size image. The
-sidecar declares this with `image_max_tokens`. llama-packer enforces it as a
-**per-slot floor**: when vision is served, the solved context is never allowed
-to drop below `image_max_tokens` (when the budget affords it).
+have enough per-slot context to fit an image **and answer about it**. The
+operator declares the resolution they intend to serve with
+`min_image_megapixels`, and llama-packer converts it to a token floor.
 
-The floor is applied in `_image_floor_tokens`:
+Megapixels rather than tokens because that is the unit an operator thinks in,
+and because the token count is not a property of the model alone — it depends
+on the resolution of the image actually sent. `min_image_megapixels: 2` means
+"this model must be able to handle a 2-megapixel image"; the number of tokens
+that is depends on the projector.
+
+### Converting megapixels to tokens
+
+The projector geometry is read from the mmproj GGUF header
+(`llama_packer/ggufmeta.py` — a few kilobytes, no tensors, no dependency).
+For a pixel-proportional projector each output token covers a square of
+`patch_size × spatial_merge_size` pixels:
+
+```
+pixels_per_token = (patch_size × spatial_merge_size)²
+image_tokens     = min_image_megapixels × 1_000_000 / pixels_per_token
+```
+
+Qwen3-VL: `patch_size=16`, `spatial_merge_size=2` → 1024 pixels/token:
+
+| Image | MP | tokens |
+|---|---|---|
+| 720p | 0.9 | ~900 |
+| 1080p | 2.1 | ~2048 |
+| 4K | 8.3 | ~8100 |
+| Qwen default cap 16384 | 16.8 | 16384 |
+
+That last row is the point of the knob: the model's *default* cap is a 16.8 MP
+image, which nobody sends. `min_image_megapixels: 2` cuts the image budget
+roughly eightfold and hands the difference back to context.
+
+### The output reserve
+
+The floor is the image budget **plus** room to answer:
+
+```
+floor = image_tokens + image_output_reserve
+```
+
+Without the reserve an entry could be sized to exactly the image budget: the
+model sees the picture and has nothing left to describe it with. The default
+is `_DEFAULT_IMAGE_OUTPUT_RESERVE` (1024); a sidecar `image_output_reserve`
+overrides it for OCR/transcription, which need far more.
+
+### Warnings
+
+`Model.image_budget_warnings()` reports, once per model, the declarations that
+cannot take effect:
+
+| Declaration | Outcome |
+|---|---|
+| budget on a projector that does not scale with pixels | warned, ignored — falls back to `image_max_tokens` |
+| budget that converts to more tokens than `image_max_tokens` | warned, clamped to the cap |
+| `min_image_megapixels: 0` on a vision model | warned — vision stops being required and may be shed |
+| budget on a model with no projector at all | warned, ignored |
+
+"Does not scale with pixels" is signalled by the absence of
+`clip.vision.spatial_merge_size`: resampler/fixed-size projectors (MiniCPM-V,
+Gemma 3, LLaVA) produce a roughly constant token count regardless of
+resolution, so a megapixel budget means nothing to them.
+
+`image_max_tokens` remains the declared **cap** — the maximum image tokens
+llama-server will spend on one image. It is both the clamp target above and,
+when no megapixel budget is declared, the fallback image budget.
+
+### Vision requirement
+
+A positive `min_image_megapixels` means vision must actually be served at that
+size, so the planner adds `vision` to that model's `keep` set: the projector
+stops being shed-able whatever the category's `sacrifice` order says.
+`min_image_megapixels: 0` removes that protection — vision may be shed — which
+is why it warns.
+
+## The floor in code
 
 ```python
 def _image_floor_tokens(self, include_mmproj: bool) -> int:
     if not include_mmproj:
         return 0
-    if not (self.model.mmproj and self.model.mmproj.gguf_path):
-        return 0          # ← native vision models get NO floor
-    return self.model.image_max_tokens or 0
+    image = self.model.min_image_tokens      # from min_image_megapixels
+    if image is None:
+        image = self.model.image_max_tokens  # legacy fallback / declared cap
+    if not image:
+        return 0
+    cap = self.model.image_max_tokens
+    if cap is not None and image > cap:
+        image = cap
+    return image + self.model.image_output_reserve_tokens
 ```
 
-### The gap: native vision models get no floor
-
-The second guard returns 0 when there is no mmproj file. But native vision
-models (Qwen3-VL, Gemma 3) still produce image tokens that count against
-context. If the budget squeezes their context below `image_max_tokens`, a
-maximum-size image will not fit — the same failure the floor exists to prevent.
-
-**This is a bug.** The floor should apply to any model that can process images,
-not only those with a separate projector. The fix is to gate the floor on
-whether the model *has* vision (mmproj file OR native vision capability), not
-on whether it has an mmproj file specifically.
+The floor applies to both separate-projector and native-vision models: a
+declared image budget is itself the indicator that the model processes images.
+The pixel-proportional conversion, however, needs a projector header, so a
+native-vision model can only use the `image_max_tokens` fallback.
 
 ## VRAM budget formula
 
@@ -106,7 +177,7 @@ Where:
 
 | Term | Meaning |
 |---|---|
-| `vram_total` | Total VRAM budget for this model (from `--vram-total` or fleet matrix) |
+| `vram_total` | Total VRAM budget for this model (from `--vram` or fleet matrix) |
 | `reserve` | `_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)` — driver/compositor overhead |
 | `spare` | Operator-declared spare (`--spare`) |
 | `margin` | Safety margin on measured constants |
@@ -125,19 +196,17 @@ by which shedding vision buys context.
 Image tokens use **non-causal attention**: all tokens within a single image
 attend to each other bidirectionally (the `scope_non_causal` RAII helper in
 libmtmd disables causal masking for the image chunk). This means all image
-tokens for one image must be processed in a **single ubatch**. If
-`image_max_tokens` exceeds `ubatch`, the prefill will fail. llama.cpp handles
-this internally by raising ubatch as needed, but it is a further reason the
-context floor matters: a model whose context is squeezed below
-`image_max_tokens` cannot process a full image in one ubatch.
+tokens for one image must be processed in a **single ubatch**. If the image
+budget exceeds `ubatch`, the prefill will fail. llama.cpp raises ubatch as
+needed, but it is a further reason the context floor matters: a model whose
+context is squeezed below its image budget cannot process a full image in one
+ubatch.
 
 ## Summary
 
-| Architecture | mmproj file? | `include_mmproj` axis | Image floor applies? |
+| Architecture | mmproj file? | `include_mmproj` axis | Megapixel knob |
 |---|---|---|---|
-| LLaVA, Qwen2-VL, Gemma 3 (external projector) | Yes | Live — shedding frees VRAM | Yes |
-| Qwen3-VL, Gemma 3 (native vision) | No | No-op — nothing to shed | **No — this is the bug** |
+| LLaVA, MiniCPM-V, Gemma 3 | Yes | Live — shedding frees VRAM | warned + ignored (fixed/resampled tokens) |
+| Qwen2-VL / Qwen3-VL | Yes | Live — shedding frees VRAM | honoured (`spatial_merge_size` present) |
+| Native multimodal | No | No-op — nothing to shed | warned + ignored (no projector geometry) |
 
-The fix is to make `_image_floor_tokens` return `image_max_tokens` for any
-model that can process images, regardless of whether vision is via a separate
-projector or baked into the main weights.
