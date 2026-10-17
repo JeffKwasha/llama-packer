@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import pytest
 
+import llama_packer.writer as writer
 from llama_packer.writer import (
+    FALLBACK,
     KNOWN_CAPABILITIES,
     UsageCatalogue,
     UsageDemand,
@@ -654,3 +656,51 @@ def test_met_demands_enforces_require(make_model, tmp_path):
     planner = Planner([plain], profiles, fit_bin="unused", vram_total=48 * 1024)
     assert planner.met_demands(plain, 65536, 1, include_mmproj=True) == ()
 
+
+# ── degradation levels: a category's own order, not a global threshold ────
+
+
+def test_shed_levels_are_prefixes_of_the_declared_order():
+    """`sacrifice: [draft]` must try draft first, not vision.
+
+    The old `_mmproj_drop_pass` dropped vision from a global context
+    threshold before any category was read, so a category that would rather
+    keep vision and give up its draft had no say in it.
+    """
+    # Cumulative along the declared order, then the default tail: a category
+    # that named one thing still concedes the other once that is gone.
+    assert writer.shed_levels(("vision",)) == (
+        frozenset(), frozenset({"vision"}),
+        frozenset({"vision", "draft"}))
+    assert writer.shed_levels(("draft",)) == (
+        frozenset(), frozenset({"draft"}),
+        frozenset({"draft", "vision"}))
+    assert writer.shed_levels(("vision", "draft")) == (
+        frozenset(), frozenset({"vision"}), frozenset({"vision", "draft"}))
+
+
+def test_required_capabilities_are_never_shed():
+    order = writer.shed_levels(("vision",), required=frozenset({"vision"}))
+    assert frozenset({"vision"}) not in order, order
+
+
+def test_unnamed_capabilities_come_last_not_first():
+    """A category that names nothing still degrades, in the default order.
+
+    Empty tuple is *no stated preference*, not *refuse to degrade* — the
+    distinction matters, and conflating them was the bug.
+    """
+    assert writer.shed_levels(()) == (
+        frozenset(), frozenset({"vision"}), frozenset({"vision", "draft"}))
+
+
+def test_none_sacrifice_means_never_degrade():
+    assert writer.shed_levels(None) == (frozenset(),)
+
+
+def test_fallback_is_a_bare_minimum_category():
+    """Every model emits this; it has no name and never degrades."""
+    assert FALLBACK.name == ""
+    assert FALLBACK.min_context == 4096
+    assert FALLBACK.min_parallel == 1
+    assert FALLBACK.sacrifice is None   # never degrades

@@ -762,6 +762,55 @@ KNOWN_CAPABILITIES = frozenset({"vision", "draft"})
 #: speed — giving that up is the expensive trade, so it is last.
 DEFAULT_SACRIFICE_ORDER: tuple[str, ...] = ("vision", "draft")
 
+#: Capabilities a category may ask to have shed, in the order to try them.
+#: The ladder walks prefixes of a category's own ``sacrifice:`` list — not a
+#: global order — so "cut vision first" is a property of the category the
+#: operator declared, not a fleet-wide threshold applied to every model.
+SHEDDABLE: frozenset[str] = frozenset(DEFAULT_SACRIFICE_ORDER)
+
+
+def shed_levels(sacrifice: tuple[str, ...] | None,
+                sheddable: frozenset[str] = SHEDDABLE,
+                required: frozenset[str] = frozenset(),
+                ) -> tuple[frozenset[str], ...]:
+    """Degradation levels to try, least-shed first.
+
+    One level per prefix of the declared order: ``[]``, ``{vision}``,
+    ``{vision, draft}``. Cumulative because each step is a further
+    concession — but bounded by the prefix, so a capability the category
+    never named is only reached once the named ones are gone, and anything
+    in ``required`` is never shed at all.
+
+    ``None`` means *never degrade* and yields the single empty rung: that is
+    the null category, which has no goals to protect and so keeps mmproj and
+    MTP even when that costs it all of its context. An empty tuple is
+    different — a category that expressed no preference is still willing to
+    concede in the default order.
+
+    This replaces the old fleet-wide ``_mmproj_drop_pass``, which decided
+    vision from a global context threshold before any category was read.
+    """
+    if sacrifice is None:
+        return (frozenset(),)
+    order = [c for c in sacrifice if c in sheddable and c not in required]
+    order += [c for c in DEFAULT_SACRIFICE_ORDER
+              if c in sheddable and c not in required and c not in order]
+    levels = [frozenset()]
+    for cap in order:
+        levels.append(levels[-1] | {cap})
+    return tuple(levels)
+
+
+#: The null category: every model's baseline serving. Bare minimums only and
+#: no category name in the id. It never degrades — it keeps mmproj and MTP
+#: even when that means serving at ``_MIN_CTX_SIZE`` — because with no goals
+#: to protect, capability is the only thing left to give up. It holds one
+#: slot (no auto-parallel search) and joins no set, because a sideload set is
+#: about routing, which is what categories are for.
+FALLBACK: "UsageDemand" = UsageDemand(
+    name="", min_context=_MIN_CTX_SIZE, min_parallel=1,
+    require=frozenset(), sacrifice=None)   # None: never degrade
+
 
 @dataclass(frozen=True)
 class UsageCatalogue:
