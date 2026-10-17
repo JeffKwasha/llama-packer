@@ -715,15 +715,6 @@ class UsageDemand:
         """True when an entry served at (ctx, parallel) meets this demand."""
         return ctx >= self.min_context and parallel >= self.min_parallel
 
-    def shed_order(self) -> tuple[str, ...]:
-        """Capabilities to give up, most-preferred-first.
-
-        Anything named in ``sacrifice`` comes first in the order given;
-        capabilities not named follow, so an unlisted ``vision`` is still
-        reachable as a last resort.  ``require`` entries never appear.
-        """
-        named = [c for c in self.sacrifice if c not in self.require]
-        return tuple(named)
 
 
 def _parse_ctx_size(v: object) -> int | None:
@@ -1607,6 +1598,28 @@ class Planner:
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
+    def can_meet(self, model, demand: "UsageDemand") -> bool:
+        """Whether *model* has what the category ``require``s.
+
+        ``require`` gates existence, which is a different thing from
+        ``keep``: a model lacking a required capability does not satisfy the
+        category at all, so no entry may be named for it. ``keep`` only
+        forbids shedding.
+
+        This gate used to live in ``met_demands`` and went with it, which left
+        a text-only model free to claim ``require: [vision]`` -- an id that
+        promised a capability the entry did not advertise.
+        """
+        have_vision = (model.mmproj is not None
+                       and model.mmproj.gguf_path is not None)
+        have_draft = model.mtp is not None or model.mtp_baked_in
+        for cap in demand.require:
+            if cap == "vision" and not have_vision:
+                return False
+            if cap == "draft" and not have_draft:
+                return False
+        return True
+
     def solve_rung(self, model, demand: "UsageDemand", *,
                    parallel: int, cache_type: str, spare_mb: int,
                    design_ctx: int | None = None,
@@ -1826,29 +1839,6 @@ class Planner:
             return ()
         return resolve_usage(model.usage_tags, self.usage, logger)
 
-    def met_demands(self, model: Model, ctx: int, parallel: int,
-                    include_mmproj: bool, tools_demoted: bool = False,
-                    ) -> tuple[UsageDemand, ...]:
-        """Demands this exact serving satisfies, ``require`` included.
-
-        ``satisfied_by`` only checks the context/slot minimums; a category
-        may also *require* a capability.  An id must never over-claim, so a
-        vision-less serving cannot be named for a ``require: [vision]``
-        category even when its context clears the floor.
-        """
-        out: list[UsageDemand] = []
-        served_flags_str = served_flags(model, include_mmproj, tools_demoted)
-        for d in self.demands_for(model):
-            if not d.satisfied_by(ctx, parallel):
-                continue
-            if "vision" in d.require and not (
-                    {"i", "v"} & set(served_flags_str)):
-                continue
-            if "draft" in d.require and not (
-                    model.mtp is not None or model.mtp_baked_in):
-                continue
-            out.append(d)
-        return tuple(out)
 
     def _price_sets(self) -> None:
         """Cost every chat set by the residents it can hold alongside chat.
@@ -2271,6 +2261,15 @@ class Planner:
                         cap_ctx = min(cap_ctx, self.max_context)
                     for demand in (*self.demands_for(model), FALLBACK):
                         is_null = demand is FALLBACK
+                        if not self.can_meet(model, demand):
+                            # require gates existence: a model without the
+                            # capability does not satisfy the category, so
+                            # nothing may be named for it.
+                            logger.info("%s: %s requires %s, which this "
+                                        "model lacks; not emitted",
+                                        model.stem, demand.name or "fallback",
+                                        ", ".join(sorted(demand.require)))
+                            continue
                         floor = resolve_min_ctx(
                             view, pin_ctx=pin_ctx,
                             tools_min_ctx=self.knobs.tools_min_ctx,

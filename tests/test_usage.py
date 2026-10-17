@@ -509,33 +509,38 @@ def test_dump_yaml_annotates_set_memory():
     assert text.count("# rag:") == 1  # the `vars: rag` key is not annotated
 
 
-def test_met_demands_enforces_require(make_model, tmp_path):
-    # A serving must never be named for a category whose `require` it fails:
-    # a text-only serving cannot claim a `require: [vision]` category.
+def test_require_gates_existence(make_model, tmp_path):
+    """A model lacking a required capability does not satisfy the category.
+
+    This is `require` and not `keep`: `keep` only forbids shedding, while a
+    category that `require`s vision simply does not apply to a text-only
+    model, so no entry may be named for it. The gate lived in
+    Planner.met_demands and went when that did, which briefly let a
+    text-only model claim `require: [vision]`.
+
+    Validates: SPEC.md: 'require and keep are different and both are
+    honoured'.
+    """
     from llama_packer.writer import Planner
-    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
-    profiles = Profiles({
-        "defaults": {"cache_type": "q8_0", "parallel": 1},
-        "usage": {"qa": {"min_context": "32k", "require": ["vision"]}},
-    })
-    with_vis = make_model("v", context_length=65536,
-                          capabilities=["image"],
-                          usage=["qa"],
-                          mmproj={"file": "v-mmproj.gguf",
-                                  "capabilities": ["image"]})
-    planner = Planner([with_vis], profiles, fit_bin="unused",
-                      vram_total=48 * 1024)
-    assert [d.name for d in planner.met_demands(
-        with_vis, 65536, 1, include_mmproj=True)] == ["qa"]
-    assert planner.met_demands(
-        with_vis, 65536, 1, include_mmproj=False) == ()
-    # No mmproj at all (the `…-vision` misnomer case): text only, no claim.
-    plain = make_model("p", context_length=65536, usage=["qa"])
-    planner = Planner([plain], profiles, fit_bin="unused", vram_total=48 * 1024)
-    assert planner.met_demands(plain, 65536, 1, include_mmproj=True) == ()
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    text_only = make_model("t")
+    with_vision = make_model("v", mmproj={"file": "v-mmproj.gguf",
+                                          "capabilities": ["image"]})
+    planner = Planner([text_only, with_vision], _profiles_with_usage(),
+                      fit_bin="unused", vram_total=48 * 1024)
+    need_vision = UsageDemand(name="qa", min_context=32768,
+                              require=frozenset({"vision"}))
+    assert planner.can_meet(with_vision, need_vision)
+    assert not planner.can_meet(text_only, need_vision)
 
-
-# ── degradation levels: a category's own order, not a global threshold ────
+    # And the draft case: no companion, no category.
+    need_draft = UsageDemand(name="c", min_context=32768,
+                             require=frozenset({"draft"}))
+    assert not planner.can_meet(text_only, need_draft)
+    # keep, by contrast, does not gate.
+    keeps = UsageDemand(name="c2", min_context=32768,
+                        keep=frozenset({"draft"}))
+    assert planner.can_meet(text_only, keeps)
 
 
 def test_shed_levels_are_prefixes_of_the_declared_order():
