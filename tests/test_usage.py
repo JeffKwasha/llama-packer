@@ -431,6 +431,8 @@ def test_untagged_gets_a_bare_id(make_model):
     and still reaches clients. The solved context deliberately stays out of
     the id; a repack that moved 182k to 180k must not rename the model out
     from under a client that cached it.
+
+    Validates: SPEC.md, 'Ids carry no context': an untagged entry is the bare stem.
     """
     m = make_model("plain", context_length=262144)
     config = emit_config([m], {"plain": [_variant(131072, ())]},
@@ -440,6 +442,10 @@ def test_untagged_gets_a_bare_id(make_model):
 
 
 def test_same_model_two_groups_disambiguated(make_model):
+    """
+    Validates: SPEC.md, 'Ids carry no context': ids stay stable across repacks, so the
+    disambiguator describes the serving and never the solve.
+    """
     # Two profile groups can land on the same category+flags; the first keeps
     # the stable name, the duplicate appends a discriminator rather than
     # colliding into a fatal error.
@@ -460,6 +466,8 @@ def test_duplicate_ids_do_not_move_when_context_moves(make_model):
     It used to be the context label, which emit_config's own docstring rules
     out: opencode/hermes cache ids at startup, so a context-derived suffix
     repoints a cached id at a different serving on every repack.
+
+    Validates: SPEC.md, 'Ids carry no context': 182k -> 180k must not rename a model.
     """
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
@@ -488,7 +496,11 @@ def test_category_slugged_for_the_id(make_model):
 
 
 def test_unusable_category_name_falls_back_to_a_bare_id(make_model):
-    """A name that cannot survive slugging drops the segment, not the entry."""
+    """A name that cannot survive slugging drops the segment, not the entry.
+
+    Validates: SPEC.md, 'Ids carry no context': a name that cannot slug drops the
+    segment, not the entry.
+    """
     m = make_model("m", context_length=262144)
     profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
                          "usage": {"***": {"min_context": "64k"}}})
@@ -549,6 +561,9 @@ def test_shed_levels_are_prefixes_of_the_declared_order():
     The old `_mmproj_drop_pass` dropped vision from a global context
     threshold before any category was read, so a category that would rather
     keep vision and give up its draft had no say in it.
+
+    Validates: SPEC.md, 'Shedding is described per category': the ladder walks the
+    category's own sacrifice order, not a global one.
     """
     # Cumulative along the declared order, then the default tail: a category
     # that named one thing still concedes the other once that is gone.
@@ -563,6 +578,9 @@ def test_shed_levels_are_prefixes_of_the_declared_order():
 
 
 def test_required_capabilities_are_never_shed():
+    """
+    Validates: SPEC.md, 'Shedding is described per category': require gates existence.
+    """
     order = writer.shed_levels(("vision",), required=frozenset({"vision"}))
     assert frozenset({"vision"}) not in order, order
 
@@ -572,17 +590,27 @@ def test_unnamed_capabilities_come_last_not_first():
 
     Empty tuple is *no stated preference*, not *refuse to degrade* — the
     distinction matters, and conflating them was the bug.
+
+    Validates: SPEC.md, 'Shedding is described per category': what a category omits is
+    shed last, in the order from `shed:`.
     """
     assert writer.shed_levels(()) == (
         frozenset(), frozenset({"vision"}), frozenset({"vision", "draft"}))
 
 
 def test_none_sacrifice_means_never_degrade():
+    """
+    Validates: docs/plans/category-semantics.md, 'The null category (fallback)': the
+    fallback keeps mmproj and MTP even at the cost of all its context.
+    """
     assert writer.shed_levels(None) == (frozenset(),)
 
 
 def test_fallback_is_a_bare_minimum_category():
-    """Every model emits this; it has no name and never degrades."""
+    """Every model emits this; it has no name and never degrades.
+
+    Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
+    """
     assert FALLBACK.name == ""
     assert FALLBACK.min_context == 4096
     assert FALLBACK.min_parallel == 1
@@ -598,6 +626,9 @@ def test_keep_protects_from_shedding_without_gating_existence():
     Making this `require` would silently drop every coding model that has no
     draft companion -- a large share of the fleet -- which is why it needed
     a word of its own rather than a wider meaning for `require`.
+
+    Validates: SPEC.md: 'require and keep are different and both are honoured' -- keep
+    forbids shedding; only require gates existence.
     """
     d = UsageDemand(name="coding", min_context=133120, keep=frozenset({"draft"}))
     assert d.require == frozenset()
@@ -634,6 +665,9 @@ def _served_without_draft(demand):
 
 
 def test_keep_is_parsed_from_profiles():
+    """
+    Validates: SPEC.md, `usage:` block: `keep:` parses like `require:`.
+    """
     profiles = Profiles({"defaults": {}, "usage": {
         "coding": {"min_context": "128k", "keep": ["draft"],
                    "sacrifice": ["vision"]}}})

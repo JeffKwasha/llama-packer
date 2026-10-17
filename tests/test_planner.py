@@ -1184,7 +1184,10 @@ def _demand(name="coding", **kw):
 
 
 def test_rung_drops_vision_when_it_buys_context(make_model):
-    """The plain case: shedding the projector is worth it, so it is shed."""
+    """The plain case: shedding the projector is worth it, so it is shed.
+
+    Validates: SPEC.md, 'Shedding is described per category': most context that fits wins.
+    """
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 90000, False: 200000})
     rung = p.solve_rung(m, _demand(min_context=131072), parallel=1,
@@ -1199,6 +1202,9 @@ def test_rung_keeps_vision_when_it_is_free(make_model):
     "coding ... only adds vision if VRAM is sufficient for MAX DESIGN
     CONTEXT + VISION." Both levels afford the same context, so the more
     capable one wins instead of being discarded for no gain.
+
+    Validates: SPEC.md, 'Shedding is described per category': 'only adds vision if VRAM
+    is sufficient for MAX DESIGN CONTEXT + VISION'.
     """
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 200000, False: 200000})
@@ -1209,7 +1215,11 @@ def test_rung_keeps_vision_when_it_is_free(make_model):
 
 
 def test_rung_is_none_when_the_category_cannot_be_served(make_model):
-    """No id may claim a category the fleet cannot deliver."""
+    """No id may claim a category the fleet cannot deliver.
+
+    Validates: SPEC.md: 'A category that cannot meet min_context at any rung emits
+    nothing.'
+    """
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 40960, False: 40960})
     assert p.solve_rung(m, _demand(min_context=131072), parallel=1,
@@ -1217,7 +1227,10 @@ def test_rung_is_none_when_the_category_cannot_be_served(make_model):
 
 
 def test_rung_honours_keep_then_falls_back_to_vision(make_model):
-    """keep: [draft] stops the ladder shedding MTP, so it moves to vision."""
+    """keep: [draft] stops the ladder shedding MTP, so it moves to vision.
+
+    Validates: SPEC.md: 'keep only forbids shedding'.
+    """
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 90000, False: 200000})
     rung = p.solve_rung(
@@ -1228,7 +1241,10 @@ def test_rung_honours_keep_then_falls_back_to_vision(make_model):
 
 
 def test_fallback_never_degrades(make_model):
-    """No goals to protect, so capability is all that is left to give up."""
+    """No goals to protect, so capability is all that is left to give up.
+
+    Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
+    """
     from llama_packer.writer import FALLBACK
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 4096, False: 262144})
@@ -1249,6 +1265,8 @@ def test_keep_draft_is_enforced_now_that_the_axis_exists(make_model):
     costed and never shed, so `keep: [draft]` was correct by accident rather
     than by design. With the axis real, a category without `keep` has to be
     able to shed it -- otherwise there is nothing for `keep` to protect.
+
+    Validates: SPEC.md: 'require and keep are different and both are honoured'.
     """
     m = make_model("c", backend="llama-server", context_length=262144)
     seen = []

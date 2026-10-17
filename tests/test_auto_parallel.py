@@ -200,6 +200,9 @@ def test_design_max_is_a_ceiling_not_a_floor(make_model):
     locked to parallel 1 -- because a capability claim about the model was
     being read as an operating decision about the fleet. The floor is now
     half the design context, and two slots win on score.
+
+    Validates: SPEC.md, 'Context Tiers': sidecar context_length is a design maximum, a
+    ceiling applied when serving, never a floor.
     """
     m = make_model("ap", backend="llama-server", role="chat")
     _scripted_by_parallel(m, {1: 32768, 2: 16384})
@@ -209,7 +212,10 @@ def test_design_max_is_a_ceiling_not_a_floor(make_model):
 
 
 def test_explicit_max_context_still_pins_and_floors(make_model):
-    """--max-context is a real pin, so the old behaviour survives there."""
+    """--max-context is a real pin, so the old behaviour survives there.
+
+    Validates: SPEC.md, 'Context Tiers': --max-context is a real pin and its own floor.
+    """
     m = make_model("ap", backend="llama-server", role="chat")
     _scripted_by_parallel(m, {1: 32768, 2: 16384})
     planner = _planner(m)
@@ -438,6 +444,8 @@ def test_serving_pin_ignores_the_design_max():
     slots was to edit context_length -- rewriting what the model can do in
     order to express how we want it served. min_context: is that key, and it
     was already separate.
+
+    Validates: SPEC.md, 'Context Tiers': only --max-context pins a serving context.
     """
     p = Planner.__new__(Planner)
     p.max_context = 0
@@ -458,6 +466,9 @@ def test_category_floor_beats_the_tools_heuristic():
     floored at an unreachable 131072, fell back to one slot, and then failed
     its own category's min_parallel of 2 -- declaring it aux made it strictly
     harder to serve.
+
+    Validates: docs/plans/category-semantics.md: a declared category outranks the
+    heuristics that guess about undeclared models.
     """
     view = _view(capabilities=["tools", "image"])
     assert resolve_min_ctx(view) == 131072          # untagged: unchanged
@@ -465,7 +476,10 @@ def test_category_floor_beats_the_tools_heuristic():
 
 
 def test_category_floor_never_overrides_the_operator():
-    """`min_context:` and --max-context are the operator's, not a guess."""
+    """`min_context:` and --max-context are the operator's, not a guess.
+
+    Validates: SPEC.md, 'Context Tiers': min_context and --max-context outrank a category.
+    """
     view = _view(capabilities=["tools"], min_context=200000)
     assert resolve_min_ctx(view, category_floor=81920) == 200000
     pinned = _view(capabilities=["tools"])
@@ -474,6 +488,9 @@ def test_category_floor_never_overrides_the_operator():
 
 
 def test_multi_category_takes_the_heaviest():
-    """`usage: [coding, chat]` serves at coding's window, not chat's."""
+    """`usage: [coding, chat]` serves at coding's window, not chat's.
+
+    Validates: SPEC.md, `usage:`: each satisfiable category emits its own entry.
+    """
     view = _view(capabilities=["tools"])
     assert resolve_min_ctx(view, category_floor=133120) == 133120
