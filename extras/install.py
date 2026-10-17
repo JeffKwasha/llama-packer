@@ -365,6 +365,20 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
     report_resolved(dir_)
 
 
+def _is_existing_dir(path: str) -> bool:
+    """``Path.is_dir`` that treats an unreadable path as "not there".
+
+    ``is_dir`` ignores ENOENT and ENOTDIR but re-raises EACCES, so pointing
+    HF_HOME at something the service cannot read (a ``/root/...`` path, say)
+    raises PermissionError. That is precisely the case this check exists to
+    warn about, so it must not crash on it.
+    """
+    try:
+        return Path(path).is_dir()
+    except OSError:
+        return False
+
+
 def report_resolved(dir_: Path) -> None:
     """Print the path macros the emitted config actually resolved to.
 
@@ -381,7 +395,7 @@ def report_resolved(dir_: Path) -> None:
         if line.startswith(("HF_HOME=", "MODELS_DIR=", "LLAMA_DIR=")):
             name, _, value = line.partition("=")
             print(f"    {name}={value}")
-            if name == "HF_HOME" and not Path(value).is_dir():
+            if name == "HF_HOME" and not _is_existing_dir(value):
                 logger.warning("HF_HOME=%s does not exist — hf_repo models "
                                "will not resolve; pass --hf-home", value)
 

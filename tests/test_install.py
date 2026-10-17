@@ -335,6 +335,29 @@ def test_report_resolved_quiet_when_hf_home_exists(tmp_path, caplog):
     assert not caplog.records, [r.message for r in caplog.records]
 
 
+def test_report_resolved_warns_when_hf_home_is_unreadable(tmp_path, monkeypatch,
+                                                          caplog):
+    """EACCES (an HF_HOME under /root, say) must warn, not raise.
+
+    ``Path.is_dir`` re-raises permission errors — it only swallows ENOENT and
+    ENOTDIR — so before this the installer crashed on exactly the
+    misconfiguration it exists to report. Forced here so the test does not
+    depend on the runner's privileges, which is how the bug slipped through
+    locally.
+
+    Validates: docs/install.md, 'Pass --hf-home if your models come from an
+    HF cache'.
+    """
+    (tmp_path / "config.env").write_text("HF_HOME=/root/.cache/huggingface\n")
+
+    def boom(self):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(ins.Path, "is_dir", boom)
+    ins.report_resolved(tmp_path)          # must not raise
+    assert any("does not exist" in r.getMessage() for r in caplog.records)
+
+
 # --- the unit is verified before it becomes the unit systemd reads --------
 
 

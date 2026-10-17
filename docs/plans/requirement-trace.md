@@ -102,3 +102,4 @@ and every one of them carries a `Validates:` citation.
 | 48 | `cpu`/`cuda` do not silently install Vulkan | `test_cpu_backend_does_not_install_vulkan` |
 | 49 | llama-swap validates as the service user, not root | `test_validate_runs_as_the_service_user` |
 | 50 | The unit is verified before it becomes the unit systemd reads | `test_rejected_unit_leaves_the_previous_one_installed`, `test_candidate_name_is_a_valid_unit_name` |
+| 51 | An unreadable `HF_HOME` warns instead of crashing the installer | `test_report_resolved_warns_when_hf_home_is_unreadable` |
