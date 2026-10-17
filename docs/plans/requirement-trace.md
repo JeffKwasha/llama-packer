@@ -46,46 +46,47 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 19 | `context_length:` is a ceiling, applied in **both** solve branches | `test_sidecar_ceiling_binds_in_the_squeeze_branch`, `test_sidecar_ceiling_is_a_min_not_a_fixed_cap` |
-| 20 | Only `--max-context` pins; `context_length:` is never a floor | `test_serving_pin_ignores_the_design_max`, `test_explicit_max_context_still_pins_and_floors`, `test_design_max_is_a_ceiling_not_a_floor` |
-| 21 | A declared category outranks the tools heuristic | `test_category_floor_beats_the_tools_heuristic` |
-| 22 | `min_context:` and `--max-context` outrank a category | `test_category_floor_never_overrides_the_operator` |
+| 20 | Native vision (no mmproj file) still gets the image floor | `test_calc_ctx_image_floor_native_vision` |
+| 21 | Only `--max-context` pins; `context_length:` is never a floor | `test_serving_pin_ignores_the_design_max`, `test_explicit_max_context_still_pins_and_floors`, `test_design_max_is_a_ceiling_not_a_floor` |
+| 22 | A declared category outranks the tools heuristic | `test_category_floor_beats_the_tools_heuristic` |
+| 23 | `min_context:` and `--max-context` outrank a category | `test_category_floor_never_overrides_the_operator` |
 
 ## Entry ids
 
 | # | Requirement | Test |
 |---|---|---|
-| 23 | The id carries no context — 182k → 180k must not rename a model | `test_duplicate_ids_do_not_move_when_context_moves` |
-| 24 | An untagged entry is the bare stem | `test_untagged_gets_a_bare_id` |
-| 25 | A name that cannot be slugged drops the segment, not the entry | `test_unusable_category_name_falls_back_to_a_bare_id` |
-| 26 | Ids stay stable across repacks; the disambiguator describes the serving | `test_same_model_two_groups_disambiguated` |
+| 24 | The id carries no context — 182k → 180k must not rename a model | `test_duplicate_ids_do_not_move_when_context_moves` |
+| 25 | An untagged entry is the bare stem | `test_untagged_gets_a_bare_id` |
+| 26 | A name that cannot be slugged drops the segment, not the entry | `test_unusable_category_name_falls_back_to_a_bare_id` |
+| 27 | Ids stay stable across repacks; the disambiguator describes the serving | `test_same_model_two_groups_disambiguated` |
 
 ## VRAM safety
 
 | # | Requirement | Test |
 |---|---|---|
-| 27 | No emitted entry may need more VRAM than exists | `test_calc_ctx_never_reports_a_context_it_cannot_afford`, `test_overallocation_guard_catches_an_injected_violation` |
-| 28 | The guard stays quiet and drops nothing on a sane plan | `test_overallocation_guard_is_quiet_when_the_plan_is_sane` |
-| 29 | A CPU-resident model gets no free slots | `test_cpu_resident_chat_gets_no_auto_parallel` (planned) — covered today by `test_calc_ctx_cpu_resident_returns_design` |
-| 30 | `tools` is demoted on the entry's **own** served context | `test_plan_demotes_tools_below_the_threshold_without_a_matrix`, `test_plan_keeps_tools_when_the_context_clears_the_threshold` |
+| 28 | No emitted entry may need more VRAM than exists | `test_calc_ctx_never_reports_a_context_it_cannot_afford`, `test_overallocation_guard_catches_an_injected_violation` |
+| 29 | The guard stays quiet and drops nothing on a sane plan | `test_overallocation_guard_is_quiet_when_the_plan_is_sane` |
+| 30 | A CPU-resident model gets no free slots | `test_cpu_resident_chat_gets_no_auto_parallel` (planned) — covered today by `test_calc_ctx_cpu_resident_returns_design` |
+| 31 | `tools` is demoted on the entry's **own** served context | `test_plan_demotes_tools_below_the_threshold_without_a_matrix`, `test_plan_keeps_tools_when_the_context_clears_the_threshold` |
 
 ## Allocation
 
 | # | Requirement | Test |
 |---|---|---|
-| 31 | Residents serve a fixed small context and are charged for it | `test_resident_rag_is_reserved_at_its_fixed_context` |
-| 32 | Resident parallelism is ignored — never buys context from chat | `test_resident_parallelism_is_ignored` |
-| 33 | Admission is per entry, on the resolved serving | `test_set_admission_is_per_entry_not_per_stem` |
-| 34 | The fallback joins no set | `test_the_fallback_entry_joins_no_set` |
-| 35 | The fallback runs the slot solve at exponent 0 | `test_fallback_slot_exponent_is_zero` |
-| 36 | Ties in the slot score go to more slots | `test_ties_go_to_more_slots` |
+| 32 | Residents serve a fixed small context and are charged for it | `test_resident_rag_is_reserved_at_its_fixed_context` |
+| 33 | Resident parallelism is ignored — never buys context from chat | `test_resident_parallelism_is_ignored` |
+| 34 | Admission is per entry, on the resolved serving | `test_set_admission_is_per_entry_not_per_stem` |
+| 35 | The fallback joins no set | `test_the_fallback_entry_joins_no_set` |
+| 36 | The fallback runs the slot solve at exponent 0 | `test_fallback_slot_exponent_is_zero` |
+| 37 | Ties in the slot score go to more slots | `test_ties_go_to_more_slots` |
 
 ## Deploy
 
 | # | Requirement | Test |
 |---|---|---|
-| 37 | Installs are atomic; a truncated tree is never certified | `test_cpp_truncated_dir_is_not_certified_as_installed` |
-| 38 | The pruner never removes a bundle a symlink points at | `test_prune_never_removes_the_bundle_a_symlink_points_at` |
-| 39 | An ambiguous target selector exits non-zero | `test_ambiguous_prefix_is_an_error_not_a_guess` |
-| 40 | `cpu`/`cuda` do not silently install Vulkan | `test_cpu_backend_does_not_install_vulkan` |
-| 41 | llama-swap validates as the service user, not root | `test_validate_runs_as_the_service_user` |
-| 42 | The unit is verified before it becomes the unit systemd reads | `test_rejected_unit_leaves_the_previous_one_installed`, `test_candidate_name_is_a_valid_unit_name` |
+| 38 | Installs are atomic; a truncated tree is never certified | `test_cpp_truncated_dir_is_not_certified_as_installed` |
+| 39 | The pruner never removes a bundle a symlink points at | `test_prune_never_removes_the_bundle_a_symlink_points_at` |
+| 40 | An ambiguous target selector exits non-zero | `test_ambiguous_prefix_is_an_error_not_a_guess` |
+| 41 | `cpu`/`cuda` do not silently install Vulkan | `test_cpu_backend_does_not_install_vulkan` |
+| 42 | llama-swap validates as the service user, not root | `test_validate_runs_as_the_service_user` |
+| 43 | The unit is verified before it becomes the unit systemd reads | `test_rejected_unit_leaves_the_previous_one_installed`, `test_candidate_name_is_a_valid_unit_name` |

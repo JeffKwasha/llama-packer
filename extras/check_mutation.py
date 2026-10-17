@@ -22,16 +22,17 @@ ROOT = Path(__file__).resolve().parent.parent
 TRACE = ROOT / "docs/plans/requirement-trace.md"
 # requirement -> (file, substring) whose deletion should break the tests
 MUTATIONS = {
-    3: ("llama_packer/writer.py", "for demand in (*self.demands_for(model), FALLBACK):"),
-    5: ("llama_packer/writer.py", "if demand is FALLBACK:\n            self.set_admission"),
-    7: ("llama_packer/writer.py", "                best = rung\n"),
-    20: ("llama_packer/writer.py", "        return min(pins) if pins else None\n"),
-    11: ("llama_packer/writer.py", "                return best\n"),
-    16: ("llama_packer/writer.py", "def can_meet(self, model, demand"),
-    19: ("llama_packer/vram.py", "    def _sidecar_ceiling(self) -> int | None:"),
-    23: ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
-    33: ("llama_packer/writer.py", "def record_admission(self, model, demand"),
-    35: ("llama_packer/writer.py", "power=0.0 if is_null else None,"),
+    "test_every_category_gets_an_entry": ("llama_packer/writer.py", "for demand in (*self.demands_for(model), FALLBACK):"),
+    "test_untagged_gets_a_bare_id": ("llama_packer/writer.py", "if demand is FALLBACK:\n            self.set_admission"),
+    "test_rung_drops_vision_when_it_buys_context": ("llama_packer/writer.py", "                best = rung\n"),
+    "test_fallback_keeps_capability_until_the_minimum_forces_it": ("llama_packer/writer.py", "                return best\n"),
+    "test_require_gates_existence": ("llama_packer/writer.py", "def can_meet(self, model, demand"),
+    "test_sidecar_ceiling_binds_in_the_squeeze_branch": ("llama_packer/vram.py", "    def _sidecar_ceiling(self) -> int | None:"),
+    "test_calc_ctx_image_floor_native_vision": ("llama_packer/vram.py", "        return self.model.image_max_tokens or 0\n"),
+    "test_serving_pin_ignores_the_design_max": ("llama_packer/writer.py", "        return min(pins) if pins else None\n"),
+    "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
+    "test_set_admission_is_per_entry_not_per_stem": ("llama_packer/writer.py", "def record_admission(self, model, demand"),
+    "test_fallback_slot_exponent_is_zero": ("llama_packer/writer.py", "power=0.0 if is_null else None,"),
 }
 
 
@@ -43,10 +44,11 @@ def tests_for(req: int, trace: str) -> list[str]:
 def main() -> int:
     trace = TRACE.read_text()
     bad = 0
-    for req, (rel, needle) in sorted(MUTATIONS.items()):
-        names = tests_for(req, trace)
+    for test_name, (rel, needle) in sorted(MUTATIONS.items()):
+        row = next((ln for ln in trace.splitlines() if f"`{test_name}`" in ln), "")
+        names = [test_name] + [n for n in re.findall(r"`(test_[A-Za-z0-9_]+)`", row) if n != test_name]
         if not names:
-            print(f"  #{req:<3} no tests named")
+            print(f"  {test_name} no tests named")
             bad += 1
             continue
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,7 +58,7 @@ def main() -> int:
             target = work / rel
             text = target.read_text()
             if needle not in text:
-                print(f"  #{req:<3} MUTATION STALE - anchor not found in {rel}")
+                print(f"  {test_name} MUTATION STALE - anchor not found in {rel}")
                 bad += 1
                 continue
             target.write_text(text.replace(needle, "", 1))
@@ -67,7 +69,7 @@ def main() -> int:
                     ["grep", "-rlE", rf"^def {n}\(", "tests"],
                     cwd=work, capture_output=True, text=True, check=False).stdout.split()
                 if not hit:
-                    print(f"  #{req:<3} {n} not found in tests/")
+                    print(f"          - {n} not found in tests/")
                     bad += 1
                     break
                 files.update(hit)
@@ -98,8 +100,8 @@ def main() -> int:
                 # printed regardless, so a test that never catches anything
                 # stays visible rather than quietly riding along.
                 caught = any(ok for _, ok in results)
-                print(f"  #{req:<3} {'CAUGHT ' if caught else 'MISSED '} "
-                      f"{', '.join(names)[:58]}")
+                print(f"  {test_name[:52]:<52} "
+                      f"{'CAUGHT' if caught else 'MISSED'}")
                 for n, ok in results:
                     if not ok:
                         print(f"          - {n}: other code path")

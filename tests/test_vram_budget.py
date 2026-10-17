@@ -537,14 +537,20 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
                for r in caplog.records)
 
 
-def test_calc_ctx_image_floor_no_mmproj_no_floor(make_model, tmp_path):
-    # image_max_tokens without an attached mmproj: no flags, no floor.
+def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
+    """Native vision (no mmproj file) must still get the image floor.
+
+    Qwen3-VL / Gemma3 have vision baked into the main weights. image_max_tokens
+    is set, image tokens count against context, and the per-slot floor applies.
+
+    Validates: docs/models/vision-context.md.
+    """
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = make_model("i", **{"derived": fit, "image_max_tokens": 9440})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
-    assert ctx == 8192
+    assert ctx >= 9440
 
 
 def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):

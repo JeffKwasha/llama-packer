@@ -1404,12 +1404,13 @@ class VramBudget:
     def _image_floor_tokens(self, include_mmproj: bool) -> int:
         """Per-slot token floor that must stay reservable for image tokens.
 
-        ``image_max_tokens`` when the vision projection is served and the
-        sidecar declares a cap; 0 otherwise.
+        ``image_max_tokens`` when vision is served and the sidecar declares a
+        cap; 0 otherwise. Applies to both mmproj and native vision models —
+        ``image_max_tokens`` being set is itself the indicator that the model
+        can process images, regardless of whether the projector is a separate
+        file or baked into the main weights.
         """
         if not include_mmproj:
-            return 0
-        if not (self.model.mmproj and self.model.mmproj.gguf_path):
             return 0
         return self.model.image_max_tokens or 0
 
