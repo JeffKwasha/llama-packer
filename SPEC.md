@@ -323,6 +323,8 @@ Two things follow from this.
 
 That tie rule is the whole of "coding drops vision to maximise context, and only adds vision when it is free": shedding usually buys context, so the projector goes; when VRAM holds design context either way, nothing is bought and the projector stays attached rather than being discarded for no gain.
 
+**A category and the null category want different things from the same rung list**, so `solve_rung` takes `prefer_capability`. A category takes the rung buying the **most context** — coding would rather have 262144 tokens text-only than 131072 with a projector. The null category takes the **first** rung that qualifies, because it has no goals and handing up a capability to buy context nobody asked for is a pointless trade. On the live fleet that shows as `gemma4-31b-hauhaucs-balanced.ti` (fallback, vision kept, 155648) beside `gemma4-31b-hauhaucs-balanced.coding.t` (vision shed, 180224).
+
 `require` and `keep` are different and both are honoured: `require` gates existence (a model lacking the capability does not satisfy the category, so no entry claims it), while `keep` only forbids shedding — a coding model with no MTP draft is still coding. A category that cannot meet `min_context` at any rung emits **nothing**. Capabilities named by neither list are shed last, in the order from `shed:` in profiles.yaml, which defaults to vision before draft.
 
 `min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
@@ -398,12 +400,10 @@ model gets one, and it too can fail.
 
 These belonged to the two-mechanism design and nothing consults them for
 allocation any more: `evict_costs:`, `sets:`, `categories:`, `min_chat_ctx`,
-`coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`. They are still
-accepted and still warn-free, because the group loop has not yet been
-rewritten onto this model — see the loop restructure in
-[docs/plans/one-rung-search.md](docs/plans/one-rung-search.md). **They are
-documented here as dead configuration, not as features.** They stop being
-parsed when the restructure lands.
+`coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`. **Documented here as
+dead configuration, not as features.** The knobs still read them (and still
+warn on a bad value), so removing the parsing is a separate cleanup rather
+than part of the restructure that stopped using them.
 
 ### What `parallel_power` actually controls
 
