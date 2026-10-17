@@ -171,8 +171,9 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
         fit_bin="unused", vram_total=48 * 1024, spare=None, max_context=None,
     )
     ids = list(config["models"])
-    # ids are <stem>.<category|ctx>.<flags>, so match on the stem prefix
-    assert any(i.startswith("chat.") for i in ids), ids
+    # ids are <stem>[.<category>][.<flags>]; with no usage: tag and no
+    # served flags an entry is just the stem.
+    assert "chat" in ids, ids
     assert not any(i.startswith("bad") for i in ids), ids
 
 

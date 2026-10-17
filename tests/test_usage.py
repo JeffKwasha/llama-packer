@@ -539,11 +539,19 @@ def test_ids_stable_when_context_changes(make_model):
     assert list(a["models"]) == list(b["models"]) == ["qwen38.coding.ti"]
 
 
-def test_untagged_falls_back_to_context_label(make_model):
+def test_untagged_gets_a_bare_id(make_model):
+    """No category, no context segment -- just the model.
+
+    Every model emits an id: an untagged one is served on the bare minimums
+    and still reaches clients. The solved context deliberately stays out of
+    the id; a repack that moved 182k to 180k must not rename the model out
+    from under a client that cached it.
+    """
     m = make_model("plain", context_length=262144)
     config = emit_config([m], {"plain": [_variant(131072, ())]},
                          _profiles_with_usage(), TVARS)
-    assert list(config["models"]) == ["plain.128k"]
+    assert list(config["models"]) == ["plain"]
+    assert config["models"]["plain"]["metadata"]["ctx_size"] == 131072
 
 
 def test_same_model_two_groups_disambiguated(make_model):
@@ -594,14 +602,15 @@ def test_category_slugged_for_the_id(make_model):
     assert list(config["models"]) == ["m.my-code.t"]
 
 
-def test_unusable_category_name_falls_back_to_ctx(make_model):
+def test_unusable_category_name_falls_back_to_a_bare_id(make_model):
+    """A name that cannot survive slugging drops the segment, not the entry."""
     m = make_model("m", context_length=262144)
     profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
                          "usage": {"***": {"min_context": "64k"}}})
     cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
     v = _variant(80000, (cat.get("***"),))
     config = emit_config([m], {"m": [v]}, profiles, TVARS)
-    assert list(config["models"]) == ["m.78k"]
+    assert list(config["models"]) == ["m"]
 
 
 def test_dump_yaml_annotates_set_memory():

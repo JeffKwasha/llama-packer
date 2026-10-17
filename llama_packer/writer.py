@@ -2957,11 +2957,16 @@ def emit_config(models: list[Model], plan: dict,
         cat_id = utils.slugify(cat) if cat is not None else ""
         if not cat_id:
             cat = None
-        tail = cat_id if cat_id else ctx_label(ctx)
+        # The id never carries the solved context. A client that cached
+        # `...256k` sees a *different model* after any repack that moved the
+        # context by one rounding step — 182k -> 180k is not a change of
+        # serving, it is a change of name, and clients treat the name as
+        # identity. The context belongs in the display name and in
+        # `metadata.ctx_size`, both of which a client re-reads.
+        tail = ".".join(x for x in (cat_id, flags) if x)
         disp = f" · {cat}" if cat is not None else ""
-        disp += f" {ctx_label(ctx)}"
+        disp += f" {ctx_label(ctx)}"          # display only, never the id
         if flags:
-            tail += f".{flags}"
             disp += f" [{flags}]"
         return tail, disp
 
@@ -2988,7 +2993,7 @@ def emit_config(models: list[Model], plan: dict,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
                 vram_note=v.vram_note,
             )
-            entry_id += f".{tail}"
+            entry_id += f".{tail}" if tail else ""
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "

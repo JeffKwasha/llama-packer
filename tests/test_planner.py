@@ -155,8 +155,8 @@ def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_pa
     # carries the image flag and its reduced context in the display name.
     ids = set(config["models"])
     assert len(ids) == 2
-    text_id = "vis.195k"
-    vis_id = "vis.64k.i"
+    text_id = "vis"
+    vis_id = "vis.i"
     assert ids == {text_id, vis_id}, ids
     main = config["models"][text_id]
     vision = config["models"][vis_id]
@@ -242,8 +242,8 @@ def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
     config = emit_config([m], {"vis": variants}, profiles, TVARS)
     ids = set(config["models"])
     assert len(ids) == 2
-    vis_id = "vis.128k.i"
-    text_id = "vis.156k"
+    vis_id = "vis.i"
+    text_id = "vis"
     assert ids == {vis_id, text_id}, ids
     assert "--mmproj" in config["models"][vis_id]["cmd"]
     text = config["models"][text_id]
@@ -550,7 +550,7 @@ def test_plan_vision_companion_over_budget_suppressed(tmp_path, make_model,
                for r in caplog.records)
     # And no vision entry is emitted alongside.
     config = emit_config([m], {"vc": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vc.128k"}
+    assert set(config["models"]) == {"vc"}
 
 
 def test_plan_vision_and_text_both_over_budget_disables(tmp_path, make_model,
