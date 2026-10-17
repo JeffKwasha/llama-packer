@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor (requires-python); 3.13 is a current
+        # release to catch syntax that only parses on newer interpreters.
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install -e . pytest
+      - name: Tests
+        run: python -m pytest tests/ -q
+      - name: Requirement trace is complete
+        run: python extras/check_trace.py
+      - name: Every traced requirement fails without its code
+        # Copies the tree once per sampled rule and shells out to pytest, so
+        # it runs on one interpreter only.
+        if: matrix.python-version == '3.13'
+        run: python extras/check_mutation.py
