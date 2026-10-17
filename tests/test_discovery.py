@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import logging
 
-from llama_packer.model import Model
-from llama_packer.utils import hf_snapshot_file
+from llama_packer.model import Model, WeightFinder
+
+from conftest import _hf_tree
 
 
 def _sidecar(name: str) -> str:
@@ -128,31 +129,19 @@ def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
                for r in caplog.records)
 
 
-def _hf_tree(tmp_path, repo="org/repo", rev="abc123", files=("model.gguf",), with_ref=True):
-    hub = tmp_path / "hf" / "hub"
-    snap = hub / f"models--{repo.replace('/', '--')}" / "snapshots" / rev
-    snap.mkdir(parents=True)
-    for f in files:
-        (snap / f).write_bytes(b"x")
-    if with_ref:
-        refs = hub / f"models--{repo.replace('/', '--')}" / "refs"
-        refs.mkdir(parents=True)
-        (refs / "main").write_text(rev)
-    return tmp_path / "hf"
-
-
-def test_hf_snapshot_file_refs_main(tmp_path):
+def test_snapshot_exact_refs_main(tmp_path):
     hf_home = _hf_tree(tmp_path)
-    hit = hf_snapshot_file("org/repo", "model.gguf", hf_home)
+    f = WeightFinder()
+    hit = f.snapshot_exact("org/repo", "model.gguf", hf_home)
     assert hit is not None and hit.name == "model.gguf"
     assert "abc123" in str(hit)
-    assert hf_snapshot_file("org/repo", "missing.gguf", hf_home) is None
-    assert hf_snapshot_file("org/other", "model.gguf", hf_home) is None
+    assert f.snapshot_exact("org/repo", "missing.gguf", hf_home) is None
+    assert f.snapshot_exact("org/other", "model.gguf", hf_home) is None
 
 
-def test_hf_snapshot_file_no_ref_single_snapshot(tmp_path):
-    hf_home = _hf_tree(tmp_path, with_ref=False)
-    hit = hf_snapshot_file("org/repo", "model.gguf", hf_home)
+def test_snapshot_exact_no_ref_single_snapshot(tmp_path):
+    hf_home = _hf_tree(tmp_path, ref=None)
+    hit = WeightFinder().snapshot_exact("org/repo", "model.gguf", hf_home)
     assert hit is not None and hit.name == "model.gguf"
 
 
@@ -177,19 +166,27 @@ def test_model_explicit_model_missing_everywhere_raises(tmp_path):
         Model(md_path, fm, hf_home=hf_home)
 
 
-def test_hf_snapshot_file_glob_exact_wins(tmp_path):
+def test_snapshot_exact_bare_and_glob(tmp_path):
     hf_home = _hf_tree(tmp_path, files=("model.gguf", "mmproj-F16.gguf"))
-    assert hf_snapshot_file("org/repo", "model.gguf", hf_home).name == "model.gguf"
-    assert hf_snapshot_file("org/repo", "mmproj*.gguf", hf_home).name == "mmproj-F16.gguf"
+    f = WeightFinder()
+    hit = f.snapshot_exact("org/repo", "model.gguf", hf_home)
+    assert hit is not None and hit.name == "model.gguf"
+    g = Model.from_ref("mmproj*.gguf", hf_repo="org/repo",
+                       hf_home=hf_home, finder=f)
+    assert g is not None and g.gguf_path is not None
+    assert g.gguf_path.name == "mmproj-F16.gguf"
 
 
-def test_hf_snapshot_file_ambiguous_glob_is_none(tmp_path, caplog):
+def test_snapshot_glob_ambiguous_is_none(tmp_path, caplog):
     from llama_packer.utils import hf_snapshot_dir
     hf_home = _hf_tree(tmp_path, files=("mmproj-F16.gguf", "mmproj-BF16.gguf"))
+    f = WeightFinder()
     with caplog.at_level(logging.WARNING):
-        assert hf_snapshot_file("org/repo", "mmproj*.gguf", hf_home) is None
+        assert Model.from_ref("mmproj*.gguf", hf_repo="org/repo",
+                              hf_home=hf_home, finder=f) is None
     assert any("ambiguous" in r.message for r in caplog.records)
-    assert hf_snapshot_dir("org/repo", hf_home).is_dir()
+    snap = hf_snapshot_dir("org/repo", hf_home)
+    assert snap is not None and snap.is_dir()
 
 
 def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
@@ -374,37 +371,97 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
                    for r in caplog.records)
 
 
-# ── t2s (kokoro) discovery ────────────────────────────────────────────────
-
-def test_t2s_optin_hf_repo_only_sidecar(tmp_path, caplog):
-    # Kokoro weights are baked into the container image: a t2s sidecar needs
-    # no local model file at all — hf_repo alone identifies it.
-    from llama_packer.backends import infer_backend
-    root = tmp_path / "models"
-    (root / "t2s").mkdir(parents=True)
-    (root / "t2s" / "kokoro-v1.md").write_text(
-        "---\nname: kokoro-v1\nhf_repo: hexgrad/Kokoro-82M\n---\n")
-
-    with caplog.at_level(logging.ERROR):
-        models = Model.from_dir(root, generate_stubs=False,
-                                dir_roles={"t2s": "t2s"})
-    assert len(models) == 1
-    m = models[0]
-    assert m.role == "t2s"
-    # Backend inference needs the configured image (from_dir passes no avail,
-    # so availability gating happens at pack time, not discovery time).
-    assert infer_backend(m, {"kokoro_image": "img"}) == "kokoro-podman"
+# ── audio (t2s) discovery is exercised by the audio-cpp backend tests ─────
 
 
-def test_t2s_onnx_sidecar_stem_resolves(tmp_path):
-    # A locally downloaded .onnx copy resolves by same-stem convention.
-    root = tmp_path / "models"
-    (root / "t2s").mkdir(parents=True)
-    (root / "t2s" / "kokoro-v1.onnx").write_bytes(b"x")
-    (root / "t2s" / "kokoro-v1.md").write_text(_sidecar("Kokoro v1"))
+# ── snapshot subdirectories ─────────────────────────────────────────────
+# Weight files nested below the snapshot top level resolve via explicit
+# relative paths, unique bare basenames, and single-model auto-detect.
 
-    models = Model.from_dir(root, generate_stubs=False,
-                            dir_roles={"t2s": "t2s"})
-    assert len(models) == 1
-    assert models[0].gguf_path is not None
-    assert models[0].gguf_path.name == "kokoro-v1.onnx"
+
+def test_snapshot_exact_subdir_and_bare(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Sub/model.gguf", "README.md"))
+    f = WeightFinder()
+    hit = f.snapshot_exact("org/repo", "Sub/model.gguf", hf_home)
+    assert hit is not None and hit.parent.name == "Sub"
+    # Bare basename finds the single nested hit (config files never match).
+    bare = f.snapshot_exact("org/repo", "model.gguf", hf_home)
+    assert bare is not None and bare == hit
+
+
+def test_snapshot_exact_bare_ambiguous_across_depths_warns(tmp_path, caplog):
+    hf_home = _hf_tree(tmp_path, files=("model.gguf", "Sub/model.gguf"))
+    f = WeightFinder()
+    with caplog.at_level(logging.WARNING):
+        assert f.snapshot_exact("org/repo", "model.gguf", hf_home) is None
+    assert any("ambiguous" in r.message for r in caplog.records)
+    # The explicit relative path still resolves.
+    hit = f.snapshot_exact("org/repo", "Sub/model.gguf", hf_home)
+    assert hit is not None and hit.parent.name == "Sub"
+
+
+def test_snapshot_nested_glob_via_from_ref(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("A/x-mmproj-F16.gguf", "B/y.gguf"))
+    f = WeightFinder()
+    hit = Model.from_ref("*mmproj*.gguf", hf_repo="org/repo",
+                         hf_home=hf_home, finder=f)
+    assert hit is not None and hit.gguf_path is not None
+    assert hit.gguf_path.parent.name == "A"
+    hit = Model.from_ref("B/*.gguf", hf_repo="org/repo",
+                         hf_home=hf_home, finder=f)
+    assert hit is not None and hit.gguf_path is not None
+    assert hit.gguf_path.name == "y.gguf"
+
+
+def test_model_resolves_subdir_model_from_hf_cache(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf",))
+    md_path = tmp_path / "kokoro.md"
+    fm = {"name": "kokoro", "model": "Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf",
+          "hf_repo": "org/repo"}
+    m = Model(md_path, fm, hf_home=hf_home)
+    assert m.gguf_path is not None
+    assert m.gguf_path.name == "kokoro-82m-q8_0.gguf"
+
+
+def test_model_resolves_unique_nested_bare_name(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Sub/only.gguf",))
+    md_path = tmp_path / "only.md"
+    m = Model(md_path, {"name": "only", "model": "only.gguf",
+                        "hf_repo": "org/repo"}, hf_home=hf_home)
+    assert m.gguf_path is not None and m.gguf_path.parent.name == "Sub"
+
+
+def test_model_ambiguous_bare_name_across_depths_raises(tmp_path):
+    import pytest
+    hf_home = _hf_tree(tmp_path, files=("model.safetensors",
+                                        "speech_tokenizer/model.safetensors"))
+    md_path = tmp_path / "q.md"
+    with pytest.raises(ValueError, match="not found"):
+        Model(md_path, {"name": "q", "model": "model.safetensors",
+                        "hf_repo": "org/repo"}, hf_home=hf_home)
+
+
+def test_snapshot_auto_detect_single_nested_model(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("Sub/only.gguf",))
+    md_path = tmp_path / "auto.md"
+    m = Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
+              hf_home=hf_home)
+    assert m.gguf_path is not None and m.gguf_path.parent.name == "Sub"
+
+
+def test_snapshot_auto_detect_prefers_top_level(tmp_path):
+    hf_home = _hf_tree(tmp_path, files=("model.safetensors",
+                                        "speech_tokenizer/model.safetensors"))
+    md_path = tmp_path / "auto.md"
+    m = Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
+              hf_home=hf_home)
+    assert m.gguf_path is not None and m.gguf_path.parent.name == "abc123"
+
+
+def test_snapshot_auto_detect_several_nested_models_errors(tmp_path):
+    import pytest
+    hf_home = _hf_tree(tmp_path, files=("A/a.gguf", "B/b.gguf"))
+    md_path = tmp_path / "auto.md"
+    with pytest.raises(ValueError, match="several models"):
+        Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
+              hf_home=hf_home)

@@ -218,13 +218,61 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
         ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=1024)
     assert ctx == _MIN_CTX_SIZE
     # The warning must say what the user gets and why: needs vs budget and
-    # the effect (served at minimum context).
+    # the verdict (the model cannot load — the planner disables it).
     msg = next(r.message for r in caplog.records
                if "need" in r.message and "budget" in r.message)
     assert "30000" in msg          # needs MiB
     assert "29696" in msg          # budgeted MiB (32768 - 2048 - 1024)
-    assert "minimum context" in msg
-    assert str(_MIN_CTX_SIZE) in msg
+    assert "cannot load" in msg
+    # The budget verdict is recorded for the planner's gating check.
+    assert model.vram.over_budget_reason is not None
+    assert "30000" in model.vram.over_budget_reason
+    assert model.vram.vram_squeezed is False
+
+
+def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
+                                                           caplog):
+    """The invariant: an emitted entry must never need more VRAM than exists.
+
+    The window this covers is narrow and was a real hole — the model loads,
+    so ``remaining > 0`` and no over-budget fires, but the honest context
+    left is below the minimum. ``ctx = max(ctx, _MIN_CTX_SIZE)`` clamped
+    *upward* over that, and ``_auto_parallel`` infers feasibility from
+    ``ctx >= floor``, so the fabricated value was accepted as a real slot
+    count. GLM47's c with qwen35's corrected D made that reachable:
+    2000 MiB left, 4 slots bought 1863 tokens, reported as 4096.
+
+    Validates: docs/plans/requirement-trace.md #27: no emitted entry may need more
+    VRAM than exists.
+    """
+    import logging
+    from llama_packer.vram import _MIN_CTX_SIZE
+
+    fm = {"model_mib": 20471, "kv_per_token_mib": 0.02743133544921875,
+          "slot_mib": 448.87, "compute_mib": 1174, "source": "llama-server",
+          "cache_type": "q8_0", "shape": ""}
+    model = make_model("tight", **{"derived": fm})
+
+    # 24576 - reserve(2048) - weights(20471) - compute(1174) leaves ~883 MiB.
+    with caplog.at_level(logging.WARNING):
+        ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+                                  parallel=4, design_ctx=202752)
+    assert ctx < _MIN_CTX_SIZE, "reported a servable context"
+    assert model.vram.over_budget_reason is not None
+    assert "below the" in model.vram.over_budget_reason
+
+
+def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
+    """One MiB more budget and the same model serves -- so the guard above
+    is a threshold, not a blanket refusal."""
+    fm = {"model_mib": 20471, "kv_per_token_mib": 0.02743133544921875,
+          "slot_mib": 448.87, "compute_mib": 1174, "source": "llama-server",
+          "cache_type": "q8_0", "shape": ""}
+    model = make_model("roomy", **{"derived": fm})
+    ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+                              parallel=1, design_ctx=202752)
+    assert ctx >= 4096
+    assert model.vram.over_budget_reason is None
 
 
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
@@ -233,6 +281,59 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
     # available = 32768 - 2048 - 3072 = 27648; remaining = 27648-11000 = 16648
     # design cost = 16384 <= 16648 -> design still fits
     assert ctx == 32768
+
+
+# ── over-budget / squeeze gating flags ───────────────────────────────────
+
+
+def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
+    import logging
+
+    fm = {"model_mib": 1000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+          "compute_mib": 100, "cache_type": "q8_0",
+          "source": "llama-server", "shape": ""}
+    model = make_model("nb", **{"derived": fm})
+    with caplog.at_level(logging.WARNING):
+        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=40000)
+    assert ctx == _MIN_CTX_SIZE
+    assert model.vram.over_budget_reason is not None
+    assert "exhausted" in model.vram.over_budget_reason
+    assert model.vram.vram_squeezed is False
+
+
+def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
+    # Weights fit but the full 32768 design context does not: the solve
+    # falls back smaller and flags the squeeze for the description note.
+    fm = {"model_mib": 32000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+          "compute_mib": 100, "cache_type": "q8_0",
+          "source": "llama-server", "shape": ""}
+    model = make_model("sq", **{"derived": fm})
+    ctx = model.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    # available = 47104; remaining = 47104 - 32100 = 15004
+    # design cost = 16384 > 15004 -> squeezed; not over budget.
+    assert ctx < 32768
+    assert model.vram.over_budget_reason is None
+    assert model.vram.vram_squeezed is True
+
+
+def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
+    """Flags are per-solve: a tight call's verdict must not leak into the
+    next call's plan (groups may carry different spare)."""
+    tight = make_model("r1", **{"derived": {
+        "model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+        "compute_mib": 100, "cache_type": "q8_0",
+        "source": "llama-server", "shape": ""}})
+    tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    assert tight.vram.over_budget_reason is not None
+
+    # Same budget object, looser effective budget via the fitting block:
+    # swap the measured quad for one that fits and the flags must clear.
+    tight.vram.effective_static = lambda *a, **k: (
+        1000, 0.5, 0.0, 100)
+    ctx = tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    assert tight.vram.over_budget_reason is None
+    assert tight.vram.vram_squeezed is False
+    assert ctx >= _MIN_CTX_SIZE
 
 
 def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
@@ -248,6 +349,10 @@ def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
 
 
 def test_calc_ctx_cpu_resident_returns_design(make_model):
+    """
+    Validates: SPEC.md, 'VRAM Allocation': a CPU-resident model costs no VRAM, so its
+    context is its design maximum.
+    """
     model = make_model("e", device="cpu", context_length=8192)
     ctx = model.vram.calc_ctx(1024, fit_bin="unused")
     assert ctx == 8192
@@ -403,17 +508,18 @@ def _vision(make_model, tmp_path, stem, fit, **extra):
 
 
 def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
-    # A declared image_max_tokens must fit the solved context: the ctx is
-    # raised from the rounded-down value to the floor when affordable.
+    # A declared image budget plus the output reserve must fit the solved
+    # context: the ctx is raised from the rounded-down value to the floor
+    # when affordable.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
-    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9000)
+    model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=7500)
     ctx = model.view_for(True).vram.calc_ctx(
         32768, fit_bin="unused", include_mmproj=True)
     # remaining = 30720 - 26000 - mmproj(0 + 150) = 4570; affordable 9140
-    # tokens; rounded ctx 8192 -> raised to the 9000 floor (affordable)
-    assert ctx == 9000
+    # tokens; rounded ctx 8192 -> raised to 7500 + 1024 reserve = 8524
+    assert ctx == 8524
 
 
 def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
@@ -432,14 +538,20 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
                for r in caplog.records)
 
 
-def test_calc_ctx_image_floor_no_mmproj_no_floor(make_model, tmp_path):
-    # image_max_tokens without an attached mmproj: no flags, no floor.
+def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
+    """Native vision (no mmproj file) must still get the image floor.
+
+    Qwen3-VL / Gemma3 have vision baked into the main weights. image_max_tokens
+    is set, image tokens count against context, and the per-slot floor applies.
+
+    Validates: docs/models/vision-context.md.
+    """
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = make_model("i", **{"derived": fit, "image_max_tokens": 9440})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
-    assert ctx == 8192
+    assert ctx >= 9440
 
 
 def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
@@ -450,6 +562,114 @@ def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9440)
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=False)
     assert ctx == 8192
+
+
+def _write_mmproj(path, *, patch=16, merge=2, projector="qwen3vl_merger"):
+    """Write a minimal but valid GGUF carrying clip vision geometry."""
+    import struct
+
+    def s(x: str) -> bytes:
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+
+    kv = {"clip.vision.patch_size": patch,
+          "clip.projector_type": projector}
+    if merge:
+        kv["clip.vision.spatial_merge_size"] = merge
+    body = b""
+    for k, v in kv.items():
+        body += s(k)
+        if isinstance(v, str):
+            body += struct.pack("<I", 8) + s(v)
+        else:
+            body += struct.pack("<I", 4) + struct.pack("<I", int(v))
+    header = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+              + struct.pack("<Q", len(kv)))
+    path.write_bytes(header + body)
+
+
+def _vision_geom(make_model, tmp_path, stem, fit, *, patch=16, merge=2,
+                 projector="qwen3vl_merger", **extra):
+    """Vision model whose mmproj carries real clip geometry."""
+    p = tmp_path / f"{stem}-mmproj.gguf"
+    _write_mmproj(p, patch=patch, merge=merge, projector=projector)
+    fm = {"derived": fit, "mmproj": {"file": p.name,
+                                     "capabilities": ["image"]}}
+    fm.update(extra)
+    return make_model(stem, **fm)
+
+
+_FIT = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
+        "compute_mib": 1000, "cache_type": "q8_0",
+        "source": "llama-server", "shape": ""}
+
+
+def test_min_image_megapixels_converts_through_geometry(make_model, tmp_path):
+    """2 megapixels at 1024 pixels/token is 1953 image tokens.
+
+    Validates: docs/models/vision-context.md.
+    """
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=2)
+    assert model.vision_geometry.pixels_per_token == 1024
+    assert model.min_image_tokens == 1953
+    assert model.image_output_reserve_tokens == 1024
+
+
+def test_min_image_megapixels_floor_includes_output_reserve(make_model, tmp_path):
+    """The floor is image tokens plus room to answer, not the image alone.
+
+    Validates: docs/models/vision-context.md.
+    """
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=1, image_output_reserve=2048)
+    assert model.min_image_tokens == 977
+    assert model.view_for(True).vram._image_floor_tokens(True) == 977 + 2048
+
+
+def test_min_image_megapixels_ignored_on_non_proportional(make_model, tmp_path,
+                                                            caplog):
+    """A projector that does not scale with pixels cannot honour the knob.
+
+    Validates: docs/models/vision-context.md.
+    """
+    import logging
+    model = _vision_geom(make_model, tmp_path, "i", _FIT, patch=14, merge=1,
+                         projector="minicpmv4_6", min_image_megapixels=2)
+    assert model.min_image_tokens is None
+    with caplog.at_level(logging.WARNING):
+        model.image_budget_warnings()
+    assert any("does not scale with resolution" in r.message
+               for r in caplog.records)
+
+
+def test_min_image_megapixels_too_large_warns(make_model, tmp_path, caplog):
+    """A budget above the declared cap is reported, then clamped.
+
+    Validates: docs/models/vision-context.md.
+    """
+    import logging
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=20, image_max_tokens=16384)
+    assert model.min_image_tokens == 19531          # 20 MP at 1024 px/token
+    with caplog.at_level(logging.WARNING):
+        model.image_budget_warnings()
+    assert any("above image_max_tokens" in r.message for r in caplog.records)
+    assert model.view_for(True).vram._image_floor_tokens(True) == 16384 + 1024
+
+
+def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog):
+    """0 means vision is not required; it may be shed, and that warns.
+
+    Validates: docs/models/vision-context.md.
+    """
+    import logging
+    model = _vision_geom(make_model, tmp_path, "i", _FIT,
+                         min_image_megapixels=0)
+    assert model.min_image_tokens is None
+    with caplog.at_level(logging.WARNING):
+        model.image_budget_warnings()
+    assert any("vision is not required" in r.message for r in caplog.records)
 
 
 # ── solve_matrix_ctx ──────────────────────────────────────────────────────
@@ -663,3 +883,50 @@ def test_correction_keys_on_baked_in_draft_not_companion(
     fp2 = m2.vram._fit_params_serve("unused", "q8_0")
     assert fp2 is not None
     assert fp2.slot_mib == pytest.approx(10.0 + 448.9)
+
+
+def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
+    """The operator's pin must bind whether or not the design context fits.
+
+    The ceiling was only applied in the design-fits branch, so the same model
+    and sidecar produced two different answers depending on which branch the
+    budget happened to select: 32768 when it fit, 98304 when VRAM forced the
+    squeeze. SPEC spells out both clamps, and the caller cannot recover it --
+    _bounded_ctx passes design_context, which prefers the GGUF header over
+    the sidecar.
+
+    Validates: docs/plans/requirement-trace.md #19: context_length is a ceiling in
+    both branches, not only the one that fits.
+    """
+    fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
+          "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
+          "shape": ""}
+    model = make_model("pinned", context_length=32768, **{"derived": fm})
+
+    roomy = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+                               design_ctx=131072)
+    assert roomy == 32768
+
+    tight = model.vram.calc_ctx(16384, fit_bin="unused", parallel=1,
+                               design_ctx=131072)
+    assert tight <= 32768, f"squeeze ignored the sidecar pin: {tight}"
+    assert model.vram.vram_squeezed is True
+
+
+def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
+    """The ceiling must only ever lower the ceiling, never impose one.
+
+    Worth asserting explicitly because make_model seeds every sidecar with
+    ``context_length: 32768`` -- so a loose pin has to be able to raise the
+    served context above that, or "no pin" and "pinned at 32k" look
+    identical in the fixtures.
+
+    Validates: docs/plans/requirement-trace.md #19.
+    """
+    fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
+          "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
+          "shape": ""}
+    model = make_model("unpinned", context_length=131072, **{"derived": fm})
+    ctx = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+                              design_ctx=131072)
+    assert ctx == 131072

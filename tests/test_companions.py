@@ -122,6 +122,29 @@ def test_mtp_gate_undecidable_keeps_declared(tmp_path, make_model):
     assert m._mtp_info() == (True, 2)  # unparseable header: declared intent
 
 
+def test_mtp_baked_in_distinguishes_companion_from_nextn(tmp_path, make_model):
+    # The serve-correction table's mtp dimension means "draft baked into the
+    # main GGUF".  A `speculative:` companion overrides a baked-in nextn
+    # draft, so the same model is False for that dimension — which is why
+    # the probe must not file a companion witness under it.
+    baked = make_model("baked", mtp=True)
+    _mini_gguf(baked.gguf_path, ["blk.1.nextn_eh_proj.weight"])
+    assert baked.mtp is None
+    assert baked.mtp_baked_in is True
+
+    # Companion must exist before construction resolves it.
+    (tmp_path / "dspark.gguf").write_bytes(b"\x00" * 64)
+    over = make_model("over", mtp=True, speculative="dspark.gguf")
+    _mini_gguf(over.gguf_path, ["blk.1.nextn_eh_proj.weight"])
+    assert over.mtp is not None                # override wins over nextn
+    assert over._mtp_info()[0] is True         # MTP still on, n_max default
+    assert over.mtp_baked_in is False          # ...but not the baked-in shape
+
+    stripped = make_model("stripped", mtp=True)
+    _mini_gguf(stripped.gguf_path, ["blk.0.attn_q.weight"])
+    assert stripped.mtp_baked_in is False       # gated off entirely
+
+
 def test_gguf_has_mtp_layers(tmp_path):
     from llama_packer.utils import gguf_has_mtp_layers
     _mini_gguf(tmp_path / "with.gguf", ["blk.1.nextn_eh_proj.weight"])

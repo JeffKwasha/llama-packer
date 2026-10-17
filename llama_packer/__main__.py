@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import textwrap
 from typing import NoReturn
@@ -17,7 +18,8 @@ from pathlib import Path
 
 import yaml
 
-from llama_packer import Model, __version__, find_bin_dir
+from llama_packer import Model, __version__, find_bin_dir, utils
+from llama_packer import model as _modelmod
 from llama_packer.hardware import GpuProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
@@ -31,22 +33,27 @@ from llama_packer.consts import (
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
-from llama_packer.writer import build_config, write_yaml, EmittedConfig
+from llama_packer.writer import (
+    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
-from llama_packer.backends.kokoro import KOKORO_DEFAULT_IMAGES, KOKORO_CONTAINER_PORT
-
+from llama_packer.backends.audio_cpp import (AUDIO_CPP_DEFAULT_BIN,
+                                             AUDIO_CPP_SERVER_KNOBS)
 
 
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbosity: int = 0) -> None:
+def setup_logging(verbosity: int = 0, floor: int | None = None) -> None:
     # Each -v drops LOGLEVEL by 10 from the WARNING default (-v: INFO,
     # -vv: DEBUG, -vvv: 0/NOTSET); never negative.
     level = max(0, logging.WARNING - 10 * max(0, verbosity))
+    if floor is not None:
+        # A dry run's whole output is in the log: every withheld write is
+        # reported there, so it has to be visible without extra flags.
+        level = min(level, floor)
     logging.basicConfig(
         level=level,
         format="%(levelname).1s | %(message)s",
@@ -101,7 +108,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
               llama-packer --output /etc/ls/config.yaml
         """),
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print config to stdout instead of writing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print config to stdout and touch nothing on disk: "
+                             "no config.yaml, no config.env, no stub sidecars, "
+                             "no derived: measurement write-back")
     parser.add_argument("--remeasure", action="store_true",
                         help="Ignore saved VRAM measurements (sidecar `derived:` "
                              "blocks) and re-run the fast fit-params trio for "
@@ -127,19 +137,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-home", help="HF_HOME root (the dir containing hub/) for hub snapshot "
                         "resolution and path grouping (overrides profiles.yaml hf_home / $HF_HOME)")
     parser.add_argument("--profiles", default="profiles.yaml", help="Profiles file (default: profiles.yaml)")
-    parser.add_argument("--no-stubs", action="store_true", help="Skip generating stub .md files")
+    parser.add_argument("--create-stubs", action="store_true",
+                        help="Create an empty stub .md beside every model "
+                             "file that has no sidecar, as an editing surface. "
+                             "Off by default: a pack never writes into the "
+                             "models tree unless asked. Models without a "
+                             "sidecar are still discovered and served with "
+                             "built-in defaults either way.")
     parser.add_argument("--agents", action="store_true",
                         help="Write the AGENTS.md model guide to the models directory if missing "
                              "(never overwrites an existing file; bundled template)")
     parser.add_argument("--extra-dirs", nargs="*", default=["embed", "rerank"], help="Extra subdirectories of --models-dir to scan for orphan GGUFs (default: embed rerank)")
-    parser.add_argument("--spare", help="Additional VRAM to reserve on TOP of the fixed 2048 MiB system+driver reserve "
-                                         "(1024 MiB OS/driver + 1024 MiB video framebuffer): suffixed (2G, 512m, 64k) or bare number "
+    parser.add_argument("--spare", help="Extra VRAM to reserve on top of the fixed 2048 MiB base "
+                                         "(1024 OS/driver + 1024 compositor). This is the operator's slack for "
+                                         "other VRAM tenants (immich, browsers, games): suffixed (2G, 512m, 64k) or bare number "
                                          "(auto: GB if < 3×VRAM, else MB)")
     parser.add_argument("--vram", help="Total GPU VRAM: suffixed (32G, 24576m) or bare MB (overrides auto-detection). "
                                          "The fixed 2048 MiB system+video reserve plus --spare are subtracted before budgeting context.")
-    parser.add_argument("--baseline", help="Driver/compositor VRAM already in use, added to the fixed 2048 MiB reserve "
+    parser.add_argument("--baseline", help="Compositor/desktop VRAM already in use. Replaces the fixed 1024 MiB "
+                                          "compositor portion when larger, so reserve = 1024 + max(1024, baseline); "
+                                          "values <=1024 are a no-op. Use --spare for extra tenants/headroom instead. "
                                           "(default: 0; live auto-detection is disabled so the packer's own resident model "
-                                          "servers are not counted against the budget). Set only when other non-model processes occupy VRAM.")
+                                          "servers are not counted against the budget).")
     parser.add_argument("--unified-system-mb", help="System memory reserved for the OS on unified-memory hosts "
                                           "(GB10/DGX Spark, Apple Silicon): suffixed (8G, 4096m) or bare MB. "
                                           "Default: 8192 (8 GiB). Only applies to auto-detected unified pools; "
@@ -159,19 +178,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vllm-image", help="vLLM docker image for `vllm-docker` backend models "
                          "(overrides profiles.yaml vllm.image)")
     parser.add_argument("--vllm-server", help="vLLM binary for `vllm` backend models "
-                         "(overrides profiles.yaml vllm.bin; default: vllm on PATH)")
+                         "(overrides profiles.yaml vllm.bin / $VLLM_BIN_DIR / the run directory)")
     parser.add_argument("--sd-server", help="sd-server binary for `sd-server` backend "
-                         "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / sd-server on PATH)")
+                         "(overrides profiles.yaml sd.bin / $SD_BIN_DIR / the run directory)")
     parser.add_argument("--whisper-server", help="whisper-server binary for `whisper-server` backend "
-                        "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / whisper-server on PATH)")
-    parser.add_argument("--kokoro-image", help="container image for `kokoro-podman` backend "
-                         "(overrides profiles.yaml t2s.image; default: vendor-detected upstream image)")
+                        "(overrides profiles.yaml whisper.bin / $WHISPER_BIN_DIR / the run directory)")
+    parser.add_argument("--audio-cpp-server", help="audiocpp_server binary for `audio-cpp` backend "
+                        "(overrides profiles.yaml audio_cpp.bin / $AUDIOCPP_BIN_DIR / the run directory)")
+    parser.add_argument("--audio-cpp-backend", help="audio.cpp runtime backend "
+                        "(cuda|vulkan|cpu|metal|hip; overrides profiles.yaml audio_cpp.backend; "
+                        "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
+    parser.add_argument("--idle-unload", type=int, default=None, metavar="SECONDS",
+                        help="Emit a top-level globalTTL: unload any model after SECONDS "
+                             "of inactivity (llama-swap default: 0 = never). Useful when "
+                             "another program (ComfyUI, a game) needs VRAM on short notice.")
     return parser.parse_args(argv[1:] if argv else None)
 
 
-def write_agents_md(models_dir: Path) -> None:
+def write_agents_md(models_dir: Path) -> None:  # noqa: D401 - see body
     """Write the bundled AGENTS.md guide into ``models_dir`` if missing.
 
     The canonical guide ships inside the package
@@ -188,6 +214,9 @@ def write_agents_md(models_dir: Path) -> None:
         src = importlib.resources.files("llama_packer").joinpath("templates", "models_AGENTS.md")
         if not src.is_file():
             logger.warning("bundled AGENTS.md template missing: %s", src)
+            return
+        if utils.DRY_RUN:
+            utils.note_fs_op("write", dest, "AGENTS.md guide")
             return
         shutil.copyfile(str(src), dest)
         try:
@@ -250,14 +279,19 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
 def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     """Resolve the swap-matrix configuration before build_config.
 
-    Returns (matrix_cfg, embed_model, rerank_model). Without a ``matrix:``
-    section the matrix is disabled — make that state visible when the fleet
-    actually has RAG models, otherwise a silently missing co-loading setup
-    looks exactly like a bug (it has, repeatedly).
+    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
+
+    ``categories`` maps each declared category name → its selected model
+    (defaults: ``emb``/``rnk`` bound to the embeddings/rerank models).  The
+    RAG pair still drives the shared chat-context solve; every *other*
+    category (e.g. ``tts``/``stt``) is returned in ``fixed`` as a
+    fixed-overhead resident reserved alongside chat and RAG.
+
+    Without a ``matrix:`` section the matrix is disabled — make that state
+    visible when the fleet actually has RAG models, otherwise a silently
+    missing co-loading setup looks exactly like a bug (it has, repeatedly).
     """
     matrix_cfg = profiles_cfg.get("matrix")
-    embed_model = None
-    rerank_model = None
     if not matrix_cfg:
         emb = _select_model(models, "embeddings", args.embed, logger)
         rnk = _select_model(models, "rerank", args.rerank, logger)
@@ -266,33 +300,68 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
                 "matrix: disabled — profiles.yaml has no matrix: section; "
                 "RAG co-loading off (emb: %s, rnk: %s)",
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
-        return None, None, None
+        return None, None, None, {}, ()
     embed_model = _select_model(models, "embeddings", args.embed, logger)
     rerank_model = _select_model(models, "rerank", args.rerank, logger)
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
-        return None, None, None
+        return None, None, None, {}, ()
     if rerank_model is None:
         logger.warning("no rerank model found; skipping matrix")
-        return None, None, None
+        return None, None, None, {}, ()
+
+    # Declared categories (defaults bind the RAG pair).  Category names are
+    # the matrix var names; roles may repeat (e.g. tts/stt on t2s/s2t).
+    cat_specs = matrix_cfg.get("categories") or {
+        "emb": {"role": "embeddings"}, "rnk": {"role": "rerank"}}
+    categories: dict[str, "Model"] = {}
+    for name, spec in cat_specs.items():
+        spec = spec if isinstance(spec, dict) else {}
+        role = str(spec.get("role") or "")
+        selector = spec.get("selector")
+        if not role:
+            logger.warning("matrix: category %r has no role; omitted", name)
+            continue
+        model = _select_model(models, role, selector, logger)
+        if model is None:
+            logger.warning("matrix: category %r: no %s model%s; omitted",
+                           name, role,
+                           f" matching {selector!r}" if selector else "")
+            continue
+        categories[str(name)] = model
+    # Back-compat: the canonical RAG names always resolve.
+    categories.setdefault("emb", embed_model)
+    categories.setdefault("rnk", rerank_model)
+
+    known = set(categories)
+    for key in (matrix_cfg.get("evict_costs") or {}):
+        if key not in known:
+            logger.warning("matrix: evict_costs key %r is not a declared "
+                           "category %s; llama-swap will ignore it",
+                           key, sorted(known))
+
+    fixed = [(n, m) for n, m in categories.items()
+             if m is not embed_model and m is not rerank_model]
     logger.info("matrix embed: %s", embed_model.stem)
     logger.info("matrix rerank: %s", rerank_model.stem)
-    return matrix_cfg, embed_model, rerank_model
+    if fixed:
+        logger.info("matrix categories: %s",
+                    ", ".join(f"{n}={m.stem}" for n, m in fixed))
+    return matrix_cfg, embed_model, rerank_model, categories, fixed
 
 
 # Var-name prefix per co-load role, used in set expressions
 # (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
-_COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
 
 
-def _build_matrix_vars(models: list, embed_model, rerank_model,
+def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
                        coload_stems: list[str],
                        entry_ids_by_stem: dict[str, list[str]], logger) -> tuple[dict, list[str]]:
     """Auto-collect matrix vars: chat entries + selected embed/rerank + co-loads.
 
-    Each chat model contributes a var per emitted entry id (the bare id and,
-    when present, its text-only variant — see writer.TEXT_SUFFIX), so text
-    variants join the same co-loading sets as their parent entry.  The
+    Each chat model contributes a var per emitted entry id (the vision
+    serving and, when present, its vision-less variant), so those variants
+    join the same co-loading sets as their parent entry.  The
     stem → ids mapping comes from the emitter (EmittedConfig) so naming is
     owned in exactly one place.  Opportunistically included non-chat models
     (``coload_stems``, from the matrix solve) contribute one role-prefixed
@@ -309,25 +378,45 @@ def _build_matrix_vars(models: list, embed_model, rerank_model,
         for eid in entry_ids_by_stem.get(m.stem, []):
             chat_idx += 1
             vars_[f"c{chat_idx}"] = eid
-    if embed_model is not None:
-        vars_["emb"] = embed_model.template_id
-    if rerank_model is not None:
-        vars_["rnk"] = rerank_model.template_id
+    # Declared categories contribute one var each (emb, rnk, tts, stt, …);
+    # the category names are what `sets:` expressions reference.  Each must
+    # point at an EMITTED entry id, which now carries the served context
+    # (zerank-2 -> zerank-2-4k) — template_id no longer names an entry, and
+    # llama-swap rejects a var that points at a model not in the roster.
+    def entry_of(model) -> str | None:
+        ids = entry_ids_by_stem.get(model.stem) or []
+        return ids[0] if ids else None
+
+    for name, model in (categories or {}).items():
+        if name in vars_:
+            logger.warning("matrix: category var %r collides with an existing "
+                           "var; skipped", name)
+            continue
+        eid = entry_of(model)
+        if eid is None:
+            logger.warning("matrix: category var %r: %s emitted no entry; "
+                           "omitted", name, model.stem)
+            continue
+        vars_[name] = eid
+    for name, model in (("emb", embed_model), ("rnk", rerank_model)):
+        if model is not None and name not in vars_:
+            eid = entry_of(model)
+            if eid is not None:
+                vars_[name] = eid
     by_stem = {m.stem: m for m in models}
     coload_vars: list[str] = []
     for stem in coload_stems:
         m = by_stem.get(stem)
         if m is None:
             continue
-        prefix = _COLOAD_VAR_PREFIX.get(m.role, "coload")
-        name, n = prefix, 1
-        while name in vars_:
-            n += 1
-            name = f"{prefix}{n}"
-        vars_[name] = m.template_id
+        eid = entry_of(m)
+        if eid is None:
+            continue
+        name = coload_var_name(m.role, vars_)
+        vars_[name] = eid
         coload_vars.append(name)
-    logger.info("matrix vars: %d chat + emb + rnk + %d coload",
-                chat_idx, len(coload_vars))
+    logger.info("matrix vars: %d chat + %d category + %d coload",
+                chat_idx, len(categories or {}), len(coload_vars))
     return vars_, coload_vars
 
 
@@ -379,18 +468,25 @@ def _health_check_timeout(models, args) -> int:
 
 
 def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
-                        coload_vars: list[str], logger) -> dict:
+                        coload_vars: list[str], logger,
+                        chat_expr_by_set: dict[str, str] | None = None,
+                        ) -> dict:
     """Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs.
 
     Placeholders expand to parenthesized OR-lists of VAR NAMES (not model
     IDs — the llama-swap sets DSL references var names, which map to model
     IDs via ``vars``).  With no co-loads included, a ``__COLOAD_VARS__`` term
     is dropped from the expression entirely.
+
+    *chat_expr_by_set* overrides the chat OR-list per set, so a model that
+    cannot hold its context alongside a set's residents is left out of that
+    set alone instead of every set.
     """
-    coload_expr = "(" + " | ".join(coload_vars) + ")" if coload_vars else None
+    coload_expr = ("(" + " | ".join(coload_vars) + ")") if coload_vars else None
     expanded: dict[str, str] = {}
     for sname, sexpr in sets_cfg.items():
-        expr = sexpr.replace("__CHAT_VARS__", chat_expr)
+        this_chat = (chat_expr_by_set or {}).get(sname, chat_expr)
+        expr = sexpr.replace("__CHAT_VARS__", this_chat)
         if coload_expr:
             expr = expr.replace("__COLOAD_VARS__", coload_expr)
         else:
@@ -405,9 +501,78 @@ def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
     return expanded
 
 
+def resolve_host_binary(
+    cli: str | None,
+    section: str | None,
+    env_var: str,
+    default_name: str,
+    fallback: str = "",
+    run_dir: Path | None = None,
+) -> str | None:
+    """Resolve one host-only server binary, by the same rule for every backend.
+
+    One chain, so "where does llama-packer look for sd-server?" has a single
+    answer:
+
+        ``--<x>-server`` > ``profiles.yaml <section>.bin`` > ``$<ENV_VAR>``
+        > the run directory > ``PATH``
+
+    The run-directory tier is what makes llama.cpp and the rest agree.
+    llama.cpp has always been found by scanning the working directory for
+    ``llama-b[0-9]*``; every other engine fell back to ``shutil.which()``,
+    which never looks at the cwd — so an ``audiocpp_server`` sitting beside
+    the build it was installed with was invisible, and every deployment had
+    to paper over that with its own ``*_BIN_DIR``. Scanning the run
+    directory closes the gap in the direction llama.cpp already worked.
+
+    ``$*_BIN_DIR`` and ``profiles.yaml`` may name a *directory* (mirroring
+    ``LLAMA_BIN_DIR``); a directory expands to ``<dir>/<default_name>``.
+
+    ``fallback`` is returned when nothing resolves — vLLM keeps its built-in
+    default rather than going unresolved. An explicit setting that does not
+    exist is returned as given rather than dropped, so a stale ``bin:``
+    disables the backend with a clear message instead of quietly resolving
+    to something else.
+    """
+    candidates: list[str] = []
+    if cli:
+        candidates.append(str(cli))
+    if section:
+        candidates.append(str(section))
+    if env_value := os.environ.get(env_var):
+        candidates.append(env_value)
+    if default_name:
+        base = Path(run_dir) if run_dir is not None else Path.cwd()
+        if (in_run_dir := base / default_name).is_file():
+            candidates.append(str(in_run_dir))
+        if (on_path := shutil.which(default_name)) is not None:
+            candidates.append(on_path)
+    for raw in candidates:
+        cand = Path(raw)
+        if cand.is_dir():
+            cand = cand / default_name
+        return str(cand)
+    return fallback or None
+
+
 def main(argv: list[str] | None = None) -> None:
+    """Emit config.yaml for llama-swap.
+
+    ``--dry-run`` is contractually read-only: it prints the config and
+    creates, modifies and deletes **nothing**.  Three things would otherwise
+    write, so all three are gated here rather than deep in the pipeline:
+    the config and its ``config.env``, the stub sidecars discovery creates
+    beside orphan model files, and the ``derived:`` measurement cache
+    written back into every sidecar it measures.
+    """
     args = parse_args(argv)
-    setup_logging(args.verbose)
+    setup_logging(args.verbose,
+                  floor=logging.INFO if args.dry_run else None)
+
+    # One pack per process, so this is the whole lifetime of the setting.
+    # Must happen before discovery and measurement, both of which write.
+    utils.set_dry_run(args.dry_run)
+    _modelmod.persisted_sidecars_reset()
     logger = logging.getLogger(__name__)
     if args.verbose:
         logger.info("llama-packer %s", __version__)
@@ -503,49 +668,56 @@ def main(argv: list[str] | None = None) -> None:
     vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
     vllm_bin = str(args.vllm_server or vllm_cfg.get("bin") or VLLM_DEFAULT_BIN)
 
-    # sd-server resource configuration (CLI > profiles.yaml `sd:` section >
-    # $SD_BIN_DIR > sd-server on PATH).  Single host binary for now (docker follow-up).
-    sd_cfg = profiles_cfg.get("sd") or {}
-    sd_bin_raw = args.sd_server or sd_cfg.get("bin") or os.environ.get("SD_BIN_DIR") or shutil.which("sd-server")
-    sd_bin = None
-    if sd_bin_raw:
-        raw = str(sd_bin_raw)
-        # SD_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR); expand to binary inside.
-        cand = Path(raw)
-        if cand.is_dir():
-            cand = cand / "sd-server"
-        sd_bin = str(cand) if cand else None
-        # When the explicit path doesn't exist, fall back to which() so a
-        # stale profile bin doesn't disable inference entirely.
-        if sd_bin and not Path(sd_bin).is_file() and not shutil.which(str(sd_bin)):
-            # Keep the raw value — is_available will be False, inference won't pick it,
-            # but an explicit `backend: sd-server` still reports a clear error.
-            pass
+    # Host binaries. All four resolve by the same chain (see
+    # resolve_host_binary): CLI > profiles.yaml > $<ENV_VAR> > run directory >
+    # PATH.  Resolved before discovery so backend inference knows whether a
+    # backend can actually run.
+    vllm_cfg = profiles_cfg.get("vllm") or {}
+    vllm_image = str(args.vllm_image or vllm_cfg.get("image") or VLLM_DEFAULT_IMAGE)
+    vllm_bin = str(resolve_host_binary(
+        args.vllm_server, vllm_cfg.get("bin"), "VLLM_BIN_DIR", "vllm",
+        fallback=VLLM_DEFAULT_BIN) or VLLM_DEFAULT_BIN)
 
-    # whisper-server resource configuration (CLI > profiles.yaml `whisper:` section >
-    # $WHISPER_BIN_DIR > whisper-server on PATH).  Single host binary.
-    whisper_cfg = profiles_cfg.get("whisper") or {}
-    whisper_bin_raw = (args.whisper_server or whisper_cfg.get("bin")
-                       or os.environ.get("WHISPER_BIN_DIR") or shutil.which("whisper-server"))
-    whisper_bin = None
-    if whisper_bin_raw:
-        cand = Path(str(whisper_bin_raw))
-        if cand.is_dir():  # WHISPER_BIN_DIR may be a directory (mirrors LLAMA_BIN_DIR)
-            cand = cand / "whisper-server"
-        whisper_bin = str(cand)
+    # audio-cpp backend layering (resolved in AudioCppBackend.build_cmd):
+    # sidecar `audio_cpp.backend` > explicit (this chain) > vendor auto
+    # (NVIDIA->cuda, AMD->vulkan, else cpu) > cpu.
+    audio_cpp_cfg = profiles_cfg.get("audio_cpp") or {}
+    audio_cpp_bin = resolve_host_binary(
+        args.audio_cpp_server, audio_cpp_cfg.get("bin"), "AUDIOCPP_BIN_DIR",
+        "audiocpp_server")
+    whisper_bin = resolve_host_binary(
+        args.whisper_server, (profiles_cfg.get("whisper") or {}).get("bin"),
+        "WHISPER_BIN_DIR", "whisper-server")
+    sd_bin = resolve_host_binary(
+        args.sd_server, (profiles_cfg.get("sd") or {}).get("bin"),
+        "SD_BIN_DIR", "sd-server")
+    audio_cpp_backend = str(args.audio_cpp_backend
+                            or audio_cpp_cfg.get("backend") or "").lower()
+    if audio_cpp_backend in ("auto",):
+        audio_cpp_backend = ""
+    audio_cpp_backend_auto = {"nvidia": "cuda", "amd": "vulkan"}.get(
+        detect_gpu_vendor(), "cpu")
 
-    # kokoro-podman resource configuration (CLI > profiles.yaml `t2s:` section >
-    # vendor-detected upstream image).  `vendor:` (auto|nvidia|amd|cpu) picks
-    # the default image tag AND device flags; `image:`/--kokoro-image overrides
-    # the tag only; `podman_args:` replaces the auto device flags entirely.
-    t2s_cfg = profiles_cfg.get("t2s") or {}
-    kokoro_vendor = str(t2s_cfg.get("vendor") or detect_gpu_vendor())
-    if kokoro_vendor not in KOKORO_DEFAULT_IMAGES:
-        logger.warning("profiles.yaml t2s.vendor: %r unknown (auto/nvidia/amd/cpu); "
-                       "using cpu defaults", kokoro_vendor)
-        kokoro_vendor = "cpu"
-    kokoro_image = str(args.kokoro_image or t2s_cfg.get("image")
-                       or KOKORO_DEFAULT_IMAGES[kokoro_vendor])
+    # Probe the binary's compiled backends once (fast: --list-devices loads
+    # the ggml registry).  Parsed device labels map to the server-JSON enum;
+    # build_cmd warns when an emitted backend is missing from the probe.
+    audio_cpp_probe = ""
+    if audio_cpp_bin and os.access(audio_cpp_bin, os.X_OK):
+        _probe_labels = {"VULKAN": "vulkan", "CPU": "cpu", "CUDA": "cuda",
+                         "ROCM": "hip", "HIP": "hip", "METAL": "metal"}
+        try:
+            probe = subprocess.run([audio_cpp_bin, "--list-devices"],
+                                   capture_output=True, text=True,
+                                   timeout=30, check=False)
+            found = {_probe_labels[m.group(1).upper()]
+                     for line in (probe.stdout + probe.stderr).splitlines()
+                     if (m := re.match(r"\s*([A-Za-z]+):\d+", line))
+                     and m.group(1).upper() in _probe_labels}
+            if found:
+                audio_cpp_probe = ",".join(sorted(found))
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("audio-cpp: backend probe failed for %s: %s",
+                         audio_cpp_bin, exc)
 
     # Discover models via a depth-first walk.  The scope stack carries the
     # global override rules (bottom scope); each directory's models.yaml is
@@ -558,14 +730,18 @@ def main(argv: list[str] | None = None) -> None:
             "vllm_bin": vllm_bin,
             "sd_bin": sd_bin or "",
             "whisper_bin": whisper_bin or "",
-            "kokoro_image": kokoro_image,
+            "audio_cpp_bin": audio_cpp_bin or "",
+            # Container runtimes: probed once so container transports are only
+            # inferred when their runtime is actually on PATH.
+            "docker": bool(shutil.which("docker")),
+            "podman": bool(shutil.which("podman")),
         },
         allowed=[str(b) for b in backends_cfg] or None,
     )
     stack.push({"overrides": profiles_cfg.get("overrides")},
                origin=str(profiles_path))
     models = discover(models_dirs, stack=stack,
-                      generate_stubs=not args.no_stubs,
+                      generate_stubs=args.create_stubs,
                       extra_dirs=args.extra_dirs, dir_roles=dir_roles,
                       hf_home=hf_home)
     if not models:
@@ -645,15 +821,30 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["vllm_bin"] = vllm_bin
     template_vars.setdefault("sd_bin", "sd-server")
     template_vars.setdefault("whisper_bin", "whisper-server")
-    template_vars["kokoro_image"] = kokoro_image
-    template_vars["kokoro_vendor"] = kokoro_vendor
-    template_vars["podman_args"] = str(t2s_cfg.get("podman_args") or "")
-    template_vars["kokoro_container_port"] = str(
-        t2s_cfg.get("container_port") or KOKORO_CONTAINER_PORT)
-    if t2s_cfg.get("voices_dir"):
-        template_vars["voices_dir"] = str(t2s_cfg["voices_dir"])
+    template_vars["audio_cpp_bin"] = audio_cpp_bin or AUDIO_CPP_DEFAULT_BIN
+    if audio_cpp_backend:
+        template_vars["audio_cpp_backend"] = audio_cpp_backend
+    template_vars["audio_cpp_backend_auto"] = audio_cpp_backend_auto
+    if audio_cpp_probe:
+        template_vars["audio_cpp_bin_backends"] = audio_cpp_probe
+    for _knob in AUDIO_CPP_SERVER_KNOBS:
+        _value = audio_cpp_cfg.get(_knob)
+        if _value in (None, ""):
+            continue
+        if _knob == "voice_dir":
+            # Upstream resolves relative voice_dir against the config file's
+            # directory (/tmp/llama-swap/) — always emit an absolute path.
+            _value = os.path.abspath(os.path.expanduser(str(_value)))
+        template_vars[f"audio_cpp_{_knob}"] = str(_value)
+    _tmpdir = audio_cpp_cfg.get("tmpdir")
+    if _tmpdir not in (None, ""):
+        template_vars["audio_cpp_tmpdir"] = str(_tmpdir)
 
     template_vars["docker_args"] = str(vllm_cfg.get("docker_args") or VLLM_DEFAULT_DOCKER_ARGS)
+    # GPU vendor for container device flags (docker --runtime/--gpus vs
+    # podman --device); overridable per run via profiles.yaml.
+    template_vars["container_vendor"] = str(
+        vllm_cfg.get("container_vendor") or detect_gpu_vendor())
     template_vars["container_port"] = str(vllm_cfg.get("container_port") or VLLM_DEFAULT_CONTAINER_PORT)
     # Host HF_HOME root bind-mounted into vllm-docker containers
     # (/root/.cache/huggingface).  HF_HUB_OFFLINE forbids downloads, so this
@@ -662,8 +853,8 @@ def main(argv: list[str] | None = None) -> None:
     template_vars["hf_cache"] = str(vllm_cfg.get("hf_cache")
                                     or profiles_cfg.get("hf_home") or "")
     template_vars["vllm_args"] = backend_args(vllm_cfg, "vllm")
-    template_vars["sd_args"] = backend_args(sd_cfg, "sd")
-    template_vars["whisper_args"] = backend_args(whisper_cfg, "whisper")
+    template_vars["sd_args"] = backend_args(profiles_cfg.get("sd"), "sd")
+    template_vars["whisper_args"] = backend_args(profiles_cfg.get("whisper"), "whisper")
     template_vars["llama_args"] = backend_args(profiles_cfg.get("llama_server"), "llama_server")
     # The named batch/ubatch keys render after the global args and win per
     # flag: args -b/-ub would be silently shadowed — point at the keys.
@@ -690,8 +881,24 @@ def main(argv: list[str] | None = None) -> None:
                     template_vars["gpu_mem_util"])
 
     # Detect matrix configuration before build_config
-    matrix_cfg, embed_model, rerank_model = _detect_matrix(
-        profiles_cfg, models, args, logger)
+    (matrix_cfg, embed_model, rerank_model, matrix_categories,
+     matrix_fixed) = _detect_matrix(profiles_cfg, models, args, logger)
+
+    # ── Degenerate-budget refusal ──
+    # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):
+    # nothing can load.  Refuse here, before any VRAM work, so the existing
+    # working config is never overwritten by an empty one.
+    spare_check_mb = Profiles(profiles_cfg).global_spare_mb(args.spare,
+                                                            gpu.vram_mb)
+    reserve_check = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, gpu.baseline_mb)
+    available_check = gpu.vram_mb - reserve_check - spare_check_mb
+    if gpu.vram_mb > 0 and available_check <= 0:
+        fatal("VRAM budget exhausted: %d MiB total - %d MiB reserve - "
+              "%d MiB spare = %d MiB available. Nothing can load; "
+              "not overwriting the existing config. Reduce --spare or "
+              "--baseline.",
+              gpu.vram_mb, reserve_check, spare_check_mb,
+              int(available_check))
 
     # Build config (progress bar appears only once the denominator is
     # known — total=len(models); without rich / non-TTY it is a no-op).
@@ -714,6 +921,7 @@ def main(argv: list[str] | None = None) -> None:
             models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
             spare=args.spare, max_context=max_ctx,
             matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
+            fixed_categories=matrix_fixed,
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
@@ -733,7 +941,8 @@ def main(argv: list[str] | None = None) -> None:
     if not args.no_macros:
         from llama_packer.macros import Macro, Macros
         Macro.clear()
-        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub)
+        Macros(profiles_cfg, Profiles(profiles_cfg), models_dirs, sub,
+               hf_home=hf_home)
         # Apply env substitution to flag macro definitions as well (they were
         # built with placeholder-aware sub, but ensure consistency)
         flag_macros = Macro.definitions()
@@ -747,6 +956,12 @@ def main(argv: list[str] | None = None) -> None:
             if cmd:
                 entry["cmd"] = Macro.apply(cmd)
     if not config.get("models"):
+        if args.spare or args.baseline:
+            fatal("no model entries generated — VRAM reservation "
+                  "(--spare %s, --baseline %s) leaves too little budget "
+                  "for any model; not overwriting the existing config. "
+                  "Reduce the reservation or wait for other programs to "
+                  "exit.", args.spare or "none", args.baseline or "none")
         fatal("no model entries generated")
     logger.info("entries: %d generated", len(config["models"]))
 
@@ -767,43 +982,104 @@ def main(argv: list[str] | None = None) -> None:
     # ── Swap matrix: build matrix vars if configured ──
     if matrix_cfg and embed_model and rerank_model:
         vars_, coload_vars = _build_matrix_vars(
-            models, embed_model, rerank_model, config.coload_stems,
-            config.entry_ids_by_stem, logger)
+            models, embed_model, rerank_model, matrix_categories,
+            config.coload_stems, config.entry_ids_by_stem, logger)
         chat_var_names = [k for k in vars_ if re.fullmatch(r"c\d+", k)]
-        # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
-        chat_expr = "(" + " | ".join(chat_var_names) + ")"
-        sets_cfg = matrix_cfg.get("sets") or {}
-        sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars, logger)
-        if coload_vars:
-            joined = " ".join(str(s) for s in sets_cfg.values())
-            if "__COLOAD_VARS__" not in joined:
-                logger.info(
-                    "matrix: co-loads %s included but no set references "
-                    "__COLOAD_VARS__; they stay outside the co-loading sets",
-                    coload_vars)
-        # llama-swap schema: matrix lives under routing.router.settings.matrix,
-        # not at the top level.
-        config["routing"] = {
-            "router": {
-                "use": "matrix",
-                "settings": {"matrix": {
-                    "vars": vars_,
-                    "evict_costs": matrix_cfg.get("evict_costs", {}),
-                    "sets": sets,
-                }},
-            },
-        }
+        if not chat_var_names:
+            # Every chat model was disabled by VRAM gating — a degenerate
+            # empty OR-list would be a syntactically valid but semantically
+            # broken set.  Skip matrix routing entirely: models serve
+            # individually (no co-loading) until a looser budget brings
+            # chat entries back.
+            logger.warning(
+                "matrix: no chat models survived VRAM gating; skipping "
+                "matrix routing (models will serve individually)")
+        else:
+            # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
+            chat_expr = "(" + " | ".join(chat_var_names) + ")"
+            sets_cfg = matrix_cfg.get("sets") or {}
+            # Per-set chat lists: a model that cannot meet its usage demands
+            # beside a set's residents is dropped from that set only.  An
+            # untagged model is in every set, exactly as before.
+            id_stem = {eid: stem
+                       for stem, ids in config.entry_ids_by_stem.items()
+                       for eid in ids}
+            # Admission is per entry: (stem, category). The fallback entry has
+            # no category name and joins no set.
+            id_cat = {eid: config.entry_category.get(eid)
+                      for eid, _ in id_stem.items()}
+            per_set: dict[str, list[str]] = {}
+            if config.set_admission:
+                for sname in sets_cfg:
+                    per_set[sname] = []
+                for var in chat_var_names:
+                    key = (id_stem.get(vars_[var], "") or var,
+                           id_cat.get(vars_[var]))
+                    admitted = config.set_admission.get(key)
+                    # No entry means this serving was never judged against a
+                    # set -- an untagged model belongs everywhere, as before.
+                    if admitted is None or sname in admitted:
+                        per_set[sname].append(var)
+                dropped = {s: sorted(set(chat_var_names) - set(v))
+                           for s, v in per_set.items()
+                           if set(v) != set(chat_var_names)}
+                for sname, gone in sorted(dropped.items()):
+                    if gone:
+                        stems = sorted({id_stem.get(vars_[g], g) or g
+                                        for g in gone})
+                        logger.info(
+                            "usage: set %r excludes %d chat model(s) that "
+                            "cannot meet their demands beside it: %s",
+                            sname, len(stems),
+                            ", ".join(st[:24] for st in stems[:8])
+                            + (" ..." if len(stems) > 8 else ""))
+            sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars,
+                                       logger,
+                                       chat_expr_by_set={
+                                           s: "(" + " | ".join(v) + ")"
+                                           for s, v in per_set.items() if v})
+            if coload_vars:
+                joined = " ".join(str(s) for s in sets_cfg.values())
+                if "__COLOAD_VARS__" not in joined:
+                    logger.info(
+                        "matrix: co-loads %s included but no set references "
+                        "__COLOAD_VARS__; they stay outside the co-loading "
+                        "sets", coload_vars)
+            # llama-swap schema: matrix lives under routing.router.settings.
+            # matrix, not at the top level.
+            config["routing"] = {
+                "router": {
+                    "use": "matrix",
+                    "settings": {"matrix": {
+                        "vars": vars_,
+                        "evict_costs": matrix_cfg.get("evict_costs", {}),
+                        "sets": sets,
+                    }},
+                },
+            }
 
     # Top-level llama-swap settings
     config["healthCheckTimeout"] = hct
+    if args.idle_unload is not None:
+        if args.idle_unload < 0:
+            fatal("--idle-unload must be >= 0 (0 disables idle unloading)")
+        config["globalTTL"] = args.idle_unload
 
     output_path = Path(args.output).absolute()
 
     if args.dry_run:
         payload = config.plain() if isinstance(config, EmittedConfig) else config
-        sys.stdout.write(yaml.dump(payload, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        sys.stdout.write(dump_yaml(
+            payload, getattr(config, "set_overheads", None)))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
+        utils.note_fs_op("write", output_path)
+        utils.note_fs_op("write", output_path.with_name("config.env"))
+        # Report what was withheld, so a preview is evidence. The count is
+        # the headline: a reader should not have to grep the log to learn
+        # that nothing was touched.
+        logger.info("dry run: nothing was written — config, config.env, stub "
+                    "sidecars and derived: caches all withheld")
     else:
         write_yaml(config, output_path)
         logger.info("written: %s", output_path)

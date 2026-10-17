@@ -29,6 +29,10 @@ chat/
 log
 parallel.log
 
+# Working scratchpad — untracked again; the B+C plan it carried stays
+# readable in the history of the commit that added it.
+todo.md
+
 # Large build artifacts / model weights (not source)
 .old/
 llama-b*/

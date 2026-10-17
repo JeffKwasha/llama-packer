@@ -8,6 +8,8 @@ import os
 import sys
 import types
 
+import pytest
+
 from llama_packer.progress import PackerProgress
 
 
@@ -34,6 +36,7 @@ def test_active_bar_routes_logs_through_console(monkeypatch):
     """While the bar is live, log records render through the bar's rich
     console (which prints them ABOVE the bar) and the previous handlers are
     restored on stop."""
+    pytest.importorskip("rich")          # the bar is a no-op without it
     import llama_packer.progress as prog
 
     p = prog.PackerProgress(enabled=True)
@@ -58,6 +61,7 @@ def test_active_bar_routes_logs_through_console(monkeypatch):
 
 
 def test_active_bar_restores_handlers_even_on_stop_error(monkeypatch):
+    pytest.importorskip("rich")
     import llama_packer.progress as prog
 
     p = prog.PackerProgress(enabled=True)

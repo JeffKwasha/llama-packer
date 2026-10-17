@@ -3,11 +3,46 @@
 Helper scripts that live next to this repo but aren't part of the
 llama-packer Python package.
 
-- [`update`](update) — downloads/installs prebuilt `llama.cpp` + `llama-swap`
-  binaries into the **current working directory**. Run `./extras/update --help`
-  for options. The CPU architecture is auto-detected for both downloads
-  (llama.cpp `x64`/`arm64`; llama-swap `linux_amd64`/`linux_arm64`); `--arch`
-  overrides it. Run it from wherever you want the binaries installed.
+- [`update.py`](update.py) — downloads/installs prebuilt server binaries into
+  the **current working directory**. Run `./extras/update.py --help` for options.
+  Pure stdlib Python (no venv/deps), so it runs on a bare box too.
+  **Targets are positional selectors** — `llama`/`ll`, `cpp`, `swap`, `audio`/`a`,
+  `whisper`/`w`, `sd`/`stable`, and `all` for everything. Globs work (`s*`), and an
+  ambiguous prefix is an error rather than a guess. `all` is matched in full only,
+  because `a` is an alias for audio.cpp — otherwise the one-letter shorthand would
+  be ambiguous. A bare `./extras/update.py` still updates only **llama.cpp +
+  llama-swap**; `all` adds the other three. Only llama-swap publishes a
+  `checksums.txt`, so it is the only one of the five that gets a real sha256
+  check.
+  Backends are positional too (`vulkan`, `rocm`, `cpu`); llama.cpp takes them as
+  part of its legacy version token. Per-project quirks are handled: audio.cpp
+  follows llama.cpp's asset naming and ships binaries on its semver tag; whisper.cpp
+  publishes a semver tag *and* an asset-less build tag per release (only `bNNNN`
+  carries binaries) and ships a **bundle** whose `.so` files travel with the binary
+  via `RUNPATH=$ORIGIN`; stable-diffusion.cpp versions as `master-N-<sha>`, ships
+  **zips** rather than tarballs, spells the arch `x86_64`, is also a bundle, and
+  has both Vulkan and ROCm Linux builds.
+  The CPU architecture is auto-detected for all downloads
+  (llama.cpp/audio.cpp/whisper `x64`/`arm64`, stable-diffusion `x86_64`/`aarch64`;
+  llama-swap `linux_amd64`/`linux_arm64`); `--arch` overrides it. Run it from
+  wherever you want the binaries installed. Superseded versions are pruned after
+  each install — the newest 3 `llama-b*/` dirs and the newest 2 versioned entries
+  per engine (`--keep-swap N`, `--keep-engine-versions N`); anything a symlink still
+  points at is kept. **llama-swap downloads are sha256-verified against the
+  release `checksums.txt`** before anything is installed, and a mismatch
+  quarantines the file as `_HASH_FAIL_*` and leaves the current binary alone.
+  No other target publishes a manifest — checked against the b11658 llama.cpp
+  release, whose 36 assets are all binaries — so the rest are pinned to an
+  immutable tag URL over TLS and nothing more. That is a real limit, and it is
+  stated rather than papered over. Rewritten from bash in
+  2026-10: `--help` now exits 0 instead of 1, and `. extras/update.py --help`
+  (sourcing) can no longer kill your shell the way the bash version did.
+- [`install.py`](install.py) — deploys llama-swap under systemd from a run
+  directory (`/opt/llama` by default), running as a chosen system user:
+  creates the account, installs the binaries, regenerates `config.yaml` with
+  llama-packer, writes the hardened [`llama-swap.service.in`](llama-swap.service.in)
+  unit, enables and starts it. See [docs/install.md](../docs/install.md).
+  Run `./extras/install.py --help`; `--dry-run` prints every change first.
 - [`fit-sweep`](fit-sweep) — llama-fit-params VRAM data points for the affine
   law `VRAM(C, p) = fixed + c·C + D·p`. Header-only (~0.6 s/run, no tensor
   data, no server, no meaningful VRAM use): safe on platter storage and

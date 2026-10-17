@@ -68,10 +68,10 @@ from llama_packer.consts import (
     _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
     _WEIGHT_CPU_MAP_TOLERANCE_MIB,
-    _KOKORO_COMPUTE_MB,
+    _AUDIO_CPP_COMPUTE_MB,
     ESTIMATE_ERROR_REASON,
 )
-from llama_packer.backends import (FIXED_OVERHEAD_BACKENDS, KOKORO_BACKENDS,
+from llama_packer.backends import (AUDIO_CPP_BACKENDS, FIXED_OVERHEAD_BACKENDS,
                                    SD_BACKENDS, VLLM_BACKENDS,
                                    WHISPER_BACKENDS, get_backend)
 
@@ -89,7 +89,7 @@ _FIT_PARAMS_REQUIRED = frozenset(
 # Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
                      **{n: _WHISPER_COMPUTE_MB for n in WHISPER_BACKENDS},
-                     **{n: _KOKORO_COMPUTE_MB for n in KOKORO_BACKENDS}}
+                     **{n: _AUDIO_CPP_COMPUTE_MB for n in AUDIO_CPP_BACKENDS}}
 
 # Persisted blocks acceptable without re-measurement.  The retired plain
 # fit-params measurement (KV-pool only, no corrections) is deliberately
@@ -544,6 +544,15 @@ class VramBudget:
         #: Set when no estimate source worked for this model — the planner
         #: surfaces it as metadata.estimated/estimate_error on every entry.
         self.unestimated_reason: str | None = None
+        #: Set when the budget cannot even hold weights + compute (the model
+        #: cannot load at any context) — the planner disables the entry.
+        #: ``None`` when the budget fits; reset at the top of every
+        #: ``calc_ctx`` call so each solve reports its own budget.
+        self.over_budget_reason: str | None = None
+        #: Set when the design context did not fit and the solve fell back to
+        #: a smaller context — the planner stamps a description note.
+        #: Reset alongside ``over_budget_reason`` on every ``calc_ctx`` call.
+        self.vram_squeezed: bool = False
 
     # ── saved fit-params from frontmatter ──
 
@@ -864,8 +873,9 @@ class VramBudget:
         # The correction's mtp dimension means "a draft is baked into the
         # main GGUF" — that is what the witness measured and what delta_d
         # prices.  A separate draft companion does not qualify (its cost
-        # is folded in by effective_static instead).
-        mtp_on = self.model.mtp is None and self.model._mtp_info()[0]
+        # is folded in by effective_static instead).  Model.mtp_baked_in is
+        # the same predicate memory_probe files the row under.
+        mtp_on = self.model.mtp_baked_in
         corr = get_serve_correction(self.model.arch or "unknown", cache_type,
                                     mtp_on, shape)
         if corr is not None:
@@ -917,6 +927,7 @@ class VramBudget:
         fit_bin: str,
         cache_type: str = "q8_0",
         llama_args: str = "",
+        allow_cpu: bool = False,
     ) -> FitParams | None:
         """Get affine VRAM constants for this model at *cache_type*.
 
@@ -929,17 +940,22 @@ class VramBudget:
         ``-ub``) — the in-memory cache and the persisted block are both
         shape-bound, so a profiles/batch-key change re-measures instead of
         reusing stale compute terms.  ``remeasure`` (CLI ``--remeasure``)
-        skips the saved-block path entirely.
+        skips the saved-block path entirely.  ``allow_cpu`` measures
+        CPU-resident models too (their constants describe host RAM, used
+        for the emitted memory tag — never for VRAM sizing); without it
+        CPU-resident models return None as before.
         """
         shape = (llama_args or "").strip()
         if (cache_type, shape) in self._static_cache:
             return self._static_cache[(cache_type, shape)]
 
-        if self.model.backend in FIXED_OVERHEAD_BACKENDS \
-                or getattr(self.model, "on_cpu", False):
+        if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Fixed-overhead backends are sized from file size + a fixed
             # buffer (effective_static); CPU-resident models are not
             # VRAM-bound.  Neither has meaningful FitParams.
+            return None
+        if getattr(self.model, "on_cpu", False) and not allow_cpu:
+            # CPU-resident models are not VRAM-bound (see allow_cpu).
             return None
 
         # 1. Saved values from frontmatter (legacy fit-params blocks and
@@ -1125,7 +1141,9 @@ class VramBudget:
         cache_type: str = "q8_0",
         design_ctx: int | None = None,
         include_mmproj: bool = True,
+        include_draft: bool = True,
         llama_args: str = "",
+        allow_cpu: bool = False,
     ) -> tuple[int, float, float, int] | None:
         """Combined affine VRAM constants for main model plus its companions.
 
@@ -1134,15 +1152,22 @@ class VramBudget:
         numbers, so downstream context math sees a single budget.  The MTP
         draft is folded only when the main block did *not* come from the
         serve-shaped measurement — those blocks are measured with the
-        draft running and already carry it.
+        draft running and already carry it.  ``allow_cpu`` is passed
+        through to :meth:`fit_params_static` (host-RAM constants for the
+        emitted memory tag on CPU-resident models).
+
+        *include_draft* is the ladder's ``draft`` axis: a category may keep
+        an MTP companion or give it up to buy context. A draft baked into
+        the main block is not separable and stays counted either way.
         """
-        cache_key = ("effective", cache_type, include_mmproj, llama_args)
+        cache_key = ("effective", cache_type, include_mmproj, include_draft,
+                     llama_args)
         if cache_key in self._effective_cache:
             return self._effective_cache[cache_key]
 
-        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t,
-        # kokoro-podman t2s): VRAM = weights (file size, 0 when baked into the
-        # image) + a fixed runtime buffer, no KV terms.  These are excluded
+        # Fixed-overhead backends (sd-server diffusion, whisper-server s2t):
+        # VRAM = weights (file size, 0 when baked into a container image) + a
+        # fixed runtime buffer, no KV terms.  These are excluded
         # from the shared chat matrix, so precise factors are irrelevant;
         # calc_ctx returns design_ctx when kv_per_token_mib==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
@@ -1171,7 +1196,8 @@ class VramBudget:
             return params
 
         main = self.fit_params_static(fit_bin, cache_type=cache_type,
-                                      llama_args=llama_args)
+                                       llama_args=llama_args,
+                                       allow_cpu=allow_cpu)
         if main is None:
             return None
 
@@ -1188,7 +1214,7 @@ class VramBudget:
         slot_mib = main.slot_mib
         compute_mib = main.compute_mib
 
-        if main.source != "llama-server" and self.model.mtp \
+        if include_draft and main.source != "llama-server" and self.model.mtp \
                 and self.model.mtp.gguf_path:
             draft = self._companion_fit(self.model.mtp, main,
                                         cache_type=cache_type)
@@ -1221,6 +1247,7 @@ class VramBudget:
         parallel: int = 1,
         spare_mb: int = 0,
         include_mmproj: bool = True,
+        include_draft: bool = True,
         baseline_mb: int = 0,
         cache_type: str = "q8_0",
         design_ctx: int | None = None,
@@ -1248,10 +1275,18 @@ class VramBudget:
         if self.model.on_cpu:
             return self._design_ctx()
 
+        # Each solve reports its own budget: clear the gating flags so a
+        # tight group's verdict does not leak into a looser group's plan.
+        self.over_budget_reason = None
+        self.vram_squeezed = False
+
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
         available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
         if available <= 0:
+            self.over_budget_reason = (
+                f"VRAM budget exhausted: {int(available)} MiB available "
+                f"(total {vram_total_mb} - reserve {reserve} - spare {spare_mb})")
             logger.warning("available VRAM <= 0 for %s (spare=%d)",
                            self.model.stem, spare_mb)
             return _MIN_CTX_SIZE
@@ -1262,6 +1297,7 @@ class VramBudget:
         static = self.effective_static(
             fit_bin, cache_type=cache_type,
             design_ctx=design, include_mmproj=include_mmproj,
+            include_draft=include_draft,
             llama_args=llama_args,
         )
 
@@ -1281,13 +1317,15 @@ class VramBudget:
         model_mib, kv_per_token, slot_mib, compute_mib = static
         remaining = available - model_mib - compute_mib
         if remaining <= 0:
+            self.over_budget_reason = (
+                f"weights + compute need {int(model_mib + compute_mib)} MiB, "
+                f"only {int(available)} MiB budgeted (VRAM {vram_total_mb} - "
+                f"reserve {reserve} - spare {spare_mb})")
             logger.warning(
                 "%s: weights + compute need %d MiB, only %d MiB budgeted "
-                "(VRAM %d - reserve %d - spare %d) — serving at minimum "
-                "context %d",
+                "(VRAM %d - reserve %d - spare %d) — model cannot load",
                 self.model.stem, int(model_mib + compute_mib),
-                int(available), vram_total_mb, reserve, spare_mb,
-                _MIN_CTX_SIZE)
+                int(available), vram_total_mb, reserve, spare_mb)
             return _MIN_CTX_SIZE
 
         # Image token budget: image tokens are ordinary tokens inside the
@@ -1299,35 +1337,94 @@ class VramBudget:
         # If design context fits, use it (capped by sidecar context_length)
         design_cost = (kv_per_token * design + slot_mib) * parallel
         if design_cost <= remaining:
-            sidecar_ctx = self.model.frontmatter.get("context_length")
-            if sidecar_ctx is not None:
-                ctx = min(design, sidecar_ctx)
-            else:
-                ctx = design
+            sidecar_ctx = self._sidecar_ceiling()
+            ctx = min(design, sidecar_ctx) if sidecar_ctx is not None else design
             return self._raise_to_image_floor(ctx, img_floor, cap=ctx,
                                               affordable=ctx)
+
+        # Design context does not fit: serve smaller and tell the planner
+        # (the emitted description gets an over-budget note).
+        self.vram_squeezed = True
 
         # Solve the affine equation for the per-slot context
         if kv_per_token <= 0:
             return _MIN_CTX_SIZE
         max_ctx = int((remaining - slot_mib * parallel)
                       / (kv_per_token * parallel))
+        if max_ctx < _MIN_CTX_SIZE:
+            # It loads, but not at a context worth serving. Clamping *up* to
+            # _MIN_CTX_SIZE emits an entry asking for more VRAM than
+            # remains -- the one failure this tool exists to prevent -- and
+            # _auto_parallel reads that clamped value as feasible, so the
+            # flaw propagates into slot choice. Overbudget instead: the
+            # planner retries text-only, then omits the stem. A model not
+            # fitting is ordinary (--spare 24G leaves most of the fleet
+            # unable to run, and emitting what fits is the whole point);
+            # emitting a config that cannot load is not.
+            self.over_budget_reason = (
+                f"weights + {parallel} slot(s) leave {int(remaining)} MiB, "
+                f"which buys {max_ctx} context tokens — below the "
+                f"{_MIN_CTX_SIZE} minimum")
+            logger.warning("%s: cannot serve — %s", self.model.stem,
+                           self.over_budget_reason)
+            return 0
         ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)
+        # The sidecar's context_length is an operator ceiling, and it binds
+        # here exactly as it does when the design context fits. Without this
+        # the two branches disagree: the same model with the same sidecar
+        # got 32768 when it fit and 98304 when VRAM forced the squeeze, and
+        # _bounded_ctx's own clamp could not recover it because the caller
+        # passes design_context (the GGUF architectural max, which prefers
+        # the header over the sidecar) as the cap.
+        sidecar_ctx = self._sidecar_ceiling()
+        if sidecar_ctx is not None:
+            ctx = min(ctx, sidecar_ctx)
         return self._raise_to_image_floor(ctx, img_floor,
                                           cap=max_ctx, affordable=max_ctx)
 
-    def _image_floor_tokens(self, include_mmproj: bool) -> int:
-        """Per-slot token floor that must stay reservable for image tokens.
+    def _sidecar_ceiling(self) -> int | None:
+        """The sidecar's declared ``context_length``, if it declares one.
 
-        ``image_max_tokens`` when the vision projection is served and the
-        sidecar declares a cap; 0 otherwise.
+        Read from frontmatter rather than :attr:`design_context` on purpose:
+        design_context prefers the GGUF header's architectural maximum, which
+        is a capability ceiling, not an operator decision. These differ --
+        a model trained at 128k and shipped with ``context_length: 32768``
+        in its sidecar means it.
+        """
+        value = self.model.frontmatter.get("context_length")
+        if value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _image_floor_tokens(self, include_mmproj: bool) -> int:
+        """Per-slot token floor that must stay reservable for image + answer.
+
+        The floor is the image's own token budget plus a reserve for the
+        model to answer in: an entry sized to exactly the image budget could
+        see the picture and then have nothing left to describe it with.
+
+        The image budget comes from ``min_image_megapixels`` — the operator's
+        resolution knob, converted through the projector geometry — when it
+        can be honoured, else from the legacy ``image_max_tokens`` cap.
+        Applies to both mmproj and native vision models: a declared image
+        budget is itself the indicator that the model processes images.
         """
         if not include_mmproj:
             return 0
-        if not (self.model.mmproj and self.model.mmproj.gguf_path):
+        image = self.model.min_image_tokens
+        if image is None:
+            image = self.model.image_max_tokens
+        if not image:
             return 0
-        return self.model.image_max_tokens or 0
+        cap = self.model.image_max_tokens
+        if cap is not None and image > cap:
+            image = cap
+        return image + self.model.image_output_reserve_tokens
 
     def _raise_to_image_floor(
         self, ctx: int, floor: int, cap: int, affordable: int,
@@ -1457,6 +1554,18 @@ def solve_matrix_ctx(
             continue
         ctx = int((chat_budget - slot_mib * parallel)
                   / (kv_factor * parallel))
+        if ctx < _MIN_CTX_SIZE:
+            # Skip rather than clamp up. This loop keeps the *maximum* over
+            # chat models, so one model clamped to a context it cannot afford
+            # would raise the shared bar for every other chat model, pushing
+            # them into their own squeeze. They are alternatives that evict
+            # each other; the shared context is what the fleet can actually
+            # afford, never what the most desperate participant wishes for.
+            logger.warning(
+                "matrix: %s skipped — weights + %d slot(s) leave %d MiB, "
+                "below the %d-token minimum", model.stem, parallel,
+                int(chat_budget), _MIN_CTX_SIZE)
+            continue
         # The image token floor is raise-to-fit only when it was already
         # affordable; a larger floor cannot buy VRAM it doesn't have.
         if img_floor > ctx:
@@ -1465,7 +1574,6 @@ def solve_matrix_ctx(
                 "the solved chat ctx %d; large images may not fit",
                 model.stem, img_floor, ctx)
         ctx = (ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
-        ctx = max(ctx, _MIN_CTX_SIZE)
         arch_max = model.design_context
         ctx = min(ctx, arch_max)
         best_ctx = max(best_ctx, ctx)

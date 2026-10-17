@@ -167,7 +167,7 @@ def test_validate_dir_roles():
 # ── Entry-id collision detection ───────────────────────────────────────────
 
 def test_emit_config_duplicate_id_raises(make_model):
-    from llama_packer.writer import emit_config, Planner, TEXT_SUFFIX
+    from llama_packer.writer import emit_config, Planner
 
     # template_id is slug of sidecar stem (not name). Two different stems that
     # slug to the same id are "my model" and "my-model" -> both "my-model".
@@ -184,12 +184,10 @@ def test_emit_config_duplicate_id_raises(make_model):
     from llama_packer.writer import Variant
     v = Variant(parallel=1, cache_type="q8_0", spare_mb=0,
                 profiles_group=[("default", {})], ctx_size=4096,
-                include_mmproj=True, vision_ctx=None)
+                include_mmproj=True)
     plans = {m.stem: [v] for m in (a, b)}
 
     profiles = P()
     profiles.defaults = {}
     with pytest.raises(ValueError, match="duplicate entry id"):
         emit_config([a, b], plans, profiles, {})
-
-    assert TEXT_SUFFIX == "-text"

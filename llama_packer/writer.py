@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import copy
 import logging
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable, Container, Iterable, Mapping
 
 import yaml
 
@@ -24,11 +26,15 @@ from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
 from llama_packer.consts import (
+    DEFAULT_SACRIFICE_ORDER,
+    KNOWN_CAPABILITIES,
     _DIFFUSION_ARCH_RES,
     _KV_CACHE_BYTES,
+    _LLAMA_CPP_DEFAULT_UBATCH,
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
+    _RESERVE_VIDEO,
     ESTIMATE_ERROR_REASON,
 )
 from llama_packer.profiles import Profiles, parse_spare_mb
@@ -55,8 +61,70 @@ def _model_can_reason(model: Model) -> bool:
 
 
 def _strip_repeat_ws(text: str) -> str:
-    """Collapse runs of whitespace to single spaces (templates with | blocks)."""
-    return " ".join(text.split())
+    """Collapse runs of whitespace to single spaces (templates with | blocks).
+
+    Newlines are preserved: multi-line values (e.g. audio-cpp's heredoc
+    ``cmd``) depend on them.
+    """
+    return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def _fmt_mib(mib: float) -> str:
+    """Human memory size: ``X.XGB`` at/above 1 GiB, integer ``MB`` below.
+
+    Small values stay truthful (``RAM 64MB``, never ``0.0GB``) so a tiny
+    host residue is distinguishable from a missing number.
+    """
+    if mib >= 1024:
+        return f"{mib / 1024:.1f}GB"
+    return f"{int(round(mib))}MB"
+
+
+def format_mem_tag(
+    vram_mib: float | None,
+    ram_mib: float,
+    *,
+    spill_mib: float | None = None,
+    ssd_mib: float | None = None,
+) -> str:
+    """Memory-allocation tag appended to emitted entry descriptions.
+
+    A verbatim report of the decided TOTAL allocation attributable to the
+    entry (weights + companions + context at the served ``(ctx, slots)``)
+    — never capped, never re-solved: an impossible-looking ``VRAM 73.0GB``
+    on a 32 GB card is printed as decided.  ``vram_mib=None`` is a
+    CPU-resident serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
+    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (disk-resident weights)
+    are reserved grammar for a future allocator that decides a split —
+    today's allocator never splits, so callers leave them None.
+    """
+    if vram_mib is None:
+        tag = f"RAM {_fmt_mib(ram_mib)}"
+    else:
+        vram_part = f"VRAM {_fmt_mib(vram_mib)}"
+        if spill_mib is not None:
+            vram_part += f" + {_fmt_mib(spill_mib)}"
+        tag = f"{vram_part} RAM {_fmt_mib(ram_mib)}"
+    if ssd_mib is not None:
+        tag += f" SSD {_fmt_mib(ssd_mib)}"
+    return f"[{tag}]"
+
+
+# A previously emitted memory tag at the end of a description (stripped
+# before appending a fresh one, so copying a generated description back
+# into a sidecar never stacks tags on re-pack).
+_MEM_TAG_RE = re.compile(r"\s*\[(?:VRAM|RAM)\b[^\]]*\]\s*$")
+
+
+def _with_mem_tag(description: str | None, tag: str | None) -> str | None:
+    """Description with a fresh memory tag appended (idempotent).
+
+    Returns None only when there is neither a description nor a tag.
+    """
+    if tag is None:
+        return description
+    base = _MEM_TAG_RE.sub("", description or "").rstrip()
+    return f"{base} {tag}" if base else tag
 
 
 def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> list[Model]:
@@ -97,13 +165,6 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
                 if not fm_arch:
                     logger.warning("sidecar %s: diffusion arch %r but no architecture: set (e.g. architecture: wan/hunyuan-video/flux) for backend routing",
                                    model.stem, arch)
-
-        # s2t/t2s/image must not be served as chat via llama-server
-        if model.role in ("s2t", "t2s", "image") and backend.name == "llama-server":
-            logger.error("skipping %s: role %r must not use backend %r (use %s)",
-                         model.stem, model.role, backend.name,
-                         {"s2t":"whisper-server","t2s":"kokoro-podman","image":"sd-server"}[model.role])
-            continue
 
         # Capability / companion cross-check: a companion file is not a
         # capability — what it enables must be declared where it is served.
@@ -243,26 +304,36 @@ def _build_entry(
     include_mmproj: bool = True,
     name_suffix: str = "",
     tools_demoted: bool = False,
+    usage: tuple["UsageDemand", ...] = (),
     estimate_error: str | None = None,
     batch: int | None = None,
     ubatch: int | None = None,
+    mem_vram_mib: float | None = None,
+    mem_ram_mib: float | None = None,
+    vram_note: str | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
     ``include_mmproj=False`` omits the vision projection from the command,
     removes the ``image``/``video`` input capabilities, and flags
-    ``metadata.mmproj_skipped``.
-    ``name_suffix`` is appended to the model display name (e.g. the vision
-    variant's `` [vision 92k]``).
+    ``name_suffix`` is appended to the model display name.
     ``tools_demoted=True`` drops the ``tools`` capability: the matrix solve
     served the model below ``tools_min_ctx``, so advertising tool calling
     would mislead clients — ``metadata.tools_demoted`` records why.
 
     The first step resolves the serving view: with a companion block, the
     companion-on variant serves the block merged over the frontmatter while
-    the companion-off variant serves the base frontmatter (strip-by-recompute
+    the     companion-off variant serves the base frontmatter (strip-by-recompute
     — purpose is emergent from the block, never hardcoded).  Pass the base
     model here, not a view: views return themselves from ``view_for``.
+
+    ``mem_vram_mib``/``mem_ram_mib`` are the decided TOTAL allocation for
+    this serving (reported verbatim as a trailing description tag via
+    :func:`format_mem_tag`; ``None``/``None`` or a non-None
+    ``estimate_error`` emits no tag).
+    ``vram_note`` (when set) is appended after the mem tag: the entry
+    serves below its design context because ``--spare``/``--baseline``
+    constrained the budget.
     """
     model = model.view_for(include_mmproj)
     base_id = model.template_id
@@ -423,10 +494,21 @@ def _build_entry(
         entry["filters"] = {"setParamsByID": set_params}
     if model.name:
         entry["name"] = model.name + name_suffix
-    if model.description:
-        entry["description"] = model.description
+    mem_tag = None
+    if estimate_error is None and mem_ram_mib is not None:
+        mem_tag = format_mem_tag(mem_vram_mib, mem_ram_mib)
+    desc = _with_mem_tag(model.description, mem_tag)
+    if vram_note:
+        desc = f"{desc} {vram_note}".strip() if desc else vram_note
+    if desc is not None:
+        entry["description"] = desc
     # The VRAM-served -c limit (vs. capabilities.context = max trained).
     metadata["ctx_size"] = ctx_size
+    # The blessed usage categories this serving actually satisfies — the same
+    # set the id's category segment names.  Client-facing so a metadata-aware
+    # picker (or the opencode plugin) can filter without parsing the id.
+    if usage:
+        metadata["usage"] = [d.name for d in usage]
     # Client-facing estimate health: when no VRAM estimate source worked,
     # the entry is served at its minimum useful context with a conservative
     # matrix reserve — tell clients so they can treat it differently.
@@ -460,13 +542,13 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # Proxied backends (sd-server, whisper-server) are proxied HTTP services,
-    # not llama-swap managed inference — expose the standard proxy fields so
-    # llama-swap can health-check and route.  checkEndpoint "/" avoids the
-    # /health pitfall (Discussion #866: sd-server returns 200 on / only).
+    # Proxied backends (sd-server, whisper-server, audio-cpp) are proxied HTTP
+    # services, not llama-swap managed inference — expose the standard proxy
+    # fields so llama-swap can health-check and route.  Each backend names its
+    # own health path (sd-server answers "/"; audio.cpp exposes /health).
     if backend.proxied:
         entry["proxy"] = "http://127.0.0.1:${PORT}"
-        entry["checkEndpoint"] = "/"
+        entry["checkEndpoint"] = getattr(backend, "check_endpoint", "/")
 
     # Container lifecycle (llama-swap docker orchestration): cmdStop stops the
     # container itself — without it a swap/unload kills only the `docker run`
@@ -486,10 +568,11 @@ def _build_entry(
 # ── Planning ──────────────────────────────────────────────────────────────
 
 
-# Entry-id suffix of every no-mmproj variant.  Invariant: the bare ``<id>``
-# always serves vision when the model has an mmproj; the text-only serving is
-# always ``<id>-text`` (see :func:`emit_config`).
-TEXT_SUFFIX = "-text"
+#: Reserved key under which :meth:`Planner.plan` carries the per-set
+#: admission map for the emitter.  ``emit_config`` is a pure function of the
+#: plan dict, so planner state that the emitter needs rides along under a
+#: key no model stem can collide with (NUL is not valid in a stem).
+SET_ADMISSION_KEY = "\x00set_admission"
 
 
 @dataclass(frozen=True)
@@ -588,6 +671,496 @@ class MatrixKnobs:
         return self.coload_min_ctx
 
 
+@dataclass(frozen=True)
+class UsageDemand:
+    """One usage category's minimum serving requirements.
+
+    Declared in ``profiles.yaml`` under ``usage:``, which is the single
+    blessed vocabulary — a sidecar may only *tag* itself with a category
+    declared here.  A tag that is not blessed is warned about and ignored
+    (see :func:`resolve_usage`), so an operator always knows exactly which
+    demands are in force without reading every sidecar.
+
+    ``min_context`` / ``min_parallel`` are *minimums*, not requests: an
+    entry serving ``ctx >= min_context`` and ``parallel >= min_parallel``
+    satisfies the category.  ``sacrifice`` is a *preference* order for what
+    to give up when the budget is short — it is deliberately not a cost
+    order, because shedding a capability may buy no context at all (a model
+    already at its design cap has no headroom to reclaim).
+
+    Two ways to protect a capability, and the difference matters:
+
+    ``require`` — must have it.  A rung that drops one is discarded, and a
+    model that lacks the capability outright does not satisfy the category,
+    so no entry claims it.  ``require: [vision]`` is a statement that the
+    work is impossible without seeing.
+
+    ``keep`` — don't drop what this model has, but a model without it still
+    qualifies.  ``coding`` declares ``keep: [draft]``: a coding entry will
+    not drop its MTP draft, but a coding model that has no draft companion
+    is still a perfectly good coding model and still gets an entry.  Making
+    that ``require`` would silently drop every coding model without MTP.
+    """
+
+    name: str
+    min_context: int = 0
+    min_parallel: int = 1
+    require: frozenset[str] = frozenset()
+    keep: frozenset[str] = frozenset()
+    sacrifice: tuple[str, ...] | None = ()
+
+    def satisfied_by(self, ctx: int, parallel: int) -> bool:
+        """True when an entry served at (ctx, parallel) meets this demand."""
+        return ctx >= self.min_context and parallel >= self.min_parallel
+
+
+
+def _parse_ctx_size(v: object) -> int | None:
+    """Parse a context minimum: a positive int, or a ``128k``/``1M`` string."""
+    if isinstance(v, str):
+        s = v.strip().lower().rstrip("k").rstrip("m")
+        mult = 1024 if v.strip().lower().endswith("k") else (
+            1024 * 1024 if v.strip().lower().endswith("m") else 1)
+        try:
+            n = int(s)
+        except ValueError:
+            return None
+        return n * mult
+    if isinstance(v, bool):
+        return None
+    if not isinstance(v, (int, float)):
+        return None
+    n = int(v)
+    return n if n > 0 else None
+
+
+def _parse_capability_list(v: object) -> tuple[str, ...] | None:
+    """Parse a capability name list into a de-duplicated ordered tuple.
+
+    Order is preserved: ``sacrifice`` is a preference order and the ladder
+    walks it in the order written.
+    """
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple, set)):
+        return None
+    out: list[str] = []
+    for item in v:
+        if not isinstance(item, str):
+            return None
+        name = item.strip().lower()
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def shed_levels(sacrifice: tuple[str, ...] | None,
+                default_order: tuple[str, ...] = DEFAULT_SACRIFICE_ORDER,
+                required: frozenset[str] = frozenset(),
+                kept: frozenset[str] = frozenset(),
+                ) -> tuple[frozenset[str], ...]:
+    """Degradation levels to try, least-shed first.
+
+    One level per prefix of the declared order: ``[]``, ``{vision}``,
+    ``{vision, draft}``. Cumulative because each step is a further
+    concession — but bounded by the prefix, so a capability the category
+    never named is only reached once the named ones are gone. Anything in
+    ``required`` (must have it) or ``keep`` (do not drop what this model has)
+    is never shed at any level.
+
+    ``None`` means *never degrade* and yields the single empty rung: that is
+    the null category, which has no goals to protect and so keeps mmproj and
+    MTP even when that costs it all of its context. An empty tuple is
+    different — a category that expressed no preference is still willing to
+    concede in the default order.
+
+    This replaces the old fleet-wide ``_mmproj_drop_pass``, which decided
+    vision from a global context threshold before any category was read.
+    """
+    if sacrifice is None:
+        return (frozenset(),)
+    protected = required | kept
+    order = [c for c in sacrifice
+             if c in KNOWN_CAPABILITIES and c not in protected]
+    order += [c for c in default_order
+              if c in KNOWN_CAPABILITIES and c not in protected and c not in order]
+    levels = [frozenset()]
+    for cap in order:
+        levels.append(levels[-1] | {cap})
+    return tuple(levels)
+
+
+#: The null category: every model's baseline serving. Bare minimums only and
+#: no category name in the id. It keeps mmproj and MTP whenever it can — with
+#: no goals to protect, capability is the only thing left to give up — and
+#: concedes a capability only when holding it would leave no legal serving at
+#: all. An empty ``sacrifice`` says exactly that: default-order shedding,
+#: gated by the minimum, and the first qualifying rung wins rather than the
+#: one buying the most context (a category wants context; this wants
+#: capability).
+#:
+#: It joins no set. Routing is what categories are for, and this has no name
+#: to route on.
+FALLBACK: "UsageDemand" = UsageDemand(
+    name="", min_context=_MIN_CTX_SIZE, min_parallel=1,
+    require=frozenset(), sacrifice=())
+
+
+@dataclass(frozen=True)
+class UsageCatalogue:
+    """The blessed ``usage:`` categories from ``profiles.yaml``.
+
+    ``by_name`` is the lookup the planner uses; ``order`` preserves
+    declaration order so demand reporting and tie-breaks are deterministic.
+    """
+
+    by_name: Mapping[str, UsageDemand] = field(default_factory=dict)
+    order: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.by_name)
+
+    def get(self, name: str) -> UsageDemand | None:
+        return self.by_name.get(name)
+
+    @classmethod
+    def from_cfg(cls, usage_cfg: dict | None) -> "UsageCatalogue":
+        """Parse ``usage:`` from profiles.yaml.
+
+        A malformed category is warned about and dropped rather than
+        failing the pack: a bad demand must not take the fleet offline.
+        """
+        by_name: dict[str, UsageDemand] = {}
+        order: list[str] = []
+        for name, spec in (usage_cfg or {}).items():
+            if not isinstance(name, str) or not name.strip():
+                logger.warning("usage: skipping unnamed category")
+                continue
+            name = name.strip()
+            if isinstance(spec, int) and not isinstance(spec, bool):
+                # Shorthand: `coding: 128k` == min_context only.
+                spec = {"min_context": spec}
+            if not isinstance(spec, dict):
+                logger.warning("usage: category %r is not a mapping; ignoring",
+                               name)
+                continue
+            kwargs: dict = {}
+            raw_ctx = spec.get("min_context")
+            if raw_ctx is not None:
+                ctx = _parse_ctx_size(raw_ctx)
+                if ctx is None:
+                    logger.warning("usage: %s.min_context=%r is not a positive "
+                                   "context; ignoring it", name, raw_ctx)
+                else:
+                    kwargs["min_context"] = ctx
+            raw_par = spec.get("min_parallel")
+            if raw_par is not None:
+                try:
+                    par = int(raw_par)
+                    assert par > 0
+                except (TypeError, ValueError, AssertionError):
+                    logger.warning("usage: %s.min_parallel=%r is not a "
+                                   "positive integer; ignoring it", name,
+                                   raw_par)
+                else:
+                    kwargs["min_parallel"] = par
+            for key in ("require", "keep", "sacrifice"):
+                if key not in spec:
+                    continue
+                listed = _parse_capability_list(spec[key])
+                if listed is None:
+                    logger.warning("usage: %s.%s=%r is not a list of "
+                                   "capability names; ignoring it", name, key,
+                                   spec[key])
+                    continue
+                unknown = set(listed) - KNOWN_CAPABILITIES
+                if unknown:
+                    logger.warning("usage: %s.%s names unknown capabilities "
+                                   "%s (known: %s); ignoring them", name, key,
+                                   sorted(unknown),
+                                   sorted(KNOWN_CAPABILITIES))
+                known = [c for c in listed if c in KNOWN_CAPABILITIES]
+                if key in ("require", "keep"):
+                    kwargs[key] = frozenset(known)
+                else:
+                    # The declared order *is* the preference order.
+                    kwargs["sacrifice"] = tuple(known)
+            by_name[name] = UsageDemand(name=name, **kwargs)
+            order.append(name)
+        return cls(by_name=by_name, order=tuple(order))
+
+
+def resolve_usage(tags: object, catalogue: UsageCatalogue,
+                  logger_: logging.Logger | None = None) -> tuple[UsageDemand, ...]:
+    """Resolve a sidecar's ``usage:`` tags against the blessed catalogue.
+
+    An unblessed tag is warned about and ignored, so the effective demands
+    are always exactly the subset of ``profiles.yaml`` the operator wrote —
+    a sidecar can raise what it needs, never invent a category.
+
+    Accepts a bare string (one tag) or a list.  A sidecar with no tags gets
+    no demands, which leaves it governed by the global ``min_context``
+    floor as before.
+    """
+    log = logger_ or logger
+    if tags is None:
+        return ()
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple)):
+        log.warning("usage: %r is not a list of category names; ignoring",
+                    tags)
+        return ()
+    out: list[UsageDemand] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            log.warning("usage: %r is not a category name; ignoring", tag)
+            continue
+        name = tag.strip()
+        demand = catalogue.get(name)
+        if demand is None:
+            blessed = ", ".join(catalogue.order) or "(none declared)"
+            log.warning("usage: tag %r is not declared in profiles.yaml "
+                        "`usage:`; ignoring it (blessed: %s)", name, blessed)
+            continue
+        if demand not in out:
+            out.append(demand)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class Rung:
+    """One rung of the capability/context ladder: a set of shed capabilities.
+
+    ``shed`` is the set of capabilities deliberately given up at this rung
+    (empty = the model runs at full capability). ``ctx``/``parallel`` are
+    what the budget affords *at this rung*, and ``demand`` the category being
+    served -- singular, because a rung exists to answer one category.
+    """
+
+    shed: frozenset[str]
+    ctx: int
+    parallel: int
+    demand: UsageDemand
+
+
+
+
+
+CHAT_VARS_PLACEHOLDER = "__CHAT_VARS__"
+COLOAD_VARS_PLACEHOLDER = "__COLOAD_VARS__"
+
+#: Var-name prefix for an opportunistically co-loaded model, by role.  Shared
+#: with the emitter so the planner can cost a set and the router can expand
+#: it from one naming rule.
+COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
+
+
+def coload_var_name(role: str, taken: Container[str]) -> str:
+    """The co-load var name for *role*, numbered off *taken* to avoid a clash."""
+    prefix = COLOAD_VAR_PREFIX.get(role, "coload")
+    name, n = prefix, 1
+    while name in taken:
+        n += 1
+        name = f"{prefix}{n}"
+    return name
+
+
+def _strip_parens(expr: str) -> str:
+    """Drop one layer of balanced outer parentheses."""
+    s = expr.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    return s  # the trailing ')' closes something earlier
+        s = s[1:-1].strip()
+    return s
+
+
+def _split_top(expr: str, op: str) -> list[str]:
+    """Split *expr* on *op* at parenthesis depth 0, dropping outer parens.
+
+    ``"(emb | rnk2)"`` splits to ``["emb", "rnk2"]`` rather than the literal
+    ``["(emb", "rnk2)"]`` — every consumer here wants var names.
+    """
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in expr:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == op and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return [s for s in (_strip_parens(p) for p in parts) if s]
+
+
+def _names_chat_slot(expr: str, coresident: frozenset[str],
+                     coload_vars: frozenset[str]) -> bool:
+    """True when a set offers a chat slot.
+
+    The chat alternatives are spelled either by the ``__CHAT_VARS__``
+    placeholder or by explicit ``c<N>`` vars.  A var name alone is not
+    enough — ``emb``, ``rnk`` and the co-load vars are also bare words, so
+    only the ``c<N>`` shape is treated as a chat var.
+    """
+    if CHAT_VARS_PLACEHOLDER in expr:
+        return True
+    return any(re.fullmatch(r"c\d+", name) for name in coresident)
+
+
+def set_coresident_vars(expr: str, chat_vars: frozenset[str],
+                        coload_vars: frozenset[str]) -> frozenset[str]:
+    """The vars a set can co-reside with, i.e. everything but the chat choice.
+
+    A set names the *alternatives* for the chat slot (``__CHAT_VARS__`` or an
+    explicit ``c1 | c2``) AND-ed with the models that sit beside it.  Only the
+    AND-ed non-chat part is co-resident, and within an OR only one branch is
+    ever selected, so the branches are collapsed to their most expensive
+    member.  ``__COLOAD_VARS__`` is a genuine sum: those models co-load with
+    each other by construction.
+    """
+    out: set[str] = set()
+    for term in _split_top(expr, "&"):
+        if CHAT_VARS_PLACEHOLDER in term:
+            continue
+        alternatives = _split_top(term, "|")
+        if any(alt in chat_vars for alt in alternatives):
+            continue  # this term *is* the chat choice
+        if COLOAD_VARS_PLACEHOLDER in alternatives:
+            out |= coload_vars
+            continue
+        for alt in alternatives:
+            if alt and not alt.startswith("+"):
+                out.add(alt)
+    return frozenset(out)
+
+
+def set_overhead_mb(expr: str, var_mb: Mapping[str, int],
+                    chat_vars: frozenset[str],
+                    coload_vars: frozenset[str]) -> int:
+    """Worst-case co-resident VRAM (MB) charged to a chat model in *set*.
+
+    Per the llama-swap matrix contract a request collects every set
+    containing the requested model and activates the cheapest, so an entry
+    must survive the heaviest set it belongs to.  OR branches are
+    alternatives — only the most expensive is charged, because the operator
+    picks one — while co-loads genuinely stack and are summed.
+    """
+    total = 0
+    for term in _split_top(expr, "&"):
+        if CHAT_VARS_PLACEHOLDER in term:
+            continue
+        alternatives = _split_top(term, "|")
+        if any(alt in chat_vars for alt in alternatives):
+            continue
+        if COLOAD_VARS_PLACEHOLDER in alternatives:
+            total += sum(var_mb.get(v, 0) for v in coload_vars)
+            continue
+        # An AND-ed group of alternatives: charge the priciest branch only.
+        total += max((var_mb.get(alt, 0) for alt in alternatives), default=0)
+    return total
+
+
+def _probe_at_overhead(planner: "Planner", model: Model,
+                       overhead_mb: int) -> tuple[int, int] | None:
+    """What ``model`` could be served at if *overhead_mb* is spoken for.
+
+    A side probe: the real solve pins a group parallel and honours
+    auto-parallel, neither of which is known yet at admission time, so this
+    asks the plain question "does a single-sequence entry still clear its
+    demand minimums" and lets the real solve refine it afterwards.
+    """
+    view = model.view_for(model.mmproj is not None
+                          and model.mmproj.gguf_path is not None)
+    cache_type = view.cache_type_for(planner.profiles.default_cache_type)
+    try:
+        ctx = planner._bounded_ctx(
+            view, parallel=1, cache_type=cache_type,
+            spare_mb=overhead_mb, include_mmproj=True)
+    except Exception:  # a probe must never break planning
+        return None
+    if ctx <= 0:
+        return None
+    return ctx, 1
+
+
+def ctx_label(ctx: int) -> str:
+    """Compact served-context label, at most 4 characters.
+
+    Used in the display name (always) and as the entry-id tail for an
+    *untagged* serving — one satisfying no blessed ``usage:`` category, so
+    there is no stable task name to use.  ``262144 -> '256k'``,
+    ``139264 -> '136k'``, ``1048762 -> '1M'``.
+
+    The unit threshold is 1000k, not 1024k, so the label is never wider than
+    four characters; above it the value switches to whole megas.  Exact
+    contexts below the threshold cannot collide, and at or above it the
+    rounding is under 0.1% — the exact number is always available in the
+    entry's ``metadata.ctx_size``.
+    """
+    k = max(int(ctx), 0) // 1024
+    return f"{k}k" if k < 1000 else f"{max(1, round(ctx / (1024 * 1024)))}M"
+
+
+#: Flag letters for the id capability segment, in fixed emission order.
+#: ``t`` tools, ``i`` image input, ``v`` video input, ``a`` audio input,
+#: ``s`` audio (speech) output.  A serving with none of these (plain text in,
+#: text out, no tools) emits no segment — the absence is the statement.
+FLAG_LETTERS: tuple[tuple[str, str], ...] = (
+    ("tools", "t"),
+    ("image", "i"),
+    ("video", "v"),
+    ("audio", "a"),
+    ("speech", "s"),
+)
+
+
+def flags_label(capabilities: Iterable[str] | None) -> str:
+    """The id flag segment for a *served* capability set.
+
+    Each letter is present iff the serving actually carries it, so a rung
+    whose tools were demoted (served below ``tools_min_ctx``) does not claim
+    ``t``.  Returns ``""`` when nothing qualifies — a plain text-input/text-
+    output serving has nothing to flag.  The letters are joined in
+    :data:`FLAG_LETTERS` order (deterministic, so the id is stable).
+    """
+    caps_l = {str(c).lower() for c in (capabilities or ())}
+    return "".join(letter for cap, letter in FLAG_LETTERS if cap in caps_l)
+
+
+def served_flags(model: "Model", include_mmproj: bool,
+                 tools_demoted: bool) -> str:
+    """The flag segment for *model* as actually served by this variant.
+
+    Mirrors :func:`_build_entry`'s capability handling: a no-mmproj serving
+    drops the ``image``/``video`` inputs (when a companion exists), and a
+    demoted serving drops ``tools`` — so the id's flags cannot claim a
+    capability the entry does not advertise.  Keeping this next to the
+    emitter's own cap derivation is deliberate: both read the same
+    ``model.capabilities`` vocabulary.
+    """
+    caps = [str(c).lower() for c in model.capabilities]
+    if (not include_mmproj and model.role != "image"
+            and model.mmproj and model.mmproj.gguf_path):
+        caps = [c for c in caps if c not in ("image", "video")]
+    if tools_demoted:
+        caps = [c for c in caps if c != "tools"]
+    return flags_label(caps)
+
+
+
+
 def _parse_bool_knob(key: str, v: object) -> bool:
     """Parse an opt-in knob; warn and return False on garbage."""
     if isinstance(v, bool):
@@ -618,17 +1191,32 @@ def parallel_value(ctx: int, floor: int, slots: int, power: float) -> float:
 def resolve_min_ctx(view, *, pin_ctx: int | None = None,
                     tools_min_ctx: int = 131072,
                     fallback_min_ctx: int = _MIN_AGENTIC_CTX,
-                    fallback_explicit: bool = False) -> int:
+                    fallback_explicit: bool = False,
+                    category_floor: int | None = None) -> int:
     """Per-model minimum useful context: the hard floor of the (ctx, slots)
     search and the context-ratio normalizer in :func:`parallel_value`.
 
-    Cascade, first match wins: explicit sidecar ``min_context:`` → pinned
-    serving ctx (a fixed ctx is its own floor) → tool callers get the
-    agentic floor → everyone else gets half their max context (two slots are
-    then only considered when nearly two full windows fit).  The global
-    ``--min-context`` flag overrides the last two rows when explicitly set,
-    never an explicit sidecar key or a hard pin.  A pin below an explicit
-    floor warns (the pin is honoured; the floor is reported unmet).
+    Cascade, first match wins: explicit sidecar ``min_context:`` → a pinned
+    serving ctx (``--max-context``; a fixed ctx is its own floor) →
+    ``category_floor`` → tool callers get the agentic floor → everyone else
+    gets half their design context (two slots are then only considered when
+    nearly two full windows fit).  The global ``--min-context`` flag
+    overrides the last two rows when explicitly set, never an explicit
+    sidecar key or a hard pin.  A pin below an explicit floor warns (the pin
+    is honoured; the floor is reported unmet).
+
+    ``category_floor`` is the strongest demand the model declares with
+    ``usage:``, and it outranks the two heuristics below it because they are
+    guesses about undeclared models while a category is the operator saying
+    what the model is *for*. Without that, a model tagged ``aux`` (80k) that
+    also lists the ``tools`` capability was still floored at 131072 by the
+    tools heuristic -- an unreachable floor, so it fell back to one slot and
+    then failed its own category's ``min_parallel``. Declaring the work was
+    making the model *less* satisfiable.
+
+    ``context_length:`` appears nowhere in this cascade. It is the model's
+    design maximum -- a ceiling applied when serving (see
+    :meth:`VramBudget._sidecar_ceiling`), never a floor.
     """
     fm = view.frontmatter or {}
     explicit = fm.get("min_context")
@@ -648,6 +1236,8 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
             return floor
     if pin_ctx is not None:
         return pin_ctx
+    if category_floor is not None:
+        return category_floor
     if "tools" in [c.lower() for c in (view.capabilities or [])]:
         return fallback_min_ctx if fallback_explicit else tools_min_ctx
     if fallback_explicit:
@@ -781,11 +1371,10 @@ class MatrixSolve:
 class Variant:
     """One planned llama-swap entry: resolved serving params + contexts.
 
-    ``vision_ctx`` is set only when mmproj was dropped from the main variant
-    but a companion exists — the emitter then adds a best-effort vision entry.
-    A variant with ``include_mmproj=False`` is emitted as the ``<id>-text``
-    entry (this is both the on-demand text-only variant of a vision-keeping
-    model and the renamed main entry of an auto-dropped model).
+    A variant with ``include_mmproj=False`` is the vision-less serving a
+    category chose by shedding the projector; a variant with it true serves
+    vision. There is no companion entry and no text-only twin — vision is a
+    rung each category decides for itself.
     """
     parallel: int
     cache_type: str
@@ -793,32 +1382,52 @@ class Variant:
     profiles_group: list[tuple[str, dict]] = field(compare=False)
     ctx_size: int
     include_mmproj: bool
-    #: Resolved ``-b``/``-ub`` (sidecar > profile > fleet > role); rendered
-    #: explicitly on every llama-server command; ``ubatch`` also stamps the
-    #: VRAM measurement shape.
+    #: Resolved ``-b``/``-ub`` (sidecar > profile > fleet > role).  ``None``
+    #: renders no flag — llama.cpp's own builtin then applies.  ``ubatch``
+    #: also feeds the VRAM measurement shape (see :func:`measurement_args`).
     batch: int | None = None
     ubatch: int | None = None
-    vision_ctx: int | None = None
     coload: bool = False
     tools_demoted: bool = False
+    #: The categories this rung is named for. A rung answers exactly one, so
+    #: this is normally a single demand; a tuple only so the emitter can
+    #: express "nothing declared" without a second field. Empty for the
+    #: fallback entry, which carries no category name in its id.
+    usage: tuple[UsageDemand, ...] = ()
+    #: The category this variant answers, or :data:`FALLBACK` for the null
+    #: category. Singular, because a rung exists to serve one category -- which
+    #: is what lets one model emit several entries and stay unambiguous.
+    category: UsageDemand | None = None
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
+    #: Decided TOTAL memory attributable to this serving (weights +
+    #: companions + context at the served ctx/slots), in MiB — the numbers
+    #: the emitted description tag reports verbatim.  ``mem_vram_mib=None``
+    #: is a CPU-resident serving (RAM-only tag).  Both None when undecided
+    #: (no estimate) — then no tag is emitted.
+    mem_vram_mib: float | None = None
+    mem_ram_mib: float | None = None
+    #: Non-None when the VRAM budget could not afford the design context
+    #: (``--spare``/``--baseline`` active): appended to the description so
+    #: the entry visibly carries its over-budget status.
+    vram_note: str | None = None
 
 
 def resolve_batch_ubatch(
     profiles: Profiles, model: Model, profile: dict | None = None,
-) -> tuple[int, int]:
+) -> tuple[int | None, int | None]:
     """Resolved ``(batch, ubatch)`` for *model* — sidecar keys > profile
-    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults
-    (the llama.cpp builtins).  One resolution site: the rendered command
+    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults.
+    ``None`` means "nothing configured": the backend renders no flag and the
+    engine's builtin applies.  One resolution site: the rendered command
     and the VRAM measurement shape both consume these values, so the serve
     and the estimate can never drift apart on batch flags."""
     try:
         backend = get_backend(model.backend)
         role_defaults = backend.default_batch_ubatch(model.role)
     except KeyError:
-        role_defaults = (2048, 512)
+        role_defaults = (None, None)
     return model.batch_ubatch_for(
         profile, profiles.llama_server_cfg if profiles else {}, role_defaults)
 
@@ -828,10 +1437,19 @@ def measurement_args(
     profile: dict | None = None,
 ) -> str:
     """The exact flag string VRAM constants are measured (and shape-stamped)
-    under: global args + the model's resolved ``-ub``.  ``batch`` is
+    under: global args + the model's effective ``-ub``.  ``batch`` is
     excluded — measured to have no VRAM effect, so throughput tuning must
-    not invalidate estimates."""
+    not invalidate estimates.
+
+    The *effective* ubatch is stamped, not just an explicitly configured one:
+    an unset key still serves at llama.cpp's builtin, so the compute buffer
+    the constants were measured for is the one the server will actually
+    allocate.  Omitting it would change every ``derived: shape`` key and
+    force a fleet-wide re-measurement for a flag that has not moved.
+    """
     _, ubatch = resolve_batch_ubatch(profiles, model, profile)
+    if ubatch is None:
+        ubatch = _LLAMA_CPP_DEFAULT_UBATCH
     base = (global_args or "").strip()
     return f"{base} -ub {ubatch}".strip()
 
@@ -858,6 +1476,7 @@ class Planner:
         matrix_cfg: dict | None = None,
         embed_model: Model | None = None,
         rerank_model: Model | None = None,
+        fixed_categories: list[tuple[str, Model]] | None = None,
         baseline_mb: int = 0,
         min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
@@ -876,6 +1495,24 @@ class Planner:
         self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
         self.embed_model = embed_model
         self.rerank_model = rerank_model
+        # Blessed usage categories.  A model may only *tag* itself with one
+        # of these; an unblessed tag is warned about and ignored.
+        self.usage = UsageCatalogue.from_cfg(
+            getattr(profiles, "usage_cfg", None))
+        # Per-set co-resident overhead (MB) and the sets a chat model was
+        # admitted to, filled in by _solve_usage_sets.
+        self.set_overheads: dict[str, int] = {}
+        # (model stem, category name) -> the sets that entry may join. Keyed
+        # per category, not per stem: one model's `.coding` and `.aux` entries
+        # are different servings, and whichever was solved first used to speak
+        # for both.
+        self.set_admission: dict[tuple[str, str | None], frozenset[str]] = {}
+        # stem -> the sets this model was charged for, per profile group.
+        # Kept only so the charge and the admission it feeds cannot drift.
+        self._charge_sets: dict[str, list[tuple[frozenset[str], int]]] = {}
+        # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
+        # fixed-overhead residents reserved alongside chat and RAG.
+        self.fixed_categories = fixed_categories or []
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.min_context_explicit = min_context_explicit
@@ -900,6 +1537,7 @@ class Planner:
         cache_type: str,
         spare_mb: int,
         include_mmproj: bool,
+        include_draft: bool = True,
         design_ctx: int | None = None,
         context_length: int | None = None,
         profile: dict | None = None,
@@ -914,6 +1552,7 @@ class Planner:
             parallel=parallel,
             spare_mb=spare_mb,
             include_mmproj=include_mmproj,
+            include_draft=include_draft,
             baseline_mb=self.baseline_mb,
             cache_type=cache_type,
             design_ctx=design_ctx,
@@ -954,24 +1593,132 @@ class Planner:
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
+    def can_meet(self, model, demand: "UsageDemand") -> bool:
+        """Whether *model* has what the category ``require``s.
+
+        ``require`` gates existence, which is a different thing from
+        ``keep``: a model lacking a required capability does not satisfy the
+        category at all, so no entry may be named for it. ``keep`` only
+        forbids shedding.
+
+        This gate used to live in ``met_demands`` and went with it, which left
+        a text-only model free to claim ``require: [vision]`` -- an id that
+        promised a capability the entry did not advertise.
+        """
+        have_vision = (model.mmproj is not None
+                       and model.mmproj.gguf_path is not None)
+        have_draft = model.mtp is not None or model.mtp_baked_in
+        for cap in demand.require:
+            if cap == "vision" and not have_vision:
+                return False
+            if cap == "draft" and not have_draft:
+                return False
+        return True
+
+    def solve_rung(self, model, demand: "UsageDemand", *,
+                   parallel: int, cache_type: str, spare_mb: int,
+                   design_ctx: int | None = None,
+                   context_length: int | None = None,
+                   profile: dict | None = None,
+                   prefer_capability: bool = False) -> "Rung | None":
+        """The serving this category should get: most context that fits.
+
+        Walks the category's own shed levels (:func:`shed_levels`), asking the
+        budget what each one affords, and returns the level that buys the most
+        context — or ``None`` when the category's ``min_context`` is out of
+        reach at every level, which is what "this category cannot be served"
+        means, and what suppresses the entry.
+
+        Among levels that buy the *same* context, the least-shed wins. That
+        is the whole of "coding drops vision to maximise context, and only
+        keeps vision when it is free": shedding vision usually buys context,
+        so the model goes text-only; when VRAM is plentiful enough to hold
+        design context either way, nothing is bought and the projector stays
+        attached rather than being thrown away for no gain.
+
+        Only the shed axis is decided here. Slot count stays with the
+        parallel solve, which runs afterwards and may squeeze further.
+
+        Two rules for which qualifying rung wins, and they differ because
+        the categories differ. A category wants the **most context** — coding
+        would rather have 262144 tokens text-only than 131072 with a
+        projector. The null category wants the **least shed**, taking the
+        first rung that qualifies: it has no goals, so handing up a capability
+        to buy context nobody asked for is a pointless trade.
+        """
+        best: Rung | None = None
+        for shed in shed_levels(demand.sacrifice,
+                                default_order=self.profiles.shed_order,
+                                required=demand.require,
+                                kept=demand.keep):
+            # The view follows the shed level. view_for() gives an mmproj
+            # model a *separate* companion-on budget, so probing a text-only
+            # rung against the vision view would measure the vision budget
+            # again and never see what dropping the projector buys.
+            view = model.view_for("vision" not in shed)
+            ctx = self._bounded_ctx(
+                view, parallel=max(1, parallel), cache_type=cache_type,
+                spare_mb=spare_mb,
+                include_mmproj="vision" not in shed,
+                include_draft="draft" not in shed,
+                design_ctx=design_ctx, context_length=context_length,
+                profile=profile)
+            if ctx <= 0 or ctx < demand.min_context:
+                continue
+            over = getattr(view.vram, "over_budget_reason", None)
+            if over is not None:
+                # Weights plus this level's companions do not fit. A lower
+                # rung may still shed down to something that does -- but if
+                # none does, the category emits nothing rather than a config
+                # that cannot load. This is the per-category form of the
+                # fleet-wide over-budget gate, and was lost with it.
+                logger.info("%s: %s (%s)", view.stem,
+                            demand.name or "fallback", over)
+                continue
+            rung = Rung(shed=shed, ctx=ctx, parallel=max(1, parallel),
+                        demand=demand)
+            if best is None:
+                best = rung
+            elif prefer_capability:
+                # shed_levels is least-shed first, so the first rung that
+                # qualifies is the answer and nothing later can improve it.
+                return best
+            elif ctx > best.ctx:
+                best = rung
+            # Equal context: the earlier (less-shed) level stands.
+        return best
+
+    def _tools_demoted(self, view, ctx: int) -> bool:
+        """Whether this serving must drop its ``tools`` capability.
+
+        Tool calling needs a real window; below ``matrix.tools_min_ctx`` the
+        entry cannot honour it, and advertising the capability anyway
+        misleads clients about what they will get. Decided per serving
+        because each entry of a model serves its own context -- a `.coding`
+        entry and a `.aux` entry of the same model rarely match.
+        """
+        return (view.role == "chat"
+                and ctx < self.knobs.tools_min_ctx
+                and "tools" in [c.lower() for c in view.capabilities])
+
     def _serving_pin(self, view) -> int | None:
         """Explicitly pinned serving ctx, or None.
 
-        A sidecar/block ``context_length:`` or the CLI ``--max-context``
-        fixes the per-slot size (cascade row 2: a fixed ctx is its own
-        floor).  Returns the tighter of the two when both are present.
+        Only ``--max-context`` pins. A sidecar ``context_length:`` does
+        *not*: it declares what the model was **designed** for -- the ceiling
+        on what may be served -- while the served size is worked out from the
+        VRAM budget, the usage category and the parallel/context bias.
+
+        Treating it as a pin instead made the two indistinguishable, and the
+        cost was concrete: a 262144 design max became an unreachable floor,
+        so the solve fell back to parallel 1 and a model tagged for two
+        slots could never satisfy its own category. Worse, the only way to
+        fix it was to edit the sidecar -- rewriting a capability claim about
+        the model in order to express an operating decision. `min_context:`
+        is the key that means "serve at least this", and it was already
+        separate.
         """
         pins = []
-        sidecar_ctx = (view.frontmatter or {}).get("context_length")
-        if sidecar_ctx is not None:
-            try:
-                pin = int(sidecar_ctx)
-                assert pin > 0
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("context_length=%r on %s is not a positive "
-                               "integer; ignoring pin", sidecar_ctx, view.stem)
-            else:
-                pins.append(pin)
         if self.max_context is not None:
             if self.max_context > 0:
                 pins.append(self.max_context)
@@ -991,6 +1738,8 @@ class Planner:
         floor: int,
         pin_ctx: int | None,
         group_parallel: int,
+        power: float | None = None,
+        min_parallel: int = 1,
         profile: dict | None = None,
     ) -> tuple[int, int]:
         """Solve (parallel, ctx) for one unpinned chat variant.
@@ -1002,8 +1751,13 @@ class Planner:
         loop breaks at the first unaffordable slot count (affordability
         falls as slots rise).  Falls back to today's outcome (group
         parallel, max affordable ctx) when the floor is unreachable.
+
+        *min_parallel* is a soft floor from a usage demand: candidates that
+        meet it win outright, but meeting the context floor takes precedence,
+        because the context is the property the entry id advertises and
+        concurrency is only a throughput preference.
         """
-        power = self.knobs.parallel_power
+        power = self.knobs.parallel_power if power is None else power
         # vLLM's continuous batching makes a slot cost KV only (no per-slot
         # workspace), so concurrency is cheap — cap it higher there.
         pmax = (self.knobs.vllm_auto_parallel_max
@@ -1025,7 +1779,7 @@ class Planner:
 
         fallback = (group_parallel,
                     min(maxctx(group_parallel), cap_ctx))
-        best: tuple[float, int, int] | None = None  # (score, p, ctx)
+        cands: list[tuple[int, int]] = []
         for p in range(1, pmax + 1):
             m = maxctx(p)
             if m < floor:
@@ -1037,8 +1791,24 @@ class Planner:
                 ctx = min(pin_ctx, cap_ctx)
             if ctx < floor:
                 continue
+            cands.append((p, ctx))
+        # A usage demand's min_parallel is preferred, but never at the cost
+        # of the context floor: the id advertises the context, and a client
+        # that cannot fit its prompt has nothing to gain from a spare slot.
+        if min_parallel > 1:
+            preferred = [c for c in cands if c[0] >= min_parallel]
+            if preferred:
+                cands = preferred
+        # Ties go to *more* slots. With power > 0 a model holding its cap
+        # scores strictly higher at every slot count, so it never ties; the
+        # flat case is power 0, where slots are worth nothing and the choice
+        # is purely "can it hold the context at more of them". Keeping the
+        # first maximum instead gave the parallel-1 entry, which is the
+        # opposite of what a plentiful-VRAM model should do.
+        best: tuple[float, int, int] | None = None  # (score, p, ctx)
+        for p, ctx in cands:
             score = parallel_value(ctx, floor, p, power)
-            if best is None or score > best[0]:
+            if best is None or score >= best[0]:
                 best = (score, p, ctx)
         if best is None:
             logger.info("auto-parallel: %s floor %d unreachable; keeping "
@@ -1052,49 +1822,210 @@ class Planner:
 
     # ── planning passes ──
 
-    def _mmproj_drop_pass(self) -> dict[str, bool]:
-        """Decide per chat model whether the main entry keeps its mmproj.
 
-        A model keeps vision when it reaches the minimum useful context WITH
-        the projection loaded; otherwise the main entry drops it (and is
-        emitted as ``<id>-text``; a best-effort vision variant is emitted
-        alongside) — but only when dropping actually helps: a model whose
-        design context is below the minimum even text-only keeps its vision,
-        since sacrificing it buys nothing.  Uses the global spare and fleet
-        defaults; per-profile spare still bounds ctx per group.
+    def demands_for(self, model: Model) -> tuple[UsageDemand, ...]:
+        """The usage demands in force for *model*.
+
+        A tag is only a claim: it is honoured when an entry can actually
+        meet the category's minimums, and silently ignored otherwise, so a
+        model is never held to a demand the VRAM cannot satisfy.
         """
-        drop: dict[str, bool] = {}
-        global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
-        for model in self.models:
-            if model.role in utils.NON_CHAT_ROLES:
+        if not self.usage:
+            return ()
+        demands = resolve_usage(model.usage_tags, self.usage, logger)
+        # A declared resolution budget means vision must actually be served at
+        # that size, so it stops being shed-able for this model whatever the
+        # category's sacrifice order says. ``keep`` rather than ``require``:
+        # a text-only model is unaffected, and the image floor already fails
+        # the rung when the budget cannot accommodate the image.
+        mp = model.min_image_megapixels
+        if mp is not None and mp > 0 and model.mmproj is not None:
+            demands = tuple(replace(d, keep=d.keep | {"vision"}) for d in demands)
+        return demands
+
+
+    def _price_sets(self) -> None:
+        """Cost every chat set by the residents it can hold alongside chat.
+
+        Replaces the single fleet-wide ledger charge: an entry has to
+        survive the heaviest set it lands in, and which set that is depends
+        on what the model can actually afford.
+        """
+        if not self.matrix_cfg:
+            return
+        sets_cfg = self.matrix_cfg.get("sets") or {}
+        if not sets_cfg:
+            return
+        by_stem = {m.stem: m for m in self.models}
+        taken: set[str] = set()
+        var_mb: dict[str, int] = {}
+
+        def overhead(m: Model) -> int:
+            # Same pricing the matrix solve used to reserve these, so the
+            # per-set figures and the shared solve cannot disagree.
+            oh = _coload_overhead(m, self.fit_bin, self.profiles, self.knobs,
+                                  self.llama_args)
+            return int(oh or 0)
+
+        def rag_overhead(m: Model) -> int:
+            """emb/rnk cost at their *solved* RAG context, as the matrix does.
+
+            The matrix prices these from the same quad formula it feeds
+            solve_matrix_ctx with, at the small solved context — not at
+            design context, and without the co-load headroom.
+            """
+            quad = _static_params(m, self.fit_bin,
+                                  self.profiles.default_cache_type,
+                                  measurement_args(self.profiles, m,
+                                                   self.llama_args))
+            if quad is None:
+                return 0
+            mib, factor, slots, compute = quad
+            return int(mib + compute + factor * self._rag_ctx(m) + slots)
+
+        # Declared categories: `emb`/`rnk` plus any extra (stt/tts/…).
+        for name, model in (self.fixed_categories or []):
+            if model is None:
                 continue
-            if not (model.mmproj and model.mmproj.gguf_path):
+            taken.add(name)
+            var_mb[name] = overhead(model)
+        for name, model in (("emb", self.embed_model),
+                            ("rnk", self.rerank_model)):
+            if model is not None and name not in taken:
+                taken.add(name)
+                var_mb[name] = rag_overhead(model)
+        # Co-loads: the matrix solve already priced them the same way.
+        coload_vars: set[str] = set()
+        for stem, mb in (getattr(self.matrix_result, "coloads", ()) or ()):
+            m = by_stem.get(stem)
+            if m is None:
                 continue
-            on_view = model.view_for(True)
-            cache_type = on_view.cache_type_for(self.profiles.default_cache_type)
-            parallel = on_view.parallel_for(self.profiles.default_parallel)
-            ctx_with = self._bounded_ctx(
-                on_view, parallel=parallel, cache_type=cache_type,
-                spare_mb=global_spare_mb, include_mmproj=True)
-            if ctx_with >= self.min_context:
-                drop[model.stem] = False
-                logger.info("mmproj: keep for %s (ctx %d >= %d)",
-                            model.stem, ctx_with, self.min_context)
+            name = coload_var_name(m.role, taken)
+            taken.add(name)
+            var_mb[name] = int(mb)
+            coload_vars.add(name)
+
+        for sname, expr in sets_cfg.items():
+            expr = str(expr)
+            cores = set_coresident_vars(expr, frozenset(),
+                                        frozenset(coload_vars))
+            if not _names_chat_slot(expr, cores, frozenset(coload_vars)):
+                continue  # not a chat set
+            self.set_overheads[sname] = set_overhead_mb(
+                expr, var_mb, frozenset(), frozenset(coload_vars))
+        if self.set_overheads:
+            logger.info("usage: per-set co-resident overhead (MB): %s",
+                        ", ".join(f"{k}={v}" for k, v in
+                                  sorted(self.set_overheads.items())))
+
+    def _rag_ctx(self, model: Model) -> int:
+        """Served context for a RAG/fixed-overhead resident."""
+        res = self.matrix_result
+        if res is None:
+            return model.design_context
+        if model.role == "embeddings":
+            return min(model.design_context, res.embed_ctx)
+        if model.role == "rerank":
+            return min(model.design_context, res.rerank_ctx)
+        return model.design_context
+
+    def _coresident_charge(self, model: Model, pool_id: str) -> int:
+        """Co-resident MB to charge *model*'s solve, and record its sets.
+
+        Per the matrix contract an entry must survive the heaviest set it
+        belongs to, so this charges the priciest set the model is admitted
+        to.  When no sets are configured it falls back to the ledger's
+        fleet-wide reserve, so an operator without a ``matrix:`` section
+        sees no change.
+
+        Admission: a model joins a set when, at that set's overhead, it can
+        still meet one of its usage demands.  With no declared demands the
+        model is admitted everywhere it fits, which preserves today's
+        behaviour for untagged models.
+        """
+        base = self.ledger.extra_reserve_mb(pool_id)
+        if not self.set_overheads or model.role != "chat":
+            return base
+        demands = self.demands_for(model)
+        if not demands:
+            # Untagged: keep the previous fleet-wide charge rather than
+            # inventing a per-set answer the operator never asked for.
+            return base
+
+        worst = 0
+        admitted: set[str] = set()
+        for sname, oh in sorted(self.set_overheads.items()):
+            probe = _probe_at_overhead(self, model, oh)
+            if probe is None:
                 continue
-            ctx_without = self._bounded_ctx(
-                model, parallel=parallel, cache_type=cache_type,
-                spare_mb=global_spare_mb, include_mmproj=False)
-            if ctx_without < self.min_context:
-                # Below the minimum either way — no configuration fixes this;
-                # dropping vision would only degrade the model. Keep it.
-                logger.info("mmproj: %s design ctx %d is below min-context %d "
-                            "with or without vision; keeping vision",
-                            model.stem, ctx_with, self.min_context)
-                continue
-            drop[model.stem] = True
-            logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
-                        model.stem, ctx_with, self.min_context, ctx_without)
-        return drop
+            ctx, parallel = probe
+            if any(d.satisfied_by(ctx, parallel) for d in demands):
+                admitted.add(sname)
+                worst = max(worst, oh)
+        if not admitted:
+            # Meets nothing anywhere: charge the heaviest set so the entry
+            # is sized for the worst thing it could be asked to share with,
+            # and let the caller drop it from every set.
+            worst = max(self.set_overheads.values())
+            admitted = set(self.set_overheads)
+        # This function only *charges* the solve now. Which sets an entry
+        # may join is decided later, per category, on the serving that was
+        # actually resolved -- see record_admission.
+        self._charge_sets.setdefault(model.stem, []).append(
+            (frozenset(admitted), max(base, worst)))
+        logger.info(
+            "usage: %s co-resident charge %d MB (sets: %s)",
+            model.stem, max(base, worst),
+            ", ".join(sorted(admitted)) or "none")
+        return max(base, worst)
+
+    def record_admission(self, model, demand, ctx: int, parallel: int) -> None:
+        """Which sets this one *category's entry* may join.
+
+        Keyed by (stem, category) and judged on the resolved (ctx, parallel),
+        because that is the serving llama-swap would hold beside the set's
+        residents. Keying by stem alone let one category's entry ride on
+        another's verdict -- a `.coding` entry sized for 204800 and a `.aux`
+        entry sized for 81920 were treated as the same model, so whichever
+        was solved first spoke for both.
+
+        The fallback entry joins no set: routing is what categories are for,
+        and it has no name to route on.
+        """
+        if demand is FALLBACK:
+            self.set_admission[(model.stem, None)] = frozenset()
+            return
+        admitted = {sname
+                    for sname, oh in self.set_overheads.items()
+                    if self._serves_beside(model, demand, oh, parallel)}
+        if not admitted:
+            # Meets the category nowhere beside a resident. It still serves
+            # standalone -- as its own entry, outside every set.
+            logger.info("usage: %s.%s joins no set: it cannot hold its "
+                        "%d-token minimum beside any resident",
+                        model.stem, demand.name, demand.min_context)
+        else:
+            logger.info("usage: %s.%s admitted to %s",
+                        model.stem, demand.name, ", ".join(sorted(admitted)))
+        self.set_admission[(model.stem, demand.name)] = frozenset(admitted)
+
+    def _serves_beside(self, model, demand, overhead_mb: int,
+                       parallel: int) -> bool:
+        """Whether this entry still clears its demand beside ``overhead_mb``.
+
+        The probe is single-sequence by design -- it answers "does one
+        sequence still fit with that much spoken for" -- so its slot count is
+        not the entry's. Testing ``satisfied_by`` against the probe's 1 would
+        refuse every category asking for 2 slots, so the slot half of the
+        requirement is checked against the serving that was actually
+        resolved, and only the context half against the probe.
+        """
+        probe = _probe_at_overhead(self, model, overhead_mb)
+        if probe is None:
+            return False
+        ctx, _ = probe
+        return (ctx >= demand.min_context
+                and max(1, parallel) >= demand.min_parallel)
 
     def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
         """Shared chat context when a matrix section is configured."""
@@ -1107,6 +2038,8 @@ class Planner:
             baseline_mb=self.baseline_mb, drop_stems=drop_stems,
             knobs=self.knobs, memory_margin=self.memory_margin,
             llama_args=self.llama_args, synthetic=synthetic,
+            fixed_categories=self.fixed_categories,
+            coload_sets=self.matrix_cfg.get("sets"),
         )
         self.synthetic_quads = synthetic
         # Flag the synthesized models so plan() serves them at their
@@ -1182,6 +2115,50 @@ class Planner:
                            model.stem, e)
             return 0
 
+    def _variant_memory(
+        self,
+        view,
+        *,
+        cache_type: str,
+        include_mmproj: bool,
+        ctx_size: int,
+        parallel: int,
+        profile: dict | None,
+    ) -> tuple[float | None, float | None]:
+        """Decided TOTAL memory (MiB) attributable to one serving variant.
+
+        ``(vram_mib, ram_mib)`` evaluated from the combined affine quad at
+        the variant's served ``(ctx_size, parallel)`` — weights + folded
+        companions + context — exactly what the emitted description tag
+        reports verbatim (no capping, no re-solving).  CPU-resident
+        servings return ``(None, ram_mib)`` (host-RAM constants via
+        ``allow_cpu`` — never used for VRAM sizing).  ``(None, None)``
+        when undecidable (no estimate source worked).  ``parallel <= 0``
+        (uncapped vLLM) is priced single-seq, matching its ctx solve.
+        """
+        quad = view.vram.effective_static(
+            self.fit_bin, cache_type=cache_type,
+            include_mmproj=include_mmproj,
+            llama_args=measurement_args(self.profiles, view,
+                                        self.llama_args, profile),
+            allow_cpu=True,
+        )
+        if quad is None:
+            return (None, None)
+        model_mib, kv_factor, slot_mib, compute_mib = quad
+        p = parallel if parallel > 0 else 1
+        total = (model_mib + compute_mib
+                 + kv_factor * ctx_size * p + slot_mib * p)
+        if view.on_cpu:
+            return (None, float(total))
+        files_mb = view.size_mb
+        if include_mmproj and view.mmproj is not None \
+                and view.mmproj.gguf_path is not None:
+            files_mb += view.mmproj.size_mb
+        if view.mtp is not None and view.mtp.gguf_path is not None:
+            files_mb += view.mtp.size_mb
+        return (float(total), max(0.0, float(files_mb - model_mib)))
+
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
@@ -1193,9 +2170,15 @@ class Planner:
         ``tools_min_ctx``, and included co-loads are flagged so the emitter
         can expose them for matrix-var construction.
         """
-        drop_mmproj = self._mmproj_drop_pass()
+        # The shared budget assumes every projector is shed, which holds for
+        # the categories that drop vision and leaves one that keeps its
+        # projector to decide in its own rung. `_mmproj_drop_pass` used to
+        # pick that per model from a global context threshold, before any
+        # category was read -- which is how it came to contradict the
+        # category a model actually declared.
         self.matrix_result = self._solve_matrix(
-            {s for s, d in drop_mmproj.items() if d})
+            {m.stem for m in self.models
+             if m.mmproj is not None and m.mmproj.gguf_path})
         if self.matrix_result is not None:
             self.chat_ctx = self.matrix_result.chat_ctx
         coload_stems = ({s for s, _ in self.matrix_result.coloads}
@@ -1203,10 +2186,16 @@ class Planner:
         # Shared ledger: matrix residents + pools: overrides.  Per-model
         # chat solves charge this pool's extra reserve to their spare.
         self.ledger = self._build_ledger()
+        # Per-set co-resident costs, so a chat entry can be sized for the
+        # heaviest set it actually lands in rather than one fleet-wide
+        # figure.  Needs the matrix result, so it runs after the solve.
+        self._price_sets()
 
-        plan: dict[str, list[Variant]] = {}
+        # values are Variant lists, except the reserved admission key
+        plan: dict = {}
         for model in self.models:
-            include_mmproj = not drop_mmproj.get(model.stem, False)
+            model.image_budget_warnings()
+            include_mmproj = True   # per-category now; see solve_rung
             view = model.view_for(include_mmproj)
             on_view = model.view_for(True)
             context_length = view.design_context
@@ -1226,16 +2215,28 @@ class Planner:
             elif view.role == "rerank" and self.matrix_result:
                 context_length = min(context_length,
                                      self.matrix_result.rerank_ctx)
-            tools_demoted = (
-                view.role == "chat"
-                and self.chat_ctx is not None
-                and self.chat_ctx < self.knobs.tools_min_ctx
-                and "tools" in [c.lower() for c in view.capabilities])
+            # Per-serving, decided from the context this entry will actually
+            # serve -- not from the fleet's matrix target. The old test keyed
+            # off self.chat_ctx, which is (a) None whenever no matrix: section
+            # exists (the default), so demotion could never fire at all, and
+            # (b) the fleet-wide goal rather than this entry's own ctx, so a
+            # model that squeezed below the threshold kept advertising tools.
             is_coload = model.stem in coload_stems
 
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
             for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
+                # Reset the per-group serving view: a prior group's
+                # vision→text fallback must not leak into this group.
+                include_mmproj = True   # per-category now; see solve_rung
+                view = model.view_for(include_mmproj)
+                context_length = view.design_context
+                if view.role == "embeddings" and self.matrix_result:
+                    context_length = min(context_length,
+                                         self.matrix_result.embed_ctx)
+                elif view.role == "rerank" and self.matrix_result:
+                    context_length = min(context_length,
+                                         self.matrix_result.rerank_ctx)
                 # Ledger charge: this pool's extra reserve (pools: overrides
                 # + co-residents) joins the spare for chat solves only — RAG
                 # and fixed-overhead roles ARE residents; charging them
@@ -1244,7 +2245,11 @@ class Planner:
                 spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                 spare_eff = spare_mb
                 if view.role == "chat":
-                    spare_eff += self.ledger.extra_reserve_mb(pool_id)
+                    # Co-residents are charged per set, not fleet-wide: the
+                    # ledger's single figure under-reserves every model that
+                    # can also land in a heavier set (ragz's Zerank alone is
+                    # 5764 MB more than rag's co-residents).
+                    spare_eff += self._coresident_charge(model, pool_id)
                 # Auto-parallel: unpinned chat models on slot-based backends
                 # get a value-function (parallel, ctx) solve instead of the
                 # group parallel.  Pinned = sidecar/block `parallel:` or any
@@ -1253,6 +2258,14 @@ class Planner:
                     self.knobs.auto_parallel
                     and view.role == "chat"
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
+                    # A CPU-resident model's KV pool lives in host RAM, which
+                    # no VRAM ledger sees or budgets, and calc_ctx returns
+                    # the design context regardless of the slot count. So
+                    # every candidate looks equally affordable and the score
+                    # reduces to p**power, which walks straight to the cap:
+                    # 8 slots on a model declared for one is an 8x KV
+                    # over-commit in an arena nothing accounts for.
+                    and not getattr(view, "on_cpu", False)
                     and "parallel" not in (view.frontmatter or {})
                     and not any("parallel" in resolved
                                 for _, resolved in group))
@@ -1274,30 +2287,81 @@ class Planner:
                 group_parallel = parallel
                 if uncapped:
                     parallel = 1   # single-seq ctx solve; emission drops it
+                # One solve per category, plus the fallback. Each declares
+                # its own floor and its own minimum slots, and each resolves
+                # its own (shed, ctx, parallel) against the same budget -- so
+                # a `.coding` entry and a `.aux` entry for one model are
+                # entitled to different sizes, which is the point.
                 if est_error is not None:
                     ctx_size = self._unestimated_ctx(view)
-                elif auto:
+                    serves = [(FALLBACK, view, parallel, ctx_size)]
+                else:
+                    serves = []
                     pin_ctx = self._serving_pin(view)
-                    floor = resolve_min_ctx(
-                        view, pin_ctx=pin_ctx,
-                        tools_min_ctx=self.knobs.tools_min_ctx,
-                        fallback_min_ctx=self.min_context,
-                        fallback_explicit=self.min_context_explicit)
                     cap_ctx = context_length
                     if self.max_context is not None:
                         cap_ctx = min(cap_ctx, self.max_context)
-                    parallel, ctx_size = self._auto_parallel(
-                        view, cache_type=cache_type, spare_mb=spare_eff,
-                        include_mmproj=include_mmproj, cap_ctx=cap_ctx,
-                        floor=floor, pin_ctx=pin_ctx,
-                        group_parallel=parallel, profile=group[0][1])
-                else:
-                    ctx_size = self._bounded_ctx(
-                        view, parallel=parallel, cache_type=cache_type,
-                        spare_mb=spare_eff, include_mmproj=include_mmproj,
-                        design_ctx=self.chat_ctx,
-                        context_length=context_length,
-                        profile=group[0][1])
+                    for demand in (*self.demands_for(model), FALLBACK):
+                        is_null = demand is FALLBACK
+                        if not self.can_meet(model, demand):
+                            # require gates existence: a model without the
+                            # capability does not satisfy the category, so
+                            # nothing may be named for it.
+                            logger.info("%s: %s requires %s, which this "
+                                        "model lacks; not emitted",
+                                        model.stem, demand.name or "fallback",
+                                        ", ".join(sorted(demand.require)))
+                            continue
+                        floor = resolve_min_ctx(
+                            view, pin_ctx=pin_ctx,
+                            tools_min_ctx=self.knobs.tools_min_ctx,
+                            fallback_min_ctx=self.min_context,
+                            fallback_explicit=self.min_context_explicit,
+                            category_floor=demand.min_context)
+                        rung = self.solve_rung(
+                            model, demand, parallel=parallel,
+                            cache_type=cache_type, spare_mb=spare_eff,
+                            design_ctx=self.chat_ctx,
+                            context_length=cap_ctx, profile=group[0][1],
+                            prefer_capability=is_null)
+                        if rung is None:
+                            # Cannot be served at any rung: no id may claim it.
+                            # The fallback is the floor on that.
+                            continue
+                        shed_vision = "vision" in rung.shed
+                        serve_view = model.view_for(not shed_vision)
+                        if auto:
+                            par, ctx = self._auto_parallel(
+                                serve_view, cache_type=cache_type,
+                                spare_mb=spare_eff,
+                                include_mmproj=not shed_vision,
+                                cap_ctx=cap_ctx, floor=floor,
+                                pin_ctx=pin_ctx,
+                                power=0.0 if is_null else None,
+                                min_parallel=demand.min_parallel,
+                                group_parallel=parallel,
+                                profile=group[0][1])
+                        else:
+                            par = parallel
+                            ctx = self._bounded_ctx(
+                                serve_view, parallel=par,
+                                cache_type=cache_type, spare_mb=spare_eff,
+                                include_mmproj=not shed_vision,
+                                design_ctx=self.chat_ctx,
+                                context_length=cap_ctx,
+                                profile=group[0][1])
+                            if ctx < demand.min_context:
+                                continue
+                        # Admission is judged on the serving just resolved,
+                        # per category -- not on a probe taken before the
+                        # solve, and not shared across the model's other
+                        # categories.
+                        if view.role == "chat":
+                            self.record_admission(model, demand, ctx, par)
+                        serves.append((demand, serve_view, par, ctx))
+                    if not serves:
+                        continue
+                ctx_size = serves[0][3]
                 if est_error is None:
                     # Discovery during this model's own solve: calc_ctx
                     # flagged the model unestimable (no measurement source
@@ -1310,51 +2374,68 @@ class Planner:
                     if est_error is not None:
                         parallel = group_parallel
                         ctx_size = self._unestimated_ctx(view)
+                        # `serves` came from the solve this check just
+                        # invalidated; rebuild it so the emitted entry does
+                        # not carry an estimated context while claiming to be
+                        # unestimated.
+                        serves = [(FALLBACK, view, group_parallel, ctx_size)]
 
-                vision_ctx: int | None = None
-                if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
-                    vision_ctx = ctx_size if est_error is not None else (
-                        self._bounded_ctx(
-                            on_view, parallel=parallel, cache_type=cache_type,
-                            spare_mb=spare_eff, include_mmproj=True,
-                            design_ctx=self.chat_ctx,
-                            context_length=context_length,
-                            profile=group[0][1]))
-                if uncapped:
-                    parallel = 0   # emit uncapped: no --max-num-seqs
+                # Squeeze note: the budget could not afford the design
+                # context and an explicit reservation (--spare/--baseline)
+                # is what pushed it over — stamp the entry description.
+                # Gate on the user-declared spare (pool-adjusted, before
+                # co-resident charges) or a baseline above the fixed floor;
+                # and only when the served ctx is actually below design
+                # (the matrix chat_ctx target can squeeze without landing
+                # under the model's own context_length).
+                vram_note: str | None = None
+                if (est_error is None
+                        and getattr(view.vram, "vram_squeezed", False)
+                        and ctx_size < context_length
+                        and (spare_mb > 0 or self.baseline_mb > _RESERVE_VIDEO)):
+                    vram_note = (
+                        f"(over configured VRAM limits — serving at "
+                        f"{ctx_size:,} of {context_length:,} design tokens; "
+                        f"re-run without --spare/--baseline for full "
+                        f"context)")
 
-                variants.append(Variant(
-                    parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
-                    profiles_group=group, ctx_size=ctx_size,
-                    include_mmproj=include_mmproj, batch=batch, ubatch=ubatch,
-                    vision_ctx=vision_ctx,
-                    coload=is_coload, tools_demoted=tools_demoted,
-                    estimate_error=est_error))
-
-                # On-demand text-only variant: when the main entry keeps its
-                # mmproj, also plan a no-vision entry (``<id>-text``) so
-                # clients can pick the lower-memory serving.  When the main
-                # entry was auto-dropped it IS the ``-text`` entry, so no
-                # separate variant is needed.
-                if (include_mmproj and view.role == "chat"
-                        and model.mmproj and model.mmproj.gguf_path):
-                    text_ctx = ctx_size if est_error is not None else (
-                        self._bounded_ctx(
-                            model, parallel=parallel, cache_type=cache_type,
-                            spare_mb=spare_eff, include_mmproj=False,
-                            design_ctx=self.chat_ctx,
-                            context_length=context_length,
-                            profile=group[0][1]))
+                # One Variant per served category. There is no
+                # main/companion pairing and no vision-less twin: two entries
+                # for one model is two categories in sidecars, and vision is a
+                # rung each category decides for itself.
+                for demand, serve_view, serve_par, serve_ctx in serves:
+                    shed_vision = serve_view is not view
+                    demoted = self._tools_demoted(serve_view, serve_ctx)
+                    usage = () if demand is FALLBACK else (demand,)
+                    if est_error is not None:
+                        mem = (None, None)
+                    else:
+                        mem = self._variant_memory(
+                            serve_view, cache_type=cache_type,
+                            include_mmproj=not shed_vision,
+                            ctx_size=serve_ctx, parallel=serve_par,
+                            profile=group[0][1])
                     variants.append(Variant(
-                        parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
-                        profiles_group=group, ctx_size=text_ctx,
-                        include_mmproj=False, batch=batch, ubatch=ubatch,
+                        parallel=(0 if uncapped else serve_par),
+                        cache_type=cache_type, spare_mb=spare_mb,
+                        profiles_group=group, ctx_size=serve_ctx,
+                        include_mmproj=not shed_vision,
+                        batch=batch, ubatch=ubatch,
                         coload=is_coload,
-                        tools_demoted=tools_demoted,
-                        estimate_error=est_error))
-            plan[model.stem] = variants
+                        tools_demoted=demoted, usage=usage,
+                        category=demand,
+                        estimate_error=est_error,
+                        mem_vram_mib=mem[0], mem_ram_mib=mem[1],
+                        vram_note=(vram_note if serve_ctx < context_length
+                                   else None)))
+            if variants:
+                plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
+        # The admission map is planner state, not a variant, but the emitter
+        # is a pure function of `plan` — so it rides along under a key no
+        # stem can collide with, and is popped by the caller.
+        plan[SET_ADMISSION_KEY] = dict(self.set_admission)
         return plan
 
 
@@ -1368,6 +2449,24 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
     if fp is None:
         return None
     return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)
+
+
+def _sets_reference_coloads(sets_cfg: dict | None) -> bool:
+    """True when any routing set can actually co-locate a co-load with chat.
+
+    The opportunistic co-load pass reserves each candidate's VRAM against
+    *every* chat solve, on the premise that llama-swap will hold it
+    alongside the chat model.  That only happens if some set expression
+    references the ``__COLOAD_VARS__`` placeholder — the sole way a
+    co-load's var reaches a set.  A co-load with no set referencing it is
+    evicted independently, so its reservation buys nothing and only
+    shrinks context (observed 2026-09-26: two unreferenced ASR co-loads
+    charged 4725 MB and collapsed a 27B's context from 188416 to 32768).
+    Such models belong in ``__CHAT_VARS__`` instead — alternatives that
+    evict chat rather than co-residents that shrink it.
+    """
+    return any("__COLOAD_VARS__" in str(expr)
+               for expr in (sets_cfg or {}).values())
 
 
 def _solve_matrix_context(
@@ -1384,6 +2483,8 @@ def _solve_matrix_context(
     memory_margin: float = _MEMORY_MARGIN,
     llama_args: str = "",
     synthetic: dict[str, tuple[int, float, float, int]] | None = None,
+    fixed_categories: list[tuple[str, Model]] | None = None,
+    coload_sets: dict | None = None,
 ) -> MatrixSolve | None:
     """Solve the shared VRAM budget for chat context plus co-loads.
 
@@ -1403,8 +2504,12 @@ def _solve_matrix_context(
     3. *Opportunistic co-loads* (§2): enabled ``s2t``/``image`` models not on
        the GPU pool's excluded list, smallest fixed overhead first, are
        included while the chat solve stays at or above the floor
-        (``tools_min_ctx`` when a tools chat model can keep it, else
-        ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+       (``tools_min_ctx`` when a tools chat model can keep it, else
+       ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
+       Skipped entirely when no routing set references
+       ``__COLOAD_VARS__`` (*coload_sets*): a co-load nothing can
+       co-locate is never resident with chat, so reserving for it would
+       only cost context.
 
     Unestimable participants (every estimate source failed) stay in the
     solve with a zero-cost placeholder — charged nothing extra — served at
@@ -1420,10 +2525,9 @@ def _solve_matrix_context(
     spare_mb = parse_spare_mb(spare, vram_total)
 
     drop_stems = drop_stems or set()
+    fixed_categories = fixed_categories or []
 
     # Get static params for chat models (companion VRAM folded in).
-    # The drop decision (mmproj skipped to reach the min useful context) is
-    # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     # Two-phase: measure everything first, then give models with no
     # estimate a zero-cost placeholder — the rider stays in the set at its
     # minimum useful context and is assumed to fit the measured allocation
@@ -1580,29 +2684,74 @@ def _solve_matrix_context(
         else knobs.min_chat_ctx
     coloads: list[tuple[str, int]] = []
     if chat_ctx >= floor:
-        overheads: list[tuple[int, str, Model]] = []
-        for m in chat_models:
-            if m.role not in ("s2t", "image"):
-                continue
-            oh = _coload_overhead(m, fit_bin, profiles, knobs,
-                                  llama_args)
-            if oh is None:
-                logger.warning("matrix: co-load %s skipped: cannot size it",
-                               m.stem)
-                continue
-            overheads.append((oh, m.stem, m))
+        declared_stems = {m.stem for _, m in fixed_categories}
         used = 0
-        for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
+
+        def _reserve(oh: int, stem: str, declared: bool) -> int | None:
+            """Reserve *oh* MB if chat stays at/above the floor; else None."""
+            nonlocal used
             ctx = _solve(embed_ctx, rerank_ctx, fixed_overhead_mb=used + oh)
-            if ctx >= floor:
-                used += oh
+            if ctx < floor:
+                return None
+            used += oh
+            if not declared:
                 coloads.append((stem, oh))
-                logger.info("matrix: co-load %s included (%d MB, chat_ctx=%d)",
-                            stem, oh, ctx)
-            else:
+            return ctx
+
+        # 3a. Declared categories (explicit operator intent, e.g. tts/stt)
+        #     are reserved first; one that does not fit is reported and left
+        #     unreserved.
+        for name, m in fixed_categories:
+            oh = _coload_overhead(m, fit_bin, profiles, knobs, llama_args)
+            if oh is None:
+                logger.warning("matrix: category %r (%s) skipped: cannot size it",
+                               name, m.stem)
+                continue
+            ctx = _reserve(oh, m.stem, declared=True)
+            if ctx is None:
                 logger.warning(
-                    "matrix: co-load %s skipped: would drop chat ctx to %d "
-                    "(floor %d)", stem, ctx, floor)
+                    "matrix: category %r (%s) does not fit below the chat "
+                    "floor %d; not reserved", name, m.stem, floor)
+            else:
+                logger.info(
+                    "matrix: category %r (%s) reserved (%d MB, chat_ctx=%d)",
+                    name, m.stem, oh, ctx)
+
+        # 3b. Opportunistic co-loads: s2t/image models that are *not* already
+        #     a declared category, smallest fixed overhead first.
+        #     Gated on some set referencing __COLOAD_VARS__: reserving a
+        #     co-load nothing can co-locate charges every chat solve for
+        #     residency that never happens.  Models too big to live beside
+        #     chat belong in __CHAT_VARS__ (they evict chat instead).
+        if not _sets_reference_coloads(coload_sets):
+            logger.info(
+                "matrix: no routing set references __COLOAD_VARS__; "
+                "skipping opportunistic co-loads (they cannot be "
+                "co-located with chat, so reserving their VRAM would only "
+                "shrink context — put them in __CHAT_VARS__ to have them "
+                "evict chat instead)")
+        else:
+            overheads: list[tuple[int, str, Model]] = []
+            for m in chat_models:
+                if m.role not in ("s2t", "image") or m.stem in declared_stems:
+                    continue
+                oh = _coload_overhead(m, fit_bin, profiles, knobs,
+                                      llama_args)
+                if oh is None:
+                    logger.warning("matrix: co-load %s skipped: cannot size it",
+                                   m.stem)
+                    continue
+                overheads.append((oh, m.stem, m))
+            for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
+                ctx = _reserve(oh, stem, declared=False)
+                if ctx is None:
+                    logger.warning(
+                        "matrix: co-load %s skipped: would drop chat ctx below "
+                        "the floor %d", stem, floor)
+                else:
+                    logger.info(
+                        "matrix: co-load %s included (%d MB, chat_ctx=%d)",
+                        stem, oh, ctx)
     return MatrixSolve(
         chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
         coloads=tuple(coloads), squeeze=squeeze,
@@ -1648,46 +2797,118 @@ def _coload_overhead(
 # ── Emission ──────────────────────────────────────────────────────────────
 
 
-def emit_config(models: list[Model], plan: dict[str, list[Variant]],
+def emit_config(models: list[Model], plan: dict,
                 profiles: Profiles, template_vars: dict) -> EmittedConfig:
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
-    entry.  Id invariant: the bare ``<id>`` always serves vision when the
-    model has an mmproj — every no-mmproj variant is emitted as
-    ``<id>`` + :data:`TEXT_SUFFIX` (name suffix ``[text]``), whether it is
-    the on-demand text-only variant or the main entry of an auto-dropped
-    model.  A variant with ``vision_ctx`` additionally emits a best-effort
-    vision companion entry, id-suffixed ``-vision-<N>k`` where
-    ``N = vision_ctx // 1000`` (e.g. 92567 → ``-vision-92k``).
+    entry.  Entry ids are **stable across repacks**: they name the task, not
+    the solved context.  Grammar ``<template_id>.<category>.<flags>`` where
+
+    - ``<category>`` is the ``usage:`` category this entry serves; omitted
+      for an untagged model or one that meets no category, which then gets
+      the bare stem;
+    - ``<flags>`` is the served capability segment (:func:`flags_label`),
+      omitted entirely for a plain text-in/text-out serving.
+
+    Capability/value detail lives in the display ``name`` and in
+    ``metadata`` (``ctx_size``, ``usage``), never in the id. The id used to
+    carry the solved context, and opencode/hermes cache it at startup -- so
+    182k -> 180k renamed the model out from under every client that had
+    cached it. The context is not part of a serving's identity.
 
     Raises ValueError on duplicate entry ids (two models slugging to the same
     id); callers surface it as a fatal configuration error.  Returns an
     :class:`EmittedConfig` whose ``entry_ids_by_stem`` maps each model stem to
     the ids it produced.
     """
+    catalogue = UsageCatalogue.from_cfg(getattr(profiles, "usage_cfg", None))
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}
+    category_of: dict[str, str | None] = {}
     coload_stems: set[str] = set()
+    # Per-model tails already used: two profile groups (e.g. different
+    # cache_type) can land on the same category+flags, and they still need
+    # distinct ids.  The first keeps the stable name; later duplicates append
+    # their context label (deterministic given the plan's iteration order).
+    used_tails: dict[str, set[str]] = {}
+
+    def unique_tail(stem: str, tail: str, key: str) -> str:
+        """Disambiguate two servings of one stem that share a tail.
+
+        *key* must describe the serving, never the solve. It used to be the
+        context label, which this module's own docstring rules out: a
+        context-derived suffix changes whenever VRAM changes, and
+        opencode/hermes cache entry ids at startup, so a repack silently
+        repoints a cached id at a different physical serving -- and where
+        two entries of a stem can swap emission order between packs, the
+        bare tail changes which serving it names. Cache type and whether the
+        mmproj is attached are operator-declared and do not move with the
+        solve, which is exactly the property an id needs.
+        """
+        taken = used_tails.setdefault(stem, set())
+        cand = tail
+        n = 1
+        while cand in taken:
+            n += 1
+            cand = f"{tail}-{key}" if n == 2 else f"{tail}-{key}-{n}"
+        taken.add(cand)
+        return cand
+
+    def id_and_suffix(v: Variant, ctx: int, flags: str) -> tuple[str, str]:
+        """The ``.<category>.<flags>`` id tail and the display suffix.
+
+        *flags* is the served capability segment (:func:`served_flags`).
+        """
+        # The category is the variant's own, read straight off it: a rung
+        # answers exactly one category, so there is no "heaviest satisfied"
+        # search to run.
+        cats = v.usage
+        cat = cats[0].name if cats and cats[0].name else None
+        # The category is operator-chosen; a name that does not survive id
+        # slugging (or slugs empty) falls back to the context label so the id
+        # stays within the model_id charset (opencode/llama-swap/shell-safe).
+        cat_id = utils.slugify(cat) if cat is not None else ""
+        if not cat_id:
+            cat = None
+        # The id never carries the solved context. A client that cached
+        # `...256k` sees a *different model* after any repack that moved the
+        # context by one rounding step — 182k -> 180k is not a change of
+        # serving, it is a change of name, and clients treat the name as
+        # identity. The context belongs in the display name and in
+        # `metadata.ctx_size`, both of which a client re-reads.
+        tail = ".".join(x for x in (cat_id, flags) if x)
+        disp = f" · {cat}" if cat is not None else ""
+        disp += f" {ctx_label(ctx)}"          # display only, never the id
+        if flags:
+            disp += f" [{flags}]"
+        return tail, disp
+
     for model in models:
         for v in plan.get(model.stem, []):
             view = model.view_for(v.include_mmproj)
             context_length = view.design_context
-            text_only = not v.include_mmproj
             if v.coload:
                 coload_stems.add(model.stem)
+            flags = served_flags(view, v.include_mmproj, v.tools_demoted)
+            tail, disp = id_and_suffix(v, v.ctx_size, flags)
+            tail = unique_tail(model.stem, tail,
+                                f"{v.cache_type}"
+                                f"{'-vis' if v.include_mmproj else ''}")
             entry_id, entry = _build_entry(
                 view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
-                name_suffix=" [text]" if text_only else "",
+                name_suffix=disp,
                 tools_demoted=v.tools_demoted,
+                usage=v.usage,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
+                mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
+                vram_note=v.vram_note,
             )
-            if text_only:
-                entry_id += TEXT_SUFFIX
+            entry_id += f".{tail}" if tail else ""
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "
@@ -1695,31 +2916,13 @@ def emit_config(models: list[Model], plan: dict[str, list[Variant]],
             entries[entry_id] = entry
             owner[entry_id] = model.stem
             ids_by_stem.setdefault(model.stem, []).append(entry_id)
+            category_of[entry_id] = (v.category.name if v.category else None)
 
-            if v.vision_ctx is None:
-                continue
-            n_k = v.vision_ctx // 1000
-            on_view = model.view_for(True)
-            vision_id, vision_entry = _build_entry(
-                on_view, v.parallel, v.cache_type, v.profiles_group,
-                profiles.defaults, template_vars, on_view.design_context,
-                v.vision_ctx,
-                include_mmproj=True,
-                name_suffix=f" [vision {n_k}k]",
-                tools_demoted=v.tools_demoted,
-                estimate_error=v.estimate_error,
-                batch=v.batch, ubatch=v.ubatch,
-            )
-            vision_id += f"-vision-{n_k}k"
-            if vision_id in entries:
-                raise ValueError(
-                    f"duplicate entry id {vision_id!r}: model {model.stem!r} "
-                    f"collides with {owner[vision_id]!r} — rename one of them")
-            entries[vision_id] = vision_entry
-            owner[vision_id] = model.stem
-
+    set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
-                           coload_stems=sorted(coload_stems))
+                           coload_stems=sorted(coload_stems),
+                           set_admission=set_admission,
+                           entry_category=category_of)
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -1744,13 +2947,95 @@ class EmittedConfig(dict):
     """
 
     def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
-                 coload_stems: list[str] | None = None, **kwargs):
+                 coload_stems: list[str] | None = None,
+                 set_admission: dict | None = None,
+                 entry_category: dict[str, str | None] | None = None,
+                 set_overheads: dict[str, int] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
         self.coload_stems: list[str] = coload_stems or []
+        # entry id -> the category it serves (None for the fallback). Carried
+        # because the id names the category, so it is the emitter that knows.
+        self.entry_category: dict[str, str | None] = entry_category or {}
+        # (model stem, category) -> the chat sets that entry may join.
+        self.set_admission: dict[tuple[str, str | None], frozenset[str]] = (
+            set_admission or {})
+        # set name -> MiB allocated to that set's co-resident models (emb/rnk
+        # and any fixed categories).  Emitted as a comment above each `sets:`
+        # entry so the config documents its own memory split.
+        self.set_overheads: dict[str, int] = set_overheads or {}
 
     def plain(self) -> dict:
         return dict(self)
+
+
+def _verify_no_overallocation(config: EmittedConfig, plan: dict,
+                              models: list[Model], planner: "Planner") -> None:
+    """Re-derive every emitted entry's VRAM; drop any that cannot fit.
+
+    The invariant this tool exists to keep: no emitted entry asks for more
+    VRAM than the card has. Every solve upstream honours it, but there are
+    several passes and several clamps, and one edit to any of them could
+    reopen the hole without anything noticing. So the last step recomputes
+    each entry's footprint from the numbers actually written out -- its own
+    ctx_size and parallel, under the same affine law -- and compares that
+    against the budget the planner was given.
+
+    A violation here is a bug, not an operator condition: a model that simply
+    does not fit is handled upstream by omission, which is the contract. So
+    it is logged at ERROR, the entry is removed, and the pack still emits
+    everything that does fit -- impossible to miss, not fatal.
+    """
+    from llama_packer.vram import _RESERVE_SYSTEM, _RESERVE_VIDEO
+
+    reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, planner.baseline_mb)
+    spare_mb = planner.profiles.global_spare_mb(planner.spare, planner.vram_total)
+    available = int((planner.vram_total - reserve - spare_mb)
+                    / (1.0 + planner.memory_margin))
+
+    by_stem = {m.stem: m for m in models}
+    # entry_ids_by_stem is the emitter's own answer to "which model produced
+    # this id" -- the same mapping __main__ uses to build matrix vars.
+    owner = {eid: stem for stem, ids in config.entry_ids_by_stem.items()
+             for eid in ids}
+    removed: list[str] = []
+    for entry_id, entry in list(config.get("models", {}).items()):
+        model = by_stem.get(owner.get(entry_id, ""))
+        if model is None:
+            continue
+        served = entry.get("metadata", {}).get("ctx_size")
+        for variant in plan.get(model.stem, ()):
+            if variant.ctx_size != served:
+                continue
+            profile = (variant.profiles_group[0][1]
+                       if variant.profiles_group else None)
+            quad = _static_params(
+                model, planner.fit_bin, variant.cache_type,
+                measurement_args(planner.profiles, model, planner.llama_args,
+                                 profile))
+            if quad is None:
+                break
+            model_mib, kv, slot_mib, compute_mib = quad
+            parallel = max(1, variant.parallel)
+            need = int(model_mib + compute_mib
+                       + kv * variant.ctx_size * parallel
+                       + slot_mib * parallel)
+            if need > available:
+                logger.error(
+                    "invariant violated: %s needs %d MiB at ctx=%d p=%d but "
+                    "only %d MiB is available — dropped. This is a planner "
+                    "bug, not an operator condition.", entry_id, need,
+                    variant.ctx_size, parallel, available)
+                removed.append(entry_id)
+            break
+
+    if not removed:
+        return
+    for entry_id in removed:
+        config["models"].pop(entry_id, None)
+    config.entry_ids_by_stem = {
+        stem: [i for i in ids if i not in removed]
+        for stem, ids in config.entry_ids_by_stem.items()}
 
 
 def build_config(
@@ -1764,6 +3049,7 @@ def build_config(
     matrix_cfg: dict | None = None,
     embed_model: Model | None = None,
     rerank_model: Model | None = None,
+    fixed_categories: list[tuple[str, Model]] | None = None,
     baseline_mb: int = 0,
     min_context: int = _MIN_AGENTIC_CTX,
     min_context_explicit: bool = False,
@@ -1786,12 +3072,14 @@ def build_config(
         matrix_cfg: Matrix configuration for embed/rerank context solving
         embed_model: Embedding model (if matrix configured)
         rerank_model: Reranking model (if matrix configured)
+        fixed_categories: Declared matrix categories beyond the RAG pair
+            (name, model), e.g. tts/stt — reserved as fixed-overhead
+            residents alongside chat and RAG (matrix categories).
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
-            projection is dropped from the main entry, which is renamed
-            ``<id>-text`` (a ``vision-<N>k`` variant is emitted alongside,
-            still exposing vision at best-effort context).  Pass
+            projection is shed from the entry, which then carries no
+            ``i``/``v`` id flag.  Pass
             ``min_context_explicit=True`` when the value came from an
             explicit ``--min-context`` flag (as opposed to the default): the
             explicit flag overrides the per-model floor cascade's default
@@ -1809,17 +3097,100 @@ def build_config(
         supported, profiles, fit_bin, vram_total,
         spare=spare, max_context=max_context,
         matrix_cfg=matrix_cfg, embed_model=embed_model,
-        rerank_model=rerank_model, baseline_mb=baseline_mb,
+        rerank_model=rerank_model, fixed_categories=fixed_categories,
+        baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
         memory_margin=memory_margin,
         llama_args=template_vars.get("llama_args", ""),
         progress_cb=progress_cb,
     )
-    return emit_config(supported, planner.plan(), profiles, template_vars)
+    plan = planner.plan()
+    config = emit_config(supported, plan, profiles, template_vars)
+    _verify_no_overallocation(config, plan, supported, planner)
+    config.set_overheads = dict(planner.set_overheads)
+    return config
 
 
-def write_yaml(config: dict, path: Path | str) -> None:
-    """Write config to YAML file."""
+class _LiteralDumper(yaml.Dumper):
+    """YAML dumper that keeps newlines intact via literal blocks.
+
+    PyYAML's default renders multi-line strings as folded (single-quoted)
+    scalars, which collapse load-bearing newlines (e.g. audio-cpp's
+    heredoc ``cmd``) into spaces.  Forcing ``|`` style on strings that
+    contain a newline makes the round-trip exact.  Scoped to this subclass
+    so no global ``yaml.add_representer`` side effects leak elsewhere.
+    """
+
+
+def _literal_str_representer(dumper, data):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_LiteralDumper.add_representer(str, _literal_str_representer)
+
+
+def annotate_set_memory(yaml_text: str, set_overheads: Mapping[str, int],
+                        ) -> str:
+    """Insert a ``# <set>: N MiB`` comment above each matrix set.
+
+    PyYAML cannot emit comments, so the already-serialized text is walked:
+    only direct children of the ``sets:`` mapping are annotated (matched by
+    indentation), so a model id or var that happens to share a set's name is
+    never touched.  No-op when there are no priced sets.
+    """
+    if not set_overheads:
+        return yaml_text
+    lines = yaml_text.splitlines()
+    out: list[str] = []
+    in_sets = False
+    sets_indent = -1
+    for line in lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if stripped == "sets:":
+            in_sets = True
+            sets_indent = indent
+            out.append(line)
+            continue
+        if in_sets:
+            if stripped and indent <= sets_indent:
+                in_sets = False
+            elif stripped and ":" in stripped:
+                key = stripped.split(":", 1)[0].strip().strip("\"'")
+                mb = set_overheads.get(key)
+                if mb is not None:
+                    pad = " " * indent
+                    out.append(f"{pad}# {key}: {mb} MiB allocated to its "
+                               f"co-resident models ({mb / 1024:.2f} GiB)")
+        out.append(line)
+    text = "\n".join(out)
+    return text + "\n" if yaml_text.endswith("\n") else text
+
+
+def dump_yaml(payload: dict, set_overheads: Mapping[str, int] | None = None,
+              ) -> str:
+    """Serialize *payload* to a YAML string, preserving embedded newlines.
+
+    When *set_overheads* is given, each matrix set gains a comment recording
+    the VRAM allocated to its co-resident models.
+    """
+    text = yaml.dump(payload, default_flow_style=False, sort_keys=False,
+                     allow_unicode=True, Dumper=_LiteralDumper)
+    return annotate_set_memory(text, set_overheads or {})
+
+
+def write_yaml(config: dict, path: Path | str,
+               set_overheads: Mapping[str, int] | None = None) -> None:
+    """Write config to YAML file.
+
+    *set_overheads* defaults to ``config.set_overheads`` when *config* is an
+    :class:`EmittedConfig`, so callers get the matrix-set memory comments
+    without threading the planner result through by hand.
+    """
+    if set_overheads is None:
+        set_overheads = getattr(config, "set_overheads", None)
     payload = config.plain() if isinstance(config, EmittedConfig) else config
     with open(path, "w") as f:
-        yaml.dump(payload, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        f.write(dump_yaml(payload, set_overheads))

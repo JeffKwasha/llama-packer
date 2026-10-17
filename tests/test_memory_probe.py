@@ -27,6 +27,9 @@ def _fake(stem, tmp, arch="qwen3", size=100, suffix=".gguf",
     path.write_bytes(b"\x00" * 8)
     kw.setdefault("on_cpu", False)
     kw.setdefault("_override_error", None)
+    # The correction table's mtp dimension (Model.mtp_baked_in): True only
+    # for a draft baked into the main GGUF.  No companion here.
+    kw.setdefault("mtp_baked_in", True)
     return SimpleNamespace(
         stem=stem, arch=arch, size_mb=size, gguf_path=path, **kw)
 
@@ -280,3 +283,47 @@ def test_run_probe_end_to_end(tmp_path, monkeypatch):
     text = run_probe([a, b], "/bin/fit", "/bin/llama-server", "q8_0")
     assert "qb" in text and "qa" not in text  # largest represents qwen3
     assert "PASS" in text and "FAIL" not in text
+
+
+def test_probe_does_not_file_companion_draft_as_baked_in(tmp_path, monkeypatch):
+    # A witness run with --spec-draft-model carries the companion's own
+    # weights/KV in its delta, and the packer adds those separately via
+    # effective_static.  Filing it under the table's mtp dimension would
+    # double-count companion models and over-reserve every baked-in model
+    # of the same arch.  Regression (2026-09-26): a DSpark companion probe
+    # wrote qwen35|q8_0|1, a row the packer never reads for that model.
+    monkeypatch.setattr("llama_packer.gpu_state.llama_residents", lambda: [])
+
+    class FakeVram:
+        def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
+                                llama_args):
+            return {"weights": 1100.0,
+                    "kv": float(ctx // 64 + 100 * parallel),
+                    "rs": 0.0, "compute": 0.0, "output": 0.0}
+        def _fit_params_serve(self, *a, **k):
+            return SimpleNamespace(model_mib=1000, compute_mib=100,
+                                   kv_per_token_mib=1 / 64, slot_mib=100.0)
+
+    saved = []
+    monkeypatch.setattr(
+        "llama_packer.memory_probe.save_serve_correction",
+        lambda *a, **k: saved.append(a))
+
+    companion = _fake("dirk", arch="qwen35", size=400, tmp=tmp_path)
+    companion.design_context = 32768
+    companion.mtp = _fake("dspark", arch="qwen35", size=50, tmp=tmp_path)
+    companion.mtp_baked_in = False          # the companion shape
+    companion.vram = FakeVram()
+    run_probe([companion], "/bin/fit", "/bin/llama-server", "q8_0")
+    assert saved == []
+
+    # The same model without a companion files the row normally.
+    baked = _fake("baked", arch="qwen35", size=400, tmp=tmp_path)
+    baked.design_context = 32768
+    baked.mtp = None
+    baked.mtp_baked_in = True
+    baked.vram = FakeVram()
+    run_probe([baked], "/bin/fit", "/bin/llama-server", "q8_0")
+    assert len(saved) == 1
+    arch, cache_type, mtp_dim = saved[0][:3]
+    assert (arch, cache_type, mtp_dim) == ("qwen35", "q8_0", True)

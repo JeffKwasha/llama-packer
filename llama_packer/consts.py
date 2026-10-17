@@ -18,9 +18,31 @@ _DEFAULT_CONTEXT_LENGTH = 32768
 _CTX_ROUND_TO = 8192
 _MIN_CTX_SIZE = 4096
 
+# Room reserved, in tokens, for the model to answer once it has seen an
+# image. The image floor only guarantees the image itself fits; without
+# this a vision entry could be sized to exactly image_max_tokens and have
+# nothing left to generate a description in. ~1024 covers a short
+# description with headroom; per-model ``image_output_reserve`` overrides
+# it for OCR/transcription, which need far more.
+_DEFAULT_IMAGE_OUTPUT_RESERVE = 1024
+
+# Pixels per megapixel, for converting an operator's resolution budget
+# (``min_image_megapixels``) into the image token floor.
+_PIXELS_PER_MEGAPIXEL = 1_000_000
+
 # Minimum context for a chat model to be useful for agentic work
 # (tool-call loops, long sessions). 128k.
 _MIN_AGENTIC_CTX = 131072
+
+# llama-server's own builtins (`llama-server --help`): the effective values
+# when no ``batch:``/``ubatch:`` is configured and the flag is therefore not
+# rendered at all.  Kept in one place so the VRAM measurement shape can stamp
+# the *effective* ubatch while the serve command stays clean — the compute
+# buffer the estimate is calibrated for is the one llama.cpp will use either
+# way.  Verify against the build after a llama.cpp upgrade:
+#   llama-server --help | grep -A1 -- '--ubatch-size'
+_LLAMA_CPP_DEFAULT_BATCH = 2048
+_LLAMA_CPP_DEFAULT_UBATCH = 512
 
 # Reason string emitted as metadata.estimate_error on entries for models
 # with no usable VRAM estimate (metadata.estimated=false): every estimate
@@ -37,6 +59,13 @@ ESTIMATE_ERROR_REASON = (
 # VRAM reservation (MB)
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
+# Fixed base the OS/driver/compositor holds before any model loads.
+# Observed on the reference AMD R9700 (ROCm, KDE Wayland, two outputs):
+# idle USED_VRAM 1665-1796 MiB, of which display scanout is only ~101 MiB —
+# the rest is compositor textures + driver overhead.  The 2048 total is the
+# base; variable tenants (immich, browsers) are the *slack* the operator
+# covers with ``--spare`` / ``profiles.yaml hardware.spare``.  See
+# docs/plans/phase0-vram-baseline.md.
 _RESERVE_SYSTEM = 1024
 _RESERVE_VIDEO = 1024
 
@@ -146,7 +175,10 @@ _SD_COMPUTE_MB = 512
 # errs toward reserving more, like the other fixed heuristics here.
 _VLLM_PER_SEQ_MIB = 32.0
 _WHISPER_COMPUTE_MB = 100
-_KOKORO_COMPUTE_MB = 3072
+# audio.cpp: weights + a session/vocoder/diffusion buffer.  Family-dependent
+# (ASR/VAD ~512 … diffusion TTS ~3072); operators pin the exact figure with
+# the sidecar `vram_mb:` key when a family drifts from this default.
+_AUDIO_CPP_COMPUTE_MB = 1024
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # Diffusion architecture regex patterns
@@ -184,3 +216,28 @@ _DEFAULT_DIR_ROLES = {
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 _NON_CHAT_ROLES = frozenset({"embeddings", "rerank", "image", "s2t", "t2s"})
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Weight-file suffixes
+# The only files that can be models. Snapshot listings and companion
+# scans filter to these so config/asset subdirs (tokenizer/,
+# 1_Pooling/, speech_tokenizer/ config) never match.
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+_WEIGHT_SUFFIXES = frozenset({".gguf", ".safetensors", ".bin", ".onnx"})
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Capability shedding
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+#: The capabilities a category can protect or give up.  Explicit so a typo is
+#: a warning rather than a silently inert demand.
+KNOWN_CAPABILITIES = frozenset({"vision", "draft"})
+
+#: Fallback shed order, for a category that names none.  Overridable in
+#: profiles.yaml under ``shed:`` -- a category is expected to describe itself
+#: completely, but what one does *not* mention still has to go somewhere, so
+#: the tail exists; it is configuration, not code, so an operator can change
+#: what "unnamed" means.
+DEFAULT_SACRIFICE_ORDER: tuple[str, ...] = ("vision", "draft")

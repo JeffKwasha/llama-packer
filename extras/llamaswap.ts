@@ -105,8 +105,12 @@ function hasThinking(m: LlamaSwapModel): boolean {
   return !!x?.thinking || typeof x?.freethought === "number" || !!x?.modes?.includes("thinking")
 }
 
-function displayNameForId(id: string): string {
+function displayNameForId(id: string, name?: string): string {
+  // Prefer the server's display name, which carries the task/category,
+  // capability flags and context that the stable id deliberately omits.
+  // Aliases (":coder", ":thinking") share the base name, so keep the marker.
   const i = id.indexOf(":"); const base = i >= 0 ? id.slice(0, i) : id; const alias = i >= 0 ? id.slice(i + 1) : null
+  if (name && name.trim()) return alias ? `${name.trim()} (${alias})` : name.trim()
   return alias ? `${base} (${alias})` : base
 }
 
@@ -130,7 +134,7 @@ export const LlamaSwapPlugin: Plugin = async ({ client: _client }: PluginInput) 
         for (const m of data.data) {
           if (!m || typeof m.id !== "string" || !isChatModel(m) || existing[m.id]) continue
           const ctx = resolveContext(m); const out = Math.max(4096, Math.min(Math.floor(ctx / 2), DEFAULT_OUTPUT_LIMIT))
-          const modelCfg: Record<string, unknown> = { name: displayNameForId(m.id), limit: { context: ctx, output: out } }
+          const modelCfg: Record<string, unknown> = { name: displayNameForId(m.id, m.name), limit: { context: ctx, output: out } }
           if (hasVision(m)) modelCfg.attachment = true
           if (hasThinking(m)) { modelCfg.reasoning = true; modelCfg.variants = { off: { reasoning: false } } as any }
           existing[m.id] = modelCfg as any
@@ -154,7 +158,7 @@ export const LlamaSwapPlugin: Plugin = async ({ client: _client }: PluginInput) 
             for (const m of data.data) {
               if (!m || typeof m.id !== "string" || !isChatModel(m)) continue
               const ctx = resolveContext(m); const parts = [m.id]
-              const disp = displayNameForId(m.id); if (disp !== m.id) parts.push(`"${disp}"`)
+              const disp = displayNameForId(m.id, m.name); if (disp !== m.id) parts.push(`"${disp}"`)
               const q = (m.meta?.llamaswap as any)?.quantization; const p = (m.meta?.llamaswap as any)?.parameters
               if (p) parts.push(`size=${p}`); if (q) parts.push(`quant=${q}`)
               parts.push(`ctx=${ctx}`)
