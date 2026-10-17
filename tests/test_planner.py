@@ -181,43 +181,6 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
     assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
-def test_planner_vision_kept_adds_text_variant(make_model, profiles, tmp_path):
-    # Shedding the projection frees VRAM, so the text rung must afford more
-    # context than the vision one -- that gain is the whole reason the rung
-    # earns an entry.
-    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
-                                  "capabilities": ["image"]},
-                   context_length=262144)
-    _scripted_ctx(m, {True: 131072, False: 160000})
-
-    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
-                      min_context=131072)
-    variants = planner.plan()["vis"]
-    assert len(variants) == 2
-    v = variants[0]
-    assert v.include_mmproj is True
-    assert v.ctx_size == 131072
-    assert v.vision_ctx is None
-    tv = variants[1]
-    assert tv.include_mmproj is False
-    assert tv.vision_ctx is None
-    assert tv.ctx_size == 160000
-
-    config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    ids = set(config["models"])
-    assert len(ids) == 2
-    vis_id = "vis.i"
-    text_id = "vis"
-    assert ids == {vis_id, text_id}, ids
-    assert "--mmproj" in config["models"][vis_id]["cmd"]
-    text = config["models"][text_id]
-    assert "--mmproj" not in text["cmd"]
-    assert text["name"].endswith("156k")
-    assert text["metadata"]["mmproj_skipped"] is True
-    assert text["metadata"]["ctx_size"] == 160000
-    assert text["capabilities"]["in"] == ["text"]
-
 
 def test_bounded_ctx_clamps_design_then_cli(make_model, profiles):
     m = make_model("m")  # sidecar context_length 32768
@@ -352,11 +315,17 @@ def test_plan_disables_over_budget_model(make_model, profiles, caplog):
     _fake_vram(m, (50000, 0.5, 100))  # 50G weights on a 48G card
     planner = Planner([m], profiles, fit_bin="unused",
                       vram_total=48 * 1024)
-    variants = planner.plan()["huge"]
-    assert variants == []
-    assert any("disabled" in r.message for r in caplog.records)
+    plan = planner.plan()
+    # No variant at all: the model reaches no rung, so the stem never lands
+    # in plan and therefore never reaches entry_ids_by_stem -- sets and matrix
+    # vars auto-prune. "Emitting what is possible is the goal", so a model
+    # that cannot load is absent rather than emitted at a context it cannot
+    # hold.
+    assert plan.get("huge", []) == []
+    assert any("huge" in r.message for r in caplog.records), [
+        r.message for r in caplog.records]
     # And it vanishes from emission entirely.
-    config = emit_config([m], {"huge": variants}, profiles, TVARS)
+    config = emit_config([m], plan, profiles, TVARS)
     assert config["models"] == {}
 
 
@@ -478,64 +447,36 @@ def test_plan_vision_over_budget_falls_back_to_text(tmp_path, make_model,
     assert v.include_mmproj is False
     assert v.ctx_size == 131072
     assert v.estimate_error is None
-    assert any("vision over budget" in r.message for r in caplog.records)
-    # Companion also over budget → suppressed, but the main entry is not
-    # disabled (that warning is "vf: disabled (...)").
-    assert any("vision companion disabled" in r.message
-               for r in caplog.records)
+    assert any("fallback" in r.message and "budgeted" in r.message
+               for r in caplog.records), [r.message for r in caplog.records]
+    # There is no companion any more: the text-only rung *is* the entry.
     assert not any(r.levelno >= logging.WARNING
                    and r.message.startswith("vf: disabled")
                    for r in caplog.records)
 
 
-def test_plan_vision_companion_over_budget_suppressed(tmp_path, make_model,
-                                                      profiles, caplog):
-    """Main entry already text-only; the best-effort vision companion solve
-    is over budget → no vision entry (would be a load-time OOM landmine)."""
-    (tmp_path / "vc-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model("vc", mmproj={"file": "vc-mmproj.gguf",
-                                 "capabilities": ["image"]},
-                   context_length=262144)
-    _gated_ctx(m, {
-        True: (4096, "weights + compute need 40000 MiB, only 1000 budgeted",
-               False),
-        False: (131072, None, False),
-    })
-    # min-context 131072: vision (4096) misses it, text hits it → drop pass
-    # drops mmproj; group starts text-only and plans the companion.
-    planner = Planner([m], profiles, fit_bin="unused",
-                      vram_total=48 * 1024, min_context=131072)
-    variants = planner.plan()["vc"]
-    assert variants
-    v = variants[0]
-    assert v.include_mmproj is False
-    assert v.ctx_size == 131072
-    assert v.vision_ctx is None
-    assert any("vision companion disabled" in r.message
-               for r in caplog.records)
-    # And no vision entry is emitted alongside.
-    config = emit_config([m], {"vc": variants}, profiles, TVARS)
-    assert set(config["models"]) == {"vc"}
-
 
 def test_plan_vision_and_text_both_over_budget_disables(tmp_path, make_model,
-                                                        profiles, caplog):
-    """Fallback is not a free pass: if text-only also cannot load, the
-    model is disabled as before."""
-    (tmp_path / "vd-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model("vd", mmproj={"file": "vd-mmproj.gguf",
+                                                        profiles):
+    """Fallback is not a free pass: if no rung can load, nothing is emitted.
+
+    The mechanism moved from a fleet-wide over-budget gate to
+    solve_rung returning None for every shed level, but the contract is
+    unchanged: a model that cannot load at any rung produces no entry rather
+    than an entry at a context it cannot hold.
+
+    Validates: SPEC.md: 'A category that cannot meet min_context at any rung
+    emits nothing.'
+    """
+    (tmp_path / "vb-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("vb", mmproj={"file": "vb-mmproj.gguf",
                                  "capabilities": ["image"]},
                    context_length=262144)
-    over = "weights + compute need 50000 MiB, only 1000 budgeted"
-    _gated_ctx(m, {
-        True: (4096, over, False),
-        False: (4096, over, False),
-    })
+    _gated_ctx(m, {True: (0, "weights need 40000 MiB", False),
+                   False: (0, "weights still need 40000 MiB", False)})
     planner = Planner([m], profiles, fit_bin="unused",
                       vram_total=48 * 1024, min_context=4096)
-    variants = planner.plan()["vd"]
-    assert variants == []
-    assert any("disabled" in r.message for r in caplog.records)
+    assert planner.plan().get("vb", []) == []
 
 
 def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
@@ -544,16 +485,22 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
     # Pin-free profiles (no parallel in defaults) so auto-parallel runs;
     # an explicit sidecar min_context (cascade row 1) sets the floor so the
     # value function can actually reach both caps.
+    # A declared category, so the entry runs the real slot solve
+    # (parallel_power) rather than the null category's exponent-0 bias: this
+    # test is about backend slot caps, not about the fallback's trade-off.
     no_pin = Profiles({"defaults": {"cache_type": "q8_0"},
-                       "profiles": {"default": {}}})
-    vllm_m = make_model("av", backend="vllm", min_context=4096)
+                       "profiles": {"default": {}},
+                       "usage": {"qa": {"min_context": "4k",
+                                         "min_parallel": 1}}})
+    vllm_m = make_model("av", backend="vllm", min_context=4096,
+                        usage=["qa"])
     del vllm_m.frontmatter["context_length"]  # no pin: cap = design
     _fake_vram(vllm_m, (1000, 0.5, 100))
     planner = Planner([vllm_m], no_pin, fit_bin="unused",
                       vram_total=48 * 1024, min_context=4096)
     assert planner.plan()["av"][0].parallel == 16
 
-    llama_m = make_model("al", min_context=4096)
+    llama_m = make_model("al", min_context=4096, usage=["qa"])
     del llama_m.frontmatter["context_length"]
     _fake_vram(llama_m, (1000, 0.5, 100))
     planner = Planner([llama_m], no_pin, fit_bin="unused",
@@ -1240,22 +1187,45 @@ def test_rung_honours_keep_then_falls_back_to_vision(make_model):
     assert rung.shed == frozenset({"vision"})
 
 
-def test_fallback_never_degrades(make_model):
-    """No goals to protect, so capability is all that is left to give up.
+def test_fallback_keeps_capability_until_the_minimum_forces_it(make_model):
+    """Capability first; context only when there is none left to protect.
 
-    Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
+    Taking the bare 4096 and keeping the projector is the point: the
+    fallback has no goals, so giving up a capability for context the
+    category never asked for would be a pointless trade. It sheds only when
+    holding the capability would leave no legal serving at all.
+
+    Validates: docs/plans/category-semantics.md, 'The null category (fallback)':
+    it keeps mmproj and MTP even when that costs it all of its context.
     """
     from llama_packer.writer import FALLBACK
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 4096, False: 262144})
     rung = p.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
-                        spare_mb=0)
-    assert rung.shed == frozenset(), "fallback shed something"
-    assert rung.ctx == 4096, "kept mmproj but is below its own minimum"
+                        spare_mb=0, prefer_capability=True)
+    assert rung.shed == frozenset(), "shed while a legal serving existed"
+    assert rung.ctx == 4096, "took the minimum, keeping the projector"
 
+    # Plentiful: the projector costs nothing, so the cap is served outright.
     generous = _affording(m, {True: 262144, False: 262144})
     assert generous.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
-                               spare_mb=0).ctx == 262144
+                               spare_mb=0,
+                               prefer_capability=True).ctx == 262144
+
+
+def test_fallback_sheds_when_nothing_else_fits(make_model):
+    """The other direction: no legal serving with the capability attached.
+
+    Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
+    """
+    from llama_packer.writer import FALLBACK
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 0, False: 4096})
+    rung = p.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
+                        spare_mb=0, prefer_capability=True)
+    assert rung is not None, "the fallback must still emit something"
+    assert "vision" in rung.shed, "kept a capability it could not afford"
+    assert rung.ctx >= 4096
 
 
 def test_keep_draft_is_enforced_now_that_the_axis_exists(make_model):

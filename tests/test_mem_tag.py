@@ -254,32 +254,3 @@ def test_planner_cpu_model_ram_only_tag(make_model):
     config = emit_config([m], {"c": variants}, _profiles(), TVARS)
     desc = entry_for(config, "c")["description"]
     assert desc.endswith("[RAM 21.5GB]")
-
-
-def test_planner_text_variant_tag_differs(make_model, tmp_path):
-    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model(
-        "vis",
-        parallel=1,
-        context_length=262144,
-        mmproj={"file": "vis-mmproj.gguf", "capabilities": ["image"]},
-    )
-    quad_on = (2, 0.001, 10, 20)  # mmproj weight folded in
-    quad_off = (1, 0.001, 10, 20)
-    # the text rung must gain context to earn an entry at all
-    _scripted(m, 200000, {True: quad_on, False: quad_off},
-              ctx_by_mmproj={True: 200000, False: 210000})
-
-    planner = Planner(
-        [m], _profiles(), fit_bin="unused", vram_total=48 * 1024, min_context=131072
-    )
-    variants = planner.plan()["vis"]
-    assert len(variants) == 2  # main (vision) + on-demand text-only
-
-    config = emit_config([m], {"vis": variants}, _profiles(), TVARS)
-    main = entry_for(config, "vis")["description"]
-    text = [e for e in config["models"].values()
-            if "--mmproj" not in e["cmd"]][0]["description"]
-    assert main.endswith("[VRAM 232MB RAM 1MB]")
-    assert text.endswith("[VRAM 241MB RAM 0MB]"), text[-40:]
-    assert main != text

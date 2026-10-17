@@ -802,14 +802,19 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
 
 
 #: The null category: every model's baseline serving. Bare minimums only and
-#: no category name in the id. It never degrades — it keeps mmproj and MTP
-#: even when that means serving at ``_MIN_CTX_SIZE`` — because with no goals
-#: to protect, capability is the only thing left to give up. It holds one
-#: slot (no auto-parallel search) and joins no set, because a sideload set is
-#: about routing, which is what categories are for.
+#: no category name in the id. It keeps mmproj and MTP whenever it can — with
+#: no goals to protect, capability is the only thing left to give up — and
+#: concedes a capability only when holding it would leave no legal serving at
+#: all. An empty ``sacrifice`` says exactly that: default-order shedding,
+#: gated by the minimum, and the first qualifying rung wins rather than the
+#: one buying the most context (a category wants context; this wants
+#: capability).
+#:
+#: It joins no set. Routing is what categories are for, and this has no name
+#: to route on.
 FALLBACK: "UsageDemand" = UsageDemand(
     name="", min_context=_MIN_CTX_SIZE, min_parallel=1,
-    require=frozenset(), sacrifice=None)   # None: never degrade
+    require=frozenset(), sacrifice=())
 
 
 @dataclass(frozen=True)
@@ -1165,32 +1170,6 @@ def served_flags(model: "Model", include_mmproj: bool,
     return flags_label(caps)
 
 
-def category_label(demands: Iterable["UsageDemand"], catalogue: "UsageCatalogue") -> str | None:
-    """The id category segment: the heaviest satisfied ``usage:`` category.
-
-    "Heaviest" is the one with the largest declared ``min_context`` (ties by
-    catalogue declaration order, so the choice is deterministic).  A serving
-    that meets several categories is named for the most demanding one — an
-    id may under-claim, never over-claim, so a client picking the entry for
-    that task is guaranteed the minimums hold.  ``None`` when the serving
-    satisfies no blessed category (untagged, or below every floor): the
-    emitter then falls back to the context label.
-    """
-    best: UsageDemand | None = None
-    for d in demands or ():
-        if best is None:
-            best = d
-            continue
-        if d.min_context > best.min_context:
-            best = d
-        elif d.min_context == best.min_context:
-            # Tie → catalogue declaration order decides.
-            try:
-                if catalogue.order.index(d.name) < catalogue.order.index(best.name):
-                    best = d
-            except ValueError:
-                pass
-    return best.name if best is not None else None
 
 
 def _parse_bool_knob(key: str, v: object) -> bool:
@@ -1424,11 +1403,17 @@ class Variant:
     vision_ctx: int | None = None
     coload: bool = False
     tools_demoted: bool = False
-    #: The blessed ``usage:`` categories this *rung* actually satisfies (the
-    #: ids it is named for).  Empty for an untagged/unmeasured serving.
+    #: The categories this rung is named for. A rung answers exactly one, so
+    #: this is normally a single demand; a tuple only so the emitter can
+    #: express "nothing declared" without a second field. Empty for the
+    #: fallback entry, which carries no category name in its id.
     usage: tuple[UsageDemand, ...] = ()
-    #: Categories satisfied by the best-effort vision companion (served at
-    #: ``vision_ctx``); empty when there is no companion or it is unmeasured.
+    #: The category this variant answers, or :data:`FALLBACK` for the null
+    #: category. Singular, because a rung exists to serve one category -- which
+    #: is what lets one model emit several entries and stay unambiguous.
+    category: UsageDemand | None = None
+    #: Retained for constructor compatibility with older callers. There is no
+    #: vision companion any more, so nothing sets it.
     vision_usage: tuple[UsageDemand, ...] = ()
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
@@ -1622,11 +1607,12 @@ class Planner:
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
-    def solve_rung(self, view, demand: "UsageDemand", *,
+    def solve_rung(self, model, demand: "UsageDemand", *,
                    parallel: int, cache_type: str, spare_mb: int,
                    design_ctx: int | None = None,
                    context_length: int | None = None,
-                   profile: dict | None = None) -> "Rung | None":
+                   profile: dict | None = None,
+                   prefer_capability: bool = False) -> "Rung | None":
         """The serving this category should get: most context that fits.
 
         Walks the category's own shed levels (:func:`shed_levels`), asking the
@@ -1644,12 +1630,24 @@ class Planner:
 
         Only the shed axis is decided here. Slot count stays with the
         parallel solve, which runs afterwards and may squeeze further.
+
+        Two rules for which qualifying rung wins, and they differ because
+        the categories differ. A category wants the **most context** — coding
+        would rather have 262144 tokens text-only than 131072 with a
+        projector. The null category wants the **least shed**, taking the
+        first rung that qualifies: it has no goals, so handing up a capability
+        to buy context nobody asked for is a pointless trade.
         """
         best: Rung | None = None
         for shed in shed_levels(demand.sacrifice,
                                 default_order=self.profiles.shed_order,
                                 required=demand.require,
                                 kept=demand.keep):
+            # The view follows the shed level. view_for() gives an mmproj
+            # model a *separate* companion-on budget, so probing a text-only
+            # rung against the vision view would measure the vision budget
+            # again and never see what dropping the projector buys.
+            view = model.view_for("vision" not in shed)
             ctx = self._bounded_ctx(
                 view, parallel=max(1, parallel), cache_type=cache_type,
                 spare_mb=spare_mb,
@@ -1659,10 +1657,27 @@ class Planner:
                 profile=profile)
             if ctx <= 0 or ctx < demand.min_context:
                 continue
-            if best is None or ctx > best.ctx:
-                best = Rung(shed=shed, ctx=ctx, parallel=max(1, parallel),
-                            demand=demand)
-            # Equal context: the earlier (less-shed) level stands, so stop.
+            over = getattr(view.vram, "over_budget_reason", None)
+            if over is not None:
+                # Weights plus this level's companions do not fit. A lower
+                # rung may still shed down to something that does -- but if
+                # none does, the category emits nothing rather than a config
+                # that cannot load. This is the per-category form of the
+                # fleet-wide over-budget gate, and was lost with it.
+                logger.info("%s: %s (%s)", view.stem,
+                            demand.name or "fallback", over)
+                continue
+            rung = Rung(shed=shed, ctx=ctx, parallel=max(1, parallel),
+                        demand=demand)
+            if best is None:
+                best = rung
+            elif prefer_capability:
+                # shed_levels is least-shed first, so the first rung that
+                # qualifies is the answer and nothing later can improve it.
+                return best
+            elif ctx > best.ctx:
+                best = rung
+            # Equal context: the earlier (less-shed) level stands.
         return best
 
     def _tools_demoted(self, view, ctx: int) -> bool:
@@ -1715,6 +1730,7 @@ class Planner:
         floor: int,
         pin_ctx: int | None,
         group_parallel: int,
+        power: float | None = None,
         min_parallel: int = 1,
         profile: dict | None = None,
     ) -> tuple[int, int]:
@@ -1733,7 +1749,7 @@ class Planner:
         because the context is the property the entry id advertises and
         concurrency is only a throughput preference.
         """
-        power = self.knobs.parallel_power
+        power = self.knobs.parallel_power if power is None else power
         # vLLM's continuous batching makes a slot cost KV only (no per-slot
         # workspace), so concurrency is cheap — cap it higher there.
         pmax = (self.knobs.vllm_auto_parallel_max
@@ -1798,50 +1814,6 @@ class Planner:
 
     # ── planning passes ──
 
-    def _mmproj_drop_pass(self) -> dict[str, bool]:
-        """Decide per chat model whether the main entry keeps its mmproj.
-
-        A model keeps vision when it reaches the minimum useful context WITH
-        the projection loaded; otherwise the main entry drops it (the
-        vision-less serving carries no ``i``/``v`` flag and a best-effort
-        vision variant is emitted alongside) — but only when dropping
-        actually helps: a model whose design context is below the minimum
-        even text-only keeps its vision, since sacrificing it buys nothing.
-        Uses the global spare and fleet defaults; per-profile spare still
-        bounds ctx per group.
-        """
-        drop: dict[str, bool] = {}
-        global_spare_mb = self.profiles.global_spare_mb(self.spare, self.vram_total)
-        for model in self.models:
-            if model.role in utils.NON_CHAT_ROLES:
-                continue
-            if not (model.mmproj and model.mmproj.gguf_path):
-                continue
-            on_view = model.view_for(True)
-            cache_type = on_view.cache_type_for(self.profiles.default_cache_type)
-            parallel = on_view.parallel_for(self.profiles.default_parallel)
-            ctx_with = self._bounded_ctx(
-                on_view, parallel=parallel, cache_type=cache_type,
-                spare_mb=global_spare_mb, include_mmproj=True)
-            if ctx_with >= self.min_context:
-                drop[model.stem] = False
-                logger.info("mmproj: keep for %s (ctx %d >= %d)",
-                            model.stem, ctx_with, self.min_context)
-                continue
-            ctx_without = self._bounded_ctx(
-                model, parallel=parallel, cache_type=cache_type,
-                spare_mb=global_spare_mb, include_mmproj=False)
-            if ctx_without < self.min_context:
-                # Below the minimum either way — no configuration fixes this;
-                # dropping vision would only degrade the model. Keep it.
-                logger.info("mmproj: %s design ctx %d is below min-context %d "
-                            "with or without vision; keeping vision",
-                            model.stem, ctx_with, self.min_context)
-                continue
-            drop[model.stem] = True
-            logger.info("mmproj: drop for %s (vision ctx %d < %d; text ctx %d)",
-                        model.stem, ctx_with, self.min_context, ctx_without)
-        return drop
 
     def demands_for(self, model: Model) -> tuple[UsageDemand, ...]:
         """The usage demands in force for *model*.
@@ -2167,9 +2139,15 @@ class Planner:
         ``tools_min_ctx``, and included co-loads are flagged so the emitter
         can expose them for matrix-var construction.
         """
-        drop_mmproj = self._mmproj_drop_pass()
+        # The shared budget assumes every projector is shed, which holds for
+        # the categories that drop vision and leaves one that keeps its
+        # projector to decide in its own rung. `_mmproj_drop_pass` used to
+        # pick that per model from a global context threshold, before any
+        # category was read -- which is how it came to contradict the
+        # category a model actually declared.
         self.matrix_result = self._solve_matrix(
-            {s for s, d in drop_mmproj.items() if d})
+            {m.stem for m in self.models
+             if m.mmproj is not None and m.mmproj.gguf_path})
         if self.matrix_result is not None:
             self.chat_ctx = self.matrix_result.chat_ctx
         coload_stems = ({s for s, _ in self.matrix_result.coloads}
@@ -2185,7 +2163,7 @@ class Planner:
         # values are Variant lists, except the reserved admission key
         plan: dict = {}
         for model in self.models:
-            include_mmproj = not drop_mmproj.get(model.stem, False)
+            include_mmproj = True   # per-category now; see solve_rung
             view = model.view_for(include_mmproj)
             on_view = model.view_for(True)
             context_length = view.design_context
@@ -2218,7 +2196,7 @@ class Planner:
             for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
                 # Reset the per-group serving view: a prior group's
                 # vision→text fallback must not leak into this group.
-                include_mmproj = not drop_mmproj.get(model.stem, False)
+                include_mmproj = True   # per-category now; see solve_rung
                 view = model.view_for(include_mmproj)
                 context_length = view.design_context
                 if view.role == "embeddings" and self.matrix_result:
@@ -2277,41 +2255,66 @@ class Planner:
                 group_parallel = parallel
                 if uncapped:
                     parallel = 1   # single-seq ctx solve; emission drops it
+                # One solve per category, plus the fallback. Each declares
+                # its own floor and its own minimum slots, and each resolves
+                # its own (shed, ctx, parallel) against the same budget -- so
+                # a `.coding` entry and a `.aux` entry for one model are
+                # entitled to different sizes, which is the point.
                 if est_error is not None:
                     ctx_size = self._unestimated_ctx(view)
-                elif auto:
+                    serves = [(FALLBACK, view, parallel, ctx_size)]
+                else:
+                    serves = []
                     pin_ctx = self._serving_pin(view)
-                    # A usage demand is the floor the value function may not
-                    # trade below: `coding`'s 128k is the reason the model is
-                    # tagged, so auto-parallel optimising *past* it is fine
-                    # and trading under it is not. It sets the floor rather
-                    # than only raising it -- see resolve_min_ctx.
-                    demands = self.demands_for(model)
-                    want = max((d.min_context for d in demands), default=None)
-                    floor = resolve_min_ctx(
-                        view, pin_ctx=pin_ctx,
-                        tools_min_ctx=self.knobs.tools_min_ctx,
-                        fallback_min_ctx=self.min_context,
-                        fallback_explicit=self.min_context_explicit,
-                        category_floor=want)
                     cap_ctx = context_length
                     if self.max_context is not None:
                         cap_ctx = min(cap_ctx, self.max_context)
-                    min_parallel = max((d.min_parallel for d in demands),
-                                       default=1)
-                    parallel, ctx_size = self._auto_parallel(
-                        view, cache_type=cache_type, spare_mb=spare_eff,
-                        include_mmproj=include_mmproj, cap_ctx=cap_ctx,
-                        floor=floor, pin_ctx=pin_ctx,
-                        min_parallel=min_parallel,
-                        group_parallel=parallel, profile=group[0][1])
-                else:
-                    ctx_size = self._bounded_ctx(
-                        view, parallel=parallel, cache_type=cache_type,
-                        spare_mb=spare_eff, include_mmproj=include_mmproj,
-                        design_ctx=self.chat_ctx,
-                        context_length=context_length,
-                        profile=group[0][1])
+                    for demand in (*self.demands_for(model), FALLBACK):
+                        is_null = demand is FALLBACK
+                        floor = resolve_min_ctx(
+                            view, pin_ctx=pin_ctx,
+                            tools_min_ctx=self.knobs.tools_min_ctx,
+                            fallback_min_ctx=self.min_context,
+                            fallback_explicit=self.min_context_explicit,
+                            category_floor=demand.min_context)
+                        rung = self.solve_rung(
+                            model, demand, parallel=parallel,
+                            cache_type=cache_type, spare_mb=spare_eff,
+                            design_ctx=self.chat_ctx,
+                            context_length=cap_ctx, profile=group[0][1],
+                            prefer_capability=is_null)
+                        if rung is None:
+                            # Cannot be served at any rung: no id may claim it.
+                            # The fallback is the floor on that.
+                            continue
+                        shed_vision = "vision" in rung.shed
+                        serve_view = model.view_for(not shed_vision)
+                        if auto:
+                            par, ctx = self._auto_parallel(
+                                serve_view, cache_type=cache_type,
+                                spare_mb=spare_eff,
+                                include_mmproj=not shed_vision,
+                                cap_ctx=cap_ctx, floor=floor,
+                                pin_ctx=pin_ctx,
+                                power=0.0 if is_null else None,
+                                min_parallel=demand.min_parallel,
+                                group_parallel=parallel,
+                                profile=group[0][1])
+                        else:
+                            par = parallel
+                            ctx = self._bounded_ctx(
+                                serve_view, parallel=par,
+                                cache_type=cache_type, spare_mb=spare_eff,
+                                include_mmproj=not shed_vision,
+                                design_ctx=self.chat_ctx,
+                                context_length=cap_ctx,
+                                profile=group[0][1])
+                            if ctx < demand.min_context:
+                                continue
+                        serves.append((demand, serve_view, par, ctx))
+                    if not serves:
+                        continue
+                ctx_size = serves[0][3]
                 if est_error is None:
                     # Discovery during this model's own solve: calc_ctx
                     # flagged the model unestimable (no measurement source
@@ -2324,82 +2327,12 @@ class Planner:
                     if est_error is not None:
                         parallel = group_parallel
                         ctx_size = self._unestimated_ctx(view)
+                        # `serves` came from the solve this check just
+                        # invalidated; rebuild it so the emitted entry does
+                        # not carry an estimated context while claiming to be
+                        # unestimated.
+                        serves = [(FALLBACK, view, group_parallel, ctx_size)]
 
-                # ── VRAM gating ──
-                # Weights + compute exceed this group's budget: the model
-                # cannot load at any context.  Skip the group (a looser
-                # group may still fit) — skipped stems never reach
-                # entry_ids_by_stem, so matrix vars/sets auto-prune.
-                # With the vision projection attached, first fall back to
-                # text-only: the companion may be what no longer fits.
-                if est_error is None:
-                    over_budget = getattr(view.vram, "over_budget_reason",
-                                          None)
-                    if over_budget is not None:
-                        if (include_mmproj and model.mmproj is not None
-                                and model.mmproj.gguf_path is not None):
-                            include_mmproj = False
-                            view = model.view_for(False)
-                            context_length = view.design_context
-                            if view.role == "embeddings" and self.matrix_result:
-                                context_length = min(
-                                    context_length,
-                                    self.matrix_result.embed_ctx)
-                            elif view.role == "rerank" and self.matrix_result:
-                                context_length = min(
-                                    context_length,
-                                    self.matrix_result.rerank_ctx)
-                            if auto:
-                                pin_ctx = self._serving_pin(view)
-                                floor = resolve_min_ctx(
-                                    view, pin_ctx=pin_ctx,
-                                    tools_min_ctx=self.knobs.tools_min_ctx,
-                                    fallback_min_ctx=self.min_context,
-                                    fallback_explicit=self.min_context_explicit,
-                                    category_floor=max(
-                                        (d.min_context
-                                         for d in self.demands_for(model)),
-                                        default=None))
-                                cap_ctx = context_length
-                                if self.max_context is not None:
-                                    cap_ctx = min(cap_ctx, self.max_context)
-                                parallel, ctx_size = self._auto_parallel(
-                                    view, cache_type=cache_type,
-                                    spare_mb=spare_eff, include_mmproj=False,
-                                    cap_ctx=cap_ctx, floor=floor,
-                                    pin_ctx=pin_ctx,
-                                    group_parallel=(1 if uncapped
-                                                    else group_parallel),
-                                    profile=group[0][1])
-                            else:
-                                ctx_size = self._bounded_ctx(
-                                    view, parallel=parallel,
-                                    cache_type=cache_type,
-                                    spare_mb=spare_eff, include_mmproj=False,
-                                    design_ctx=self.chat_ctx,
-                                    context_length=context_length,
-                                    profile=group[0][1])
-                            over_budget = getattr(
-                                view.vram, "over_budget_reason", None)
-                            if over_budget is None:
-                                logger.info(
-                                    "%s: vision over budget; serving "
-                                    "text-only at %d", view.stem, ctx_size)
-                                est_error = getattr(
-                                    model.vram, "unestimated_reason", None) \
-                                    or getattr(view.vram,
-                                               "unestimated_reason", None)
-                                if est_error is not None:
-                                    parallel = group_parallel
-                                    ctx_size = self._unestimated_ctx(view)
-                            else:
-                                logger.warning("%s: disabled (%s)",
-                                               view.stem, over_budget)
-                                continue
-                        else:
-                            logger.warning("%s: disabled (%s)",
-                                           view.stem, over_budget)
-                            continue
                 # Squeeze note: the budget could not afford the design
                 # context and an explicit reservation (--spare/--baseline)
                 # is what pushed it over — stamp the entry description.
@@ -2419,112 +2352,40 @@ class Planner:
                         f"re-run without --spare/--baseline for full "
                         f"context)")
 
-                vision_ctx: int | None = None
-                if not include_mmproj and model.mmproj and model.mmproj.gguf_path:
-                    vision_ctx = ctx_size if est_error is not None else (
-                        self._bounded_ctx(
-                            on_view, parallel=parallel, cache_type=cache_type,
-                            spare_mb=spare_eff, include_mmproj=True,
-                            design_ctx=self.chat_ctx,
-                            context_length=context_length,
-                            profile=group[0][1]))
-                    if (vision_ctx is not None and est_error is None
-                            and getattr(on_view.vram, "over_budget_reason",
-                                        None) is not None):
-                        logger.warning(
-                            "%s: vision companion disabled (%s)",
-                            model.stem, on_view.vram.over_budget_reason)
-                        vision_ctx = None
-                vision_usage: tuple[UsageDemand, ...] = ()
-                if vision_ctx is not None and est_error is None:
-                    vision_usage = self.met_demands(
-                        model, vision_ctx, parallel, include_mmproj=True)
-                # Computed before `parallel` is zeroed for uncapped vLLM:
-                # a slot count is what satisfies a category, and 0 would
-                # silently drop every demand from the id.
-                demand_parallel = parallel
-                tools_demoted = self._tools_demoted(view, ctx_size)
-                rung_usage = () if est_error is not None else self.met_demands(
-                    model, ctx_size, parallel, include_mmproj, tools_demoted)
-                if uncapped:
-                    parallel = 0   # emit uncapped: no --max-num-seqs
-
-                if est_error is not None:
-                    mem: tuple[float | None, float | None] = (None, None)
-                    vmem: tuple[float | None, float | None] = (None, None)
-                else:
-                    mem = self._variant_memory(
-                        view, cache_type=cache_type,
-                        include_mmproj=include_mmproj, ctx_size=ctx_size,
-                        parallel=parallel, profile=group[0][1])
-                    vmem = self._variant_memory(
-                        on_view, cache_type=cache_type,
-                        include_mmproj=True, ctx_size=vision_ctx,
-                        parallel=parallel, profile=group[0][1]) \
-                        if vision_ctx is not None else (None, None)
-
-                variants.append(Variant(
-                    parallel=parallel, cache_type=cache_type, spare_mb=spare_mb,
-                    profiles_group=group, ctx_size=ctx_size,
-                    include_mmproj=include_mmproj, batch=batch, ubatch=ubatch,
-                    vision_ctx=vision_ctx,
-                    coload=is_coload, tools_demoted=tools_demoted,
-                    usage=rung_usage,
-                    vision_usage=vision_usage,
-                    estimate_error=est_error,
-                    mem_vram_mib=mem[0], mem_ram_mib=mem[1],
-                    mem_vision_vram_mib=vmem[0],
-                    mem_vision_ram_mib=vmem[1],
-                    vram_note=vram_note))
-
-                # On-demand vision-less variant: when the main entry keeps its
-                # mmproj, also plan a no-vision entry so clients can pick the
-                # lower-memory serving.  When the main entry was auto-dropped
-                # it IS that entry, so no separate variant is needed.
-                if (include_mmproj and view.role == "chat"
-                        and model.mmproj and model.mmproj.gguf_path):
-                    text_ctx = ctx_size if est_error is not None else (
-                        self._bounded_ctx(
-                            model, parallel=parallel, cache_type=cache_type,
-                            spare_mb=spare_eff, include_mmproj=False,
-                            design_ctx=self.chat_ctx,
-                            context_length=context_length,
-                            profile=group[0][1]))
-                    tmem: tuple[float | None, float | None] = \
-                        (None, None) if est_error is not None else \
-                        self._variant_memory(
-                            model, cache_type=cache_type,
-                            include_mmproj=False, ctx_size=text_ctx,
-                            parallel=parallel, profile=group[0][1])
-                    if text_ctx > ctx_size:
-                        text_usage = () if est_error is not None else (
-                            self.met_demands(model, text_ctx, demand_parallel,
-                                            include_mmproj=False,
-                                            tools_demoted=tools_demoted))
-                        variants.append(Variant(
-                            parallel=parallel, cache_type=cache_type,
-                            spare_mb=spare_mb, profiles_group=group,
-                            ctx_size=text_ctx,
-                            include_mmproj=False, batch=batch, ubatch=ubatch,
-                            coload=is_coload,
-                            # Its own context: the text-only twin exists to
-                            # buy context, so it is often the rung that
-                            # clears the threshold the main entry misses.
-                            tools_demoted=self._tools_demoted(view, text_ctx),
-                            usage=text_usage,
-                            estimate_error=est_error,
-                            mem_vram_mib=tmem[0], mem_ram_mib=tmem[1]))
+                # One Variant per served category. There is no
+                # main/companion pairing and no vision-less twin: two entries
+                # for one model is two categories in sidecars, and vision is a
+                # rung each category decides for itself.
+                for demand, serve_view, serve_par, serve_ctx in serves:
+                    shed_vision = serve_view is not view
+                    demoted = self._tools_demoted(serve_view, serve_ctx)
+                    usage = () if demand is FALLBACK else (demand,)
+                    if est_error is not None:
+                        mem = vmem = (None, None)
                     else:
-                        # Shedding the projection bought no context — the
-                        # model is already at its design cap, or something
-                        # else is the binding constraint.  A text-only twin
-                        # at the same context is a strictly worse duplicate
-                        # of the main entry, so it is not emitted.
-                        logger.info(
-                            "mmproj: %s text-only variant would serve the "
-                            "same %d ctx as the main entry; not emitted",
-                            model.stem, text_ctx)
-            plan[model.stem] = variants
+                        mem = self._variant_memory(
+                            serve_view, cache_type=cache_type,
+                            include_mmproj=not shed_vision,
+                            ctx_size=serve_ctx, parallel=serve_par,
+                            profile=group[0][1])
+                        vmem = (None, None)
+                    variants.append(Variant(
+                        parallel=(0 if uncapped else serve_par),
+                        cache_type=cache_type, spare_mb=spare_mb,
+                        profiles_group=group, ctx_size=serve_ctx,
+                        include_mmproj=not shed_vision,
+                        batch=batch, ubatch=ubatch,
+                        vision_ctx=None, coload=is_coload,
+                        tools_demoted=demoted, usage=usage,
+                        category=demand,
+                        estimate_error=est_error,
+                        mem_vram_mib=mem[0], mem_ram_mib=mem[1],
+                        mem_vision_vram_mib=vmem[0],
+                        mem_vision_ram_mib=vmem[1],
+                        vram_note=(vram_note if serve_ctx < context_length
+                                   else None)))
+            if variants:
+                plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
         # The admission map is planner state, not a variant, but the emitter
@@ -2623,8 +2484,6 @@ def _solve_matrix_context(
     fixed_categories = fixed_categories or []
 
     # Get static params for chat models (companion VRAM folded in).
-    # The drop decision (mmproj skipped to reach the min useful context) is
-    # decided in Planner._mmproj_drop_pass and threaded in via drop_stems.
     # Two-phase: measure everything first, then give models with no
     # estimate a zero-cost placeholder — the rider stays in the set at its
     # minimum useful context and is assumed to fit the measured allocation
@@ -2964,7 +2823,11 @@ def emit_config(models: list[Model], plan: dict,
         companion serves at a different context, so it may satisfy a
         different set).
         """
-        cat = category_label(v.usage if usage is None else usage, catalogue)
+        # The category is the variant's own, read straight off it: a rung
+        # answers exactly one category, so there is no "heaviest satisfied"
+        # search to run. `usage=` survives only so an override is possible.
+        cats = usage if usage is not None else v.usage
+        cat = cats[0].name if cats and cats[0].name else None
         # The category is operator-chosen; a name that does not survive id
         # slugging (or slugs empty) falls back to the context label so the id
         # stays within the model_id charset (opencode/llama-swap/shell-safe).

@@ -324,7 +324,6 @@ def _profiles_stub(**kw):
 
 from llama_packer.writer import (  # noqa: E402
     Variant,
-    category_label,
     emit_config,
     flags_label,
     served_flags,
@@ -353,22 +352,6 @@ def _id_cat() -> UsageCatalogue:
 def test_flags_label_subset_and_order(caps, expected):
     assert flags_label(caps) == expected
 
-
-def test_category_label_picks_heaviest_satisfied():
-    cat = _id_cat()
-    demands = _demands(cat, "qa", "chat", "coding")
-    assert category_label(demands, cat) == "coding"
-
-
-def test_category_label_tie_breaks_by_declaration_order():
-    cat = UsageCatalogue.from_cfg({"a": {"min_context": "64k"},
-                                   "b": {"min_context": "64k"}})
-    # b listed first but a is declared first — declaration order wins.
-    assert category_label(_demands(cat, "b", "a"), cat) == "a"
-
-
-def test_category_label_none_without_demands():
-    assert category_label((), _id_cat()) is None
 
 
 def test_served_flags_drops_image_and_demoted_tools(make_model, tmp_path):
@@ -614,7 +597,7 @@ def test_fallback_is_a_bare_minimum_category():
     assert FALLBACK.name == ""
     assert FALLBACK.min_context == 4096
     assert FALLBACK.min_parallel == 1
-    assert FALLBACK.sacrifice is None   # never degrades
+    assert FALLBACK.sacrifice == ()      # default order, floor-gated
 
 
 # ── keep vs require ───────────────────────────────────────────────────────
