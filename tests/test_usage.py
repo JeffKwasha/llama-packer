@@ -13,7 +13,6 @@ from llama_packer.writer import (
     UsageCatalogue,
     UsageDemand,
     _parse_ctx_size,
-    plan_ladder,
     resolve_usage,
 )
 
@@ -152,122 +151,6 @@ def _d(cat: UsageCatalogue, name: str) -> UsageDemand:
 
 def _demands(cat: UsageCatalogue, *names: str) -> tuple[UsageDemand, ...]:
     return tuple(_d(cat, n) for n in names)
-
-
-def test_ladder_keeps_full_rung_when_shedding_buys_nothing():
-    # A model already at its design cap reclaims no context by shedding, so
-    # it must not get a redundant text-only twin.
-    cat = _cat(coding={"min_context": "128k", "min_parallel": 1})
-    rungs = plan_ladder(lambda shed: (262144, 1), (_d(cat, "coding"),),
-                        frozenset({"vision", "draft"}))
-    assert len(rungs) == 1
-    assert rungs[0].shed == frozenset()
-    assert rungs[0].ctx == 262144
-
-
-def test_ladder_sheds_the_capability_that_actually_buys_context():
-    cat = _cat(coding={"min_context": "128k", "min_parallel": 1})
-    # full is short of the demand; dropping vision clears it; the draft is
-    # then worthless because context is already maxed.
-    def afford(shed):
-        if "vision" in shed:
-            return (262144, 1)
-        if "draft" in shed:
-            return (131072, 1)
-        return (98304, 1)
-
-    rungs = plan_ladder(afford, (_d(cat, "coding"),),
-                        frozenset({"vision", "draft"}))
-    assert [r.shed for r in rungs] == [frozenset({"vision"})]
-    assert rungs[0].ctx == 262144
-
-
-def test_ladder_never_sheds_a_required_capability():
-    cat = _cat(qa={"min_context": "32k", "require": ["vision"]})
-    def afford(shed):
-        return (131072, 1) if shed else (98304, 1)
-
-    rungs = plan_ladder(afford, (_d(cat, "qa"),),
-                        frozenset({"vision", "draft"}))
-    # the full rung and the draft-shed rung survive; nothing sheds vision
-    assert [r.shed for r in rungs] == [frozenset(), frozenset({"draft"})]
-    assert all("vision" not in r.shed for r in rungs)
-
-
-def test_ladder_drops_rung_satisfying_nothing():
-    cat = _cat(coding={"min_context": "128k", "min_parallel": 1})
-    rungs = plan_ladder(lambda shed: (16384, 1), (_d(cat, "coding"),),
-                        frozenset({"vision", "draft"}))
-    assert rungs == ()
-
-
-def test_ladder_drops_rung_gaining_nothing_over_a_more_capable_one():
-    # Every rung lands on 256k, so only the most capable one is worth an
-    # entry: the rest are strictly worse duplicates (same context, fewer
-    # capabilities).
-    cat = _cat(coding={"min_context": "128k", "min_parallel": 1})
-    rungs = plan_ladder(lambda shed: (262144, 1), (_d(cat, "coding"),),
-                        frozenset({"vision", "draft"}))
-    assert [r.shed for r in rungs] == [frozenset()]
-
-
-def test_ladder_min_parallel_is_a_floor_too():
-    cat = _cat(chat={"min_context": "32k", "min_parallel": 4})
-    # ctx is ample but only 2 slots: the demand is unmet, so no rung stands
-    rungs = plan_ladder(lambda shed: (262144, 2), (_d(cat, "chat"),),
-                        frozenset({"vision"}))
-    assert rungs == ()
-
-
-def test_ladder_satisfies_several_categories_with_one_entry():
-    cat = _cat(coding={"min_context": "128k", "min_parallel": 1},
-               chat={"min_context": "64k", "min_parallel": 2},
-               qa={"min_context": "32k", "min_parallel": 2})
-    demands = tuple(cat.get(n) for n in cat.order)
-    rungs = plan_ladder(lambda shed: (262144, 2), demands,
-                        frozenset({"vision", "draft"}))
-    assert len(rungs) == 1
-    # one entry at 256k/2 covers all three
-    assert {d.name for d in rungs[0].demands} == {"coding", "chat", "qa"}
-
-
-def test_ladder_without_demands_keeps_every_distinct_rung():
-    # Back-compat path: a model with no `usage:` tag is governed by the
-    # global min_context floor instead, so no demand filtering applies and
-    # every distinct rung is kept.  Shedding vision frees VRAM, so it must
-    # raise the affordable context.
-    def afford(shed):
-        return (196608, 1) if "vision" not in shed else (262144, 1)
-
-    rungs = plan_ladder(afford, (), frozenset({"vision"}))
-    assert [r.shed for r in rungs] == [frozenset(), frozenset({"vision"})]
-
-
-def test_ladder_respects_the_most_protective_demand():
-    # One category wants the draft kept, another wants vision kept; the
-    # merged order sheds neither until both are gone.
-    cat = _cat(a={"sacrifice": ["vision", "draft"]},
-               b={"sacrifice": ["draft", "vision"]})
-    from llama_packer.writer import _shed_order
-    order = _shed_order((_d(cat, "a"), _d(cat, "b")), frozenset({"vision", "draft"}))
-    # 'vision' sorts first because category `a` prefers to keep the draft
-    assert order == ("vision", "draft")
-
-
-def test_rung_label_is_readable():
-    cat = _cat(coding={"min_context": "32k"})
-    def afford(shed):
-        if "vision" in shed and "draft" in shed:
-            return (131072, 1)
-        if "vision" in shed:
-            return (98304, 1)
-        return (65536, 1)
-
-    labels = {r.label for r in plan_ladder(afford, (_d(cat, "coding"),),
-                                           frozenset({"vision", "draft"}))}
-    assert "full" in labels
-    assert "vision" in labels
-    assert "draft+vision" in labels
 
 
 # ── per-set co-resident overhead ────────────────────────────────────────────

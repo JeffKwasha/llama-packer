@@ -939,105 +939,18 @@ class Rung:
     """One rung of the capability/context ladder: a set of shed capabilities.
 
     ``shed`` is the set of capabilities deliberately given up at this rung
-    (empty = the model runs at full capability).  ``ctx``/``parallel`` are
-    what the budget affords *at this rung*, and ``demands`` the usage
-    categories that result.
+    (empty = the model runs at full capability). ``ctx``/``parallel`` are
+    what the budget affords *at this rung*, and ``demand`` the category being
+    served -- singular, because a rung exists to answer one category.
     """
 
     shed: frozenset[str]
     ctx: int
     parallel: int
-    demands: tuple[UsageDemand, ...]
-
-    @property
-    def label(self) -> str:
-        """Human-readable rung name for logs (``full`` when nothing shed)."""
-        return "+".join(sorted(self.shed)) if self.shed else "full"
+    demand: UsageDemand
 
 
-def _shed_order(demands: tuple[UsageDemand, ...],
-                sheddable: frozenset[str]) -> tuple[str, ...]:
-    """Merge every demand's sacrifice preference into one shed order.
 
-    An entry serving several categories must satisfy all of them, so the
-    order is the *most protective* across them: a capability any demand
-    requires is never shed, and capabilities named by an earlier demand
-    sort earlier.  Anything still unranked follows
-    :data:`DEFAULT_SACRIFICE_ORDER` — vision before draft, since an MTP
-    draft roughly doubles generation speed and is the costly thing to
-    lose.
-    """
-    required: set[str] = set()
-    preference: list[str] = []
-    for d in demands:
-        required |= set(d.require)
-        for cap in d.sacrifice:
-            if cap not in preference:
-                preference.append(cap)
-    for cap in DEFAULT_SACRIFICE_ORDER:
-        if cap not in preference:
-            preference.append(cap)
-    order = [c for c in preference if c in sheddable and c not in required]
-    order += sorted(sheddable - required - set(order))
-    return tuple(order)
-
-
-def plan_ladder(afford: Callable[[frozenset[str]], tuple[int, int] | None],
-                demands: tuple[UsageDemand, ...],
-                sheddable: frozenset[str],
-                ) -> tuple[Rung, ...]:
-    """Enumerate the capability ladder and keep the rungs worth emitting.
-
-    *afford* maps a set of shed capabilities to the ``(ctx, parallel)`` the
-    budget allows at that rung, or ``None`` when that rung does not fit.
-    It is called for every subset rather than walked in a fixed order,
-    because ``sacrifice`` is a *preference*, not a cost order: shedding a
-    capability may buy no context at all, and a rung that gains nothing is
-    not worth an entry.
-
-    Rungs are kept when they satisfy at least one demand and actually gain
-    context over the next-more-capable rung — so a model already at its
-    design cap does not get a redundant text-only twin.
-    """
-    order = _shed_order(demands, sheddable)
-    required: set[str] = set()
-    for d in demands:
-        required |= set(d.require)
-
-    # Enumerate every subset (not a fixed-order walk: `sacrifice` is a
-    # preference, and shedding may buy nothing at all).
-    subsets: list[frozenset[str]] = [frozenset()]
-    for cap in order:
-        subsets += [s | {cap} for s in subsets]
-
-    # Keep the rungs worth an entry, ordered most-capable first (fewest
-    # capabilities shed, ties by preference order).
-    rungs: list[Rung] = []
-    for shed in sorted(subsets, key=lambda s: (len(s),
-                                               tuple(order.index(c)
-                                                     for c in sorted(s)))):
-        if shed & required:
-            continue  # a demand requires one of these; never shed it
-        got = afford(shed)
-        if got is None:
-            continue
-        ctx, parallel = got
-        met = tuple(d for d in demands if d.satisfied_by(ctx, parallel))
-        if demands and not met:
-            continue  # satisfies nothing: this rung is pointless
-        rungs.append(Rung(shed=shed, ctx=ctx, parallel=parallel, demands=met))
-
-    # A rung earns an entry only by buying context over *every* more capable
-    # rung; otherwise it is a strictly worse duplicate (same context, fewer
-    # capabilities).  This is what stops a model already at its design cap
-    # from getting a redundant text-only twin.
-    kept: list[Rung] = []
-    best_ctx = -1
-    for rung in rungs:
-        if rung.ctx > best_ctx:
-            kept.append(rung)
-            best_ctx = rung.ctx
-    return tuple(kept)
 
 
 CHAT_VARS_PLACEHOLDER = "__CHAT_VARS__"
@@ -1748,7 +1661,7 @@ class Planner:
                 continue
             if best is None or ctx > best.ctx:
                 best = Rung(shed=shed, ctx=ctx, parallel=max(1, parallel),
-                            demands=(demand,))
+                            demand=demand)
             # Equal context: the earlier (less-shed) level stands, so stop.
         return best
 

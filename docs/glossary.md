@@ -33,17 +33,19 @@ either way it should not be used in a commit message until it is.
 | **co-resident** | Loaded at the same time as others. Chat models take turns and share the pool; embed/rerank are pinned resident. | SPEC "Matrix Context Solving" |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
 | **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | writer, SPEC 305 |
-| **gain-gating** | A reduced variant is emitted only if shedding actually *buys* context. A model already at its design cap gets no text-only twin. | `writer.py:plan_ladder` |
+| **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same, the least shed wins. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
 
 ## The capability ladder
 
 | Term | Means | Code |
 |---|---|---|
 | **rung** | One point on the ladder: a set of capabilities deliberately given up, plus the `(ctx, parallel)` the budget affords there. | `writer.py:Rung` |
-| **the ladder** (`plan_ladder`) | Enumerates every subset of sheddable capabilities and keeps the rungs worth emitting. The sheddable axes are `vision` and `draft`. **Currently unreachable from production** — `require:`/`sacrifice:` are declared but not acted on. See [plans/one-rung-search.md](plans/one-rung-search.md). | `writer.py` |
-| **`full`** | The rung label when nothing is shed. | `Rung.label` |
-| **`sacrifice`** | A *preference* order for what to give up first, not a cost order — shedding something may buy nothing, which is why every subset is tried rather than a fixed walk. | `DEFAULT_SACRIFICE_ORDER` |
-| **require** | A capability a demand will not give up. Never shed. | `UsageDemand.require` |
+| **the ladder** (`shed_levels`) | The rungs to try for one category: one per prefix of its `sacrifice:` order, minus anything `require:`/`keep:` protects. | `writer.py:shed_levels` |
+| **solve_rung** | Picks the rung: the one buying the most context, tie-broken toward keeping capabilities. `None` when the category cannot be met at all, and no entry is emitted. | `writer.py:solve_rung` |
+| **`sacrifice`** | A *preference* order for what to give up first, not a cost order — shedding may buy nothing, which is why every rung is tried rather than one fixed walk. | `UsageDemand.sacrifice` |
+| **require** | A capability the category will not be without. Gates existence: a model lacking it does not satisfy the category. | `UsageDemand.require` |
+| **keep** | Don't drop what this model has, but a model without it still qualifies. The difference from `require` is why `coding` can keep its draft without excluding every model that has none. | `UsageDemand.keep` |
+| **shed: (profiles)** | Order for capabilities a category does not name. Config, not code, so what "unnamed" means is the operator's call. | `Profiles.shed_order` |
 | **mmproj** | The vision projector. Shedding it makes a model text-only and frees its VRAM. | llama-server |
 | **MTP** | Multi-token prediction draft model. Roughly doubles generation speed and is the costly thing to lose, so it sits late in the sacrifice order. | SPEC "MTP Speculative Decoding" |
 

@@ -1,6 +1,14 @@
 # Plan: one rung search — collapse the serial VRAM passes
 
-Status: **proposal — not scheduled**. Recorded 2026-10-15.
+Status: **superseded** by [category-semantics.md](category-semantics.md) and
+`shade_levels()`/`solve_rung()`. Kept for the conflict inventory, which is
+still the best inventory of where the six passes disagree with each other.
+
+Note the two names that appear throughout are now dead: `plan_ladder` and
+`_shed_order` had no production caller, and were removed. The enumeration
+they describe is `shed_levels`, and the rung choice is `solve_rung`.
+
+Recorded 2026-10-15.
 Related: [matrix-categories.md](matrix-categories.md), [opportunistic-coload.md](opportunistic-coload.md),
 [usage-tag-table.md](usage-tag-table.md), `llama_packer/writer.py`, SPEC.md "Matrix Context Solving",
 docs/glossary.md ("the capability ladder").
