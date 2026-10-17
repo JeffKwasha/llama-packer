@@ -86,10 +86,48 @@ stays above the category's `min_context`. That is stricter than vision,
 which coding sheds freely. Modelled as `require: [draft]` on the category —
 data, not code — so it stays expressible.
 
-## Sets
+## Allocation: residents then remainder
 
-Admission to a routing set is per category and uses the *resolved* serving,
-not the model: a model is admitted to the set its emitted category entry can
-actually serve alongside that set's residents. A category that cannot be met
-alongside RAG is not admitted to that set; the model's fallback entry stays
-standalone, and sideload routing goes through the categories.
+Two tiers, and only two.
+
+**Residents** are pinned for as long as the service is up, because losing
+them means losing the KV cache and reloading on every lookup. Embeddings and
+rerank are the clear case; STT and TTS are the optional ones. Each resident
+serves a *fixed small context* — `embed_context` / `rerank_context`, default
+4096. Two reasons, and the second is the important one:
+
+- clients standardise on one RAG context and chunk to it, so the embed size
+  is a stable contract rather than a function of what else is loaded;
+- **a fixed small context makes the resident tier's VRAM a number you can
+  compute up front**, which is what makes the remainder meaningful. A
+  context that flexed with load would make the budget move under you.
+
+That cap is not a compromise to be revisited when VRAM is tight — it is the
+thing that lets the rest of the card be allocated confidently. If VRAM were
+the binding constraint, more tokens in main chat context is worth more than
+more in RAG context. When a resident has to grow — needing STT resident as
+well as RAG — it grows slightly within the tier rather than by introducing a
+second mechanism.
+
+**Everything else loads on demand.** Chat is not pinned. On this box that is
+the whole picture: one resident tier, one remainder, no further tiers to
+reason about. `matrix:` in its current form also carries `evict_costs:` and
+four-way set expressions (`ragz`, `voice`, `talk`) which exist to answer
+"which neighbours ride along with chat"; that question disappears when the
+resident tier is one list with fixed contexts.
+
+```
+resident_vram  = Σ VRAM(resident, at its own fixed context)
+chat_budget    = vram_total − reserve − spare − resident_vram
+```
+
+Then, per chat model, per declared category *and* the fallback:
+
+```
+solve (shed, ctx, parallel) from chat_budget
+```
+
+Each member resolves its own context and decides its own mmproj, against
+the same number. There is no shared `chat_ctx` and no per-set re-solve —
+those were two mechanisms answering one question, and every bug where one
+pass read a value the other decided came from that.
