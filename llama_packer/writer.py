@@ -1371,12 +1371,10 @@ class MatrixSolve:
 class Variant:
     """One planned llama-swap entry: resolved serving params + contexts.
 
-    ``vision_ctx`` is set only when mmproj was dropped from the main variant
-    but a companion exists — the emitter then adds a best-effort vision entry.
-    A variant with ``include_mmproj=False`` is emitted as the vision-less
-    ``.<category>.<flags>`` entry (this is both the on-demand text-only
-    variant of a vision-keeping model and the renamed main entry of an
-    auto-dropped model).
+    A variant with ``include_mmproj=False`` is the vision-less serving a
+    category chose by shedding the projector; a variant with it true serves
+    vision. There is no companion entry and no text-only twin — vision is a
+    rung each category decides for itself.
     """
     parallel: int
     cache_type: str
@@ -1389,7 +1387,6 @@ class Variant:
     #: also feeds the VRAM measurement shape (see :func:`measurement_args`).
     batch: int | None = None
     ubatch: int | None = None
-    vision_ctx: int | None = None
     coload: bool = False
     tools_demoted: bool = False
     #: The categories this rung is named for. A rung answers exactly one, so
@@ -1401,9 +1398,6 @@ class Variant:
     #: category. Singular, because a rung exists to serve one category -- which
     #: is what lets one model emit several entries and stay unambiguous.
     category: UsageDemand | None = None
-    #: Retained for constructor compatibility with older callers. There is no
-    #: vision companion any more, so nothing sets it.
-    vision_usage: tuple[UsageDemand, ...] = ()
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
@@ -1414,10 +1408,6 @@ class Variant:
     #: (no estimate) — then no tag is emitted.
     mem_vram_mib: float | None = None
     mem_ram_mib: float | None = None
-    #: Same pair for the best-effort vision companion entry (served at
-    #: ``vision_ctx`` with the projection); None when no vision entry.
-    mem_vision_vram_mib: float | None = None
-    mem_vision_ram_mib: float | None = None
     #: Non-None when the VRAM budget could not afford the design context
     #: (``--spare``/``--baseline`` active): appended to the description so
     #: the entry visibly carries its over-budget status.
@@ -2418,27 +2408,24 @@ class Planner:
                     demoted = self._tools_demoted(serve_view, serve_ctx)
                     usage = () if demand is FALLBACK else (demand,)
                     if est_error is not None:
-                        mem = vmem = (None, None)
+                        mem = (None, None)
                     else:
                         mem = self._variant_memory(
                             serve_view, cache_type=cache_type,
                             include_mmproj=not shed_vision,
                             ctx_size=serve_ctx, parallel=serve_par,
                             profile=group[0][1])
-                        vmem = (None, None)
                     variants.append(Variant(
                         parallel=(0 if uncapped else serve_par),
                         cache_type=cache_type, spare_mb=spare_mb,
                         profiles_group=group, ctx_size=serve_ctx,
                         include_mmproj=not shed_vision,
                         batch=batch, ubatch=ubatch,
-                        vision_ctx=None, coload=is_coload,
+                        coload=is_coload,
                         tools_demoted=demoted, usage=usage,
                         category=demand,
                         estimate_error=est_error,
                         mem_vram_mib=mem[0], mem_ram_mib=mem[1],
-                        mem_vision_vram_mib=vmem[0],
-                        mem_vision_ram_mib=vmem[1],
                         vram_note=(vram_note if serve_ctx < context_length
                                    else None)))
             if variants:
@@ -2869,20 +2856,15 @@ def emit_config(models: list[Model], plan: dict,
         taken.add(cand)
         return cand
 
-    def id_and_suffix(v: Variant, ctx: int, flags: str,
-                      usage: tuple["UsageDemand", ...] | None = None
-                      ) -> tuple[str, str]:
+    def id_and_suffix(v: Variant, ctx: int, flags: str) -> tuple[str, str]:
         """The ``.<category>.<flags>`` id tail and the display suffix.
 
-        *flags* is the served capability segment (:func:`served_flags`);
-        *usage* overrides the variant's own satisfied categories (the vision
-        companion serves at a different context, so it may satisfy a
-        different set).
+        *flags* is the served capability segment (:func:`served_flags`).
         """
         # The category is the variant's own, read straight off it: a rung
         # answers exactly one category, so there is no "heaviest satisfied"
-        # search to run. `usage=` survives only so an override is possible.
-        cats = usage if usage is not None else v.usage
+        # search to run.
+        cats = v.usage
         cat = cats[0].name if cats and cats[0].name else None
         # The category is operator-chosen; a name that does not survive id
         # slugging (or slugs empty) falls back to the context label so the id
@@ -2935,36 +2917,6 @@ def emit_config(models: list[Model], plan: dict,
             owner[entry_id] = model.stem
             ids_by_stem.setdefault(model.stem, []).append(entry_id)
             category_of[entry_id] = (v.category.name if v.category else None)
-
-            if v.vision_ctx is None:
-                continue
-            on_view = model.view_for(True)
-            v_flags = served_flags(on_view, True, v.tools_demoted)
-            v_tail, v_disp = id_and_suffix(v, v.vision_ctx, v_flags,
-                                           usage=v.vision_usage)
-            v_tail = unique_tail(model.stem, v_tail,
-                                 f"{v.cache_type}-vis")
-            vision_id, vision_entry = _build_entry(
-                on_view, v.parallel, v.cache_type, v.profiles_group,
-                profiles.defaults, template_vars, on_view.design_context,
-                v.vision_ctx,
-                include_mmproj=True,
-                name_suffix=v_disp,
-                tools_demoted=v.tools_demoted,
-                usage=v.vision_usage,
-                estimate_error=v.estimate_error,
-                batch=v.batch, ubatch=v.ubatch,
-                mem_vram_mib=v.mem_vision_vram_mib,
-                mem_ram_mib=v.mem_vision_ram_mib,
-            )
-            vision_id += f".{v_tail}"
-            if vision_id in entries:
-                raise ValueError(
-                    f"duplicate entry id {vision_id!r}: model {model.stem!r} "
-                    f"collides with {owner[vision_id]!r} — rename one of them")
-            entries[vision_id] = vision_entry
-            owner[vision_id] = model.stem
-            ids_by_stem.setdefault(model.stem, []).append(vision_id)
 
     set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
