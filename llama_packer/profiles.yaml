@@ -96,6 +96,9 @@ usage:
     min_context: 130k
     min_parallel: 1
     sacrifice: [vision]
+    # Refuses to drop the MTP draft, but a coding model with no draft
+    # companion is still coding -- `require` would gate it out entirely.
+    keep: [draft]
   chat:
     min_context: 64k
     min_parallel: 2

@@ -704,3 +704,58 @@ def test_fallback_is_a_bare_minimum_category():
     assert FALLBACK.min_context == 4096
     assert FALLBACK.min_parallel == 1
     assert FALLBACK.sacrifice is None   # never degrades
+
+
+# ── keep vs require ───────────────────────────────────────────────────────
+
+
+def test_keep_protects_from_shedding_without_gating_existence():
+    """`coding` refuses to drop MTP, but a model without MTP is still coding.
+
+    Making this `require` would silently drop every coding model that has no
+    draft companion -- a large share of the fleet -- which is why it needed
+    a word of its own rather than a wider meaning for `require`.
+    """
+    d = UsageDemand(name="coding", min_context=133120, keep=frozenset({"draft"}))
+    assert d.require == frozenset()
+    # MTP is protected from the ladder...
+    levels = writer.shed_levels(d.sacrifice, required=d.require, kept=d.keep)
+    assert all("draft" not in lvl for lvl in levels), levels
+    # ...but a model without it still satisfies the category. The existence
+    # gate lives in met_demands, which drops a demand whose required
+    # capability is not in the served flags -- satisfied_by itself only ever
+    # looked at context and slots.
+    assert _served_without_draft(d), "keep must NOT gate existence"
+    strict = UsageDemand(name="coding", min_context=133120,
+                         require=frozenset({"draft"}))
+    assert not _served_without_draft(strict), "require must gate existence"
+    # satisfied_by itself only ever looked at context and slots; the
+    # capability gate is met_demands' job, so it cannot tell them apart.
+    assert d.satisfied_by(133120, 1) == strict.satisfied_by(133120, 1)
+
+
+def _served_without_draft(demand):
+    """Whether *demand* counts as met by a text-only, no-draft serving.
+
+    Mirrors Planner.met_demands' capability gate: a demand is kept only if
+    every capability it requires is in the served flags. Text-only serving
+    serves neither vision nor draft, so both keys reduce to the same question.
+    """
+    served = {"t"}
+    for cap in demand.require:
+        if cap == "vision" and not ({"i", "v"} & served):
+            return False
+        if cap == "draft":
+            return False
+    return demand.satisfied_by(133120, 1)
+
+
+def test_keep_is_parsed_from_profiles():
+    profiles = Profiles({"defaults": {}, "usage": {
+        "coding": {"min_context": "128k", "keep": ["draft"],
+                   "sacrifice": ["vision"]}}})
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    d = cat.get("coding")
+    assert d.keep == frozenset({"draft"})
+    assert d.sacrifice == ("vision",)
+    assert d.require == frozenset()

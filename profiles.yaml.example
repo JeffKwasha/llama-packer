@@ -38,6 +38,7 @@ usage:
     min_context: 128k
     min_parallel: 1
     sacrifice: [vision]
+    keep: [draft]
   chat:
     min_context: 64k
     min_parallel: 2

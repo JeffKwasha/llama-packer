@@ -681,22 +681,33 @@ class UsageDemand:
     (see :func:`resolve_usage`), so an operator always knows exactly which
     demands are in force without reading every sidecar.
 
-    ``min_context`` / ``min_parallel`` are *minimums*, not requests: one
+    ``min_context`` / ``min_parallel`` are *minimums*, not requests: an
     entry serving ``ctx >= min_context`` and ``parallel >= min_parallel``
-    satisfies the category, so a single entry can cover several categories
-    at once.  ``require`` lists capabilities that must survive every rung
-    of the capability/context ladder; a rung that drops one is discarded.
-    ``sacrifice`` is a *preference* order for what to give up when the
-    budget is short — it is deliberately not a cost order, because shedding
-    a capability may buy no context at all (a model already at its design
-    cap has no headroom to reclaim).
+    satisfies the category.  ``sacrifice`` is a *preference* order for what
+    to give up when the budget is short — it is deliberately not a cost
+    order, because shedding a capability may buy no context at all (a model
+    already at its design cap has no headroom to reclaim).
+
+    Two ways to protect a capability, and the difference matters:
+
+    ``require`` — must have it.  A rung that drops one is discarded, and a
+    model that lacks the capability outright does not satisfy the category,
+    so no entry claims it.  ``require: [vision]`` is a statement that the
+    work is impossible without seeing.
+
+    ``keep`` — don't drop what this model has, but a model without it still
+    qualifies.  ``coding`` declares ``keep: [draft]``: a coding entry will
+    not drop its MTP draft, but a coding model that has no draft companion
+    is still a perfectly good coding model and still gets an entry.  Making
+    that ``require`` would silently drop every coding model without MTP.
     """
 
     name: str
     min_context: int = 0
     min_parallel: int = 1
     require: frozenset[str] = frozenset()
-    sacrifice: tuple[str, ...] = ()
+    keep: frozenset[str] = frozenset()
+    sacrifice: tuple[str, ...] | None = ()
 
     def satisfied_by(self, ctx: int, parallel: int) -> bool:
         """True when an entry served at (ctx, parallel) meets this demand."""
@@ -772,6 +783,7 @@ SHEDDABLE: frozenset[str] = frozenset(DEFAULT_SACRIFICE_ORDER)
 def shed_levels(sacrifice: tuple[str, ...] | None,
                 sheddable: frozenset[str] = SHEDDABLE,
                 required: frozenset[str] = frozenset(),
+                kept: frozenset[str] = frozenset(),
                 ) -> tuple[frozenset[str], ...]:
     """Degradation levels to try, least-shed first.
 
@@ -792,9 +804,10 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
     """
     if sacrifice is None:
         return (frozenset(),)
-    order = [c for c in sacrifice if c in sheddable and c not in required]
+    protected = required | kept
+    order = [c for c in sacrifice if c in sheddable and c not in protected]
     order += [c for c in DEFAULT_SACRIFICE_ORDER
-              if c in sheddable and c not in required and c not in order]
+              if c in sheddable and c not in protected and c not in order]
     levels = [frozenset()]
     for cap in order:
         levels.append(levels[-1] | {cap})
@@ -870,7 +883,7 @@ class UsageCatalogue:
                                    raw_par)
                 else:
                     kwargs["min_parallel"] = par
-            for key in ("require", "sacrifice"):
+            for key in ("require", "keep", "sacrifice"):
                 if key not in spec:
                     continue
                 listed = _parse_capability_list(spec[key])
@@ -886,8 +899,8 @@ class UsageCatalogue:
                                    sorted(unknown),
                                    sorted(KNOWN_CAPABILITIES))
                 known = [c for c in listed if c in KNOWN_CAPABILITIES]
-                if key == "require":
-                    kwargs["require"] = frozenset(known)
+                if key in ("require", "keep"):
+                    kwargs[key] = frozenset(known)
                 else:
                     # The declared order *is* the preference order.
                     kwargs["sacrifice"] = tuple(known)
@@ -1817,10 +1830,16 @@ class Planner:
             preferred = [c for c in cands if c[0] >= min_parallel]
             if preferred:
                 cands = preferred
+        # Ties go to *more* slots. With power > 0 a model holding its cap
+        # scores strictly higher at every slot count, so it never ties; the
+        # flat case is power 0, where slots are worth nothing and the choice
+        # is purely "can it hold the context at more of them". Keeping the
+        # first maximum instead gave the parallel-1 entry, which is the
+        # opposite of what a plentiful-VRAM model should do.
         best: tuple[float, int, int] | None = None  # (score, p, ctx)
         for p, ctx in cands:
             score = parallel_value(ctx, floor, p, power)
-            if best is None or score > best[0]:
+            if best is None or score >= best[0]:
                 best = (score, p, ctx)
         if best is None:
             logger.info("auto-parallel: %s floor %d unreachable; keeping "
