@@ -1720,6 +1720,45 @@ class Planner:
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
+    def solve_rung(self, view, demand: "UsageDemand", *,
+                   parallel: int, cache_type: str, spare_mb: int,
+                   design_ctx: int | None = None,
+                   context_length: int | None = None,
+                   profile: dict | None = None) -> "Rung | None":
+        """The serving this category should get: most context that fits.
+
+        Walks the category's own shed levels (:func:`shed_levels`), asking the
+        budget what each one affords, and returns the level that buys the most
+        context — or ``None`` when the category's ``min_context`` is out of
+        reach at every level, which is what "this category cannot be served"
+        means, and what suppresses the entry.
+
+        Among levels that buy the *same* context, the least-shed wins. That
+        is the whole of "coding drops vision to maximise context, and only
+        keeps vision when it is free": shedding vision usually buys context,
+        so the model goes text-only; when VRAM is plentiful enough to hold
+        design context either way, nothing is bought and the projector stays
+        attached rather than being thrown away for no gain.
+
+        Only the shed axis is decided here. Slot count stays with the
+        parallel solve, which runs afterwards and may squeeze further.
+        """
+        best: Rung | None = None
+        for shed in shed_levels(demand.sacrifice, required=demand.require,
+                                kept=demand.keep):
+            ctx = self._bounded_ctx(
+                view, parallel=max(1, parallel), cache_type=cache_type,
+                spare_mb=spare_mb, include_mmproj="vision" not in shed,
+                design_ctx=design_ctx, context_length=context_length,
+                profile=profile)
+            if ctx <= 0 or ctx < demand.min_context:
+                continue
+            if best is None or ctx > best.ctx:
+                best = Rung(shed=shed, ctx=ctx, parallel=max(1, parallel),
+                            demands=(demand,))
+            # Equal context: the earlier (less-shed) level stands, so stop.
+        return best
+
     def _tools_demoted(self, view, ctx: int) -> bool:
         """Whether this serving must drop its ``tools`` capability.
 

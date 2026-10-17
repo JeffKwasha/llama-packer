@@ -1181,3 +1181,95 @@ def test_cpu_resident_chat_gets_no_auto_parallel(make_model, profiles):
     planner._bounded_ctx = lambda *a, **k: 131072
     plan = planner.plan()
     assert [v.parallel for v in plan["cpu-chat"]] == [1]
+
+
+# ── solve_rung: most context that fits, vision kept only when free ───────
+
+
+def _affording(model, by_shed):
+    """_bounded_ctx keyed on include_mmproj, in MiB-equivalent ctx terms."""
+    def fake(view, *, parallel, include_mmproj, **_kw):
+        return by_shed[bool(include_mmproj)]
+    planner = _single_planner(model)
+    planner._bounded_ctx = fake
+    return planner
+
+
+def _single_planner(model):
+    from llama_packer.writer import Planner
+    p = Planner.__new__(Planner)
+    p.vram_total = 48 * 1024
+    p.fit_bin = "unused"
+    p.baseline_mb = 0
+    p.memory_margin = 0.0
+    p.profiles = SimpleNamespace(default_cache_type="q8_0")
+    p.llama_args = ""
+    p.max_context = None
+    p.min_context = 65536
+    p.min_context_explicit = False
+    p.knobs = MatrixKnobs()
+    return p
+
+
+def _demand(name="coding", **kw):
+    from llama_packer.writer import UsageDemand
+    return UsageDemand(name=name, **kw)
+
+
+def test_rung_drops_vision_when_it_buys_context(make_model):
+    """The plain case: shedding the projector is worth it, so it is shed."""
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 90000, False: 200000})
+    rung = p.solve_rung(m, _demand(min_context=131072), parallel=1,
+                        cache_type="q8_0", spare_mb=0)
+    assert rung.shed == frozenset({"vision"})
+    assert rung.ctx == 200000
+
+
+def test_rung_keeps_vision_when_it_is_free(make_model):
+    """Plentiful VRAM: text-only buys nothing, so the projector stays.
+
+    "coding ... only adds vision if VRAM is sufficient for MAX DESIGN
+    CONTEXT + VISION." Both levels afford the same context, so the more
+    capable one wins instead of being discarded for no gain.
+    """
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 200000, False: 200000})
+    rung = p.solve_rung(m, _demand(min_context=131072), parallel=1,
+                        cache_type="q8_0", spare_mb=0)
+    assert rung.shed == frozenset()
+    assert rung.ctx == 200000
+
+
+def test_rung_is_none_when_the_category_cannot_be_served(make_model):
+    """No id may claim a category the fleet cannot deliver."""
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 40960, False: 40960})
+    assert p.solve_rung(m, _demand(min_context=131072), parallel=1,
+                        cache_type="q8_0", spare_mb=0) is None
+
+
+def test_rung_honours_keep_then_falls_back_to_vision(make_model):
+    """keep: [draft] stops the ladder shedding MTP, so it moves to vision."""
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 90000, False: 200000})
+    rung = p.solve_rung(
+        m, _demand(min_context=131072, keep=frozenset({"draft"})),
+        parallel=1, cache_type="q8_0", spare_mb=0)
+    assert "draft" not in rung.shed
+    assert rung.shed == frozenset({"vision"})
+
+
+def test_fallback_never_degrades(make_model):
+    """No goals to protect, so capability is all that is left to give up."""
+    from llama_packer.writer import FALLBACK
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 4096, False: 262144})
+    rung = p.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
+                        spare_mb=0)
+    assert rung.shed == frozenset(), "fallback shed something"
+    assert rung.ctx == 4096, "kept mmproj but is below its own minimum"
+
+    generous = _affording(m, {True: 262144, False: 262144})
+    assert generous.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
+                               spare_mb=0).ctx == 262144
