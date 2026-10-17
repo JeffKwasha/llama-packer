@@ -70,7 +70,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Configurable co-resident `categories` + shared chat/RAG VRAM solving + opportunistic s2t/image co-loads + knobs (`min_chat_ctx`, `tools_min_ctx`, …) | [Matrix Context Solving](#matrix-context-solving) |
+| `matrix` | Resident RAG classes at a fixed small context, plus the knobs that allocate the remainder to chat (`embed_context`, `rerank_context`, `auto_parallel*`, `parallel_power`) | [VRAM Allocation](#vram-allocation) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
@@ -299,7 +299,7 @@ When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` 
 - **Over-budget disable.** `calc_ctx` records `over_budget_reason` when weights + compute do not fit any context (or the reserve/spare leaves ≤ 0 available). Such a group is **skipped** — the model is not emitted. Skipped stems never reach the matrix vars, so routing auto-prunes; if *every* chat model is gated away, matrix routing is omitted entirely (warning logged) rather than emitting a degenerate empty OR-list.
 - **Vision → text fallback.** Before disabling a vision model whose main (mmproj-on) solve is over budget, the planner re-solves with the projection detached. If the text-only fit succeeds, the entry is served without `--mmproj` (INFO logged). If text also fails, the model is disabled. Each profile group re-derives `include_mmproj` / view / design context, so one group's fallback never leaks into the next.
 - **Vision companion suppression.** When a main vision-less entry has a best-effort vision companion and that companion's own solve is over budget, the companion entry is dropped (warning logged) rather than emitted as an OOM landmine.
-- **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted, before co-resident charges) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
+- **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted, before any resident charge) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
 - **Degenerate refusal.** If `vram_total − reserve − spare ≤ 0`, the run fatals *before* any VRAM work (exit 1) and does **not** overwrite an existing `config.yaml`. Same guard applies when the reservation leaves zero model entries.
 
 `--idle-unload SECONDS` emits a top-level `globalTTL: SECONDS` (llama-swap: unload any model after that many seconds of inactivity; `0` = never, the llama-swap default; llama-packer omits the key when the flag is absent). Intended for co-residency with ComfyUI/games that need VRAM on short notice without re-packing.
@@ -315,11 +315,9 @@ usage:
   qa:     {min_context: 32k,  min_parallel: 2, require: [vision]}
 ```
 
-A sidecar tags itself with `usage: [coding, chat]`. **A tag is a claim, not a guarantee**: the planner emits a variant only where an entry can actually meet the minimums. A tag not declared in `profiles.yaml` is warned about and ignored, so the categories in force are exactly the ones the operator wrote — a sidecar can raise what it needs but never invent a category. Untagged models are governed by the global `min_context` exactly as before, which is what makes the migration incremental. `min_context:` in a sidecar still parses and still means one implicit category.
+A sidecar tags itself with `usage: [coding, chat]`. **The category is the operator's declaration, not an inference** — nothing about the model or the GPU chooses it or overrides it, exactly as `hf_url` and `context_length` are declarations. A tag not declared in `profiles.yaml` is warned about and ignored, so the categories in force are exactly the ones the operator wrote. Each satisfiable category emits its **own** entry; two entries for one model is therefore just two categories in sidecars, not a separate mechanism. Every model additionally gets a **fallback** entry with bare minimums and no category name in the id, so an untagged model still reaches clients.
 
-Three things follow from this.
-
-**Set membership is derived, not declared.** llama-swap's matrix router collects every set containing the requested model and activates the *cheapest* (ties by definition order), and only the requested model is actually started — set membership is permission to co-reside, not a promise to load. So an entry must survive the **heaviest set it belongs to**, which is a per-set number the single fleet-wide ledger charge could not express. `set_overhead_mb()` prices each set from its expression: an OR branch is an alternative so only the priciest is charged (`& (emb | rnk2)` costs rnk2's 5766 MB, not both), while `__COLOAD_VARS__` is a genuine sum because those models co-load with each other. A model is admitted to a set when it can still meet one of its categories at that set's overhead, and `__CHAT_VARS__` expands **per set** to the models that qualify. A 27B that meets `coding` beside emb+rnk but not beside a 5.7 GB reranker joins `rag` and is dropped from `ragz`; it is not forced to size for the heavier of the two. Any model excluded from a set is logged by name.
+Two things follow from this.
 
 **Shedding is described per category, and resolved by `solve_rung()`.** Each category declares `sacrifice:` (an ordered preference for what to give up), `keep:` (do not drop what this model has) and `require:` (must have it, or the category does not apply). `shed_levels()` turns those into the ladder of rungs to try — one per prefix of the declared order — and `solve_rung()` asks the budget what each one affords, keeping the level that buys the **most context**, and among levels buying the same context the **least shed**.
 
@@ -329,59 +327,83 @@ That tie rule is the whole of "coding drops vision to maximise context, and only
 
 `min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
 
-**Co-loads must be groupable to be reserved.** See [Matrix Context Solving](#matrix-context-solving): the opportunistic co-load pass is skipped when no set references `__COLOAD_VARS__`, since the reservation would buy nothing.
+## VRAM Allocation
 
-## Matrix Context Solving
+Two tiers, and only two.
 
-When `profiles.yaml` defines a `matrix` section, the system solves a shared VRAM budget equation across all model types. The co-resident classes are declared by `categories:` — defaulting to the RAG pair `emb`/`rnk`, with additional fixed-overhead categories (e.g. `tts`/`stt`) allowed:
+### Residents
+
+Pinned for as long as the service is up, because losing them means losing
+the KV cache and reloading on every lookup. Embeddings and rerank are the
+clear case; speech (STT/TTS) are optional residents.
+
+Each resident serves a **fixed small context** — `embed_context` /
+`rerank_context`, default 4096. Two reasons, and the second is what makes
+the rest of this section work:
+
+- clients standardise on one RAG context and chunk to it, so the embed size
+  is a stable contract rather than a function of what else is loaded;
+- **a fixed small context makes the resident tier's VRAM a number you can
+  compute up front**, which is what makes the remainder meaningful. A
+  context that flexed with load would make the budget move under you.
+
+The cap is not a concession to revisit when VRAM is tight. If VRAM binds,
+context in main chat is worth more than context in RAG.
+
+Residents are selected by role, or by `--embed` / `--rerank` CLI selectors.
+**They always serve single-slot**: resident parallelism must never buy
+context away from the chat it serves. A declared `parallel:` on an
+embeddings/rerank model is ignored with a note.
+
+### Remainder
 
 ```
-reserve = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
-available = vram_total - reserve - spare
-chat_ctx solves Σ(chat_weight + chat_factor × chat_ctx) = available - embed - rerank - coloads
+reserve        = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
+available      = vram_total - reserve - spare
+resident_vram  = Σ VRAM(resident, at its own fixed context)
+chat_budget    = available - resident_vram
 ```
 
-The solver (`llama_packer/vram.py:solve_matrix_ctx`) finds the maximum chat context that coexists with fixed embed/rerank allocations (at their declared contexts). All chat models share the same VRAM pool (llama-swap evicts between them), so the solver picks the largest feasible context across all chat models. Smaller chat models are never raised above their own design context — they are only clamped down to it. Unestimable chat participants ("riders", zero-cost placeholders) ride the measurable models' solve: they never set the shared bar (their native max would inflate `chat_ctx` for everyone and suppress tools demotion) and are flagged `estimated: false`.
+`chat_budget` is **a number**, not a solved context. Each chat model then
+resolves its own serving against it, through its category:
 
-Embed/rerank models are auto-selected as the smallest model of each role, or matched by `--embed`/`--rerank` CLI selectors (declared categories select by their `role:`). **They always serve single-slot**: a declared `parallel:` on an embeddings/rerank model is ignored with a note — resident parallelism must never buy context away from the main chat it serves.
-
-### Categories
-
-`matrix.categories:` maps a category **name** (the var name referenced by `sets:`) to the role that selects its model:
-
-```yaml
-matrix:
-  categories:
-    emb: {role: embeddings}
-    rnk: {role: rerank}
-    tts: {role: t2s}      # optional fixed-overhead resident
-    stt: {role: s2t}
-  evict_costs: {emb: 100, rnk: 100, tts: 50, stt: 50}
-  sets:
-    rag:   "__CHAT_VARS__ & emb & rnk"
-    voice: "__CHAT_VARS__ & (tts | stt)"
+```
+for each chat model:
+    for each declared category, and the fallback:
+        solve (shed, ctx, parallel) from chat_budget
 ```
 
-- Defaults to `{emb: {role: embeddings}, rnk: {role: rerank}}`, so existing configs are unchanged.
-- `emb`/`rnk` drive the shared chat-context solve below. Every **other** declared category is a **fixed-overhead resident**: reserved alongside chat and RAG, smallest-first, while chat stays at or above the co-load floor.
-- A category that cannot be sized is skipped with a warning; one that does not fit the floor is **not reserved** (its var is still emitted, so a `sets:` branch referencing it may over-subscribe — the warning is the signal).
-- `evict_costs:` keys must be declared category names; an unknown key is warned about and left to llama-swap (which ignores it).
-- Model selection is by role, with the same smallest-VRAM / `--embed`/`--rerank` selector logic used for the RAG pair.
+Two chat models therefore land on **different** contexts — a `.coding` entry
+takes what its category asks for, a small `.aux` entry takes what is left.
+That is the intended outcome, not something to reconcile. There is no shared
+`chat_ctx` and no per-set re-solve; those were two mechanisms answering one
+question, and every defect where one pass read a value the other decided
+came from that.
 
-`tts` and `stt` are separate categories because switching between them forces a resident reload; `(tts | stt)` in a set is a runtime choice, not a co-load. Additional audio roles (`vc`, `vad`, `music`, `separation`) are recorded in [docs/plans/audio-roles.md](docs/plans/audio-roles.md).
+A model smaller than its own category's `min_context` at every rung emits
+**nothing** for that category. The fallback entry is the floor on that: every
+model gets one, and it too can fail.
 
 ### Knobs (matrix section keys)
 
 | key | default | meaning |
 | --- | --- | --- |
-| `min_chat_ctx` | 65536 | Co-load decision floor: a co-load is only included while chat stays at or above this |
-| `tools_min_ctx` | 131072 | Tools advertisement threshold; also the floor when a tools chat model can still keep it |
-| `coload_min_ctx` | 20480 | emb/rerank squeeze floor |
-| `ctx_gain_min` | 4096 | Minimum chat-context gain for a squeeze to be adopted |
-| `estimate_headroom` | 1.25 | Padding applied to *estimated* (not measured/pinned) co-load overheads |
+| `embed_context` | 4096 | Context the resident embeddings model serves at |
+| `rerank_context` | 4096 | Context the resident rerank model serves at |
 | `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins. Set `false` to disable fleet-wide; a sidecar `parallel:` pin opts a single model out |
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
 | `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth. See "What `parallel_power` actually controls" below — the neutral point is model-dependent, so a fleet-wide value is a *bias*, not a target |
+
+### Retired, still parsed
+
+These belonged to the two-mechanism design and nothing consults them for
+allocation any more: `evict_costs:`, `sets:`, `categories:`, `min_chat_ctx`,
+`coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`. They are still
+accepted and still warn-free, because the group loop has not yet been
+rewritten onto this model — see the loop restructure in
+[docs/plans/one-rung-search.md](docs/plans/one-rung-search.md). **They are
+documented here as dead configuration, not as features.** They stop being
+parsed when the restructure lands.
 
 ### What `parallel_power` actually controls
 
@@ -406,11 +428,18 @@ So the neutral point is a property of the model, not a constant:
 
 That is the intended shape, and it lines up with how the fleet is used. A
 large agentic model carries both a high `floor` and an expensive per-slot
-cost, so it is pushed to `parallel: 1` — its `floor` is `tools_min_ctx`
-(128k), and any second slot would drop it below a window that cannot drive a
-tool call. A small quick model has a low floor and cheap slots, so the same
-`0.75` walks it up to the cap. `floor` does most of the work; `B` sets the
-rate at which the other side gives way.
+cost, so it is pushed to `parallel: 1` — its `floor` comes from its category
+(128k for `coding`), and any second slot would drop it below a window that
+cannot drive a tool call. A small quick model has a low floor and cheap
+slots, so the same `0.75` walks it up to the cap. `floor` does most of the
+work; `B` sets the rate at which the other side gives way.
+
+The null category runs the same solve with exponent **0** — slots worth
+nothing in the score, so the choice is purely "can it hold the context at
+more of them", which is what a plentiful-VRAM small model should do. Ties go
+to *more* slots; with a positive exponent a capped model scores strictly
+higher at every slot count and never ties, so this only affects the flat
+case.
 
 Two consequences worth knowing before turning it:
 
@@ -418,45 +447,39 @@ Two consequences worth knowing before turning it:
   no value of `B` that is correct for every model at once — that is the
   price of one fleet-wide knob.
 - **The floor gates first.** A candidate below `floor` is rejected outright,
-  so `B` only arbitrates between candidates that already clear it. On a
-  model whose floor is unreachable at any slot count, the solve falls back
-  to the group parallel and logs `auto-parallel: <stem> floor <n>
-  unreachable`.
+  so `B` only arbitrates between candidates that already clear it.
 
 Invalid values warn and fall back to the default; the solve never fails on a bad knob.
 
-### emb/rerank squeeze
-
-When the baseline solve puts chat below `tools_min_ctx`, the solver re-solves with embed/rerank contexts clamped to `coload_min_ctx`. The squeeze is adopted only when it buys chat at least `ctx_gain_min`; otherwise design contexts are kept. An adopted squeeze is *realized*: the reduced context is emitted into the embed/rerank commands (that emit is what frees the VRAM), and `metadata.ctx_size` on those entries reflects it.
-
-### Opportunistic co-loads
-
-After the squeeze pass, enabled `s2t` and `image` models that are **not already declared categories** (and not `embeddings`/`rerank` — unconditional residents) are included smallest-fixed-overhead-first while the chat solve stays at or above the floor. Declared non-RAG categories (e.g. `tts`/`stt`) are reserved *first*, before this opportunistic pass:
-
-- floor = `tools_min_ctx` when a chat model declares `tools` and the baseline still keeps it; otherwise `min_chat_ctx`.
-- A candidate that would drop chat below the floor is skipped with a warning naming model and MB; it does not block smaller candidates later in the list.
-- Fixed overhead = weights + fixed compute (zero KV terms for these backends). An operator-pinned `vram_mb` sidecar field is authoritative (`source: config`); otherwise the file-size + per-backend-buffer estimate applies, padded by `estimate_headroom` when no measurement exists. CPU-resident candidates cost 0.
-- Shared process overhead is counted once per process, not per model — a multi-model entry (e.g. a speech server hosting ASR + VAD + diarization) is budgeted as Σ(weights + per-model activations) + one shared constant; pin the entry with `vram_mb` to encode the sum directly.
-
-Included co-loads appear in the matrix routing: `_build_matrix_vars` adds one role-prefixed var per included model (`s2t`, `img`; numbered on collision) in addition to one var per declared category, and set expressions may reference the `__COLOAD_VARS__` placeholder (expanded like `__CHAT_VARS__` to a parenthesized OR-list of var names; dropped from the expression when no co-loads were included). Co-loads whose entry ids are not referenced by any set stay outside the co-loading groups (independent eviction).
-
-**The pass is gated on `__COLOAD_VARS__` being referenced.** Reserving a co-load's VRAM against every chat solve is only sound if llama-swap can actually hold it beside the chat model, and the placeholder is the only way a co-load's var reaches a set. With no set referencing it, the co-load is evicted independently, so the reservation buys nothing and only costs context — so the whole opportunistic pass is skipped with an INFO line. Models too large to live beside chat belong in `__CHAT_VARS__`: they then evict chat (an alternative in the same bucket) rather than shrinking it. Declared `categories:` are exempt — naming one is explicit operator intent, and a category's own name is what a set references.
-
 ### tools demotion
 
-A chat model declaring `capabilities: [tools]` that the matrix solve serves below `tools_min_ctx` gets the capability demoted in its emitted entries: `capabilities.tools: false` and `metadata.tools_demoted: true` (per entry; the sidecar declaration is untouched, so re-packing at a higher served context restores it). This keeps `/v1/models` consumers (hermes, opencode, UIs) from sending tool calls to a window too small to serve them. Note `capabilities.context` reports the max *trained* context (`design_context`) regardless; the VRAM-served limit lives in `metadata.ctx_size`.
+A chat entry declaring `capabilities: [tools]` that its own solve serves
+below `tools_min_ctx` gets the capability demoted: `capabilities.tools:
+false` and `metadata.tools_demoted: true` (the sidecar declaration is
+untouched, so re-packing at a higher served context restores it). This keeps
+`/v1/models` consumers (hermes, opencode, UIs) from sending tool calls to a
+window too small to serve them. `capabilities.context` reports the max
+*trained* context (`design_context`) regardless; the VRAM-served limit lives
+in `metadata.ctx_size`.
 
-## Main-Chat Context Determination
+## Context Tiers
 
-The full context ladder, smallest to largest:
+Smallest to largest, for any served entry:
 
 1. `_MIN_CTX_SIZE` (4096) — hard emit floor for any served entry.
-2. `matrix.coload_min_ctx` (20K) — emb/rerank squeeze floor (above).
-3. `matrix.min_chat_ctx` (64K) — co-load decision floor: co-loads may not push chat below it. emb/rerank, being unconditional, may — at which point tools demotion is the signal.
-4. `matrix.tools_min_ctx` (128K) — tools advertisement threshold (above).
-5. `design_context` / `--max-context` — never raised, only clamped down.
+2. The category's `min_context`, or the null category's 4096 — the floor the
+   `(ctx, parallel)` search will not trade below.
+3. `design_context` / `--max-context` — never raised, only clamped down.
 
-Without a matrix section, each model's context is solved independently by `calc_ctx` against the shared budget minus fixed co-load overheads (none included) — unchanged historical behavior.
+`sidecar context_length:` is the model's **design maximum**, a ceiling applied
+when serving. It is never a floor: reading it as one made a 262144 design max
+an unreachable floor, forced the model to one slot, and left the only remedy
+editing the sidecar — rewriting a claim about the model to express an
+operating decision. `min_context:` is the key that states a floor, and it was
+already separate.
+
+`--min-context` overrides the floor fleet-wide when set explicitly, never an
+explicit sidecar `min_context:`.
 
 ## MTP Speculative Decoding
 
@@ -872,7 +895,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Memory estimation
 
-`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, zero KV terms, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM; the entry is excluded from the shared chat budget solve itself, but (unlike before) is a candidate for the opportunistic co-load pass when a matrix section is configured — included only while chat keeps its floor (a 40 GB diffusion model simply won't fit after the RAG set).
+`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, zero KV terms, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM. A 40 GB diffusion model will not fit after the resident tier, and the category solve says so rather than the config pretending otherwise: if no rung fits, no entry is emitted.
 
 ### Binary precedence
 
@@ -948,11 +971,11 @@ zero KV terms, `compute_mib = 100` (measured on Vulkan: process footprint
 ≈ Σ model files — activation memory is small; sd-server keeps its 512 MiB
 diffusion buffer); a sidecar `vram_mb` pins the total outright.
 `ctx_size` tracks `design_context` (sidecar `context_length` or default)
-without affecting VRAM. s2t models are candidates for the *opportunistic
-co-load pass* (see Matrix Context Solving): with a matrix section configured,
-the smallest ones join the shared resident set while chat keeps its floor.
-The emitted `--parallel` maps the sidecar/profile slot count to concurrent
-transcription workers.
+without affecting VRAM. s2t models can be declared
+**residents** (see [VRAM Allocation](#vram-allocation)), in which case they
+are reserved alongside RAG and served at a fixed small context so repeated
+lookups do not reload them. The emitted `--parallel` maps the sidecar/profile
+slot count to concurrent transcription workers.
 
 ## Audio Backend (audio-cpp)
 
