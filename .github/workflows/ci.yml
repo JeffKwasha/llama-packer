@@ -20,7 +20,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e . pytest
+        # [progress] pulls rich so the active-bar tests exercise the real
+        # bar; without it they importorskip and the path goes untested.
+        run: pip install -e ".[progress]" pytest
       - name: Tests
         run: python -m pytest tests/ -q
       - name: Requirement trace is complete

@@ -21,7 +21,9 @@ progress = ["rich"]
 llama-packer = "llama_packer.__main__:main"
 
 [dependency-groups]
-dev = ["pytest"]
+# rich backs the progress bar; its tests importorskip it, but the dev group
+# carries it so `pytest` exercises the real bar rather than skipping it.
+dev = ["pytest", "rich"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
