@@ -353,6 +353,9 @@ def test_rejected_unit_leaves_the_previous_one_installed(tmp_path, monkeypatch):
     systemd re-reads the unit directory on any daemon-reload or at boot, so
     a unit that failed verification would become the one that starts -- not
     running now, but silently wrong once reloaded.
+
+    Validates: docs/plans/requirement-trace.md #42: the unit is verified before it
+    becomes the unit systemd reads.
     """
     unit = tmp_path / "llama-swap.service"
     unit.write_text("[Unit]\nDescription=old-good\n")
@@ -373,6 +376,9 @@ def test_candidate_name_is_a_valid_unit_name(tmp_path, monkeypatch):
     It prints "Failed to prepare filename: Invalid argument" and exits 0
     without inspecting anything, which would make the verify step a no-op
     that approves any unit at all.
+
+    Validates: docs/plans/requirement-trace.md #42: the candidate must keep the
+    .service suffix, or systemd-analyze exits 0 without reading it.
     """
     unit = tmp_path / "llama-swap.service"
     _, candidate = _install_unit(monkeypatch, unit, tmp_path, lambda _p: None)
@@ -388,6 +394,9 @@ def test_validate_runs_as_the_service_user(tmp_path, monkeypatch):
     of the entry, so running llama-swap as root out of it lets any member
     of --group swap in a binary and have root execute it on the next
     install.
+
+    Validates: docs/plans/requirement-trace.md #41: llama-swap validates as the
+    service user, never root out of a group-writable directory.
     """
     commands = []
     r = ins.Runner(dry_run=False)

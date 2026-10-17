@@ -612,6 +612,9 @@ def test_cpp_truncated_dir_is_not_certified_as_installed(tmp_path,
     reported as "already installed" forever after, and install.py wrote
     its path into config.yaml as LLAMA_DIR. Requiring the binary is what
     makes a partial install invisible to both tools.
+
+    Validates: docs/plans/requirement-trace.md #37: installs are atomic; a truncated
+    tree is never certified as a good install.
     """
     (d := tmp_path / "llama-b11539").mkdir()          # directory exists...
     (d / "libggml.so").write_bytes(b"partial")        # ...but no llama-server
@@ -993,6 +996,10 @@ def test_target_glob_selects_a_set():
 
 
 def test_ambiguous_prefix_is_an_error_not_a_guess():
+    """
+    Validates: docs/plans/requirement-trace.md #39: an ambiguous selector exits
+    non-zero instead of falling through to the default targets.
+    """
     # Guessing wrong here installs the wrong engine's binary.
     with pytest.raises(upd.TargetError, match="ambiguous"):
         _sel("s")
@@ -1166,6 +1173,9 @@ def test_prune_never_removes_the_bundle_a_symlink_points_at(tmp_path):
     "never delete what a symlink points at" guarantee was a no-op for
     whisper.cpp and stable-diffusion.cpp -- and the engine just installed
     was the one deleted, leaving a dangling link.
+
+    Validates: docs/plans/requirement-trace.md #38: the pruner must not delete a
+    bundle a symlink points at.
     """
     keep = _bundle(tmp_path, "sd-server-v1000")
     _bundle(tmp_path, "sd-server-v999")
@@ -1211,6 +1221,9 @@ def test_cpu_backend_does_not_install_vulkan():
     word already present and returned it untouched, so the Vulkan branch
     claimed the request. An operator on a box without Vulkan silently got
     a build they did not ask for.
+
+    Validates: docs/plans/requirement-trace.md #40: cpu/cuda must not silently install
+    Vulkan.
     """
     assert upd._backend_version(upd.DEFAULT_VERSION, "cpu") == "latest-cpu"
     assert upd._backend_version(upd.DEFAULT_VERSION, "cuda") == "latest-cuda"
@@ -1325,3 +1338,20 @@ def test_arch_tables_are_consistent():
     assert upd.get_llama_swap_arch("amd64") == "linux_amd64"
     assert upd.get_sd_arch("amd64") == "x86_64"
     assert upd.get_sd_arch("arm64") == "aarch64"
+
+
+def test_ambiguous_target_selector_is_refused(monkeypatch, capsys):
+    """An unresolvable selector stops the run; it does not fall through.
+
+    `resolve_positionals` used to append the error to `notes`, which left
+    `selected` empty and fell through to the default targets — so
+    `update.py s` printed "ambiguous: matches sd, swap" and then went ahead
+    and installed several gigabytes, exiting 0.
+
+    Validates: docs/plans/requirement-trace.md #39 -- an ambiguous target
+    selector exits non-zero.
+    """
+    monkeypatch.setattr(upd, "gh_api", lambda _u: {"assets": []})
+    rc = upd.main(["s"])
+    assert rc == 1, "an ambiguous selector must not install anything"
+    assert "ambiguous" in capsys.readouterr().err

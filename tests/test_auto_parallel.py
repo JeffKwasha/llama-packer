@@ -507,3 +507,23 @@ def test_multi_category_takes_the_heaviest():
     """
     view = _view(capabilities=["tools"])
     assert resolve_min_ctx(view, category_floor=133120) == 133120
+
+
+def test_cpu_resident_chat_gets_no_auto_parallel(make_model):
+    """Host-RAM KV lives in an arena no VRAM ledger budgets.
+
+    calc_ctx returns the design context regardless of the slot count for a
+    CPU-resident model, so every candidate looks equally affordable and the
+    score reduces to p**power — walking straight to the cap. Eight slots on
+    a model declared for one is an 8x KV over-commit nothing accounts for.
+
+    Validates: docs/plans/requirement-trace.md #29.
+    """
+    from llama_packer.profiles import Profiles as _P
+    model = make_model("cpu-chat", role="chat", device="cpu")
+    planner = Planner([model],
+                      _P({"defaults": {"cache_type": "q8_0"},
+                          "profiles": {"default": {}}}),
+                      fit_bin="unused", vram_total=64 * 1024)
+    planner._bounded_ctx = lambda *a, **k: 131072
+    assert [v.parallel for v in planner.plan()["cpu-chat"]] == [1]

@@ -664,3 +664,42 @@ def test_keep_is_parsed_from_profiles():
     assert d.keep == frozenset({"draft"})
     assert d.sacrifice == ("vision",)
     assert d.require == frozenset()
+
+
+# ── the category is a declaration, and these prove each rule ──────────────
+
+
+def test_usage_tags_resolve_to_declared_demands():
+    """A sidecar's `usage:` resolves to exactly what profiles.yaml declared.
+
+    Validates: docs/plans/requirement-trace.md #1 -- the category comes from
+    the sidecar tag; nothing infers or overrides it.
+    """
+    profiles = Profiles({"defaults": {}, "usage": {
+        "coding": {"min_context": "130k", "min_parallel": 1},
+        "aux": {"min_context": "80k", "min_parallel": 2}}})
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    got = resolve_usage(["coding", "aux"], cat)
+    assert [d.name for d in got] == ["coding", "aux"]
+    assert [d.min_context for d in got] == [133120, 81920]
+    # Declaration order is preserved, not sorted by weight.
+    assert [d.name for d in resolve_usage(["aux", "coding"], cat)] == \
+        ["aux", "coding"]
+
+
+def test_usage_tag_not_declared_warns_and_is_ignored(caplog):
+    """Only declared categories exist; an undeclared one cannot be invented.
+
+    Validates: docs/plans/requirement-trace.md #2 -- an undeclared tag
+    warns and is ignored, so the categories in force are exactly the ones
+    the operator wrote.
+    """
+    import logging
+    profiles = Profiles({"defaults": {}, "usage": {
+        "coding": {"min_context": "130k"}}})
+    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    with caplog.at_level(logging.WARNING):
+        got = resolve_usage(["coding", "invented"], cat)
+    assert [d.name for d in got] == ["coding"]
+    assert any("invented" in r.message for r in caplog.records), [
+        r.message for r in caplog.records]

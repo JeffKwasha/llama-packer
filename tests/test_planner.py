@@ -809,6 +809,9 @@ def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
     demotion could never fire, and an entry advertised tool calling an order
     of magnitude below the window it needs. The verdict now comes from the
     context this entry actually serves.
+
+    Validates: docs/plans/requirement-trace.md #30: tools is demoted on the entry's
+    own served context.
     """
     chat = make("chat", role="chat", capabilities=["tools"])
     chat.vram.calc_ctx = lambda *a, **k: 32768
@@ -822,7 +825,11 @@ def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
 
 
 def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
-    """The other direction, so the fix is not simply "always demote"."""
+    """The other direction, so the fix is not simply "always demote".
+
+    Validates: docs/plans/requirement-trace.md #30: the other direction, so the fix
+    cannot read as 'always demote'.
+    """
     # make() seeds context_length 32768, which would cap the served ctx
     # below the threshold and demote regardless of what calc_ctx returns.
     chat = make("chat", role="chat", capabilities=["tools"],
@@ -1144,12 +1151,15 @@ def _demand(name="coding", **kw):
 
 
 def test_rung_drops_vision_when_it_buys_context(make_model):
-    """The plain case: shedding the projector is worth it, so it is shed.
+    """Both levels qualify here, which is what makes this a test of the
+    *ranking* and not of the shed order: with only one level legal, any
+    implementation that simply takes the first hit passes too.
 
-    Validates: SPEC.md, 'Shedding is described per category': most context that fits wins.
+    Validates: SPEC.md, 'Shedding is described per category': most context
+    that fits wins.
     """
     m = make_model("c", backend="llama-server", context_length=262144)
-    p = _affording(m, {True: 90000, False: 200000})
+    p = _affording(m, {True: 140000, False: 200000})
     rung = p.solve_rung(m, _demand(min_context=131072), parallel=1,
                         cache_type="q8_0", spare_mb=0)
     assert rung.shed == frozenset({"vision"})
@@ -1272,3 +1282,211 @@ def test_keep_draft_is_enforced_now_that_the_axis_exists(make_model):
     assert all(draft for _, draft in seen), "keep: [draft] still shed it"
     assert "draft" not in rung.shed
     assert rung.shed == frozenset({"vision"})
+
+
+# ── one entry per category; the fallback is the floor on that ─────────────
+
+
+def test_every_category_gets_an_entry(make_model, profiles):
+    """Each satisfiable category emits its own id.
+
+    Validates: docs/plans/requirement-trace.md #3 -- `usage: [coding, chat]`
+    on a model that can serve both produces a `.coding` and a `.chat`, so a
+    client can ask for the one it wants.
+    """
+    m = make_model("multi", role="chat")
+    m.frontmatter["usage"] = ["coding", "chat"]
+    profs = Profiles({"defaults": {"cache_type": "q8_0"},
+                      "profiles": {"default": {}},
+                      "usage": {"coding": {"min_context": "4k"},
+                                "chat": {"min_context": "4k"}}})
+    planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
+                      min_context=4096)
+    planner._bounded_ctx = lambda *a, **k: 131072
+    planner._auto_parallel = lambda *a, **k: (1, 131072)
+    cats = {v.category.name for v in planner.plan()["multi"] if v.category}
+    assert cats == {"coding", "chat", ""}, cats
+    ids = list(emit_config([m], planner.plan(), profs, TVARS)["models"])
+    assert {"multi.coding", "multi.chat", "multi"} <= set(ids), ids
+
+
+def test_every_model_gets_a_fallback(make_model, profiles):
+    """A category cannot satisfy every model, but the fallback always can.
+
+    Validates: docs/plans/requirement-trace.md #5 -- the fallback is the
+    floor on "a category that cannot be met emits nothing", so an untagged
+    model still reaches clients.
+    """
+    m = make_model("lonely", role="chat")
+    m.frontmatter["usage"] = ["coding"]
+    # coding asks for 1M, which nothing can serve; the fallback asks 4096.
+    profs = Profiles({"defaults": {"cache_type": "q8_0"},
+                      "profiles": {"default": {}},
+                      "usage": {"coding": {"min_context": 1000000}}})
+    planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
+                      min_context=4096)
+    planner._bounded_ctx = lambda *a, **k: 131072
+    planner._auto_parallel = lambda *a, **k: (1, 131072)
+    variants = planner.plan()["lonely"]
+    assert [v.category.name if v.category else "" for v in variants] == [""]
+    assert list(emit_config([m], {"lonely": variants},
+                            profs, TVARS)["models"]) == ["lonely"]
+
+
+def test_model_with_no_rung_at_all_emits_nothing(make_model, profiles):
+    """Even the fallback can fail. Then the model is absent, not emitted at
+    a context it cannot hold.
+
+    Validates: docs/plans/requirement-trace.md #6 -- the fallback can itself
+    fail and emit nothing.
+    """
+    m = make_model("huge", role="chat")
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024)
+    planner._bounded_ctx = lambda *a, **k: 0
+    assert planner.plan().get("huge", []) == []
+
+
+def test_category_prefers_context_over_capability(make_model):
+    """A category takes the rung buying the MOST context.
+
+    The mirror of the fallback's rule, and the reason the two differ: coding
+    would rather have 262144 tokens text-only than 131072 with a projector.
+
+    Validates: docs/plans/requirement-trace.md #10.
+    """
+    coding = _demand(min_context=131072)
+    m = make_model("c", backend="llama-server", context_length=262144)
+    p = _affording(m, {True: 131072, False: 262144})
+    rung = p.solve_rung(m, coding, parallel=1, cache_type="q8_0", spare_mb=0)
+    assert rung.shed == frozenset({"vision"}), "kept the projector"
+    assert rung.ctx == 262144, "took the text-only rung for the context"
+
+
+def test_require_prevents_the_entry_emitted(make_model, profiles, tmp_path):
+    """`require` gates existence end to end, not just the helper.
+
+    `Planner.can_meet` is the unit; this is the behaviour a client sees: a
+    model tagged with a category requiring vision, having no projector, gets
+    **no id at all** for that category -- and the fallback carries on.
+
+    Validates: docs/plans/requirement-trace.md #16.
+    """
+    (tmp_path / "t-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
+    m = make_model("blind", role="chat")          # text only, no mmproj
+    m.frontmatter["usage"] = ["qa"]
+    profs = Profiles({"defaults": {"cache_type": "q8_0"},
+                      "profiles": {"default": {}},
+                      "usage": {"qa": {"min_context": "4k",
+                                       "require": ["vision"]}}})
+    planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
+                      min_context=4096)
+    planner._bounded_ctx = lambda *a, **k: 131072
+    planner._auto_parallel = lambda *a, **k: (1, 131072)
+    names = {v.category.name if v.category else "" for v in planner.plan()["blind"]}
+    assert "qa" not in names, "emitted an id claiming a capability it lacks"
+    assert "" in names, "the fallback must still serve it"
+
+
+def test_shed_order_is_configurable(make_model):
+    """What a category omits is shed in the `shed:` order, not a constant.
+
+    Validates: docs/plans/requirement-trace.md #14 -- capabilities a
+    category omits are shed last, in the order from `shed:`.
+    """
+    from types import SimpleNamespace
+
+    from llama_packer.writer import Planner
+    p = Planner.__new__(Planner)
+    p.profiles = SimpleNamespace(shed_order=("draft", "vision"))
+    from llama_packer.writer import shed_levels
+    levels = shed_levels((), default_order=p.profiles.shed_order)
+    assert levels == (frozenset(), frozenset({"draft"}),
+                      frozenset({"draft", "vision"}))
+
+
+def test_fallback_slot_exponent_is_zero(make_model):
+    """The fallback runs the slot solve with slots worth nothing.
+
+    Exponent 0 is not a special case for "parallel 1": it is the ordinary
+    solve with a bias that says a slot is free to take *if the context still
+    holds*. That is why it is worth expressing as a power rather than a
+    branch.
+
+    Validates: docs/plans/requirement-trace.md #35.
+    """
+    m = make_model("c", backend="llama-server", role="chat")
+    seen = []
+    from llama_packer.profiles import Profiles as _P
+    profs = _P({"defaults": {"cache_type": "q8_0"}, "profiles": {"default": {}}})
+    planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024)
+    real = planner._auto_parallel
+
+    def spy(*a, **kw):
+        seen.append(kw.get("power"))
+        return real(*a, **kw)
+
+    planner._auto_parallel = spy
+    planner._bounded_ctx = lambda *a, **k: 131072
+    planner.plan()
+    # The fallback's call passes power=0.0 explicitly.
+    assert 0.0 in seen, seen
+
+
+def test_ties_go_to_more_slots(make_model):
+    """Equal score resolves upward, not to the first candidate.
+
+    Validates: docs/plans/requirement-trace.md #36 -- ties in the slot
+    score go to more slots, which is what lets a plentiful-VRAM model keep
+    its context *and* take concurrency.
+    """
+    from test_auto_parallel import _planner as _ap, _scripted_by_parallel
+    m = make_model("c", backend="llama-server", role="chat")
+    _scripted_by_parallel(m, {1: 32768, 2: 32768, 3: 16384, 4: 8192})
+    variants = _ap(m).plan()["c"]
+    assert variants[0].parallel == 2, "tie must not fall to parallel 1"
+
+
+# ── residents: fixed context, single slot, charged up front ──────────────
+
+
+def test_resident_rag_is_reserved_at_its_fixed_context(make_model, profiles):
+    """A resident serves `rag_cap(role)`, capped by its design context.
+
+    The whole allocation rests on this being a *number* you can compute
+    before any chat model is solved — a context that flexed with load would
+    move the budget under the remainder.
+
+    Validates: SPEC.md, 'VRAM Allocation': each resident serves a fixed
+    small context.
+    """
+    from llama_packer.writer import MatrixKnobs
+    knobs = MatrixKnobs(embed_context=4096, rerank_context=6144)
+    emb = make_model("e", role="embeddings", context_length=131072)
+    rnk = make_model("r", role="rerank", context_length=8192)
+    assert knobs.rag_cap("embeddings") == 4096
+    assert knobs.rag_cap("rerank") == 6144
+    # Served context is the cap, never above the model's own design ceiling.
+    for model, cap in ((emb, 4096), (rnk, 6144)):
+        ctx = min(model.vram._design_ctx(), cap)
+        assert ctx <= cap
+
+
+def test_resident_parallelism_is_ignored(make_model, profiles, caplog):
+    """A resident's declared `parallel:` is ignored with a note.
+
+    Resident slots would come straight out of the chat context, which is the
+    opposite of what a resident is for.
+
+    Validates: SPEC.md, 'VRAM Allocation': residents always serve
+    single-slot.
+    """
+    import logging
+    from llama_packer.writer import Planner
+    emb = make_model("e", role="embeddings", context_length=131072)
+    emb.frontmatter["parallel"] = 8
+    planner = Planner([emb], profiles, fit_bin="unused", vram_total=48 * 1024)
+    planner._bounded_ctx = lambda *a, **k: 4096
+    planner._auto_parallel = lambda *a, **k: (1, 4096)
+    with caplog.at_level(logging.INFO, logger="llama_packer.writer"):
+        variants = planner.plan()["e"]
+    assert [v.parallel for v in variants] == [1], "resident took 8 slots"

@@ -241,6 +241,9 @@ def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
     ``ctx >= floor``, so the fabricated value was accepted as a real slot
     count. GLM47's c with qwen35's corrected D made that reachable:
     2000 MiB left, 4 slots bought 1863 tokens, reported as 4096.
+
+    Validates: docs/plans/requirement-trace.md #27: no emitted entry may need more
+    VRAM than exists.
     """
     import logging
     from llama_packer.vram import _MIN_CTX_SIZE
@@ -346,6 +349,10 @@ def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
 
 
 def test_calc_ctx_cpu_resident_returns_design(make_model):
+    """
+    Validates: SPEC.md, 'VRAM Allocation': a CPU-resident model costs no VRAM, so its
+    context is its design maximum.
+    """
     model = make_model("e", device="cpu", context_length=8192)
     ctx = model.vram.calc_ctx(1024, fit_bin="unused")
     assert ctx == 8192
@@ -772,6 +779,9 @@ def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
     squeeze. SPEC spells out both clamps, and the caller cannot recover it --
     _bounded_ctx passes design_context, which prefers the GGUF header over
     the sidecar.
+
+    Validates: docs/plans/requirement-trace.md #19: context_length is a ceiling in
+    both branches, not only the one that fits.
     """
     fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
           "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
@@ -795,6 +805,8 @@ def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
     ``context_length: 32768`` -- so a loose pin has to be able to raise the
     served context above that, or "no pin" and "pinned at 32k" look
     identical in the fixtures.
+
+    Validates: docs/plans/requirement-trace.md #19.
     """
     fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
           "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",

@@ -498,6 +498,10 @@ def test_overallocation_guard_catches_an_injected_violation(make_model,
                                                            monkeypatch, caplog):
     """The guard must fire on a planner that misbehaves, not just agree.
 
+    Validates: docs/plans/requirement-trace.md #27 -- the emit-time guard is
+    the backstop for "no emitted entry may need more VRAM than exists", so it
+    has to be shown to fire rather than merely agree with a healthy planner.
+
     Everything upstream honours "never emit an entry that cannot load", so
     on a healthy planner this check has nothing to do. That is exactly why
     it needs a test that *breaks* the planner deliberately: otherwise it
@@ -536,6 +540,10 @@ def test_overallocation_guard_catches_an_injected_violation(make_model,
 
 def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,
                                                              monkeypatch, caplog):
+    """The other half: silence when the plan is fine.
+
+    Validates: docs/plans/requirement-trace.md #28.
+    """
     import logging
     from llama_packer.writer import build_config
 
