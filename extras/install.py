@@ -47,6 +47,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -63,6 +64,12 @@ _GPU_GROUPS = ("render", "video")
 #: Connector symlinks live beside the card nodes as ``card0-DP-1`` and
 #: would pass a bare glob; only the bare nodes are GPU device handles.
 _CARD_RE = re.compile(r"^card\d+$")
+
+#: How long to wait for llama-swap to bind its socket and answer. The unit is
+#: Type=simple, so `systemctl enable --now` returns as soon as the process is
+#: forked — well before the API is reachable.
+_PROBE_TIMEOUT_S = 30.0
+_PROBE_INTERVAL_S = 0.5
 
 #: Template placeholder shape. Scoped to ALL-CAPS so systemd's own
 #: ``SystemCallFilter=@system-service`` — an at-set name, not one of ours
@@ -532,7 +539,8 @@ def verify_unit(unit: Path) -> None:
                        "(ignored): %s", len(ignored), ignored[0])
 
 
-def start(r: Runner, unit: Path, dir_: Path, listen: str, user: str) -> None:
+def start(r: Runner, unit: Path, dir_: Path, listen: str, user: str,
+          timeout_s: float = _PROBE_TIMEOUT_S) -> None:
     """Validate the config, then enable and start the unit.
 
     Validation comes first on purpose: llama-swap rejects a config with an
@@ -560,22 +568,33 @@ def start(r: Runner, unit: Path, dir_: Path, listen: str, user: str) -> None:
     else:
         print(f"  $ systemctl daemon-reload")
         print(f"  $ systemctl enable --now {unit.name}")
-    probe(r, listen)
+    probe(r, listen, timeout_s)
 
 
-def probe(r: Runner, listen: str) -> None:
-    """Report what the API is actually advertising after the start."""
+def probe(r: Runner, listen: str, timeout_s: float = _PROBE_TIMEOUT_S) -> None:
+    """Wait for the API to answer, then report what it advertises.
+
+    Poll rather than request once: a single call races the socket against
+    llama-swap's bind and reports a dead service for one that came up fine,
+    which is what it did on the first successful install. Only a deadline
+    that expires is a failure.
+    """
     if r.dry_run:
         return
     host, _, port = listen.rpartition(":")
     url = f"http://{host or '127.0.0.1'}:{port}/v1/models"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as res:
-            data = json.load(res)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise InstallError(
-            f"service did not answer on {url}: {exc}\n"
-            f"  journalctl -u llama-swap -n 50")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as res:
+                data = json.load(res)
+            break
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            if time.monotonic() >= deadline:
+                raise InstallError(
+                    f"service did not answer on {url} within {timeout_s:g}s: "
+                    f"{exc}\n  journalctl -u llama-swap -n 50")
+            time.sleep(_PROBE_INTERVAL_S)
     models = data.get("data", [])
     print(f"  {url}: {len(models)} models")
     for m in models[:5]:
@@ -644,6 +663,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default), or leave the binaries already there")
     p.add_argument("--unit", default="/etc/systemd/system/llama-swap.service",
                    help="unit file path to write")
+    p.add_argument("--health-check-timeout", type=float, default=_PROBE_TIMEOUT_S,
+                   help="seconds to wait for the API to answer after start "
+                        f"(default {_PROBE_TIMEOUT_S:g})")
     p.add_argument("--memory-high", default="32G",
                    help="MemoryHigh= soft cap (default 32G)")
     p.add_argument("--memory-max", default="40G",
@@ -692,7 +714,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_start:
             print("  --no-start: not enabling or starting")
         else:
-            start(r, unit, dir_, args.listen, args.user)
+            start(r, unit, dir_, args.listen, args.user,
+                  args.health_check_timeout)
     except InstallError as exc:
         logger.error("%s", exc)
         return 1

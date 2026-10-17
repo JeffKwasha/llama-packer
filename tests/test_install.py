@@ -471,6 +471,57 @@ def test_validate_runs_as_the_service_user(tmp_path, monkeypatch):
     assert validate[0][:4] == ["runuser", "-u", "lemonade", "--"], validate[0]
 
 
+def test_probe_waits_for_a_slow_start(monkeypatch, capsys):
+    """A single request races the socket against llama-swap's bind, so the
+    probe must poll — otherwise it reports a dead service for one that came
+    up fine, which is what it did on the first successful install.
+
+    Validates: docs/install.md, the /v1/models health probe.
+    """
+    import urllib.error
+
+    calls = {"n": 0}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"data": [{"id": "m", "name": "M"}]}'
+
+    def fake_urlopen(url, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise urllib.error.URLError("Connection refused")
+        return _Resp()
+
+    monkeypatch.setattr(ins.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ins.time, "sleep", lambda s: None)
+    ins.probe(ins.Runner(dry_run=False), "127.0.0.1:8123")
+    assert calls["n"] == 3
+    assert "1 models" in capsys.readouterr().out
+
+
+def test_probe_gives_up_after_the_deadline(monkeypatch):
+    """Validates: docs/install.md, the /v1/models health probe."""
+    import urllib.error
+
+    clock = {"t": 0.0}
+
+    def fake_urlopen(url, timeout=None):
+        raise urllib.error.URLError("Connection refused")
+
+    monkeypatch.setattr(ins.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ins.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(ins.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + 10))
+    with pytest.raises(ins.InstallError, match="did not answer"):
+        ins.probe(ins.Runner(dry_run=False), "127.0.0.1:8123", timeout_s=5)
+
+
 def test_repack_does_not_repoint_home(tmp_path, monkeypatch):
     """HOME=dir_ made the HF cache fallback resolve under the run dir.
 

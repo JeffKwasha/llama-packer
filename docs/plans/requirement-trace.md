@@ -105,3 +105,5 @@ and every one of them carries a `Validates:` citation.
 | 51 | An unreadable `HF_HOME` warns instead of crashing the installer | `test_report_resolved_warns_when_hf_home_is_unreadable` |
 | 52 | The unit is enableable: it carries `[Install] WantedBy=` | `test_unit_is_enableable` |
 | 53 | `InaccessiblePaths=` lists only directories present on this host | `test_render_unit_lists_only_present_hidden_dirs`, `test_inaccessible_paths_omits_absent` |
+| 54 | The health probe waits for the socket instead of racing it | `test_probe_waits_for_a_slow_start` |
+| 55 | The probe fails, with the journal hint, only after the deadline | `test_probe_gives_up_after_the_deadline` |
