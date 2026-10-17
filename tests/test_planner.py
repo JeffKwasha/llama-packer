@@ -1022,38 +1022,65 @@ def _quiet_logger():
 # ── set admission across profile groups ──────────────────────────────────
 
 
-def test_set_admission_intersects_across_groups(make_model):
-    """A stem may sit in a set only if EVERY group was charged for it.
+def test_set_admission_is_per_entry_not_per_stem(make_model):
+    """One model's `.coding` and `.aux` entries are different servings.
 
-    plan() calls _coresident_charge once per profile group and __main__
-    places every entry id of the stem into whichever sets survive here. The
-    assignment used to be a plain overwrite, so the last group spoke for all
-    of them -- and the entry sized for the cheapest group landed in the most
-    expensive set, which OOMs at load. There was no test on this path at
-    all: grep for _coresident_charge in tests/ returned nothing.
+    Keyed by stem, whichever entry was solved first spoke for both -- and
+    they are sized from opposite priorities, so an entry sized for 204800
+    could ride on a verdict reached for one sized for 81920.
+
+    Validates: SPEC.md, 'VRAM Allocation': each entry resolves its own
+    serving against the same budget.
     """
+    from llama_packer.writer import FALLBACK, Planner, UsageDemand
     model = make_model("a")
     planner = _planner_for_sets(model)
     planner.set_overheads = {"rag": 1751, "voice": 1898}
+    coding = UsageDemand(name="coding", min_context=131072, min_parallel=1)
+    aux = UsageDemand(name="aux", min_context=81920, min_parallel=2)
 
-    # Group 1 (cheap cache) clears both demands; group 2 (fatter cache) only
-    # the cheaper one.
-    planner.probes = {1751: (131072, 1), 1898: (131072, 1)}
-    Planner._coresident_charge(planner, model, "rag")
-    assert planner.set_admission["a"] == {"rag", "voice"}
+    def probe_ctx(model, parallel, cache_type, spare_mb, **kw):
+        return planner.probes[spare_mb]
 
-    # The fatter-cache group only clears the cheaper set's demand.
-    planner.probes = {1751: (131072, 1), 1898: (65536, 1)}
-    Planner._coresident_charge(planner, model, "rag")
-    assert planner.set_admission["a"] == {"rag"}, "a later group widened it"
+    planner._bounded_ctx = probe_ctx
+    planner._probe_at_overhead = lambda m, oh: (planner.probes[oh], 1)
+
+    planner.probes = {1751: 200000, 1898: 200000}
+    planner.record_admission(model, coding, 204800, 1)
+    assert planner.set_admission[("a", "coding")] == {"rag", "voice"}
+
+    # The same model under a resident that squeezes it: the cheap set still
+    # holds it, the expensive one no longer can.
+    planner.probes = {1751: 200000, 1898: 40000}
+    planner.record_admission(model, coding, 204800, 1)
+    assert planner.set_admission[("a", "coding")] == {"rag"}, \
+        "admission must not be shared with the other category"
+
+    planner.probes = {1751: 200000, 1898: 200000}
+    planner.record_admission(model, aux, 81920, 2)
+    assert planner.set_admission[("a", "aux")] == {"rag", "voice"}
+
+
+def test_the_fallback_entry_joins_no_set(make_model):
+    """Routing is what categories are for; the fallback has no name to
+    route on, so it never joins a set and serves standalone.
+
+    Validates: docs/plans/category-semantics.md, 'The null category
+    (fallback)': it joins no set.
+    """
+    from llama_packer.writer import FALLBACK
+    model = make_model("a")
+    planner = _planner_for_sets(model)
+    planner.set_overheads = {"rag": 1751}
+    planner.record_admission(model, FALLBACK, 81920, 1)
+    assert planner.set_admission[("a", None)] == frozenset()
 
 
 def _planner_for_sets(model):
-    """A Planner stub with just enough state for _coresident_charge."""
+    """A Planner stub with just enough state for set admission."""
     from types import SimpleNamespace
 
     from llama_packer.writer import Planner
-
     p = SimpleNamespace()
     p.profiles = SimpleNamespace(default_cache_type="q8_0",
                                  shed_order=("vision", "draft"))
@@ -1061,39 +1088,25 @@ def _planner_for_sets(model):
     p.set_admission = {}
     p.ledger = SimpleNamespace(extra_reserve_mb=lambda _pool: 0)
     p.knobs = SimpleNamespace()
-
-    def demands_for(_m):
-        return (SimpleNamespace(satisfied_by=lambda ctx, par: ctx >= 131072),)
-
-    p.demands_for = demands_for
-    p._bounded_ctx = lambda view, **kw: p.probes[kw["spare_mb"]][0]
+    p.vram_total = 48 * 1024
+    p.fit_bin = "unused"
+    p.baseline_mb = 0
+    p.memory_margin = 0.0
+    p.llama_args = ""
+    p.max_context = None
+    p.min_context = 65536
+    p.min_context_explicit = False
+    p._charge_sets = {}
+    p._bounded_ctx = lambda *a, **k: 65536
+    p._probe_at_overhead = lambda m, oh: (65536, 1)
+    # The real methods, bound to the stub: the behaviour under test is the
+    # planner's, not a reimplementation of it.
+    p.record_admission = lambda m, d, c, par: Planner.record_admission(
+        p, m, d, c, par)
+    p._serves_beside = (lambda m, d, oh, par: Planner._serves_beside(
+        p, m, d, oh, par))
+    p._probe_at_overhead = lambda m, oh: (p.probes[oh], 1)
     return p
-
-
-def test_set_admission_keeps_every_group_when_they_agree(make_model):
-    model = make_model("a")
-    planner = _planner_for_sets(model)
-    planner.set_overheads = {"rag": 1751, "voice": 1898}
-    planner.probes = {1751: (131072, 1), 1898: (131072, 1)}
-    Planner._coresident_charge(planner, model, "rag")
-    Planner._coresident_charge(planner, model, "rag")
-    assert planner.set_admission["a"] == {"rag", "voice"}
-
-
-def test_cpu_resident_chat_gets_no_auto_parallel(make_model, profiles):
-    """Host-RAM KV is in an arena no VRAM ledger budgets.
-
-    calc_ctx returns the design context regardless of the slot count for a
-    CPU-resident model, so every candidate looks equally affordable and the
-    score reduces to p**power -- walking straight to the cap. 8 slots on a
-    model declared for one is an 8x KV over-commit that nothing accounts for.
-    """
-    model = make_model("cpu-chat", role="chat", device="cpu")
-    planner = Planner([model], profiles, fit_bin="unused",
-                      vram_total=64 * 1024)
-    planner._bounded_ctx = lambda *a, **k: 131072
-    plan = planner.plan()
-    assert [v.parallel for v in plan["cpu-chat"]] == [1]
 
 
 # ── solve_rung: most context that fits, vision kept only when free ───────

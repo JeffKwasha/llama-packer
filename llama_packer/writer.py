@@ -1514,7 +1514,14 @@ class Planner:
         # Per-set co-resident overhead (MB) and the sets a chat model was
         # admitted to, filled in by _solve_usage_sets.
         self.set_overheads: dict[str, int] = {}
-        self.set_admission: dict[str, set[str]] = {}
+        # (model stem, category name) -> the sets that entry may join. Keyed
+        # per category, not per stem: one model's `.coding` and `.aux` entries
+        # are different servings, and whichever was solved first used to speak
+        # for both.
+        self.set_admission: dict[tuple[str, str | None], frozenset[str]] = {}
+        # stem -> the sets this model was charged for, per profile group.
+        # Kept only so the charge and the admission it feeds cannot drift.
+        self._charge_sets: dict[str, list[tuple[frozenset[str], int]]] = {}
         # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
         # fixed-overhead residents reserved alongside chat and RAG.
         self.fixed_categories = fixed_categories or []
@@ -1964,27 +1971,64 @@ class Planner:
             # and let the caller drop it from every set.
             worst = max(self.set_overheads.values())
             admitted = set(self.set_overheads)
-        # Intersect across profile groups, never overwrite. plan() calls this
-        # once per group, and __main__ places *every* entry id of the stem
-        # into whichever sets survive here — so the last group to run used to
-        # speak for all of them, and an entry sized for the cheapest group
-        # landed in the most expensive set. That is a load-time OOM in the
-        # exact class this tool exists to prevent: admitted must mean *this
-        # group was charged for that set's residents*, for every group.
-        prev = self.set_admission.get(model.stem)
-        if prev is not None:
-            dropped_now = prev - admitted
-            if dropped_now:
-                logger.info("usage: %s leaves %s under a later profile group",
-                            model.stem, ", ".join(sorted(dropped_now)))
-            admitted = prev & admitted
-        self.set_admission[model.stem] = admitted
-        charge = max(base, worst)
+        # This function only *charges* the solve now. Which sets an entry
+        # may join is decided later, per category, on the serving that was
+        # actually resolved -- see record_admission.
+        self._charge_sets.setdefault(model.stem, []).append(
+            (frozenset(admitted), max(base, worst)))
         logger.info(
             "usage: %s co-resident charge %d MB (sets: %s)",
-            model.stem, charge,
+            model.stem, max(base, worst),
             ", ".join(sorted(admitted)) or "none")
-        return charge
+        return max(base, worst)
+
+    def record_admission(self, model, demand, ctx: int, parallel: int) -> None:
+        """Which sets this one *category's entry* may join.
+
+        Keyed by (stem, category) and judged on the resolved (ctx, parallel),
+        because that is the serving llama-swap would hold beside the set's
+        residents. Keying by stem alone let one category's entry ride on
+        another's verdict -- a `.coding` entry sized for 204800 and a `.aux`
+        entry sized for 81920 were treated as the same model, so whichever
+        was solved first spoke for both.
+
+        The fallback entry joins no set: routing is what categories are for,
+        and it has no name to route on.
+        """
+        if demand is FALLBACK:
+            self.set_admission[(model.stem, None)] = frozenset()
+            return
+        admitted = {sname
+                    for sname, oh in self.set_overheads.items()
+                    if self._serves_beside(model, demand, oh, parallel)}
+        if not admitted:
+            # Meets the category nowhere beside a resident. It still serves
+            # standalone -- as its own entry, outside every set.
+            logger.info("usage: %s.%s joins no set: it cannot hold its "
+                        "%d-token minimum beside any resident",
+                        model.stem, demand.name, demand.min_context)
+        else:
+            logger.info("usage: %s.%s admitted to %s",
+                        model.stem, demand.name, ", ".join(sorted(admitted)))
+        self.set_admission[(model.stem, demand.name)] = frozenset(admitted)
+
+    def _serves_beside(self, model, demand, overhead_mb: int,
+                       parallel: int) -> bool:
+        """Whether this entry still clears its demand beside ``overhead_mb``.
+
+        The probe is single-sequence by design -- it answers "does one
+        sequence still fit with that much spoken for" -- so its slot count is
+        not the entry's. Testing ``satisfied_by`` against the probe's 1 would
+        refuse every category asking for 2 slots, so the slot half of the
+        requirement is checked against the serving that was actually
+        resolved, and only the context half against the probe.
+        """
+        probe = _probe_at_overhead(self, model, overhead_mb)
+        if probe is None:
+            return False
+        ctx, _ = probe
+        return (ctx >= demand.min_context
+                and max(1, parallel) >= demand.min_parallel)
 
     def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
         """Shared chat context when a matrix section is configured."""
@@ -2310,6 +2354,12 @@ class Planner:
                                 profile=group[0][1])
                             if ctx < demand.min_context:
                                 continue
+                        # Admission is judged on the serving just resolved,
+                        # per category -- not on a probe taken before the
+                        # solve, and not shared across the model's other
+                        # categories.
+                        if view.role == "chat":
+                            self.record_admission(model, demand, ctx, par)
                         serves.append((demand, serve_view, par, ctx))
                     if not serves:
                         continue
@@ -2783,6 +2833,7 @@ def emit_config(models: list[Model], plan: dict,
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}
+    category_of: dict[str, str | None] = {}
     coload_stems: set[str] = set()
     # Per-model tails already used: two profile groups (e.g. different
     # cache_type) can land on the same category+flags, and they still need
@@ -2877,6 +2928,7 @@ def emit_config(models: list[Model], plan: dict,
             entries[entry_id] = entry
             owner[entry_id] = model.stem
             ids_by_stem.setdefault(model.stem, []).append(entry_id)
+            category_of[entry_id] = (v.category.name if v.category else None)
 
             if v.vision_ctx is None:
                 continue
@@ -2911,7 +2963,8 @@ def emit_config(models: list[Model], plan: dict,
     set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
                            coload_stems=sorted(coload_stems),
-                           set_admission=set_admission)
+                           set_admission=set_admission,
+                           entry_category=category_of)
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -2937,15 +2990,18 @@ class EmittedConfig(dict):
 
     def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
                  coload_stems: list[str] | None = None,
-                 set_admission: dict[str, set[str]] | None = None,
+                 set_admission: dict | None = None,
+                 entry_category: dict[str, str | None] | None = None,
                  set_overheads: dict[str, int] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
         self.coload_stems: list[str] = coload_stems or []
-        # stem -> the chat sets that model was admitted to.  Only populated
-        # for models carrying a usage tag; an untagged model appears in every
-        # set, which is the pre-existing behaviour.
-        self.set_admission: dict[str, set[str]] = set_admission or {}
+        # entry id -> the category it serves (None for the fallback). Carried
+        # because the id names the category, so it is the emitter that knows.
+        self.entry_category: dict[str, str | None] = entry_category or {}
+        # (model stem, category) -> the chat sets that entry may join.
+        self.set_admission: dict[tuple[str, str | None], frozenset[str]] = (
+            set_admission or {})
         # set name -> MiB allocated to that set's co-resident models (emb/rnk
         # and any fixed categories).  Emitted as a comment above each `sets:`
         # entry so the config documents its own memory split.

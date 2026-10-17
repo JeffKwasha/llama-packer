@@ -1004,18 +1004,22 @@ def main(argv: list[str] | None = None) -> None:
             id_stem = {eid: stem
                        for stem, ids in config.entry_ids_by_stem.items()
                        for eid in ids}
+            # Admission is per entry: (stem, category). The fallback entry has
+            # no category name and joins no set.
+            id_cat = {eid: config.entry_category.get(eid)
+                      for eid, _ in id_stem.items()}
             per_set: dict[str, list[str]] = {}
             if config.set_admission:
                 for sname in sets_cfg:
-                    per_set[sname] = [
-                        var for var in chat_var_names
-                        # A model with no admission entry is untagged and
-                        # belongs everywhere; only a tagged model is subject
-                        # to the filter.
-                        if (config.set_admission.get(
-                                id_stem.get(vars_[var], "") or var) is None
-                            or sname in config.set_admission[
-                                id_stem.get(vars_[var], "") or var])]
+                    per_set[sname] = []
+                for var in chat_var_names:
+                    key = (id_stem.get(vars_[var], "") or var,
+                           id_cat.get(vars_[var]))
+                    admitted = config.set_admission.get(key)
+                    # No entry means this serving was never judged against a
+                    # set -- an untagged model belongs everywhere, as before.
+                    if admitted is None or sname in admitted:
+                        per_set[sname].append(var)
                 dropped = {s: sorted(set(chat_var_names) - set(v))
                            for s, v in per_set.items()
                            if set(v) != set(chat_var_names)}

@@ -396,14 +396,22 @@ model gets one, and it too can fail.
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
 | `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth. See "What `parallel_power` actually controls" below — the neutral point is model-dependent, so a fleet-wide value is a *bias*, not a target |
 
-### Retired, still parsed
+### What is left from the old design
 
-These belonged to the two-mechanism design and nothing consults them for
-allocation any more: `evict_costs:`, `sets:`, `categories:`, `min_chat_ctx`,
-`coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`. **Documented here as
-dead configuration, not as features.** The knobs still read them (and still
-warn on a bad value), so removing the parsing is a separate cleanup rather
-than part of the restructure that stopped using them.
+Two different things, and they should not be confused:
+
+`sets:`, `evict_costs:` and `categories:` are **still live** — they are
+forwarded verbatim to llama-swap's matrix router, which is their consumer.
+What changed is that admission is now per entry rather than per model: a
+`.coding` entry and a `.aux` entry of the same model get independent
+verdicts, because they are independently sized servings. A `.aux` entry
+that cannot hold its 80k minimum beside the 5.7 GB reranker is dropped from
+`ragz` while the `.coding` entry stays in it.
+
+`min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and `estimate_headroom`
+belonged to the allocation passes and **nothing consults them any more** —
+they are dead configuration that still parses, and still warns on a bad
+value. Removing the parsing is a separate cleanup.
 
 ### What `parallel_power` actually controls
 
