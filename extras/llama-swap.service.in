@@ -53,8 +53,9 @@ MemorySwapMax=@SWAP_MAX@
 # --- Filesystem: everything read-only except what's needed ---
 ProtectSystem=strict
 ProtectHome=true
+# PrivateTmp already mounts a private, writable /tmp and /var/tmp inside the
+# namespace, so no ReadWritePaths grant is needed for either.
 PrivateTmp=true
-ReadWritePaths=/var/tmp
 InaccessiblePaths=/root /home /boot /efi /srv /var/lib /var/spool
 
 # --- Devices: block all, allow only the GPU nodes this host actually has ---
