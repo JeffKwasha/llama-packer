@@ -33,7 +33,7 @@ either way it should not be used in a commit message until it is.
 | **co-resident** | Loaded at the same time as others. Chat models take turns and share the pool; embed/rerank are pinned resident. | SPEC "Matrix Context Solving" |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
 | **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | writer, SPEC 305 |
-| **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same, the least shed wins. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
+| **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same context, the least shed wins for the null category and the first qualifier stands. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
 
 ## The capability ladder
 

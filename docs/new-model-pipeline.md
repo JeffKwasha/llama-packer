@@ -13,7 +13,7 @@ file appears
   → file intrinsics (header-only)              arch, trained ctx → derived: file:
   → VRAM estimate   (vram.py fit_params_static) fit-params trio + corrections → derived:
   → matrix solve    (writer.solve_matrix_ctx)   shared chat budget minus RAG residents
-  → per-model plan  (writer.Planner.plan)       mmproj keep/drop, auto-parallel, ctx
+  → per-(model,category) plan                   vision rung, auto-parallel, ctx
   → emit            (writer.emit_config)        llama-swap entries + matrix sets
 ```
 
@@ -91,9 +91,11 @@ below `tools_min_ctx`.
 Per model (and per profile group `(parallel, cache_type, spare, batch,
 ubatch)`):
 
-- **mmproj keep/drop pass** — vision stays when the minimum useful context
-  is affordable *with* the projection; a dropped main entry is emitted without
-  the `i`/`v` capability flags and keeps a best-effort vision companion entry.
+- **Vision rung** — `solve_rung` walks the category's `sacrifice:` order per
+  category. Vision is shed when shedding it buys context, kept when it buys
+  nothing, and skipped when holding it does not fit. There is no companion
+  entry: a model emits one entry per satisfiable category, and two entries for
+  one model means two categories in sidecars.
 - **Auto-parallel** (chat, unpinned) — a value-function solve over slot
   counts `p = 1..8`: `score = (ctx/floor)^0.5 × slots^0.75`, where `ctx` is
   the affine solve at that `p`. The floor cascades: sidecar `min_context:`

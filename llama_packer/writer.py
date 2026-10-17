@@ -316,9 +316,7 @@ def _build_entry(
 
     ``include_mmproj=False`` omits the vision projection from the command,
     removes the ``image``/``video`` input capabilities, and flags
-    ``metadata.mmproj_skipped``.
-    ``name_suffix`` is appended to the model display name (e.g. the vision
-    variant's `` [vision 92k]``).
+    ``name_suffix`` is appended to the model display name.
     ``tools_demoted=True`` drops the ``tools`` capability: the matrix solve
     served the model below ``tools_min_ctx``, so advertising tool calling
     would mislead clients — ``metadata.tools_demoted`` records why.
@@ -1706,8 +1704,8 @@ class Planner:
         Tool calling needs a real window; below ``matrix.tools_min_ctx`` the
         entry cannot honour it, and advertising the capability anyway
         misleads clients about what they will get. Decided per serving
-        because the main entry, its text-only twin and its vision companion
-        each serve a different context.
+        because each entry of a model serves its own context -- a `.coding`
+        entry and a `.aux` entry of the same model rarely match.
         """
         return (view.role == "chat"
                 and ctx < self.knobs.tools_min_ctx
@@ -2820,9 +2818,7 @@ def emit_config(models: list[Model], plan: dict,
     ``metadata`` (``ctx_size``, ``usage``), never in the id. The id used to
     carry the solved context, and opencode/hermes cache it at startup -- so
     182k -> 180k renamed the model out from under every client that had
-    cached it. The context is not part of a serving's identity.  A variant with ``vision_ctx`` additionally
-    emits a best-effort vision companion entry (its flags carry the
-    ``i``/``v`` the vision-less main lacks).
+    cached it. The context is not part of a serving's identity.
 
     Raises ValueError on duplicate entry ids (two models slugging to the same
     id); callers surface it as a fatal configuration error.  Returns an
@@ -3120,9 +3116,8 @@ def build_config(
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
-            projection is dropped from the main entry, which then carries no
-            ``i``/``v`` id flag (a vision companion entry is emitted
-            alongside, still exposing vision at best-effort context).  Pass
+            projection is shed from the entry, which then carries no
+            ``i``/``v`` id flag.  Pass
             ``min_context_explicit=True`` when the value came from an
             explicit ``--min-context`` flag (as opposed to the default): the
             explicit flag overrides the per-model floor cascade's default

@@ -50,7 +50,7 @@ Also emits:
 
 1. **`_filter_supported()`** — the validation boundary (backend format/role,
    reasoning flags, cache-type knowability); runs before any VRAM work.
-2. **`Planner.plan()`** — context decisions per model: mmproj keep/drop
+2. **`Planner.plan()`** — context decisions per (model, category): vision rung,
    pre-pass, shared matrix solve, profile grouping, bounded-context clamp.
    Returns `Variant` values.
 3. **`emit_config()`** — pure rendering of plans into llama-swap entry dicts.
@@ -267,23 +267,42 @@ measurement residual errs toward reserving more.
 
 **Note:** parallel slots cost the fixed `p*D` term plus their share of the pool (`c * p * X`) — both scale with the slot count, so the solve charges them exactly.
 
-### Minimum useful context and vision (mmproj) skipping
+### Vision is a rung, not a second entry
 
-Chat models target a minimum useful context (`_MIN_AGENTIC_CTX`, default 131072 = 128k, overridable with `--min-context`). For a chat model with an mmproj companion, `calc_ctx` is evaluated both with and without the companion (at the global `--spare`) — the companion-on variant serving the block merged over the frontmatter, the companion-off variant serving the base frontmatter:
+For a chat model with an mmproj companion, whether the projector is attached is
+decided per category, by `solve_rung` walking the category's `sacrifice:` order:
 
-- `ctx_with ≥ min_context` → keep vision; the main entry is emitted with `--mmproj` and the `image` capability. A **vision-less variant** (no `--mmproj`, `image` removed, `metadata.mmproj_skipped: true`) is emitted alongside when shedding the projection buys context (`ctx_without > ctx_with`), so clients can pick the lower-memory serving; its id drops the `i`/`v` flag (see [Entry ids](#entry-ids-name-the-task-not-the-solve)).
-- `ctx_with < min_context` → the main entry **drops** mmproj and its flags lose `i`/`v`. A companion **vision variant** entry is additionally emitted with `--mmproj` at best-effort context, keeping vision available at reduced context; its flags retain `i`/`v` and the served context is in the display name.
-- `ctx_without < min_context` too → **vision is kept**: dropping the projection cannot reach the minimum either way, so sacrificing it buys nothing (a small VLM stays a full VLM). Informational log only — no warning, since no configuration can fix a design-context limit.
+- Shedding vision **buys context** → it is shed, and the entry loses its `i`/`v`
+  flags. `coding` is configured this way, so a `.coding` entry is text-only and
+  large, which is the trade it asks for.
+- Shedding vision **buys nothing** — the model is at its design cap, or some
+  other term binds — → it is kept. A capability is not thrown away for no gain.
+- Holding vision **does not fit at all** → that rung is skipped and the next one
+  along the declared order is tried.
 
-All emitted entries honor the per-profile `spare_mb` and the matrix-solved chat context; the drop decision itself is made once per model using the global spare. Every vision-less entry joins the same matrix co-loading sets as its parent entry, so `(c1 | … | cN) & emb & rnk` can hold a text variant together with the RAG models.
+There is no companion entry and no vision-less twin. A model emits **one entry
+per satisfiable category**, and vision is a property of that entry rather than a
+second serving alongside it. Two entries for one model is two categories in
+sidecars — a `coding` entry and a `coding-vision` one, the latter declaring
+`require: [vision]` — not a hardcoded pairing.
 
-**A text-only rung must earn its entry.** A vision-less variant is emitted only when `ctx_without > ctx_with` — that is, only when shedding the projection actually buys context. A model already at its design cap (or one whose binding constraint is something else) reclaims nothing, and a vision-less twin at identical context is a strictly worse duplicate of the main entry, so it is not emitted.
+On the live fleet, the same 31B at the same budget:
+
+```
+gemma4-31b-hauhaucs-balanced.ti        155648  vision kept   (fallback: capability first)
+gemma4-31b-hauhaucs-balanced.coding.t  180224  vision shed   (coding: context first)
+```
 
 ### Entry ids name the task, not the solve
 
 An id is `<template_id>.<category>.<flags>` and is **stable across repacks**:
 
-- **`<category>`** is the heaviest blessed `usage:` category the serving satisfies (largest `min_context`, ties by declaration order); it is slugged into the id charset, and a name with nothing left after slugging falls back to the context label. A serving that meets several is named for the most demanding one, so the id may under-claim but never over-claim — a client picking `….coding` is guaranteed the coding minimums hold. A serving below every floor, or from an untagged model, falls back to the context label `ctx_label()` (`256k`, `1M`; `ctx // 1024` below 1000k, whole megas above).
+- **`<category>`** is the category the entry serves, read straight off the
+  variant — a rung answers exactly one category, so there is no "heaviest
+  satisfied" search to run. A category that cannot be met emits **nothing**
+  rather than a weaker name, so an id never under-claims. A name with nothing
+  left after slugging drops the segment rather than the entry. The **fallback**
+  entry carries no category segment at all: the bare stem.
 - **`<flags>`** is the *served* capability set as first letters, in fixed order `t`,`i`,`v`,`a`,`s` (tools, image input, video input, audio input, speech output). It is omitted entirely for a plain text-in/text-out serving. A demoted serving (context below `tools_min_ctx`) drops `t`; a no-mmproj serving drops `i`/`v`. So a vision-less variant is simply the same id without `i`.
 
 A model with several profile groups can land two servings on the same category+flags; the first keeps the stable name and later duplicates append their context label (`…coding.ti-136k`), so ids stay unique without making the common case churn.
@@ -296,9 +315,17 @@ Anything that *references* an entry must resolve through `entry_ids_by_stem` (st
 
 When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` counterparts) shrinks the budget, the planner degrades visibly instead of emitting entries that OOM at load time:
 
-- **Over-budget disable.** `calc_ctx` records `over_budget_reason` when weights + compute do not fit any context (or the reserve/spare leaves ≤ 0 available). Such a group is **skipped** — the model is not emitted. Skipped stems never reach the matrix vars, so routing auto-prunes; if *every* chat model is gated away, matrix routing is omitted entirely (warning logged) rather than emitting a degenerate empty OR-list.
-- **Vision → text fallback.** Before disabling a vision model whose main (mmproj-on) solve is over budget, the planner re-solves with the projection detached. If the text-only fit succeeds, the entry is served without `--mmproj` (INFO logged). If text also fails, the model is disabled. Each profile group re-derives `include_mmproj` / view / design context, so one group's fallback never leaks into the next.
-- **Vision companion suppression.** When a main vision-less entry has a best-effort vision companion and that companion's own solve is over budget, the companion entry is dropped (warning logged) rather than emitted as an OOM landmine.
+- **Over-budget means omitted.** `calc_ctx` records `over_budget_reason` when
+  weights + compute do not fit at any context of a rung (or the reserve/spare
+  leaves ≤ 0 available). `solve_rung` skips that rung and tries the next along
+  the declared order; if none fits, that **category emits nothing** — and a model
+  whose every rung is over budget, fallback included, produces no entry at all.
+  Skipped stems never reach the matrix vars, so routing auto-prunes; if *every*
+  chat model is gated away, matrix routing is omitted entirely (warning logged)
+  rather than emitting a degenerate empty OR-list.
+- **Vision is a rung, not a fallback.** There is no "vision → text" retry and
+  no companion to suppress: the shed order already decides whether dropping the
+  projector is worth it, and a rung that does not fit is simply not a candidate.
 - **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted, before any resident charge) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
 - **Degenerate refusal.** If `vram_total − reserve − spare ≤ 0`, the run fatals *before* any VRAM work (exit 1) and does **not** overwrite an existing `config.yaml`. Same guard applies when the reservation leaves zero model entries.
 

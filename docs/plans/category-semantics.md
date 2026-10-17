@@ -48,15 +48,26 @@ Every model emits a fallback entry, in addition to any category entries. It
 has bare minimums only, no category name in the id, and it can itself fail
 and emit nothing.
 
-It never degrades: no shed levels at all, so it keeps mmproj and MTP even
-when that leaves it only `min_context` (4096). With no goals to protect,
-capability is the only thing left to give up. It joins no set — routing is
-what categories are for.
+**Capability first.** It keeps mmproj and MTP whenever a rung holding them is
+legal — even when that leaves it only `min_context` (4096). With no goals to
+protect, capability is the only thing left to give up, and trading it for
+context nobody asked for would be a pointless concession. It joins no set:
+routing is what categories are for, and it has no name to route on.
 
-`FALLBACK.sacrifice is None` means *never degrade*. An empty tuple means *no
-preference stated* and still concedes in default order. Conflating those two
-would silently disable degradation for every category that expressed no
-preference.
+Two rules meet here, and they are the reason the fallback is not just a
+category with an empty name:
+
+- **which rung wins.** A category takes the rung buying the *most context* —
+  coding would rather have 262144 text-only than 131072 with a projector. The
+  fallback takes the *first* rung that qualifies, because `shed_levels` is
+  ordered least-shed first and nothing later can improve on it. This is
+  `solve_rung(prefer_capability=...)`.
+- **when it may degrade at all.** It sheds only when holding the capability
+  would leave no legal serving, i.e. when the context would fall below
+  `min_context`. `FALLBACK.sacrifice` is `()` — *default order, gated by the
+  minimum*. `sacrifice=None` means *never degrade at all* and stays available
+  to a category that wants it; conflating the two would silently disable
+  degradation for every category that expressed no preference.
 
 ## Ids carry no context
 

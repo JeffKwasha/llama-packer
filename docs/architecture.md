@@ -27,7 +27,7 @@ main()                                        (__main__.py — thin orchestratio
 | `Model` | `model.py` | Sidecar aggregate: frontmatter accessors, companion resolution (mmproj/MTP), design context, pass-through metadata. One instance per servable model |
 | `ScopeStack` | `scope.py` | The single select-and-set engine for sidecar data: folds `models.yaml` defaults outermost→innermost, applies override rules last-match-wins per key, finalizes backend inference + path refs |
 | `Profiles` | `profiles.py` | The profiles.yaml mapping as a typed view: fleet defaults (`cache_type`, `parallel`, spare), `allow_profiles` gating, expression resolution (`base * N`), per-model variant grouping |
-| `Planner` | `writer.py` | Every *context decision*: mmproj keep/drop pre-pass, shared matrix solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
+| `Planner` | `writer.py` | Every *context decision*: per-category rung search, shared matrix solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx, optional `vram_note` (over-budget squeeze tag for the description) |
 | `emit_config` | `writer.py` | Pure rendering: plans → entry dicts. Zero VRAM contact, zero I/O |
 | `_filter_supported` | `writer.py` | **The** validation boundary: backend format/role compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
