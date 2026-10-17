@@ -121,6 +121,41 @@ def test_render_unit_lists_only_present_gpu_nodes(monkeypatch):
     assert "card0" not in body
 
 
+def test_render_unit_lists_only_present_hidden_dirs(monkeypatch):
+    # /efi is absent on a box without a separate ESP, and a missing path in
+    # InaccessiblePaths= is a fatal namespace error (226/NAMESPACE) — the
+    # service never starts. Only what exists may be listed.
+    #
+    # Validates: docs/install.md, the systemd unit the installer writes.
+    monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
+    monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
+    monkeypatch.setattr(ins, "inaccessible_paths",
+                        lambda: ["/root", "/home", "/boot"])
+    body = ins.render_unit(_args(), Path("/d"))
+    assert "InaccessiblePaths=/root /home /boot" in body
+    directives = [ln for ln in body.splitlines()
+                  if not ln.lstrip().startswith("#")]
+    assert not any("/efi" in ln for ln in directives)
+
+
+def test_inaccessible_paths_omits_absent(tmp_path):
+    """Validates: docs/install.md, the systemd unit the installer writes."""
+    there = tmp_path / "there"
+    there.mkdir()
+    gone = tmp_path / "gone"
+    assert ins.inaccessible_paths((str(there), str(gone))) == [str(there)]
+
+
+def test_unit_is_enableable():
+    # Without [Install] WantedBy=, `systemctl enable` fails and the service
+    # never comes back after a reboot.
+    #
+    # Validates: docs/install.md, the systemd unit the installer writes.
+    body = ins.TEMPLATE.read_text()
+    assert "[Install]" in body
+    assert "WantedBy=multi-user.target" in body
+
+
 def test_render_unit_rejects_untouched_token(monkeypatch, tmp_path):
     # A placeholder nobody filled is a silent misconfiguration, not a
     # cosmetic issue: the directive would reach systemd verbatim.

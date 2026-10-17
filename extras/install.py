@@ -117,6 +117,23 @@ def gpu_nodes(dri: Path = Path("/dev/dri"),
     return [n for n in nodes if Path(n).exists()]
 
 
+#: Directories worth hiding from the service. ProtectHome already covers
+#: /home and /root; the rest are host-specific (a separate /boot or /efi
+#: ESP). Only the ones that exist may be listed: systemd fails the unit with
+#: 226/NAMESPACE on a path in InaccessiblePaths= that is missing, so a
+#: hardcoded list takes the service down on any host that lacks one of them.
+_HIDDEN_DIRS = ("/root", "/home", "/boot", "/efi", "/srv", "/var/lib",
+                "/var/spool")
+
+
+def inaccessible_paths(candidates: tuple[str, ...] = _HIDDEN_DIRS) -> list[str]:
+    """The subset of :data:`_HIDDEN_DIRS` that exists on this host.
+
+    *candidates* is a parameter so the filter is testable against fake paths.
+    """
+    return [p for p in candidates if Path(p).exists()]
+
+
 def gpu_vendor() -> str | None:
     """``"amd"``, ``"nvidia"`` or ``None`` — what the device nodes imply."""
     if Path("/dev/kfd").exists():
@@ -432,6 +449,7 @@ def render_unit(args: argparse.Namespace, dir_: Path) -> str:
         ("@SWAP_MAX@", args.swap_max),
         ("@GPU_ENV@", "\n".join(gpu_env)),
         ("@DEVICE_ALLOW@", "\n".join(f"DeviceAllow={n} rw" for n in nodes)),
+        ("@INACCESSIBLE_PATHS@", " ".join(inaccessible_paths())),
     )
     # Directives only. The header prose names the placeholders it expects,
     # and substituting those mentions would corrupt the documentation

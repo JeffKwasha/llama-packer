@@ -103,3 +103,5 @@ and every one of them carries a `Validates:` citation.
 | 49 | llama-swap validates as the service user, not root | `test_validate_runs_as_the_service_user` |
 | 50 | The unit is verified before it becomes the unit systemd reads | `test_rejected_unit_leaves_the_previous_one_installed`, `test_candidate_name_is_a_valid_unit_name` |
 | 51 | An unreadable `HF_HOME` warns instead of crashing the installer | `test_report_resolved_warns_when_hf_home_is_unreadable` |
+| 52 | The unit is enableable: it carries `[Install] WantedBy=` | `test_unit_is_enableable` |
+| 53 | `InaccessiblePaths=` lists only directories present on this host | `test_render_unit_lists_only_present_hidden_dirs`, `test_inaccessible_paths_omits_absent` |

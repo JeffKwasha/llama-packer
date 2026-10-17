@@ -56,7 +56,12 @@ ProtectHome=true
 # PrivateTmp already mounts a private, writable /tmp and /var/tmp inside the
 # namespace, so no ReadWritePaths grant is needed for either.
 PrivateTmp=true
-InaccessiblePaths=/root /home /boot /efi /srv /var/lib /var/spool
+# Only directories that exist on this host may be listed: systemd treats a
+# path in InaccessiblePaths= that is missing as a fatal namespace error
+# (226/NAMESPACE) and the unit never starts. /efi is exactly that on a box
+# without a separate ESP, which is how this brought the service down.
+# install.py substitutes the present subset.
+InaccessiblePaths=@INACCESSIBLE_PATHS@
 
 # --- Devices: block all, allow only the GPU nodes this host actually has ---
 PrivateDevices=true
@@ -88,3 +93,8 @@ ProtectProc=invisible
 ProcSubset=pid
 MemoryDenyWriteExecute=false
 OOMScoreAdjust=1000
+
+[Install]
+# Without this the unit is "static": `systemctl enable` fails outright and
+# the service does not come back after a reboot.
+WantedBy=multi-user.target
