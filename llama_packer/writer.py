@@ -2889,16 +2889,17 @@ def emit_config(models: list[Model], plan: dict,
     entry.  Entry ids are **stable across repacks**: they name the task, not
     the solved context.  Grammar ``<template_id>.<category>.<flags>`` where
 
-    - ``<category>`` is the heaviest ``usage:`` category the rung satisfies
-      (:func:`category_label`); untagged servings fall back to the context
-      label (:func:`ctx_label`), their pre-``usage:`` behaviour;
+    - ``<category>`` is the ``usage:`` category this entry serves; omitted
+      for an untagged model or one that meets no category, which then gets
+      the bare stem;
     - ``<flags>`` is the served capability segment (:func:`flags_label`),
       omitted entirely for a plain text-in/text-out serving.
 
     Capability/value detail lives in the display ``name`` and in
-    ``metadata`` (``ctx_size``, ``usage``), never in the id: opencode/hermes
-    cache the id at startup, so a context-derived suffix would force a
-    restart on every repack.  A variant with ``vision_ctx`` additionally
+    ``metadata`` (``ctx_size``, ``usage``), never in the id. The id used to
+    carry the solved context, and opencode/hermes cache it at startup -- so
+    182k -> 180k renamed the model out from under every client that had
+    cached it. The context is not part of a serving's identity.  A variant with ``vision_ctx`` additionally
     emits a best-effort vision companion entry (its flags carry the
     ``i``/``v`` the vision-less main lacks).
 
