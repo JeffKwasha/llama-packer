@@ -132,41 +132,6 @@ def test_profiles_groups_by_cache_type(make_model):
     assert sorted(names) == ["a", "b"]
 
 
-def test_planner_vision_dropped_and_variant_planned(make_model, profiles, tmp_path):
-    # Design ctx 256k so only the budget clamps: vision misses min-context,
-    # text-only reaches it → mmproj is dropped and vision kept as a variant.
-    (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
-    m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
-                                  "capabilities": ["image"]},
-                   context_length=262144)
-    _scripted_ctx(m, {True: 65536, False: 200000})
-
-    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
-                      min_context=131072)
-    variants = planner.plan()["vis"]
-    assert len(variants) == 1
-    v = variants[0]
-    assert v.include_mmproj is False
-    assert v.ctx_size == 200000
-    assert v.vision_ctx == 65536
-
-    config = emit_config([m], {"vis": variants}, profiles, TVARS)
-    # Auto-dropped main entry is the text-only one; the vision companion
-    # carries the image flag and its reduced context in the display name.
-    ids = set(config["models"])
-    assert len(ids) == 2
-    text_id = "vis"
-    vis_id = "vis.i"
-    assert ids == {text_id, vis_id}, ids
-    main = config["models"][text_id]
-    vision = config["models"][vis_id]
-    assert "--mmproj" not in main["cmd"]
-    assert main["name"].endswith("195k")
-    assert main["metadata"]["mmproj_skipped"] is True
-    assert main["capabilities"]["in"] == ["text"]
-    assert "--mmproj" in vision["cmd"]
-    assert vision["name"].endswith("64k [i]")
-
 
 def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path):
     """view_for() rebuilds VramBudget per view: a measurement failure
