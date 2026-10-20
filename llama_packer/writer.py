@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 _REASONING_FORMATS = frozenset({"none", "deepseek", "deepseek-legacy", "auto"})
 _REASONING_FLAG_KEYS = ("reasoning-format", "reasoning-preserve")
 
+# Client-facing generation ceiling. Clients (OpenCode's model discovery) turn
+# this into max_tokens and clamp it to the room the prompt leaves, so it
+# bounds a reply without ever exceeding the served window.
+_MAX_OUTPUT_TOKENS = 65_536
+
 
 def _model_can_reason(model: Model) -> bool:
     """True when the model is a chat model that advertises reasoning support."""
@@ -517,8 +522,15 @@ def _build_entry(
         desc = f"{desc} {vram_note}".strip() if desc else vram_note
     if desc is not None:
         entry["description"] = desc
-    # The VRAM-served -c limit (vs. capabilities.context = max trained).
+    # capabilities.context carries the served window (what clients size
+    # against); ctx_size is the long-standing metadata spelling of the same
+    # number, kept for clients that read it. context_max preserves the
+    # trained maximum when the entry is folded below it.
     metadata["ctx_size"] = ctx_size
+    if model.role == "chat":
+        metadata["max_output_tokens"] = min(ctx_size, _MAX_OUTPUT_TOKENS)
+    if context_length != ctx_size:
+        metadata["context_max"] = context_length
     # The blessed usage categories this serving actually satisfies — the same
     # set the id's category segment names.  Client-facing so a metadata-aware
     # picker (or the opencode plugin) can filter without parsing the id.
@@ -534,15 +546,15 @@ def _build_entry(
         entry["metadata"] = metadata
 
     # Native llama-swap capabilities block (shown in /v1/models).
-    # `context` is the model's maximum trained context (GGUF architectural max
-    # > sidecar context_length > default); the VRAM-served -c limit is exposed
-    # separately as metadata.ctx_size.
+    # `context` is the served per-slot window: llama-swap documents it as the
+    # window one request can use, and clients derive their compaction and
+    # output limits from it. The trained maximum is metadata.context_max.
     entry["capabilities"] = {
         "in": in_mods,
         "out": out_mods,
         "tools": "tools" in [c.lower() for c in caps],
         "reranker": "reranker" in caps_l or model.role == "rerank",
-        "context": context_length,
+        "context": ctx_size,
     }
 
     # Per-model GPU device pinning (multi-GPU). Emits the appropriate

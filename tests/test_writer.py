@@ -45,10 +45,10 @@ def test_cpu_resident_uses_cpu_layers(make_model):
     assert "--n-gpu-layers 0" in entry["cmd"]
 
 
-def test_capabilities_context_is_max_trained_not_served(make_model):
-    # capabilities.context must advertise the model's max trained context, not
-    # the VRAM-served per-slot limit; the served limit stays in
-    # metadata.ctx_size.
+def test_capabilities_context_is_served_window(make_model):
+    # capabilities.context is what clients use for compaction and output
+    # room, so it must be the served per-slot window, not the trained max.
+    # The trained max is preserved in metadata.context_max.
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -56,9 +56,26 @@ def test_capabilities_context_is_max_trained_not_served(make_model):
         template_vars={"llama_bin": "/opt/llama-server"},
         context_length=32768, ctx_size=4096,
     )
-    assert entry["capabilities"]["context"] == 32768
+    assert entry["capabilities"]["context"] == 4096
     assert entry["metadata"]["ctx_size"] == 4096
+    assert entry["metadata"]["context_max"] == 32768
+    assert entry["metadata"]["max_output_tokens"] == 4096
     assert "--kv-unified-per-slot 4096" in entry["cmd"]
+
+
+def test_no_context_max_or_token_limits_when_nothing_is_folded(make_model):
+    # At full design context there is no fold to report, and non-chat roles
+    # have no token-generation limits to advertise.
+    model = make_model("m", backend="llama-server", role="embedding")
+    _, entry = _build_entry(
+        model, parallel=1, cache_type="q8_0",
+        profiles_group=[("default", {})], profiles_defaults={},
+        template_vars={"llama_bin": "/opt/llama-server"},
+        context_length=8192, ctx_size=8192,
+    )
+    assert entry["capabilities"]["context"] == 8192
+    assert "context_max" not in entry["metadata"]
+    assert "max_output_tokens" not in entry["metadata"]
 
 
 def test_vllm_binary_cmd(make_model):

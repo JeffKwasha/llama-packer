@@ -160,9 +160,11 @@ advertises `tools: true/false` per entry. Today it is a *static passthrough*
 of the sidecar declaration — a model declared `capabilities: [tools]`
 advertises tool calling even when the planner serves it at a solved ctx far
 below what tool calling needs. Clients (`/v1/models` consumers: hermes,
-opencode, UIs) cannot tell the difference, because `capabilities.context`
-reports the **max trained** context (`model.py:296` design_context) while the
-actually served limit lives separately in `metadata.ctx_size` (`writer.py:276`).
+opencode, UIs) cannot tell the difference from `tools` alone;
+`capabilities.context` now reports the served per-slot window and
+`metadata.context_max` the trained maximum (fixed 2026-10-20, before that
+`capabilities.context` reported the trained max while the served limit lived
+only in `metadata.ctx_size`).
 
 **Where from.** The chain is: sidecar frontmatter `capabilities: [...]`
 (hand-authored; template at `templates/models_AGENTS.md:113`) →
