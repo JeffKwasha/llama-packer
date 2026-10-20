@@ -34,7 +34,9 @@ def test_chat_cmd_shape(make_model):
     _, entry = _entry(make_model)
     cmd = entry["cmd"]
     assert cmd.startswith("/opt/llama-server --port ${PORT} -m ")
-    assert "--n-gpu-layers 999" in cmd
+    # GPU-resident models rely on llama-server's "auto" default; only
+    # CPU-resident models pin --n-gpu-layers 0.
+    assert "--n-gpu-layers" not in cmd
     assert "--cache-type-k q8_0 --cache-type-v q8_0" in cmd
 
 
@@ -557,3 +559,59 @@ def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,
         )
     assert "invariant violated" not in caplog.text
     assert config["models"], "a sane model was dropped"
+
+
+# ── the entry id reaches the engines that route on it ───────────────────────
+
+
+def test_audio_entry_id_matches_the_id_the_engine_validates(make_model):
+    """The whole point, end to end: one string, both sides.
+
+    llama-swap routes on the entry id (`kokoro-82m.s`); audio.cpp validates the
+    requested model against `models[].id` in the server.json embedded in the
+    entry's own `cmd`. They were different strings, so every audio request
+    came back "unknown model id" while the entry's health check passed — the
+    pair that made this look like a routing problem rather than a naming one.
+
+    The tail used to be appended to the id *after* `_build_entry` returned,
+    which is why no backend could see it and why fixing the backend alone was
+    impossible.
+    """
+    import json
+    import re
+
+    model = make_model("kokoro-82m-q8_0", backend="audio-cpp", role="t2s",
+                       audio_cpp={"family": "kokoro_tts"})
+    entry_id, entry = _build_entry(
+        model,
+        parallel=1,
+        cache_type="q8_0",
+        profiles_group=[("default", {})],
+        profiles_defaults={},
+        template_vars={"audio_cpp_bin": "/opt/llama/tools/audiocpp_server"},
+        context_length=32768,
+        ctx_size=32768,
+        entry_id_tail="s",
+    )
+
+    assert entry_id == "kokoro-82m-q8_0.s", "the tail must be part of the id"
+    payload = re.search(r"<<JSON\n(.*?)\nJSON\n", entry["cmd"], re.S)
+    assert payload, "audio.cpp entries carry their config in a heredoc"
+    served = json.loads(payload.group(1).replace("${PORT}", "0"))
+    assert [m["id"] for m in served["models"]] == [entry_id]
+
+
+def test_a_plain_text_entry_carries_no_tail(make_model):
+    """No flags segment means no suffix, and the id stays the bare stem."""
+    _, entry = _build_entry(
+        make_model("qwen3-8b", backend="llama-server"),
+        parallel=1,
+        cache_type="q8_0",
+        profiles_group=[("default", {})],
+        profiles_defaults={},
+        template_vars={"llama_bin": "/opt/llama/tools/llama-server"},
+        context_length=32768,
+        ctx_size=32768,
+        entry_id_tail="",
+    )
+    assert entry["cmd"].startswith("/opt/llama/tools/llama-server")

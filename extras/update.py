@@ -2,13 +2,22 @@
 """update — download and install prebuilt server binaries.
 
 Python port of the ``extras/update`` bash script (same CLI, same messages,
-same install layout). Binaries install into the **current working directory**,
-not the script's location — run it from wherever you want ``llama-b*/`` and
-``llama-swap`` to live.
+same install layout). Unlike the bash version this can never be "sourced"
+harmlessly into a shell (the ``. extras/update --help`` habit that used to
+close the terminal): a Python script always runs as its own process.
 
-Unlike the bash version this can never be "sourced" harmlessly into a shell
-(the ``. extras/update --help`` habit that used to close the terminal): a
-Python script always runs as its own process.
+**Where things install.** Every engine has a home directory, and this tool
+updates each engine *where it already is* rather than wherever it happens to
+be run from — see :func:`resolve_install_dirs`. One flat directory holds all
+of them, each as a versioned entry plus a stable symlink:
+
+    tools/llama-swap       -> llama-swap-v266
+    tools/llama-server     -> ./llama-b12345/llama-server
+    tools/whisper-server   -> ./whisper-server-b4938/whisper-server
+    tools/audiocpp_server  -> audiocpp_server-v0.9.2
+
+Old versions stay beside the new one (``--keep-swap`` / ``--keep-engine-versions``),
+so rolling forward is a symlink change and rolling back is one too.
 
 Usage: ./extras/update.py [target|backend|version ...] [options]
 
@@ -49,6 +58,7 @@ exit 1
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextlib
 import hashlib
 import json
@@ -297,6 +307,356 @@ def get_llama_cpp_arch(override: str = "") -> str:
     if machine == "s390x":
         return "s390x"
     return "x64"
+
+
+# --- install location ------------------------------------------------------
+
+#: ``extras/engines.ini``, next to this file. Committed, per-deployment, and
+#: entirely optional: an absent or empty file means "work it out" (below).
+CONFIG_NAME = "engines.ini"
+
+#: Every engine installs the same way once its directory is known: a versioned
+#: entry (a file for llama-swap/audio.cpp, a directory for everything that
+#: ships shared libraries) plus a stable *primary* name beside it. This table is
+#: what makes that discoverable, and it is also the shape the user-facing
+#: layout promises:
+#:
+#:     tools/llama-swap          -> llama-swap-v266
+#:     tools/llama-server        -> ./llama-b12345/llama-server
+#:     tools/whisper-server      -> ./whisper-server-b4938/whisper-server
+#:     tools/audiocpp_server     -> audiocpp_server-v0.9.2
+#:
+#: ``env`` is the ``*_BIN_DIR`` variable llama-packer already honors for that
+#: engine, reused here so one variable configures both tools.
+INSTALL_UNITS: dict[str, "InstallUnit"] = {}
+
+#: llama.cpp's stable name, spelled once because both the symlink maintenance
+#: and the packer's binary resolution have to agree on it.
+CPP_PRIMARY = "llama-server"
+
+
+@dataclass
+class InstallUnit:
+    """How one engine's installs are recognized on disk."""
+
+    key: str
+    primary: str                  # stable name; always a symlink after install
+    versioned: tuple[str, ...]    # globs for this engine's versioned entries
+    env: str = ""                 # *_BIN_DIR, shared with llama-packer
+
+    def _entries(self, directory: Path) -> list[Path]:
+        """One listing of *directory*, or ``[]`` if it cannot be read.
+
+        Every predicate below reads this rather than globbing: a dozen
+        ``glob()`` calls over a tools root that holds thousands of unrelated
+        entries is slow, and a predicate that has to be re-derived from the
+        filesystem at each step is one whose answer can differ between the
+        check and the use.
+        """
+        try:
+            if not directory.is_dir():
+                return []
+            return list(directory.iterdir())
+        except OSError:
+            return []
+
+    def _holds_directly(self, names: list[str]) -> bool:
+        """Whether *names* shows an install in this directory itself.
+
+        The strict half of :meth:`_holds`: no looking inside subdirectories.
+        It is what separates "this root *is* the engine's home" from "this root
+        merely *contains* the engine's home".
+        """
+        return any(fnmatch(name, pattern) for name in names
+                   for pattern in self.versioned) or self.primary in names
+
+    def _holds(self, names: list[str], directory: Path) -> bool:
+        """Whether a listing called *names* shows an install of this engine.
+
+        Three shapes, in decreasing order of how this tool writes them:
+
+        * a versioned entry beside the primary name (its own layout),
+        * the primary name itself,
+        * the primary name one or two levels down — the hand-made layouts
+          that predate this tool, such as ``whisper/bin -> whisper-v1.9.2/bin/``
+          or a source-build tree.
+
+        The looseness is deliberate and one-directional: a false positive
+        costs an update that lands in a directory that already looks like this
+        engine's, while a false negative costs a *second copy of the engine*
+        installed beside the first — which is the whole problem this layer
+        exists to remove.
+        """
+        if any(fnmatch(name, pattern) for name in names
+               for pattern in self.versioned):
+            return True
+        if self.primary in names:
+            return True
+        for name in names:
+            child = directory / name
+            if not child.is_dir():
+                continue
+            if (child / self.primary).exists():
+                return True
+            try:
+                if any((grandchild / self.primary).exists()
+                       for grandchild in child.iterdir()
+                       if grandchild.is_dir()):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def holding_children(self, directory: Path) -> list[Path]:
+        """Subdirectories of *directory* that each hold an install of this
+        engine — the ``tools/audiocpp`` + ``tools/old_audiocpp`` case."""
+        return [e for e in self._entries(directory)
+                if e.is_dir()
+                and not any(e.match(p) for p in self.versioned)
+                and self._holds([c.name for c in self._entries(e)], e)]
+
+    def descends_into(self, directory: Path) -> Path | None:
+        """The engine's own subdirectory of *directory*, when it has one.
+
+        The fleet shape is one directory per engine (``tools/whisper``,
+        ``tools/audiocpp``) sitting inside a tools root. Matching only the
+        root would install a second copy *beside* the first one — the very
+        duplication this layer exists to prevent — so when the root holds no
+        install of its own but exactly one of its children does, that child is
+        the home.
+
+        Never descends into a versioned entry: ``llama-b11658/llama-server``
+        would otherwise read as "the cpp home is the build directory", and the
+        next update would install build 12345 *inside* build 11658.
+        """
+        entries = self._entries(directory)
+        names = [e.name for e in entries]
+        if not names or self._holds_directly(names):
+            return None
+        children = self.holding_children(directory)
+        return children[0] if len(children) == 1 else None
+
+    def lives_in(self, directory: Path) -> bool:
+        """Whether *directory* already holds an install of this engine.
+
+        See :meth:`_holds` for why "already holds" is read loosely, and
+        :meth:`descends_into` for what happens when the install is one level
+        down.
+        """
+        entries = self._entries(directory)
+        if not entries:
+            return False
+        return self._holds([e.name for e in entries], directory)
+
+
+for _key, _primary, _versioned, _env in (
+    ("cpp", CPP_PRIMARY, ("llama-b[0-9]*",), "LLAMA_BIN_DIR"),
+    ("swap", "llama-swap", ("llama-swap-v[0-9]*",), "LLAMA_SWAP_BIN_DIR"),
+    ("audio", "audiocpp_server", ("audiocpp_server-v[0-9]*",), "AUDIOCPP_BIN_DIR"),
+    ("whisper", "whisper-server", ("whisper-server-b[0-9]*",), "WHISPER_BIN_DIR"),
+    ("sd", "sd-server", ("sd-server-master-*", "sd-server-v[0-9]*"),
+     "SD_BIN_DIR"),
+):
+    INSTALL_UNITS[_key] = InstallUnit(
+        key=_key, primary=_primary, versioned=_versioned, env=_env
+    )
+
+
+def config_path() -> Path:
+    """Where ``engines.ini`` is looked for: beside this script."""
+    return Path(__file__).resolve().parent / CONFIG_NAME
+
+
+def load_engines_config(path: Path | None = None) -> tuple[Path | None, dict[str, str]]:
+    """``(root, per-engine overrides)`` from ``engines.ini``; never raises.
+
+    INI via :mod:`configparser`, not YAML: this script is pure stdlib so it
+    runs on a box with no venv, and hand-rolling a YAML subset for five keys
+    is a parser bug waiting to happen. A malformed file is reported and
+    treated as absent -- a typo in the config must not stop someone from
+    updating a binary.
+
+    ``[engines] root`` is where new installs go; each other key overrides one
+    engine, so an engine that already lives somewhere else keeps living
+    there. An empty value means "unset" (the template ships that way).
+    """
+    path = path or config_path()
+    parser = configparser.ConfigParser()
+    try:
+        if not path.is_file():
+            return None, {}
+        parser.read(path, encoding="utf-8")
+    except (configparser.Error, OSError, UnicodeDecodeError) as exc:
+        eprint(f"Warning: ignoring unreadable {path}: {exc}")
+        return None, {}
+    if not parser.has_section("engines"):
+        return None, {}
+    entries = {
+        key.strip(): value.strip()
+        for key, value in parser.items("engines")
+    }
+    root = entries.pop("root", "")
+    for key in sorted(entries):
+        if key not in INSTALL_UNITS:
+            eprint(f"Warning: {path}: unknown engine {key!r} (known: "
+                   f"{', '.join(ALL_TARGETS)})")
+    engines = {k: Path(v).expanduser() for k, v in entries.items()
+               if v and k in INSTALL_UNITS}
+    return (Path(root).expanduser() if root else None), engines
+
+
+def _env_dir(unit: InstallUnit) -> Path | None:
+    """``$ENGINE_BIN_DIR`` as a directory, or None.
+
+    The packer lets these name either a binary or a directory, so both are
+    accepted here: a file contributes its parent, which is what an operator
+    who exported the full binary path means by it. ``audiocpp_server`` has no
+    suffix to go on, so "is it a file" decides rather than the spelling.
+    """
+    raw = os.environ.get(unit.env, "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        return path
+    if path.is_file() or path.suffix:
+        return path.parent
+    return path
+
+
+def _discovery_candidates() -> list[Path]:
+    """Directories that plausibly already hold an install, in order.
+
+    Ordered so the nearest answer wins: the cwd (where this tool used to
+    install, and where anyone who learned the old habit is standing), then
+    the repo directory itself, then its parent — which on this fleet is where
+    every engine actually lives — then ``$LLAMA_DIR``. Duplicates are dropped
+    so the summary does not print the same directory under two names.
+    """
+    here = Path.cwd()
+    repo = Path(__file__).resolve().parent.parent
+    candidates = [here, repo, repo.parent]
+    if raw := os.environ.get("LLAMA_DIR", "").strip():
+        candidates.append(Path(raw).expanduser())
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(path)
+    return unique
+
+
+def resolve_install_dirs(
+    overrides: dict[str, str] | None = None,
+    config: tuple[Path | None, dict[str, str]] | None = None,
+) -> dict[str, tuple[Path, str]]:
+    """``{engine key: (directory, why)}`` for every engine.
+
+    The whole point of this function: **update what is already installed,
+    where it already is**. An engine found in a candidate directory is
+    updated in that directory; only an engine with no existing install is
+    placed under the configured root. That is the difference between running
+    this from anywhere on the box and having to stand in five directories in
+    turn.
+
+    Precedence, highest first:
+
+    1. ``--dir <key>=<path>`` — for one run, no config touched.
+    2. ``[engines] <key>`` in ``engines.ini`` — the operator's declaration.
+    3. ``$<KEY>_BIN_DIR`` — the same variable llama-packer resolves with, so
+       one export configures both tools.
+    4. **an existing install**, searched from the cwd outwards (§
+       :func:`_discovery_candidates`).
+    5. ``[engines] root``, then ``$LLAMA_DIR``, then the cwd (the historical
+       behaviour, kept so a fresh install with no configuration at all still
+       works).
+    """
+    overrides = {k: v for k, v in (overrides or {}).items() if v}
+    root, per_engine = config if config is not None else load_engines_config()
+    candidates = _discovery_candidates()
+    resolved: dict[str, tuple[Path, str]] = {}
+    for key in ALL_TARGETS:
+        unit = INSTALL_UNITS[key]
+        if key in overrides:
+            resolved[key] = (Path(overrides[key]).expanduser(), "--dir")
+            continue
+        if key in per_engine:
+            resolved[key] = (per_engine[key], "engines.ini")
+            continue
+        if env_dir := _env_dir(unit):
+            resolved[key] = (env_dir, f"${unit.env}")
+            continue
+        for candidate in candidates:
+            # Descend first: a root that merely *contains* the engine's own
+            # directory (tools/ holding tools/audiocpp/) would otherwise be
+            # read as the home, and the update would land beside the install
+            # it was supposed to be updating.
+            if inner := unit.descends_into(candidate):
+                resolved[key] = (inner, "existing install")
+                break
+            rivals = unit.holding_children(candidate)
+            if len(rivals) > 1:
+                # Two directories each holding a copy: guessing which one is
+                # live would put the update beside the engine it was meant to
+                # replace. Say so and let the operator name it.
+                eprint(f"Warning: {candidate} holds {len(rivals)} "
+                       f"{key} installs ({', '.join(sorted(p.name for p in rivals))}); "
+                       f"not guessing — set it with --dir {key}=<path> or "
+                       f"[engines] {key} in {CONFIG_NAME}")
+            if unit.lives_in(candidate):
+                resolved[key] = (candidate, "existing install")
+                break
+        else:
+            if root is not None:
+                resolved[key] = (root, "engines.ini root")
+            elif raw := os.environ.get("LLAMA_DIR", "").strip():
+                resolved[key] = (Path(raw).expanduser(), "$LLAMA_DIR")
+            else:
+                resolved[key] = (Path.cwd(), "current directory")
+    return resolved
+
+
+def parse_dir_overrides(values: list[str] | None) -> dict[str, str]:
+    """``["audio=/x", "bad"]`` -> ``{"audio": "/x"}``; a bad one is an error.
+
+    Silent acceptance of a malformed override would install somewhere the
+    operator did not name, so an unusable ``--dir`` stops the run before any
+    download happens.
+    """
+    out: dict[str, str] = {}
+    for raw in values or []:
+        key, sep, path = raw.partition("=")
+        key = key.strip()
+        if not sep or not key or not path.strip():
+            raise TargetError(
+                f"--dir expects <engine>=<path>, got {raw!r} "
+                f"(engines: {', '.join(ALL_TARGETS)})")
+        if key not in INSTALL_UNITS:
+            raise TargetError(
+                f"--dir names unknown engine {key!r} "
+                f"(engines: {', '.join(ALL_TARGETS)})")
+        out[key] = path.strip()
+    return out
+
+
+def report_install_dirs(dirs: dict[str, tuple[Path, str]]) -> None:
+    """Print where each engine will be updated, and how that was decided.
+
+    Always printed, not only with ``--print-paths``: the reader's question
+    about an installer is "where did it put it", and a tool that answers that
+    only on request has already lost the argument.
+    """
+    print("\nInstall locations:")
+    width = max((len(k) for k in dirs), default=4)
+    for key in ALL_TARGETS:
+        if key not in dirs:
+            continue
+        directory, why = dirs[key]
+        primary = INSTALL_UNITS[key].primary
+        print(f"  {key:<{width}}  {directory}  "
+              f"[{primary}] ({why})")
 
 
 # --- filesystem helpers ----------------------------------------------------
@@ -551,10 +911,46 @@ def update_llama_cpp_symlinks(install_dir: Path, new_target: str) -> None:
     for link in install_dir.iterdir():
         if not link.is_symlink():
             continue
+        # The stable name points *into* a build (`./llama-b123/llama-server`),
+        # so it must not be rewritten to the build directory the way a
+        # directory-level alias is. _ensure_stable_primary owns it.
+        if link.name == CPP_PRIMARY:
+            continue
         target = os.readlink(link)
         if re.search(r"llama-b[0-9]", target):
             print(f"Updating symlink {link.name} -> {new_target} (was {target})")
             replace_symlink(link, new_target)
+    _ensure_stable_primary(install_dir, CPP_PRIMARY,
+                           f"./{new_target}/{CPP_PRIMARY}")
+
+
+def _ensure_stable_primary(install_dir: Path, primary: str,
+                           link_target: str) -> None:
+    """Keep ``<primary>`` a symlink to *link_target*, creating it if absent.
+
+    Every engine's stable name is a symlink beside its versioned entries, so
+    a config can name ``tools/llama-server`` and a later update moves what it
+    points at without anything referencing it changing. Rollback is the same
+    one-line change in the other direction.
+
+    A real file of that name is left alone and reported: something put it
+    there deliberately, and replacing a working binary with a link into a
+    directory a later prune could remove is not a call this makes silently.
+    """
+    path = install_dir / primary
+    if path.exists() and not path.is_symlink():
+        eprint(f"Note: {path} is a real file, not a symlink; leaving it "
+               "alone (point your config at it, or remove it to get the "
+               "stable-name link)")
+        return
+    if path.is_symlink():
+        if os.readlink(path) == link_target:
+            return
+        print(f"Updating symlink {primary} -> {link_target} "
+              f"(was {os.readlink(path)})")
+    replace_symlink(path, link_target)
+    if not path.is_symlink():      # created rather than repointed
+        print(f"{primary} -> {link_target}")
 
 
 def update_llama_cpp(
@@ -870,13 +1266,26 @@ class Engine:
         return next(iter(self.backends.values()))
 
 
-#: audio.cpp follows llama.cpp's naming almost exactly
-#: (``audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz``) and ships binaries on its
+#: audio.cpp follows llama.cpp's asset naming almost exactly
+#: (``audio-v0.9.2-bin-ubuntu-x64-vulkan-portable.tar.gz``) and ships binaries on its
 #: semver tag, so it needs nothing special. There is no ROCm/HIP build — the
 #: AMD path is the Vulkan one, which is what this fleet already runs.
-#: Verified against v0.9.2: the binary sits at the tarball root, carries no
-#: RUNPATH, and runs standalone (it links only libvulkan/libgomp/libstdc++).
-#: The tarball also holds a source tree, which is not worth installing.
+#:
+#: The **portable** build is the one to install, and this was measured rather
+#: than assumed: on the R9700/radv fleet the plain ``-vulkan`` build of the
+#: same tag answers /health and then dies with SIGILL on the first synthesis
+#: request, while ``-vulkan-portable`` returns a valid 24 kHz WAV. The portable
+#: builds target a baseline CPU instruction set, so they cannot be the thing
+#: that dies there. An earlier version of this comment anchored the pattern
+#: specifically to *exclude* ``-portable``, which is why the deployment ran a
+#: hand-copied portable build for a year while this installed the other one.
+#:
+#: ``bundle=True`` for the same reason it is true elsewhere: the portable
+#: tarball's ``audiocpp_server`` loads ``libggml-vulkan.so`` and its CPU
+#: backend variants from its own directory, so the directory has to travel with
+#: it. The non-portable build needs no libraries and was a solo binary; that is
+#: no longer what gets installed. The source tree the tarball also carries is
+#: not worth installing.
 AUDIO_CPP = Engine(
     key="audio",
     label="audio.cpp",
@@ -884,11 +1293,11 @@ AUDIO_CPP = Engine(
     primary="audiocpp_server",
     versioned="audiocpp_server-{tag}",
     backup="audiocpp_server.bak",
-    # anchored so the "-portable" variant does not win
-    backends={"vulkan": r"ubuntu-{arch}-vulkan\.tar\.gz$"},
+    backends={"vulkan": r"ubuntu-{arch}-vulkan-portable\.tar\.gz$"},
     tag_re=r"v[0-9]+(\.[0-9]+)*",
     names=("audiocpp_server", "bin/audiocpp_server", "build/bin/audiocpp_server"),
     checksum="warn",
+    bundle=True,
 )
 
 #: whisper.cpp publishes two tags per release: a semver one with no assets and
@@ -1408,8 +1817,11 @@ def build_parser() -> argparse.ArgumentParser:
         alias_lines.append(f"  {group:<9} {' '.join(names)}")
     parser = argparse.ArgumentParser(
         description=(
-            "Download and install prebuilt server binaries. "
-            "Install location is the current working directory."
+            "Download and install prebuilt server binaries. Each engine is "
+            "updated in the directory it is already installed in; a new "
+            "engine goes under the configured root (extras/engines.ini, "
+            "$LLAMA_DIR, else the current directory). Run with --print-paths "
+            "to see the resolution without downloading anything."
         ),
         epilog=(
             "Targets (positional, first match wins; 'all' must be typed in full):\n"
@@ -1420,13 +1832,22 @@ def build_parser() -> argparse.ArgumentParser:
             "that publish checksums.txt. 'all' adds the three that do not.\n"
             "\n"
             "Backends (positional): " + ", ".join(KNOWN_BACKENDS)
-            + "\n"
+            + "\n\n"
+            "Install locations, highest precedence first:\n"
+            "  --dir <engine>=<path>       one run only\n"
+            f"  [engines] <engine> in {CONFIG_NAME}\n"
+            "  $<ENGINE>_BIN_DIR           the same variable llama-packer reads\n"
+            "  an existing install found from the cwd outwards\n"
+            f"  [engines] root, $LLAMA_DIR, else the cwd\n"
+            "\n"
             "Environment:\n"
             "  GITHUB_TOKEN            Optional. GitHub personal access token for\n"
             "                          higher API rate limits (5000 req/hr vs 60).\n"
             "                          Also reads GITHUB_PERSONAL_ACCESS_TOKEN.\n"
             "  KEEP_SWAP_VERSIONS      Optional. Same as --keep-swap.\n"
             "  KEEP_ENGINE_VERSIONS    Optional. Same as --keep-engine-versions.\n"
+            "  LLAMA_DIR               Optional. Install root when an engine has\n"
+            "                          no install yet and no config entry.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1494,6 +1915,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Specific stable-diffusion.cpp release tag (e.g. master-968-8cd731e)",
     )
     parser.add_argument(
+        "--dir",
+        action="append",
+        metavar="ENGINE=PATH",
+        help="Install this engine into PATH for this run (repeatable). "
+             "Overrides every configured and discovered location.",
+    )
+    parser.add_argument(
+        "--print-paths",
+        action="store_true",
+        help="Print where each engine would be updated and why, then exit "
+             "without downloading anything.",
+    )
+    parser.add_argument(
         "--keep-engine-versions",
         metavar="N",
         type=positive_int,
@@ -1506,10 +1940,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    install_dir = Path.cwd()
 
     if args.swap_only and args.cpp_only:
         eprint("Error: --swap-only and --cpp-only are mutually exclusive")
+        return 1
+
+    try:
+        dir_overrides = parse_dir_overrides(args.dir)
+    except TargetError as exc:
+        eprint(f"Error: {exc}")
         return 1
 
     try:
@@ -1543,6 +1982,15 @@ def main(argv: list[str] | None = None) -> int:
         eprint(note)
     print("Targets: " + ", ".join(selected))
 
+    # Every target's directory is settled before anything is downloaded, and
+    # printed, so a run against an unexpected location is visible immediately
+    # rather than after a 200 MB download. --print-paths stops here: the
+    # answer to "where would this go?" is worth having without the download.
+    install_dirs = resolve_install_dirs(dir_overrides)
+    report_install_dirs(install_dirs)
+    if args.print_paths:
+        return 0
+
     keep_swap = (
         args.keep_swap
         if args.keep_swap is not None
@@ -1561,22 +2009,24 @@ def main(argv: list[str] | None = None) -> int:
     status = 0
     if "cpp" in selected:
         cpp_version = _backend_version(version, backend)
-        ok, installed_tag = update_llama_cpp(install_dir, cpp_version,
+        cpp_dir, _why = install_dirs["cpp"]
+        ok, installed_tag = update_llama_cpp(cpp_dir, cpp_version,
                                              args.arch)
         if not ok:
             status = 1
         elif installed_tag is not None:
             # Cleanup old versions after successful install and re-point any
             # symlinks that target an old llama-b* dir at the new one.
-            cleanup_old_versions(install_dir)
-            update_llama_cpp_symlinks(install_dir, installed_tag)
+            cleanup_old_versions(cpp_dir)
+            update_llama_cpp_symlinks(cpp_dir, installed_tag)
 
     if "swap" in selected:
+        swap_dir, _why = install_dirs["swap"]
         if swap_version:
-            ok = update_llama_swap(install_dir, keep_swap, swap_version,
+            ok = update_llama_swap(swap_dir, keep_swap, swap_version,
                                    args.arch)
         else:
-            ok = update_llama_swap(install_dir, keep_swap, "", args.arch)
+            ok = update_llama_swap(swap_dir, keep_swap, "", args.arch)
         if not ok:
             eprint("Warning: llama-swap update failed")
             status = 1
@@ -1585,9 +2035,10 @@ def main(argv: list[str] | None = None) -> int:
         if key not in selected:
             continue
         engine = ENGINES[key]
+        engine_dir, _why = install_dirs[key]
         print(f"\n=== {engine.label} ===")
         try:
-            ok = update_engine(engine, install_dir, engine_arch(engine,
+            ok = update_engine(engine, engine_dir, engine_arch(engine,
                                                                args.arch),
                                keep_engines, pinned[key],
                                backend or engine.single_backend)

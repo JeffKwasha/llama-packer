@@ -86,4 +86,6 @@ either way it should not be used in a commit message until it is.
 | **staging dir** | Scratch space *on the destination filesystem*, so an install finishes with an atomic rename. | `update.py:staging` |
 | **promote** | The rename that makes a staged build its final name. | `update.py:promote` |
 | **versioned entry** | `llama-bNNNNN`, `llama-swap-vNNN`, `<engine>-vX.Y.Z`. Kept newest-N; never pruned while a symlink points at it. | `update.py` |
+| **stable primary** | The unversioned name beside a versioned entry — `llama-server` -> `./llama-b12345/llama-server`. What a config names; updating and rolling back both move this one link. | `update.py:_ensure_stable_primary` |
+| **tools dir** | `<run dir>/tools`: where a deployment's engines live, so the run directory holds only generated config. Searched before the run directory itself. | `llama_packer/utils.py:binary_search_dirs` |
 | **the fleet tag table** | Which upstream release is installed, per engine. | `docs/plans/usage-tag-table.md` |

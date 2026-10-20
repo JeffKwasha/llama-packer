@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 
+from _gguf import write_gguf
 from llama_packer.model import Model, WeightFinder
 
 from conftest import _hf_tree
@@ -262,29 +263,13 @@ def test_modelignore_excludes_files(tmp_path):
     assert {m.stem for m in models} == {"keep"}
 
 
-def _gguf_bytes(kv: dict) -> bytes:
-    import struct
-    out = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
-           + struct.pack("<Q", len(kv)))
-    for k, v in kv.items():
-        kb = k.encode()
-        out += struct.pack("<Q", len(kb)) + kb
-        if isinstance(v, str):
-            vb = v.encode()
-            out += struct.pack("<I", 8) + struct.pack("<Q", len(vb)) + vb
-        else:
-            out += struct.pack("<I", 4) + struct.pack("<I", int(v))
-    return out
-
-
 def test_diffusion_weights_excluded_from_served_role(tmp_path, caplog):
     # A GGUF whose header architecture is a diffusion family is excluded from
     # a served chat role with an error log; the run itself continues.
     root = tmp_path / "models"
     chat = root / "chat"
     chat.mkdir(parents=True)
-    (chat / "fluxdev.gguf").write_bytes(
-        _gguf_bytes({"general.architecture": "flux1"}))
+    write_gguf(chat / "fluxdev.gguf", arch="flux1")
     (chat / "ok.gguf").write_bytes(b"x")  # unparseable header → still served
 
     with caplog.at_level(logging.ERROR):
@@ -302,9 +287,8 @@ def test_text_gguf_media_like_name_still_served(tmp_path):
     root = tmp_path / "models"
     chat = root / "chat"
     chat.mkdir(parents=True)
-    (chat / "minimax-h3.gguf").write_bytes(
-        _gguf_bytes({"general.architecture": "minimaxh3",
-                     "minimaxh3.context_length": 1000000}))
+    write_gguf(chat / "minimax-h3.gguf", arch="minimaxh3",
+               context_length=1000000)
     models = Model.from_dir(root, generate_stubs=False)
     assert [m.stem for m in models] == ["minimax-h3"]
 

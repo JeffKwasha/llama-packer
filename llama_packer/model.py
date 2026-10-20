@@ -79,6 +79,11 @@ def persisted_sidecars() -> list[str]:
 def persisted_sidecars_reset() -> None:
     """Clear the run counter (called once at the top of each pack)."""
     _PERSISTED.clear()
+
+#: Sidecars whose frontmatter already failed a round-trip this run —
+#: each repair-deserving defect is logged once, not once per persist call.
+_SIDECA_PARSE_WARNED: set[str] = set()
+
 # Older names for the same auto-generated branch, migrated on write.
 _LEGACY_MEASURED_KEYS = ("fit-params", "measured")
 
@@ -999,17 +1004,16 @@ class Model:
 
     @property
     def design_context(self) -> int:
-        """Architectural context limit (GGUF) > sidecar context_length > default.
+        """Architectural context limit (weight-file header) > sidecar
+        context_length > default.
 
         Single source of truth for a model's effective context ceiling, used by
         the VRAM budget and matrix solver alike.  A chat model whose ceiling
         lands below 4096 is almost certainly a mislabeled or corrupt GGUF
         (no real text model trains below 4k) — warned once per stem.
         """
-        arch = self.gguf_context_length
-        if arch is not None and arch > 0:
-            ctx = arch
-        else:
+        ctx = self.max_context
+        if not (isinstance(ctx, int) and ctx > 0):
             ctx = int(self.frontmatter.get(
                 "context_length", _DEFAULT_CONTEXT_LENGTH
             ))
@@ -1021,18 +1025,6 @@ class Model:
                 "configurations are errors or testcases; verify the GGUF "
                 "(is this really a text in/out model?)", self.stem, ctx)
         return ctx
-
-    @property
-    def gguf_context_length(self) -> int | None:
-        """Architectural context limit from the weight header (GGUF metadata).
-
-        Delegates to the canonical file instance, which parses once per
-        process however many sidecars claim the file. None when unavailable
-        (safetensors, missing file, parse error).
-        """
-        if self._file is not None:
-            return self._file.max_context
-        return None
 
     # ── file interface (parsed header scalars) ──
     #
@@ -1049,27 +1041,43 @@ class Model:
 
     @property
     def arch(self) -> str | None:
-        """Architecture id from the weight header (e.g. ``qwen3``)."""
+        """Architecture id from the weight header (e.g. ``qwen3``).
+
+        Recorded block first (one stat), header parse when absent or stale.
+        """
+        intr = self.file_intrinsics()
+        if intr is not None and "arch" in intr:
+            arch = intr["arch"]
+            return arch if isinstance(arch, str) and arch else None
         target = self._file_or_self()
-        if target is not self:
-            return target.arch
-        return None
+        return target.arch if target is not self else None
 
     @property
     def max_context(self) -> int | None:
-        """Architectural context limit from the weight header, if any."""
+        """Architectural context limit from the weight header, if any.
+
+        Recorded block first (one stat), header parse when absent or stale.
+        """
+        intr = self.file_intrinsics()
+        if intr is not None and "context_length" in intr:
+            ctx = intr["context_length"]
+            return ctx if isinstance(ctx, int) and ctx > 0 else None
         target = self._file_or_self()
-        if target is not self:
-            return target.max_context
-        return None
+        return target.max_context if target is not self else None
 
     @property
     def kind(self) -> str:
-        """Header-only kind: ``"text"``, ``"image"``, or ``"unknown"``."""
+        """Header-only kind: ``"text"``, ``"image"``, or ``"unknown"``.
+
+        Recorded block first (one stat), header parse when absent or stale.
+        """
+        intr = self.file_intrinsics()
+        if intr is not None:
+            kind = intr.get("kind")
+            if isinstance(kind, str) and kind:
+                return kind
         target = self._file_or_self()
-        if target is not self:
-            return target.kind
-        return "unknown"
+        return target.kind if target is not self else "unknown"
 
     def safetensors_numbers(self, cache_type: str = "q8_0") -> tuple[int, float] | None:
         """(weight_mib, kv_bytes_per_token) for safetensors files, else None.
@@ -1084,7 +1092,7 @@ class Model:
     @property
     def file_kind(self) -> str:
         """Header kind with HF model-card fallback for repo-backed models."""
-        kind = self._file_or_self().kind
+        kind = self.kind
         if kind == "unknown" and self.hf_repo:
             kind = utils.hf_readme_kind(self.hf_repo, self._hf_home) or "unknown"
         return kind
@@ -1142,12 +1150,8 @@ class Model:
         sig = self._file_stat_sig()
         if sig is None:
             return None
-        try:
-            size_mb = os.stat(target.gguf_path).st_size // (1024 ** 2)
-        except OSError:
-            return None
         block: dict = {
-            "size_mb": size_mb,
+            "size_mb": sig[0] // (1024 ** 2),
             "size_bytes": sig[0],
             "mtime_ns": sig[1],
             "arch": target.arch,
@@ -1178,6 +1182,32 @@ class Model:
             return False
         return True
 
+    def file_intrinsics(self) -> dict | None:
+        """The recorded ``file:`` block when its identity matches the file.
+
+        While the size+mtime identity matches, header intrinsics
+        (arch/context/kind) answer from the block with a single stat and
+        GGUF I/O stays a one-time cost.  None when nothing was recorded or
+        the file changed — the header is then read and the block rebuilt.
+        """
+        if not self.measured_file_valid():
+            return None
+        block = self.measured_block()
+        fb = block.get("file") if isinstance(block, dict) else None
+        return fb if isinstance(fb, dict) and fb else None
+
+    def _stamp_file_value(self, key: str, value: object) -> None:
+        """Record one file intrinsic beside a valid ``file:`` block.
+
+        The block's identity is what makes the stamp trustworthy, so a
+        stamp without one is dropped.  Sidecar-less instances (no block,
+        no identity) stay memory-only.
+        """
+        if not self.measured_file_valid():
+            return
+        self.frontmatter[MEASURED_KEY]["file"][key] = value
+        self.persist_measured()
+
     def sync_measured_file(self, write: bool = True) -> None:
         """Refresh the ``file:`` intrinsics when stale/missing.
 
@@ -1200,6 +1230,15 @@ class Model:
         block["file"] = fresh
         if write:
             self.persist_measured()
+
+    def _warn_sidecar_once(self, msg: str, *args: object) -> None:
+        """Log *msg* once per sidecar per process — operator-visible state
+        problems stay loud without repeating per persist call."""
+        key = str(self.md_path)
+        if key in _SIDECA_PARSE_WARNED:
+            return
+        _SIDECA_PARSE_WARNED.add(key)
+        logger.warning(msg, *args)
 
     def persist_measured(self, extra: dict | None = None) -> None:
         """Write the ``measured:`` block to the sidecar, preserving the rest.
@@ -1253,7 +1292,11 @@ class Model:
         try:
             fm = yml.load(parts[1])
         except Exception as e:
-            logger.debug("cannot parse sidecar frontmatter for persist: %s", e)
+            self._warn_sidecar_once(
+                "sidecar %s: frontmatter does not survive a YAML round-trip, "
+                "so measurements cannot be written back (%s).  Fix the "
+                "frontmatter — measurements stay memory-only until then.",
+                self.md_path, e)
             return
         if fm is None:
             from ruamel.yaml.comments import CommentedMap
@@ -1267,12 +1310,19 @@ class Model:
         yml.dump(fm, buf)
         new_content = "---\n" + buf.getvalue().rstrip("\n") + "\n---" + parts[2]
         try:
-            self.md_path.write_text(new_content, encoding="utf-8")
+            tmp = self.md_path.with_suffix(self.md_path.suffix + ".tmp")
+            tmp.write_text(new_content, encoding="utf-8")
+            os.replace(tmp, self.md_path)
             _PERSISTED.append(self.stem)
             logger.debug("persisted measured block for %s", self.stem)
         except (OSError, PermissionError) as e:
             logger.debug("cannot write sidecar for measured persist (%s): %s",
                          self.md_path, e)
+            try:
+                self.md_path.with_suffix(self.md_path.suffix + ".tmp").unlink(
+                    missing_ok=True)
+            except OSError:
+                pass
 
     @property
     def name(self) -> str:
@@ -1909,7 +1959,12 @@ class Model:
         path = self.gguf_path
         if path is None or not str(path).endswith(".gguf"):
             return True
-        has = utils.gguf_has_mtp_layers(str(path))
+        intr = self.file_intrinsics()
+        if intr is not None and "mtp_baked" in intr:
+            has = intr["mtp_baked"]
+        else:
+            has = utils.gguf_has_mtp_layers(str(path))
+            self._stamp_file_value("mtp_baked", has)
         if has is False and not getattr(self, "_mtp_gate_logged", False):
             self._mtp_gate_logged = True
             logger.warning(

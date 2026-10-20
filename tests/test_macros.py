@@ -151,9 +151,11 @@ def test_apply_to_dict_requires_exact_value():
 
 # ── Macros builder contract ───────────────────────────────────────────────
 
-def test_builder_always_registers_common_gpu():
+def test_no_builtin_common_gpu():
+    # llama-server defaults --n-gpu-layers to "auto" (offload all); there
+    # is nothing for a builtin to pin.
     Macros({})
-    assert Macro.get("COMMON_GPU").flags == {"--n-gpu-layers": "999"}
+    assert Macro.get("COMMON_GPU") is None
 
 
 def test_builder_parses_explicit_macro_strings():

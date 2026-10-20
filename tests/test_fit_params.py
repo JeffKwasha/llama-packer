@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from _gguf import write_gguf
 from llama_packer.vram import FitParams
 
 
@@ -109,3 +110,86 @@ def test_vram_mib_affine_prediction():
         18114 + 505 + 0.0332 * (32768 * 8) + 150 * 8)
     assert fp.vram_mib(ctx_per_slot=262144, parallel=1) == int(
         18114 + 505 + 0.0332 * 262144 + 150)
+
+
+# ── invariant (shape-independent) terms ────────────────────────────────────
+
+def test_invariant_from_dict_ignores_shape():
+    block = make_block(shape="--flash-attn on -ub 512", source="fit-estimate")
+    assert FitParams.invariant_from_dict(block, "q8_0") == (
+        10000, 0.5, 0.0, "fit-estimate")
+
+
+def test_invariant_from_dict_rejects_bad_cache_type():
+    assert FitParams.invariant_from_dict(
+        make_block(cache_type="q4_0"), "q8_0") is None
+
+
+def test_invariant_from_dict_rejects_missing_term():
+    block = make_block()
+    del block["slot_mib"]
+    assert FitParams.invariant_from_dict(block, "q8_0") is None
+
+
+def test_invariant_from_dict_rejects_unmeasured_source():
+    assert FitParams.invariant_from_dict(
+        make_block(source="guess"), "q8_0") is None
+
+
+def test_from_dict_still_rejects_shape_mismatch():
+    # The full block is shape-bound for compute; only the invariant terms
+    # survive a shape change (see the C7 reuse path below).
+    assert FitParams.from_dict(make_block(shape="-ub 2048"), "q8_0",
+                               shape="") is None
+
+
+# ── weight term from the GGUF header ────────────────────────────────────────
+
+def test_weight_mib_prefers_tensor_bytes(make_model):
+    model = make_model("w", context_length=32768)
+    write_gguf(model.gguf_path, tensor_names=["w.weight"],
+               tensor_shape=(2048, 1024))
+    assert model.vram._weight_mib(5) == 8       # tensor footprint wins
+    assert model.vram._weight_mib(100) == 100   # header estimate is the floor
+
+
+# ── C7: reuse invariant terms across a shape change ─────────────────────────
+
+def test_fit_params_static_reuses_invariant_on_shape_change(
+        make_model, monkeypatch):
+    model = make_model(
+        "c7", context_length=32768,
+        derived={
+            "model_mib": 10000, "kv_per_token_mib": 0.5, "slot_mib": 100.0,
+            "compute_mib": 1000, "source": "fit-estimate",
+            "cache_type": "q8_0", "shape": "--flash-attn on -ub 512",
+        })
+    model.resolve_companions()
+    vram = model.vram
+    new_shape = "--flash-attn on -ub 256"
+    # the saved block's shape differs, so the full block is rejected...
+    assert vram.saved_for("q8_0", new_shape) is None
+    # ...but its invariant terms are reused and only compute is re-measured.
+    monkeypatch.setattr(vram, "_fit_params_compute", lambda *a, **k: 777)
+    got = vram.fit_params_static("/bin/fit", "q8_0", llama_args=new_shape)
+    assert got is not None
+    assert (got.model_mib, got.kv_per_token_mib, got.slot_mib) == (
+        10000, 0.5, 100.0)
+    assert got.compute_mib == 777
+    assert got.shape == new_shape
+
+
+def test_fit_params_static_shape_change_without_invariant(
+        make_model, monkeypatch):
+    model = make_model(
+        "c7b", context_length=32768,
+        derived={
+            "model_mib": 10000, "source": "fit-estimate",
+            "cache_type": "q8_0", "shape": "--flash-attn on -ub 512",
+        })
+    model.resolve_companions()
+    vram = model.vram
+    monkeypatch.setattr(vram, "_fit_params_compute", lambda *a, **k: 777)
+    # no invariant terms -> the C7 reuse path cannot fire; the full estimate
+    # path is attempted (and returns None here: no fit-params binary).
+    assert vram.fit_params_static("/bin/fit", "q8_0", llama_args="x") is None

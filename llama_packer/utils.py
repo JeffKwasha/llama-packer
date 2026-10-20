@@ -23,6 +23,7 @@ from pathlib import Path
 
 import yaml
 
+from llama_packer import ggufmeta
 from llama_packer.consts import (
     _SAFETENSORS_DTYPE_BYTES,
     _KV_CACHE_BYTES,
@@ -192,62 +193,20 @@ def get_model_size_mb(model_path: str) -> int:
 def read_gguf_context_length(path: str | os.PathLike) -> int | None:
     """Read `<architecture>.context_length` from a GGUF header.
 
-    Minimal dependency-free parser: walks the metadata KV block until it finds a
-    `context_length` key and returns its integer value. Returns None for
-    safetensors, non-GGUF files, or parse failures. The value is the model's
-    architectural context limit as shipped — no RoPE/YaRN extension applied.
+    Uses the public ``gguf`` module (via :mod:`llama_packer.ggufmeta`).
+    Returns None for safetensors, non-GGUF files, or parse failures. The
+    value is the model's architectural context limit as shipped — no
+    RoPE/YaRN extension applied.
     """
-    import struct
     logger.info("reading GGUF header: %s", path)
-    try:
-        with open(path, "rb") as f:
-            if f.read(4) != b"GGUF":
-                return None
-            f.read(4)  # version (u32)
-            f.read(8)  # tensor_count (u64)
-            (n_kv,) = struct.unpack("<Q", f.read(8))  # metadata_kv_count
-            # value-type -> byte width (u8/i8/u16/i16/u32/i32/f32/bool/u64/i64/f64)
-            widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
-            for _ in range(n_kv):
-                (klen,) = struct.unpack("<Q", f.read(8))
-                if klen > 4096:  # sanity: keys are short; guards against misalignment
-                    return None
-                key = f.read(klen).decode(errors="replace")
-                (vtype,) = struct.unpack("<I", f.read(4))
-                if vtype == 8:  # string
-                    (slen,) = struct.unpack("<Q", f.read(8))
-                    f.read(slen)
-                elif vtype == 9:  # array
-                    (etype,) = struct.unpack("<I", f.read(4))
-                    (alen,) = struct.unpack("<Q", f.read(8))
-                    esize = widths.get(etype, 4)
-                    for _ in range(alen):
-                        if etype == 8:
-                            (elen,) = struct.unpack("<Q", f.read(8))
-                            f.read(elen)
-                        else:
-                            f.read(esize)
-                elif vtype in widths:
-                    raw = f.read(widths[vtype])
-                    if "context_length" in key:
-                        if vtype in (0, 1):
-                            return raw[0]
-                        if vtype == 2:
-                            return struct.unpack("<H", raw)[0]
-                        if vtype == 3:
-                            return struct.unpack("<h", raw)[0]
-                        if vtype == 4:
-                            return struct.unpack("<I", raw)[0]
-                        if vtype == 5:
-                            return struct.unpack("<i", raw)[0]
-                        if vtype == 10:
-                            return struct.unpack("<Q", raw)[0]
-                        if vtype == 11:
-                            return struct.unpack("<q", raw)[0]
-                else:
-                    return None
-    except (OSError, ValueError, struct.error):
+    reader = ggufmeta.gguf_reader(path)
+    if reader is None:
         return None
+    for key, field in reader.fields.items():
+        if key.endswith(".context_length"):
+            value = field.contents()
+            if isinstance(value, int):
+                return value
     return None
 
 
@@ -351,30 +310,78 @@ def _detect_drive_speed(model_paths: list[Path]) -> int:
     return min(speeds)
 
 
+#: Subdirectory of a deployment directory that may hold the engine binaries.
+#: A run directory mixes generated config with hundreds of MB of binaries, and
+#: ``extras/update.py`` puts every engine under one root, so the deployed
+#: layout is ``<dir>/tools/<engine>`` next to ``<dir>/config.yaml``. Both
+#: shapes are accepted everywhere: directories installed before this existed
+#: have their binaries directly in the run directory, and a repo checkout
+#: still has them there.
+TOOLS_SUBDIR = "tools"
+
+
+def binary_search_dirs(base_dir: Path) -> list[Path]:
+    """Where an engine binary may live under *base_dir*, most specific first.
+
+    ``tools/`` first: a deployment that keeps its binaries there is the shape
+    everything now writes, and finding a stale flat leftover in preference to
+    it would be the wrong answer.
+    """
+    dirs = [base_dir / TOOLS_SUBDIR, base_dir]
+    return dirs
+
+
 def get_available_versions(base_dir: Path) -> list[int]:
-    """List available llama-b#### version numbers under base_dir."""
+    """List available llama-b#### version numbers under base_dir or its tools/."""
     return sorted(
-        int(d.name.removeprefix("llama-b"))
-        for d in base_dir.glob("llama-b[0-9]*")
-        if d.is_dir()
+        {
+            int(d.name.removeprefix("llama-b"))
+            for directory in binary_search_dirs(base_dir)
+            for d in directory.glob("llama-b[0-9]*")
+            if d.is_dir()
+        }
     )
 
 
 def find_bin_dir(version: str, base_dir: Path) -> str:
-    """Resolve llama-server binary directory."""
+    """Resolve llama-server binary directory.
+
+    Returns a path **relative to** *base_dir* (e.g. ``llama-b11714``, or
+    ``tools/llama-b11714`` when the binaries live in the tools directory), so
+    the caller can join it against the directory it was given.
+
+    Searching ``tools/`` first is what lets a deployment keep its binaries out
+    of the directory holding the config; a flat run directory — a repo
+    checkout, or anything installed before that layout existed — still
+    resolves, unchanged.
+    """
     env = os.environ.get("LLAMA_BIN_DIR")
     if env:
+        env_path = Path(env)
+        versions = get_available_versions(env_path)
+        if not versions:
+            return env  # a flat binary directory
+        for directory in binary_search_dirs(env_path):
+            build = directory / f"llama-b{versions[-1]}"
+            if build.is_dir():
+                return str(build)  # a deployment root: its newest build
         return env
     if version == "latest":
         versions = get_available_versions(base_dir)
         if not versions:
             raise SystemExit(
-                "error: no llama-b#### directory found here\n"
+                f"error: no llama-b#### directory found in "
+                f"{base_dir} or {base_dir / TOOLS_SUBDIR}\n"
                 "  use --llama-server <path> or set LLAMA_BIN_DIR to locate llama-server"
             )
-        return f"llama-b{versions[-1]}"
-    if (base_dir / f"llama-b{version}").is_dir():
+        wanted = versions[-1]
+    elif (base_dir / f"llama-b{version}").is_dir():
         return f"llama-b{version}"
+    else:
+        wanted = version
+    for directory in binary_search_dirs(base_dir):
+        if (directory / f"llama-b{wanted}").is_dir():
+            return str((directory / f"llama-b{wanted}").relative_to(base_dir))
     avail = " ".join(str(v) for v in get_available_versions(base_dir))
     raise SystemExit(f"error: version {version} not found\n  available: {avail}")
 
@@ -521,10 +528,9 @@ _GGUF_PROBE_CACHE: dict[tuple[str, int], tuple[str | None, bool]] = {}
 def gguf_header_probe(path: str | os.PathLike) -> tuple[str | None, bool]:
     """Read ``(general.architecture, has_context_length)`` from a GGUF header.
 
-    Same dependency-free KV walk as :func:`read_gguf_context_length`; returns
-    ``(None, False)`` for non-GGUF or unparseable files.  Cached per mtime.
+    Uses the public ``gguf`` module; returns ``(None, False)`` for non-GGUF
+    or unparseable files.  Cached per mtime.
     """
-    import struct
     try:
         st = os.stat(path)
     except OSError:
@@ -535,47 +541,13 @@ def gguf_header_probe(path: str | os.PathLike) -> tuple[str | None, bool]:
     logger.info("reading GGUF header: %s", path)
     arch: str | None = None
     has_ctx = False
-    try:
-        with open(path, "rb") as f:
-            if f.read(4) != b"GGUF":
-                raise ValueError
-            f.read(12)  # version + tensor_count
-            (n_kv,) = struct.unpack("<Q", f.read(8))
-            widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4,
-                      7: 1, 10: 8, 11: 8, 12: 8}
-            for _ in range(n_kv):
-                (klen,) = struct.unpack("<Q", f.read(8))
-                if klen > 4096:
-                    raise ValueError
-                key_s = f.read(klen).decode(errors="replace")
-                (vtype,) = struct.unpack("<I", f.read(4))
-                if vtype == 8:
-                    (slen,) = struct.unpack("<Q", f.read(8))
-                    raw = f.read(slen)
-                    if key_s == "general.architecture":
-                        arch = raw.decode(errors="replace")
-                        if has_ctx:
-                            break
-                elif vtype == 9:  # array
-                    (etype,) = struct.unpack("<I", f.read(4))
-                    (alen,) = struct.unpack("<Q", f.read(8))
-                    esize = widths.get(etype, 4)
-                    if etype == 8:
-                        for _ in range(alen):
-                            (elen,) = struct.unpack("<Q", f.read(8))
-                            f.seek(elen, 1)
-                    else:
-                        f.seek(esize * alen, 1)
-                elif vtype in widths:
-                    f.seek(widths[vtype], 1)
-                else:
-                    raise ValueError
-                if key_s.endswith(".context_length"):
-                    has_ctx = True
-                    if arch is not None:
-                        break
-    except (OSError, ValueError, struct.error):
-        pass
+    reader = ggufmeta.gguf_reader(path)
+    if reader is not None:
+        for k, field in reader.fields.items():
+            if k == "general.architecture":
+                arch = field.contents()
+            elif k.endswith(".context_length"):
+                has_ctx = True
     _GGUF_PROBE_CACHE[key] = (arch, has_ctx)
     return arch, has_ctx
 
@@ -588,12 +560,11 @@ def gguf_has_mtp_layers(path: str | os.PathLike) -> bool | None:
 
     ``nextn`` is the tensor-name marker every GGUF MTP conversion uses
     (deepseek2/GLM/qwen nextn blocks); conversions sometimes strip them
-    while the sidecar keeps ``mtp:``.  Reads metadata and tensor names
-    only — a few hundred KiB, no tensor data — and caches per mtime.
-    Returns True / False, or None when the header cannot be parsed
-    (the caller then keeps the declared intent rather than guessing).
+    while the sidecar keeps ``mtp:``.  Reads tensor names only — no tensor
+    data — and caches per mtime.  Returns True / False, or None when the
+    header cannot be parsed (the caller then keeps the declared intent
+    rather than guessing).
     """
-    import struct
     try:
         st = os.stat(path)
     except OSError:
@@ -601,52 +572,9 @@ def gguf_has_mtp_layers(path: str | os.PathLike) -> bool | None:
     key = (str(path), st.st_mtime_ns)
     if key in _GGUF_MTP_CACHE:
         return _GGUF_MTP_CACHE[key]
-    result: bool | None = None
-    try:
-        with open(path, "rb") as f:
-            if f.read(4) != b"GGUF":
-                raise ValueError
-            f.read(4)  # version
-            (n_tensors,) = struct.unpack("<Q", f.read(8))
-            (n_kv,) = struct.unpack("<Q", f.read(8))
-            widths = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
-                      10: 8, 11: 8, 12: 8}
-
-            def skip_value() -> None:
-                (vtype,) = struct.unpack("<I", f.read(4))
-                if vtype == 8:
-                    (slen,) = struct.unpack("<Q", f.read(8))
-                    f.seek(slen, 1)
-                elif vtype == 9:
-                    (etype,) = struct.unpack("<I", f.read(4))
-                    (count,) = struct.unpack("<Q", f.read(8))
-                    if etype == 8:
-                        for _ in range(count):
-                            (slen,) = struct.unpack("<Q", f.read(8))
-                            f.seek(slen, 1)
-                    elif etype == 9:
-                        raise ValueError  # nested arrays: not seen in the wild
-                    else:
-                        f.seek(widths[etype] * count, 1)
-                else:
-                    f.seek(widths[vtype], 1)
-
-            for _ in range(n_kv):
-                (klen,) = struct.unpack("<Q", f.read(8))
-                f.seek(klen, 1)
-                skip_value()
-            for _ in range(n_tensors):
-                (nlen,) = struct.unpack("<Q", f.read(8))
-                name = f.read(nlen)
-                (ndims,) = struct.unpack("<I", f.read(4))
-                f.seek(8 * ndims + 12, 1)  # ne[] + type + offset
-                if b"nextn" in name.lower():
-                    result = True
-                    break
-            else:
-                result = False
-    except (OSError, ValueError, struct.error):
-        result = None
+    reader = ggufmeta.gguf_reader(path)
+    result = None if reader is None else any(
+        "nextn" in tensor.name.lower() for tensor in reader.tensors)
     _GGUF_MTP_CACHE[key] = result
     return result
 

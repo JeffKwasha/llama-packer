@@ -54,6 +54,56 @@ def test_find_bin_dir_unknown_version_exits(tmp_path, monkeypatch):
     assert "9" in str(exc.value) and "7" in str(exc.value)
 
 
+# ── the tools/ layout ──────────────────────────────────────────────────────
+#
+# A deployment keeps its engines in <run dir>/tools so the directory holding
+# config.yaml is not also a 400 MB binary dump. Everything that resolved a
+# binary from the run directory has to know that, and every layout installed
+# before it has to keep resolving.
+
+
+def _build(base: Path, name: str = "llama-b11714") -> Path:
+    d = base / name
+    d.mkdir(parents=True)
+    (d / "llama-server").write_text("x")
+    return d
+
+
+def test_find_bin_dir_resolves_inside_tools(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
+    _build(tmp_path / utils.TOOLS_SUBDIR)
+    assert utils.find_bin_dir("latest", tmp_path) == "tools/llama-b11714"
+
+
+def test_tools_wins_over_a_stale_flat_build(tmp_path, monkeypatch):
+    """Both layouts present: tools/ is the deployment, the flat copy is old."""
+    monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
+    _build(tmp_path, "llama-b11539")
+    _build(tmp_path / utils.TOOLS_SUBDIR, "llama-b11714")
+    assert utils.find_bin_dir("latest", tmp_path) == "tools/llama-b11714"
+
+
+def test_available_versions_span_both_layouts(tmp_path):
+    _build(tmp_path, "llama-b11539")
+    _build(tmp_path / utils.TOOLS_SUBDIR, "llama-b11714")
+    assert utils.get_available_versions(tmp_path) == [11539, 11714]
+
+
+def test_no_builds_anywhere_names_both_places_it_looked(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        utils.find_bin_dir("latest", tmp_path)
+    message = str(exc.value)
+    assert str(tmp_path) in message
+    assert utils.TOOLS_SUBDIR in message
+
+
+def test_binary_search_dirs_puts_tools_first(tmp_path):
+    dirs = utils.binary_search_dirs(tmp_path)
+    assert dirs[0] == tmp_path / utils.TOOLS_SUBDIR
+    assert dirs[-1] == tmp_path
+
+
 def test_find_bin_dir_latest_with_no_builds_exits(tmp_path, monkeypatch):
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     with pytest.raises(SystemExit):

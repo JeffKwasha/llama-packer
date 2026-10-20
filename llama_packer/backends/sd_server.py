@@ -33,6 +33,7 @@ class SdServerBackend(BaseBackend):
         include_mmproj: bool = True,
         batch: int | None = None,
         ubatch: int | None = None,
+        entry_id: str | None = None,
     ) -> tuple[str, dict]:
         # Main diffusion model is the resolved gguf/safetensors.
         assert model.gguf_path is not None or model.hf_repo is not None

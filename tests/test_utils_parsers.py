@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 
+from _gguf import write_gguf
 from llama_packer.utils import parse_context_length, parse_mem_mb
 
 
@@ -116,35 +117,18 @@ def test_hf_hub_cache_honours_huggingface_hub_cache(tmp_path, monkeypatch):
 # ── Model-kind classification (header-only) ───────────────────────────────
 
 
-def _gguf_bytes(kv: dict) -> bytes:
-    """Minimal GGUF: magic, v3 header, no tensors, string/u32 metadata only."""
-    import struct
-    out = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
-           + struct.pack("<Q", len(kv)))
-    for k, v in kv.items():
-        kb = k.encode()
-        out += struct.pack("<Q", len(kb)) + kb
-        if isinstance(v, str):
-            vb = v.encode()
-            out += struct.pack("<I", 8) + struct.pack("<Q", len(vb)) + vb
-        else:
-            out += struct.pack("<I", 4) + struct.pack("<I", int(v))
-    return out
-
-
 def test_classify_gguf_text_architecture(tmp_path):
     from llama_packer.utils import classify_file, gguf_header_probe
-    p = tmp_path / "m.gguf"
-    p.write_bytes(_gguf_bytes({"general.architecture": "qwen3vl",
-                               "qwen3vl.context_length": 262144}))
+    p = write_gguf(tmp_path / "m.gguf", arch="qwen3vl",
+                   context_length=262144)
     assert gguf_header_probe(p) == ("qwen3vl", True)
     assert classify_file(p) == "text"
 
 
 def test_classify_gguf_diffusion_architecture(tmp_path):
     from llama_packer.utils import classify_file, gguf_header_probe
-    p = tmp_path / "flux.gguf"
-    p.write_bytes(_gguf_bytes({"general.architecture": "flux1"}))
+    p = write_gguf(tmp_path / "flux.gguf", arch="flux1",
+               context_length=None)
     assert gguf_header_probe(p) == ("flux1", False)
     assert classify_file(p) == "image"
 
@@ -153,9 +137,8 @@ def test_classify_ignores_filename_llm_named_like_media(tmp_path):
     # MiniMax H3-style case: a text model whose *filename* looks media-ish is
     # still classified by its header architecture, never the name.
     from llama_packer.utils import classify_file
-    p = tmp_path / "MiniMax-H3-video-sounding-name.gguf"
-    p.write_bytes(_gguf_bytes({"general.architecture": "minimaxh3",
-                               "minimaxh3.context_length": 1000000}))
+    p = write_gguf(tmp_path / "MiniMax-H3-video-sounding-name.gguf",
+                   arch="minimaxh3", context_length=1000000)
     assert classify_file(p) == "text"
 
 

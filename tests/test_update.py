@@ -103,6 +103,28 @@ def make_binary(path: Path, text: str) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def _no_deployment_config(monkeypatch, tmp_path):
+    """Keep every test off this box's committed ``extras/engines.ini``.
+
+    Two separate hazards, one fixture. The shipped file names a real
+    deployment's directories, so a test that resolves install locations
+    without saying where they come from would assert against whichever box the
+    suite runs on -- and, worse, *install into it*: resolution feeds the
+    installers, and a stubbed download plus a real deployment directory is a
+    real deployment directory with a fake binary in it. That happened once
+    (a 22-byte llama-server in /opt/llama/tools) before this fixture existed.
+
+    Pinning the discovery candidates to ``tmp_path`` as well closes the second
+    door: with the shipped config unreadable, discovery walks outwards from
+    the cwd and would otherwise reach the real repo and the real tools root.
+    Tests that care about configuration pass it in explicitly.
+    """
+    monkeypatch.setattr(upd, "config_path",
+                        lambda: tmp_path / "no-such-engines.ini")
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+
+
 # --- version discovery / bookkeeping ---------------------------------------
 
 
@@ -736,8 +758,24 @@ def test_swap_arch_override_aliases():
 # --- single-binary engines (audio.cpp, whisper.cpp) -------------------------
 
 
-AUDIO_URL = "https://example.com/audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz"
+AUDIO_URL = "https://example.com/audio-v0.9.2-bin-ubuntu-x64-vulkan-portable.tar.gz"
+AUDIO_PLAIN_URL = "https://example.com/audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz"
 WHISPER_URL = "https://example.com/whisper-bin-ubuntu-x64.tar.gz"
+
+
+def make_audio_tarball() -> bytes:
+    """The real audio.cpp portable tarball: a directory, not a lone binary.
+
+    It ships libggml-vulkan.so and the CPU backend variants beside the server,
+    which loads them from its own directory — so copying out the binary alone
+    yields something that starts, answers /health, and then cannot find a
+    backend.
+    """
+    return make_engine_tarball(
+        "audiocpp_server",
+        wrap="audio-v0.9.2-bin-ubuntu-x64-vulkan-portable",
+        extra=(("libggml-vulkan.so", b"\x7fELF fake"),
+               ("libggml-cpu-x64.so", b"\x7fELF fake")))
 
 
 def make_engine_tarball(name: str = "audiocpp_server", subdir: str = "",
@@ -819,16 +857,28 @@ def test_resolve_engine_tag_no_match_returns_empty(monkeypatch):
     assert upd.resolve_engine_tag(upd.WHISPER, "x64") == ""
 
 
-def test_audio_cpp_asset_pattern_skips_portable():
-    # audio.cpp publishes both a plain and a "-portable" Vulkan build; the
-    # pattern is anchored so the wrong one cannot win by sort order.
+def test_audio_cpp_asset_pattern_picks_the_portable_build():
+    """The portable build is the one that works on this fleet.
+
+    Measured on the R9700/radv host: the plain ``-vulkan`` build of the same
+    tag answers /health and then dies with SIGILL on the first synthesis
+    request; ``-vulkan-portable`` returns a valid WAV. The pattern used to be
+    anchored to exclude ``-portable``, so this tool installed the build that
+    crashes while the deployment ran a hand-copied portable one.
+    """
     payload = {"assets": [
-        {"browser_download_url":
-         "https://x/audio-v0.9.2-bin-ubuntu-x64-vulkan-portable.tar.gz"},
         {"browser_download_url": AUDIO_URL},
+        {"browser_download_url": AUDIO_PLAIN_URL},
     ]}
-    assert upd.find_asset(payload, upd.AUDIO_CPP.asset_pattern("").format(
-        arch="x64")) == AUDIO_URL
+    pattern = upd.AUDIO_CPP.asset_pattern("").format(arch="x64")
+    assert upd.find_asset(payload, pattern) == AUDIO_URL
+    assert not upd.find_asset({"assets": [
+        {"browser_download_url": AUDIO_PLAIN_URL}]}, pattern)
+
+
+def test_audio_cpp_is_a_bundle_because_its_libs_must_travel():
+    # The portable server loads libggml-vulkan.so from its own directory.
+    assert upd.AUDIO_CPP.bundle, "a solo binary would not find its backend"
 
 
 def test_verify_archive_warns_when_upstream_has_no_checksums(tmp_path,
@@ -877,7 +927,7 @@ def test_verify_archive_quarantines_mismatch_in_install_dir(tmp_path,
 
 
 def test_update_engine_installs_and_symlinks(tmp_path, monkeypatch):
-    blob = make_engine_tarball("audiocpp_server")
+    blob = make_audio_tarball()
     releases = [{"tag_name": "v0.9.2",
                  "assets": [{"browser_download_url": AUDIO_URL}]}]
     monkeypatch.setattr(upd, "gh_api",
@@ -887,8 +937,9 @@ def test_update_engine_installs_and_symlinks(tmp_path, monkeypatch):
     assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2) is True
     primary = tmp_path / "audiocpp_server"
     assert primary.is_symlink()
-    assert os.readlink(primary) == "audiocpp_server-v0.9.2"
-    assert (tmp_path / "audiocpp_server-v0.9.2").is_file()
+    assert os.readlink(primary) == "audiocpp_server-v0.9.2/audiocpp_server"
+    bundle = tmp_path / "audiocpp_server-v0.9.2"
+    assert (bundle / "libggml-vulkan.so").is_file(), "libraries must travel"
 
 
 def test_update_engine_installs_bundle_with_its_libraries(tmp_path, monkeypatch):
@@ -919,7 +970,7 @@ def test_update_engine_installs_bundle_with_its_libraries(tmp_path, monkeypatch)
 
 def test_update_engine_backs_up_the_replaced_binary(tmp_path, monkeypatch):
     make_binary(tmp_path / "audiocpp_server", "old build")
-    blob = make_engine_tarball("audiocpp_server")
+    blob = make_audio_tarball()
     releases = [{"tag_name": "v0.9.2",
                  "assets": [{"browser_download_url": AUDIO_URL}]}]
     monkeypatch.setattr(upd, "gh_api",
@@ -931,7 +982,9 @@ def test_update_engine_backs_up_the_replaced_binary(tmp_path, monkeypatch):
 
 
 def test_update_engine_is_a_noop_when_already_present(tmp_path, monkeypatch):
-    make_binary(tmp_path / "audiocpp_server-v0.9.2", "engine")
+    bundle = tmp_path / "audiocpp_server-v0.9.2"
+    bundle.mkdir()
+    (bundle / "audiocpp_server").write_bytes(b"bin")
     called = []
     monkeypatch.setattr(upd, "gh_api",
                         lambda url: called.append(url) or [])
@@ -1355,3 +1408,332 @@ def test_ambiguous_target_selector_is_refused(monkeypatch, capsys):
     rc = upd.main(["s"])
     assert rc == 1, "an ambiguous selector must not install anything"
     assert "ambiguous" in capsys.readouterr().err
+
+
+# --- install-location resolution -------------------------------------------
+#
+# The rule these tests defend: running `update.py` from anywhere on the box
+# updates the engine that is already installed, in the directory it is
+# already in. Before this, the install directory was `Path.cwd()`, so the only
+# way to update audio.cpp was to cd into its directory first -- and running it
+# from the wrong place installed a second copy of an engine that was already
+# there.
+
+
+def _clean_env(monkeypatch):
+    """No inherited configuration, so resolution sees only what a test sets."""
+    for var in ("LLAMA_DIR", "LLAMA_BIN_DIR", "LLAMA_SWAP_BIN_DIR",
+                "AUDIOCPP_BIN_DIR", "WHISPER_BIN_DIR", "SD_BIN_DIR"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_existing_install_is_updated_in_place_from_anywhere(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    home = tmp_path / "tools"
+    (home / "audiocpp").mkdir(parents=True)
+    make_binary(home / "audiocpp" / "audiocpp_server", "audio")
+
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(upd, "_discovery_candidates",
+                        lambda: [elsewhere, home])
+    dirs = upd.resolve_install_dirs()
+
+    assert dirs["audio"] == (home / "audiocpp", "existing install")
+
+
+def test_the_stable_name_wins_over_a_nested_binary(tmp_path, monkeypatch):
+    """A root holding the primary name *is* the home; no descending."""
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "tools"
+    root.mkdir()
+    make_binary(root / "llama-swap", "v265")          # the stable name
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [root])
+
+    assert upd.resolve_install_dirs()["swap"][0] == root
+
+
+def test_descends_into_a_per_engine_directory(tmp_path, monkeypatch):
+    # The fleet shape: tools/ holds tools/audiocpp/, and tools/audiocpp/ is
+    # where the engine lives. Installing into tools/ instead would put a
+    # second audiocpp_server beside the first.
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "tools"
+    (root / "audiocpp").mkdir(parents=True)
+    make_binary(root / "audiocpp" / "audiocpp_server", "audio")
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [root])
+
+    assert upd.resolve_install_dirs()["audio"][0] == root / "audiocpp"
+
+
+def test_never_descends_into_a_versioned_build_dir(tmp_path, monkeypatch):
+    """llama-b11658/ holds llama-server; that is not the cpp home."""
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "tools"
+    build = root / "llama-b11658"
+    build.mkdir(parents=True)
+    make_binary(build / "llama-server", "server")
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [root])
+
+    assert upd.resolve_install_dirs()["cpp"][0] == root
+
+
+def test_two_installs_in_one_root_are_not_a_guess(tmp_path, monkeypatch, capsys):
+    """audiocpp/ and old_audiocpp/ both hold an engine: ask, do not pick."""
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "tools"
+    for name in ("audiocpp", "old_audiocpp"):
+        (root / name).mkdir(parents=True)
+        make_binary(root / name / "audiocpp_server", "audio")
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [root])
+
+    dirs = upd.resolve_install_dirs()
+
+    err = capsys.readouterr().err
+    assert "not guessing" in err and "old_audiocpp" in err
+    assert "--dir audio=" in err, "the warning must say how to settle it"
+    assert dirs["audio"][0] == root   # the root, not one of the two
+
+
+def test_dir_override_beats_everything(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "load_engines_config",
+                        lambda: (tmp_path, {"audio": str(tmp_path / "from-cfg")}))
+
+    dirs = upd.resolve_install_dirs({"audio": str(tmp_path / "explicit")})
+
+    assert dirs["audio"] == (tmp_path / "explicit", "--dir")
+
+
+def test_config_beats_discovery(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    make_binary(home / "audiocpp_server", "audio")
+    monkeypatch.setattr(upd, "_discovery_candidates",
+                        lambda: [home])
+    monkeypatch.setattr(upd, "load_engines_config",
+                        lambda: (None, {"audio": tmp_path / "declared"}))
+
+    assert upd.resolve_install_dirs()["audio"] == (
+        tmp_path / "declared", "engines.ini")
+
+
+def test_bin_dir_env_is_shared_with_llama_packer(tmp_path, monkeypatch):
+    # The packer already resolves $AUDIOCPP_BIN_DIR; one variable, both tools.
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AUDIOCPP_BIN_DIR", str(tmp_path / "engines"))
+    monkeypatch.setattr(upd, "load_engines_config", lambda: (None, {}))
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+
+    assert upd.resolve_install_dirs()["audio"] == (
+        tmp_path / "engines", "$AUDIOCPP_BIN_DIR")
+
+
+def test_bin_dir_env_accepts_a_binary_path(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    binary = tmp_path / "engines" / "whisper-server"
+    binary.parent.mkdir()
+    make_binary(binary, "server")
+    monkeypatch.setenv("WHISPER_BIN_DIR", str(binary))
+    monkeypatch.setattr(upd, "load_engines_config", lambda: (None, {}))
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+
+    assert upd.resolve_install_dirs()["whisper"][0] == tmp_path / "engines"
+
+
+def test_root_takes_over_when_nothing_is_installed(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "load_engines_config",
+                        lambda: (tmp_path / "tools", {}))
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+
+    dirs = upd.resolve_install_dirs()
+    assert dirs["audio"] == (tmp_path / "tools", "engines.ini root")
+
+
+def test_fallback_without_config_or_env_is_the_cwd(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "load_engines_config", lambda: (None, {}))
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+
+    assert upd.resolve_install_dirs()["cpp"] == (tmp_path, "current directory")
+
+
+# --- engines.ini ------------------------------------------------------------
+
+
+def test_engines_config_reads_root_and_per_engine(tmp_path):
+    cfg = tmp_path / "engines.ini"
+    cfg.write_text(
+        "[engines]\n"
+        "# a comment\n"
+        "root = /tools\n"
+        "audio = /tools/audiocpp\n"
+        "\n"
+        "[other]\n"
+        "root = ignored\n")
+
+    root, engines = upd.load_engines_config(cfg)
+
+    assert root == Path("/tools")
+    assert engines == {"audio": Path("/tools/audiocpp")}
+
+
+def test_engines_config_empty_values_mean_unset(tmp_path):
+    cfg = tmp_path / "engines.ini"
+    cfg.write_text("[engines]\nroot =\naudio =\n")
+    assert upd.load_engines_config(cfg) == (None, {})
+
+
+def test_engines_config_absent_file_is_not_an_error(tmp_path):
+    assert upd.load_engines_config(tmp_path / "nope.ini") == (None, {})
+
+
+def test_engines_config_malformed_is_reported_not_fatal(tmp_path, capsys):
+    cfg = tmp_path / "engines.ini"
+    cfg.write_text("this is not ini [[[\n")
+    root, engines = upd.load_engines_config(cfg)
+    assert (root, engines) == (None, {})
+    assert "ignoring unreadable" in capsys.readouterr().err
+
+
+def test_engines_config_unknown_engine_is_reported(tmp_path, capsys):
+    cfg = tmp_path / "engines.ini"
+    cfg.write_text("[engines]\nnope = /x\n")
+    _, engines = upd.load_engines_config(cfg)
+    assert engines == {}
+    assert "unknown engine" in capsys.readouterr().err
+
+
+def test_shipped_engines_ini_names_only_known_engines(capsys):
+    """The committed file is a real deployment's, not a template.
+
+    It must parse cleanly and name nothing the resolver does not know — a
+    typo here silently sends an update to the wrong place, which is exactly
+    the failure the config exists to prevent.
+    """
+    shipped = EXTRAS / "engines.ini"
+    assert shipped.is_file()
+    root, engines = upd.load_engines_config(shipped)
+    assert set(engines) <= set(upd.INSTALL_UNITS)
+    assert capsys.readouterr().err == ""
+    # Whatever it declares, every engine it covers resolves to that directory
+    # rather than falling back to a guess.
+    for key, declared in engines.items():
+        dirs = upd.resolve_install_dirs(config=(root, engines))
+        assert dirs[key][0] == declared, key
+
+
+# --- CLI surface ------------------------------------------------------------
+
+
+def test_dir_override_must_be_engine_equals_path():
+    with pytest.raises(upd.TargetError, match=r"expects <engine>=<path>"):
+        upd.parse_dir_overrides(["audio"])
+    with pytest.raises(upd.TargetError, match="unknown engine"):
+        upd.parse_dir_overrides(["nope=/x"])
+
+
+def test_print_paths_downloads_nothing(tmp_path, monkeypatch, capsys):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+    monkeypatch.setattr(upd, "update_llama_cpp",
+                        lambda *a, **k: pytest.fail("must not install"))
+    monkeypatch.setattr(upd, "update_llama_swap",
+                        lambda *a, **k: pytest.fail("must not install"))
+    monkeypatch.setattr(upd, "update_engine",
+                        lambda *a, **k: pytest.fail("must not install"))
+
+    assert upd.main(["all", "--print-paths"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Install locations:" in out
+    assert "audiocpp_server" in out
+
+
+def test_main_passes_each_engine_its_own_directory(tmp_path, monkeypatch):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+    seen = {}
+    monkeypatch.setattr(
+        upd, "update_llama_cpp",
+        lambda d, *_a, **_k: (seen.__setitem__("cpp", d), (True, None))[1])
+    monkeypatch.setattr(
+        upd, "update_llama_swap",
+        lambda d, *_a, **_k: (seen.__setitem__("swap", d), True)[1])
+    monkeypatch.setattr(
+        upd, "update_engine",
+        lambda eng, d, *_a, **_k: (seen.__setitem__(eng.key, d), True)[1])
+
+    assert upd.main(["all", "--dir", "audio=/srv/audio"]) == 0
+    assert seen["audio"] == Path("/srv/audio")
+
+
+def test_bad_dir_stops_before_any_download(tmp_path, monkeypatch, capsys):
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "update_llama_cpp",
+                        lambda *a, **k: pytest.fail("must not install"))
+    assert upd.main(["cpp", "--dir", "audio"]) == 1
+    assert "--dir expects" in capsys.readouterr().err
+
+
+# --- the stable llama-server name ------------------------------------------
+
+
+def test_cpp_install_creates_the_stable_server_link(tmp_path, monkeypatch):
+    # tools/llama-server -> ./llama-bNNNN/llama-server: the name a config can
+    # pin, so moving to a new build is a symlink change and nothing that
+    # references it has to be edited.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+    monkeypatch.setattr(upd, "update_llama_swap", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        upd, "gh_api", lambda _url: {"assets": [{"browser_download_url": CPP_URL}]}
+    )
+    monkeypatch.setattr(upd, "download", stub_download(make_cpp_tarball(), ""))
+
+    assert upd.main(["b11539"]) == 0
+
+    server = tmp_path / "llama-server"
+    assert server.is_symlink()
+    assert os.readlink(server) == "./llama-b11539/llama-server"
+    assert server.resolve().is_file(), "the stable name must not dangle"
+
+
+def test_stable_server_link_follows_a_new_build(tmp_path, monkeypatch):
+    (build := tmp_path / "llama-b11539").mkdir()
+    make_binary(build / "llama-server", "server")
+    (build2 := tmp_path / "llama-b11600").mkdir()
+    make_binary(build2 / "llama-server", "server")
+    os.symlink("./llama-b11539/llama-server", tmp_path / "llama-server")
+
+    upd.update_llama_cpp_symlinks(tmp_path, "b11600")
+
+    assert os.readlink(tmp_path / "llama-server") == "./llama-b11600/llama-server"
+
+
+def test_a_real_llama_server_file_is_never_replaced(tmp_path, capsys):
+    """A hand-placed binary is somebody's deliberate choice."""
+    make_binary(tmp_path / "llama-server", "hand-built")
+    build = tmp_path / "llama-b11600"
+    build.mkdir()
+    make_binary(build / "llama-server", "server")
+
+    upd.update_llama_cpp_symlinks(tmp_path, "b11600")
+
+    assert not (tmp_path / "llama-server").is_symlink()
+    assert "is a real file" in capsys.readouterr().err

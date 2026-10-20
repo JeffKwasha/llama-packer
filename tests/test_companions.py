@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 
+from _gguf import write_gguf
 from llama_packer.vram import _DRAFT_COMPUTE_MB, _DRAFT_CTX_SAFETY, _MMPROJ_COMPUTE_MB
 
 MIB = 1024 * 1024
@@ -92,15 +93,7 @@ def test_effective_static_result_is_cached(tmp_path, make_model,
 
 def _mini_gguf(path, tensor_names):
     """A parseable GGUF header with the given tensor names, no data."""
-    import struct
-    out = b"GGUF" + struct.pack("<I", 3)
-    out += struct.pack("<Q", len(tensor_names)) + struct.pack("<Q", 0)
-    for name in tensor_names:
-        nb = name.encode()
-        out += struct.pack("<Q", len(nb)) + nb
-        out += struct.pack("<I", 1) + struct.pack("<Q", 4096)
-        out += struct.pack("<I", 0) + struct.pack("<Q", 0)
-    path.write_bytes(out)
+    write_gguf(path, tensor_names=tensor_names, tensor_shape=(4, 4))
 
 
 def test_mtp_gate_blocks_stripped_gguf(tmp_path, make_model):

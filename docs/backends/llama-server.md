@@ -20,7 +20,9 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
 <llama_bin> --port ${PORT} -m <model.gguf>
   --kv-unified-per-slot <ctx> --parallel <N>
   --cache-type-k <ct> --cache-type-v <ct>
-  --n-gpu-layers (999 | 0)          # 0 when the model is CPU-resident
+  --n-gpu-layers 0                  # only when the model is CPU-resident;
+                                    # otherwise omitted (llama-server "auto"
+                                    # offloads all layers on a GPU build)
   [-b <batch> -ub <ubatch>]         # role-aware defaults
   [--mmproj <file>] [--image-min-tokens/--image-max-tokens]
   [--spec-type ... --spec-draft-model ...]   # MTP / speculative
@@ -50,7 +52,7 @@ byte-identical to a `-c parallel*X` pool (validated against `llama-fit-params`).
 Affine fit-params model (`llama-fit-params`): `model_mib + kv_per_token × ctx ×
 slots + slot_mib + compute_mib`, per `cache_type`. Measurements are persisted
 in the sidecar `derived:` block; `--remeasure` re-runs them. See
-`docs/new-model-pipeline.md`.
+`SPEC.md`.
 
 ## See also
 

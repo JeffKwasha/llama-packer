@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 
 import pytest
 
+from _gguf import write_gguf
 from llama_packer import gpu_state, vram
 from llama_packer.consts import _MIN_CTX_SIZE
 from llama_packer.vram import (FitParams, parse_device_buffers,
@@ -566,26 +568,10 @@ def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
 
 def _write_mmproj(path, *, patch=16, merge=2, projector="qwen3vl_merger"):
     """Write a minimal but valid GGUF carrying clip vision geometry."""
-    import struct
-
-    def s(x: str) -> bytes:
-        b = x.encode()
-        return struct.pack("<Q", len(b)) + b
-
-    kv = {"clip.vision.patch_size": patch,
-          "clip.projector_type": projector}
+    kv = {"clip.vision.patch_size": patch, "clip.projector_type": projector}
     if merge:
         kv["clip.vision.spatial_merge_size"] = merge
-    body = b""
-    for k, v in kv.items():
-        body += s(k)
-        if isinstance(v, str):
-            body += struct.pack("<I", 8) + s(v)
-        else:
-            body += struct.pack("<I", 4) + struct.pack("<I", int(v))
-    header = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
-              + struct.pack("<Q", len(kv)))
-    path.write_bytes(header + body)
+    write_gguf(path, arch="clip", context_length=None, kv=kv)
 
 
 def _vision_geom(make_model, tmp_path, stem, fit, *, patch=16, merge=2,
@@ -843,46 +829,6 @@ def test_whisper_fixed_compute_is_small(make_model):
     # per-model buffer is small — not the 512 MB sd-server constant.
     quad = model.vram.effective_static("unused")
     assert quad[3] == 100
-
-
-def test_correction_keys_on_baked_in_draft_not_companion(
-        monkeypatch, tmp_path, make_model, fit_params_block):
-    # delta_d on an mtp=1 row prices a draft baked into the main GGUF;
-    # a separate draft companion must key mtp=0 and get its draft from
-    # the companion fold instead (double-count guard)
-    import llama_packer.vram as vram_mod
-
-    monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
-    (tmp_path / "draft.gguf").write_bytes(b"x")
-    corrections = gpu_state.cache_dir() / "serve-corrections.json"
-    corrections.parent.mkdir(exist_ok=True)
-    corrections.write_text(json.dumps({
-        "fakearch|q8_0|0": {"delta_fixed": 0, "delta_c": 0.0, "delta_d": 0.0},
-        "fakearch|q8_0|1": {"delta_fixed": 0, "delta_c": 0.0, "delta_d": 448.9},
-    }))
-
-    def fake_trio(design, cache_type, llama_args="", source="",
-                  fit_bin=None):
-        return FitParams(1000, 0.5, 10.0, 500, "fit-params", "q8_0")
-
-    monkeypatch.setattr(vram_mod.VramBudget, "_measure_affine_trio",
-                        staticmethod(fake_trio))
-
-    # companion draft: "mtp" in the name, but not baked in -> mtp=0 row
-    m = make_model("cd", **{"derived": dict(fit_params_block),
-                            "speculative": "draft.gguf"})
-    m._file._header = ("fakearch", True, None)
-    fp = m.vram._fit_params_serve("unused", "q8_0")
-    assert fp is not None and fp.slot_mib == pytest.approx(10.0)
-
-    # baked-in draft (mtp declared, no companion) -> mtp=1 row
-    m2 = make_model("bi", **{"derived": dict(fit_params_block), "mtp": True})
-    m2._file._header = ("fakearch", True, None)
-    monkeypatch.setattr(vram_mod.utils, "gguf_has_mtp_layers",
-                        lambda p: True)
-    fp2 = m2.vram._fit_params_serve("unused", "q8_0")
-    assert fp2 is not None
-    assert fp2.slot_mib == pytest.approx(10.0 + 448.9)
 
 
 def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):

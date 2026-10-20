@@ -1,7 +1,15 @@
 # llama-swap.service -- hardened unit template for llama-packer's install.py.
 #
 # Substituted by `extras/install.py`; @PLACEHOLDER@ tokens are replaced:
-#   @USER@ @GROUP@ @DIR@ @LISTEN@
+#   @USER@ @GROUP@ @DIR@ @SWAP@ @LISTEN@
+#
+# @SWAP@ is the llama-swap binary this deployment actually has. It is
+# @DIR@/tools/llama-swap for anything installed by the current install.py,
+# and @DIR@/llama-swap for a deployment whose binaries predate that layout —
+# resolved rather than assumed, because a unit naming a file that is not
+# there fails in the least legible way available. WorkingDirectory stays the
+# run directory either way: it is where config.yaml lives, and audio.cpp
+# entries write their per-port server.json under /tmp/llama-swap from there.
 #
 # The hardening block is the point of this file and is copied verbatim into
 # the installed unit -- do not weaken it to make an install succeed. Two
@@ -34,7 +42,7 @@ RestartSec=5
 User=@USER@
 Group=@GROUP@
 WorkingDirectory=@DIR@
-ExecStart=@DIR@/llama-swap --listen @LISTEN@ --config @DIR@/config.yaml -watch-config
+ExecStart=@SWAP@ --listen @LISTEN@ --config @DIR@/config.yaml -watch-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 @GPU_ENV@
 EnvironmentFile=-@DIR@/config.env
@@ -64,7 +72,14 @@ PrivateTmp=true
 InaccessiblePaths=@INACCESSIBLE_PATHS@
 
 # --- Devices: block all, allow only the GPU nodes this host actually has ---
-PrivateDevices=true
+# DevicePolicy=closed + DeviceAllow, not PrivateDevices=true. Verified on
+# systemd 259 (2026-10-19): the private /dev never materialises the
+# DeviceAllow'd DRI/kfd nodes (open → ENOENT), so with PrivateDevices every
+# Vulkan backend is skipped and llama-server serves on CPU, silently. closed
+# keeps the cgroup-v2 BPF device blocklist on the shared /dev; note the
+# explicit node paths are required — the `char-dri` alias does not enumerate
+# under a closed policy even when the paths do.
+DevicePolicy=closed
 @DEVICE_ALLOW@
 
 # --- Privilege & kernel lockdown ---
@@ -89,8 +104,23 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictFileSystems=
 
 # --- Misc ---
+# ProtectProc=invisible hides *other users'* processes, which is the part that
+# matters here. ProcSubset=pid is deliberately NOT set, despite being the
+# natural companion: it hides the non-process entries under /proc, and the
+# serving stack reads several of them.
+#
+#   * llama-swap logs `failed to read sys stats: couldn't read /proc/meminfo`
+#     on every matrix decision without it, and the matrix planner needs total
+#     memory to decide whether a set fits at all.
+#   * The GPU backends probe system memory during device init. With
+#     /proc/meminfo unreadable, ggml's Vulkan/HIP init cannot size its buffers,
+#     the device is skipped, and llama.cpp falls back to CPU *silently* —
+#     `--n-gpu-layers` set and all — while /proc/meminfo is exactly what the
+#     GPU stack needs to see a card.
+#
+# Both failures are quiet in the sense that the service stays up and serves;
+# they show up as CPU-shaped throughput and a log line nobody reads.
 ProtectProc=invisible
-ProcSubset=pid
 MemoryDenyWriteExecute=false
 OOMScoreAdjust=1000
 

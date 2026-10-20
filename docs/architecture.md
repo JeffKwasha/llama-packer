@@ -86,8 +86,7 @@ plain data — see `tests/test_planner.py`.
 
 - [backends/](backends/) — one doc per engine: roles/formats, command shape, config keys, VRAM
 - [transports/](transports/) — host / docker / podman: launch wrapping, path translation, lifecycle
-- [new-model-pipeline.md](new-model-pipeline.md) — the end-to-end walkthrough
-  for "a GGUF appeared": discovery → fit-params estimate → matrix solve →
-  auto-parallel → emit, including the measurement-shape contract, the
-  batch/ubatch keys, and what deleting a `derived:` block actually costs
+- [SPEC.md](../SPEC.md) — behavioral contract (discovery, fit-params
+  estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch
+  keys, and what deleting a `derived:` block costs)
   (seconds of header-only work — never a server, never a probe).

@@ -303,6 +303,7 @@ def _build_entry(
     ctx_size: int,
     include_mmproj: bool = True,
     name_suffix: str = "",
+    entry_id_tail: str = "",
     tools_demoted: bool = False,
     usage: tuple["UsageDemand", ...] = (),
     estimate_error: str | None = None,
@@ -317,6 +318,13 @@ def _build_entry(
     ``include_mmproj=False`` omits the vision projection from the command,
     removes the ``image``/``video`` input capabilities, and flags
     ``name_suffix`` is appended to the model display name.
+    ``entry_id_tail`` is the already-disambiguated ``.<category>.<flags>``
+    segment; it is folded into the returned entry id **here** rather than by
+    the caller so the id is final before the launch command is composed —
+    backends that route on the requested model id (audio.cpp) embed it in
+    their own config payload and must see exactly the id the entry is
+    published under.
+
     ``tools_demoted=True`` drops the ``tools`` capability: the matrix solve
     served the model below ``tools_min_ctx``, so advertising tool calling
     would mislead clients — ``metadata.tools_demoted`` records why.
@@ -338,6 +346,16 @@ def _build_entry(
     model = model.view_for(include_mmproj)
     base_id = model.template_id
 
+    # The entry id is settled before the command is composed: the category/
+    # flags tail is passed in already disambiguated, so the backend gets the
+    # exact string this entry will be published under (audio.cpp validates
+    # the requested model id against its own config and 500s on a mismatch).
+    names = [p[0] for p in profiles_group]
+    has_default = "default" in names
+    entry_id = base_id if (has_default or len(profiles_group) > 1) else f"{base_id}.{names[0]}"
+    if entry_id_tail:
+        entry_id = f"{entry_id}.{entry_id_tail}"
+
     # Build the launch command via the model's backend.  The backend is chosen
     # by override rules (model.backend), and validation/skip of unsupported
     # format/role combos happens in build_config's pre-pass.
@@ -355,6 +373,7 @@ def _build_entry(
         model, ctx_size, parallel, cache_type, template_vars,
         include_mmproj=include_mmproj,
         batch=batch, ubatch=ubatch,
+        entry_id=entry_id,
     )
     cmd_str = _strip_repeat_ws(cmd_str)
 
@@ -376,10 +395,6 @@ def _build_entry(
     mode_params = _build_mode_params(model, profiles_group, profiles_defaults)
     if mode_params:
         set_params = mode_params
-
-    names = [p[0] for p in profiles_group]
-    has_default = "default" in names
-    entry_id = base_id if (has_default or len(profiles_group) > 1) else f"{base_id}.{names[0]}"
 
     # Metadata: pass-through frontmatter + computed selection signals.
     # Pass-through-by-default: any new sidecar field an agent writes flows
@@ -2193,7 +2208,9 @@ class Planner:
 
         # values are Variant lists, except the reserved admission key
         plan: dict = {}
-        for model in self.models:
+        n_models = len(self.models)
+        for i, model in enumerate(self.models, 1):
+            logger.info("planning %d/%d: %s", i, n_models, model.stem)
             model.image_budget_warnings()
             include_mmproj = True   # per-category now; see solve_rung
             view = model.view_for(include_mmproj)
@@ -2901,6 +2918,7 @@ def emit_config(models: list[Model], plan: dict,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
                 include_mmproj=v.include_mmproj,
                 name_suffix=disp,
+                entry_id_tail=tail,
                 tools_demoted=v.tools_demoted,
                 usage=v.usage,
                 estimate_error=v.estimate_error,
@@ -2908,7 +2926,6 @@ def emit_config(models: list[Model], plan: dict,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
                 vram_note=v.vram_note,
             )
-            entry_id += f".{tail}" if tail else ""
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "

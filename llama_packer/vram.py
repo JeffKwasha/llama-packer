@@ -1,36 +1,23 @@
 """VRAM budget calculation: affine memory measurement, context sizing, and
 matrix solving.
 
-The VRAM law (validated across families; see :mod:`llama_packer.memory_probe`
+The VRAM law (validated across families; see llama_packer.memory_probe
 and docs/plans/auto-parallel.md):
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 
-``C`` is the *total* shared KV pool (llama.cpp ``-c``; byte-identical to
-``--kv-unified-per-slot X -np p`` with pool ``p*X``), ``c`` the shared
-per-token cost, and ``D`` the fixed per-slot cost.  Every serve-shaped
-extra — MTP draft weights and KV, hybrid-arch recurrent-state (RS) caches,
-batch-size compute, slot overhead — is affine in ``(C, p)``, so a
-three-run measurement trio under the exact flags the server will run
-with pins the law from device totals alone:
 
-    D = t(C, 2) - t(C, 1)          # the fixed term cancels
-    c = 2 * (t(C, 1) - t(C/2, 1)) / C   # the pool difference cancels it
-    fixed = t(C, 1) - c*C - D
+C - the *total* shared KV pool
+p - parallel
 
-Measurements come from real ``llama-server`` runs (device buffer lines in
-the ``-lv 5`` log), not ``llama-fit-params`` — fit-params reports the KV
-pool only, blind to the RS cache, the draft, and the batch-dependent
-compute, which is exactly the undercount that made Dirk spill 4.8 GB into
-GTT (2026-09-07; see docs/plans/auto-parallel.md).
+c - the shared per-token cost
+D - the fixed per-slot cost
 
-``FitParams`` values persist in the sidecar ``derived:`` block — per
-``cache_type`` and per measured flag **shape** (``derived: shape``: the
-effective serve args — profiles global args + role batch flags; the
-compute buffer depends on batch size and flash attention, so blocks are
-never reused across shapes; a flags change re-measures).  Blocks are keyed
-by ``source``: blocks from the retired fit-params measurement are rejected
-on load and re-measured.  ``Model.persist_measured`` is the single writer.
+Measurements come from llama-fit-params, llama-packer --probe-memory
+llama-fit-params is blind to the recurrent-state cache, the baked-in
+MTP draft, and the batch-dependent compute
+
+llama-packer --probe-memory measures these directly into the sidecar ``derived:`` block
 """
 
 from __future__ import annotations
@@ -50,6 +37,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from llama_packer import gpu_state
+from llama_packer import ggufmeta
 from llama_packer import utils
 from llama_packer import vllm_estimate
 from llama_packer.consts import (
@@ -85,6 +73,13 @@ logger = logging.getLogger(__name__)
 # Required keys in the measured frontmatter block
 _FIT_PARAMS_REQUIRED = frozenset(
     {"model_mib", "kv_per_token_mib", "slot_mib", "compute_mib"})
+
+# The shape-independent subset: weights, KV geometry and per-cell recurrent
+# state do not depend on the serve flag shape, so a block measured under one
+# shape still supplies them when the shape changes.  Only ``compute_mib`` is
+# shape-bound (batch size / flash attention shape the compute buffer).
+_INVARIANT_PARAMS_REQUIRED = frozenset(
+    {"model_mib", "kv_per_token_mib", "slot_mib"})
 
 # Per-backend fixed compute map, assembled from the backend name sets.
 _FIXED_COMPUTE_MB = {**{n: _SD_COMPUTE_MB for n in SD_BACKENDS},
@@ -183,21 +178,6 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def affine_from_pair(
-    ctx_mib_1: float, ctx_mib_2: float, total_ctx: float,
-) -> tuple[float, float]:
-    """Derive ``(c, D)`` from two measurements at the same total context.
-
-    ``D`` is the per-slot cost (``ctx(2) − ctx(1)``); ``c`` the remaining
-    per-token KV share.  ``total_ctx`` must be the full ``-c`` pool the two
-    measurements were taken at.  Negative measurement noise clamps ``D``
-    to zero (err toward reserving more).
-    """
-    slot_mib = max(float(ctx_mib_2 - ctx_mib_1), 0.0)
-    kv_per_token = (ctx_mib_1 - slot_mib) / total_ctx if total_ctx > 0 else 0.0
-    return kv_per_token, slot_mib
-
-
 # llama-fit-params ``-lv 5`` log lines (0.6 s per run, no tensor data read):
 # the device report row plus the exact KV-pool and recurrent-state sizes.
 _FIT_REPORT_RE = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", re.M)
@@ -236,104 +216,6 @@ def parse_fit_log(log_text: str) -> dict[str, float] | None:
             "rs_cells": rs_cells,
         }
     return None
-
-
-# ── per-arch serve corrections (measured once by --probe-memory) ─────────
-
-_LEGACY_CORRECTIONS_NAME = "serve-corrections.json"
-_CORRECTIONS_NAME = "serve-corrections.yaml"
-_CORR_WARNED: set[str] = set()
-
-
-def _corrections_path() -> Path:
-    """Durable machine-local corrections file beside ``profiles.yaml``.
-
-    Corrections are hardware/backend-specific (allocator overhead, RS
-    geometry differences between estimate and serve): machine-local, hence
-    gitignored — but durable and inspectable, unlike a cache directory.
-    ``LLAMA_PACKER_CORRECTIONS`` relocates the file (tests; multi-host
-    checkouts).  The retired ``~/.cache`` JSON stays readable as a
-    fallback so existing calibrations survive the move without a re-probe.
-    """
-    override = os.environ.get("LLAMA_PACKER_CORRECTIONS")
-    if override:
-        return Path(override)
-    return Path(__file__).resolve().parent.parent / _CORRECTIONS_NAME
-
-
-def _load_corrections() -> dict:
-    """Parsed corrections table: the YAML file, else the legacy cache JSON.
-
-    Returns ``{}`` when neither exists.  A malformed YAML file is warned
-    about and treated as empty (the estimate then runs uncorrected).
-    """
-    path = _corrections_path()
-    for candidate, is_yaml in ((path, True),):
-        try:
-            with open(candidate) as f:
-                table = yaml.safe_load(f)
-            return table if isinstance(table, dict) else {}
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError, yaml.YAMLError) as e:
-            logger.warning("serve corrections unreadable (%s): %s — "
-                           "estimates run uncorrected", candidate, e)
-            return {}
-    # Legacy fallback: the retired machine-local cache JSON.
-    legacy = gpu_state.cache_dir() / _LEGACY_CORRECTIONS_NAME
-    try:
-        with open(legacy) as f:
-            table = json.load(f)
-        return table if isinstance(table, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def get_serve_correction(
-    arch: str, cache_type: str, mtp_on: bool, shape: str = "",
-) -> dict | None:
-    """The measured ``(delta_fixed, delta_c, delta_d)`` row for an arch.
-
-    Rows are written by ``--probe-memory`` (serve-shaped llama-server grid
-    on the family representative minus the fast fit-params estimate) and
-    keyed by ``arch | cache_type | mtp``; each row records the flag shape
-    the witness ran under.  A row measured under a *different* shape is
-    still applied — the deltas are mostly shape-independent allocator
-    bias — with a one-time per-arch note that a re-probe would refresh it.
-    Returns None when uncalibrated (the estimate runs uncorrected; that is
-    never an error).
-    """
-    table = _load_corrections()
-    row = table.get(f"{arch}|{cache_type}|{int(mtp_on)}")
-    if row is None or not isinstance(row, dict):
-        return None
-    row_shape = str(row.get("shape", ""))
-    if row_shape and shape and row_shape != shape:
-        key = f"{arch}|{cache_type}|{int(mtp_on)}"
-        if key not in _CORR_WARNED:
-            _CORR_WARNED.add(key)
-            logger.warning(
-                "serve correction for arch %r was measured under %r, now "
-                "estimating under %r — applying anyway (allocator-level "
-                "deltas); --probe-memory %s refreshes it",
-                arch, row_shape, shape, arch)
-    return row
-
-
-def save_serve_correction(
-    arch: str, cache_type: str, mtp_on: bool, row: dict,
-) -> None:
-    """Persist one correction row (merges into the YAML table)."""
-    path = _corrections_path()
-    table = _load_corrections()
-    row = dict(row)
-    row.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
-    table[f"{arch}|{cache_type}|{int(mtp_on)}"] = row
-    try:
-        with open(path, "w") as f:
-            yaml.safe_dump(table, f, default_flow_style=False, sort_keys=True)
-    except OSError as e:
-        logger.warning("cannot write serve corrections %s: %s", path, e)
 
 
 # The llama-server readiness marker: every buffer line precedes it.
@@ -435,6 +317,42 @@ class FitParams:
     source: str
     cache_type: str
     shape: str = ""
+    allocator_mib: int = 0
+    mtp_slot_mib: float = 0.0
+    compute_by_ubatch: dict | None = None
+    probe_ubatch: int = 0
+
+    @classmethod
+    def invariant_from_dict(
+        cls, d: object, cache_type: str,
+    ) -> tuple[int, float, float, str] | None:
+        """The shape-independent terms of a frontmatter block.
+
+        ``model_mib``, ``kv_per_token_mib`` and ``slot_mib`` do not depend on
+        the serve flag shape — weights, KV geometry and per-cell recurrent
+        state are all flag-independent — so a block measured under one shape
+        still supplies them when the shape changes.  Only ``compute_mib`` is
+        shape-bound.  Returns ``(model_mib, c, D, source)``, or None when the
+        block is missing, malformed, or for a different cache type.
+        """
+        if not isinstance(d, dict):
+            return None
+        if not _INVARIANT_PARAMS_REQUIRED.issubset(d):
+            return None
+        try:
+            model_mib = int(d["model_mib"])
+            kv_per_token_mib = float(d["kv_per_token_mib"])
+            slot_mib = float(d["slot_mib"])
+        except (TypeError, ValueError):
+            return None
+        if model_mib <= 0 or kv_per_token_mib <= 0 or slot_mib < 0:
+            return None
+        if str(d.get("cache_type", "")) != str(cache_type):
+            return None
+        source = str(d.get("source", ""))
+        if source not in _MEASURED_SOURCES:
+            return None
+        return model_mib, kv_per_token_mib, slot_mib, source
 
     @classmethod
     def from_dict(cls, d: object, cache_type: str,
@@ -448,27 +366,20 @@ class FitParams:
         the batch-dependent compute, so they are re-measured), or if the
         block predates shape stamping or was measured under a different
         flag shape (batch size / flash attention change the compute term —
-        stale numbers are re-measured).
+        stale numbers are re-measured).  Use :meth:`invariant_from_dict` to
+        reuse the shape-independent terms across a shape change.
         """
         if not isinstance(d, dict):
             return None
-        if not _FIT_PARAMS_REQUIRED.issubset(d):
+        inv = cls.invariant_from_dict(d, cache_type)
+        if inv is None:
             return None
+        model_mib, kv_per_token_mib, slot_mib, source = inv
         try:
-            model_mib = int(d["model_mib"])
-            kv_per_token_mib = float(d["kv_per_token_mib"])
-            slot_mib = float(d["slot_mib"])
             compute_mib = int(d["compute_mib"])
-        except (TypeError, ValueError):
+        except (KeyError, TypeError, ValueError):
             return None
-        if model_mib <= 0 or kv_per_token_mib <= 0 or slot_mib < 0 \
-                or compute_mib < 0:
-            return None
-        saved_cache = str(d.get("cache_type", ""))
-        if saved_cache != str(cache_type):
-            return None
-        source = str(d.get("source", ""))
-        if source not in _MEASURED_SOURCES:
+        if compute_mib < 0:
             return None
         if "shape" not in d:
             # Pre-shape block: the flags it was measured under are unknown,
@@ -476,14 +387,33 @@ class FitParams:
             return None
         if source in _SHAPE_SOURCES and str(d["shape"]) != str(shape):
             return None
+        def _opt_int(key, default=0):
+            try:
+                return int(d.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _opt_float(key, default=0.0):
+            try:
+                return float(d.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        cbu = d.get("compute_by_ubatch")
+        if not isinstance(cbu, dict):
+            cbu = None
         return cls(
             model_mib=model_mib,
             kv_per_token_mib=kv_per_token_mib,
             slot_mib=slot_mib,
             compute_mib=compute_mib,
             source=source,
-            cache_type=saved_cache,
+            cache_type=str(d.get("cache_type", "")),
             shape=str(d["shape"]),
+            allocator_mib=_opt_int("allocator_mib"),
+            mtp_slot_mib=_opt_float("mtp_slot_mib"),
+            compute_by_ubatch=cbu,
+            probe_ubatch=_opt_int("probe_ubatch"),
         )
 
     def to_dict(self) -> dict:
@@ -494,7 +424,7 @@ class FitParams:
         inspection instead of by archaeology.  ``shape`` records the flag
         string the values were measured under.
         """
-        return {
+        d = {
             "model_mib": self.model_mib,
             "kv_per_token_mib": self.kv_per_token_mib,
             "slot_mib": self.slot_mib,
@@ -504,12 +434,24 @@ class FitParams:
             "shape": self.shape,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
+        if self.allocator_mib:
+            d["allocator_mib"] = self.allocator_mib
+        if self.mtp_slot_mib:
+            d["mtp_slot_mib"] = self.mtp_slot_mib
+        if self.compute_by_ubatch:
+            d["compute_by_ubatch"] = self.compute_by_ubatch
+        if self.probe_ubatch:
+            d["probe_ubatch"] = self.probe_ubatch
+        return d
 
     def vram_mib(self, ctx_per_slot: int, parallel: int = 1) -> int:
         """Predicted VRAM at (per-slot context, slots) — the affine law."""
         pool = ctx_per_slot * parallel
-        return int(self.model_mib + self.compute_mib
+        return int(self.model_mib + self.compute_mib + self.allocator_mib
                    + self.kv_per_token_mib * pool + self.slot_mib * parallel)
+
+
+_CORR_WARNED: set[str] = set()
 
 
 # ── VramBudget: per-model VRAM calculator ────────────────────────────────
@@ -782,6 +724,24 @@ class VramBudget:
                 self.model.stem, ctx, parallel, outcome)
         return buffers
 
+    def _weight_mib(self, fit_model: int) -> int:
+        """Weight term: the larger of fit-params' header estimate and the
+        GGUF's on-disk tensor bytes.
+
+        ``llama-fit-params`` reports a header-derived *logical* size that
+        drops layers it does not count — baked-in MTP/nextn heads and the
+        CPU-mapped split — so it under-reports the real weight buffer by
+        ~1.3 GB on such models (measured: fit 18569 vs real 19899.31 MiB on
+        Dirk).  The GGUF tensor footprint is what the loader actually maps,
+        so it is the term to trust; the header estimate stays as a floor for
+        files whose header cannot be walked.
+        """
+        if self.model.gguf_path is not None:
+            tensor_bytes = ggufmeta.gguf_tensor_bytes(self.model.gguf_path)
+            if tensor_bytes is not None:
+                return max(fit_model, tensor_bytes // (1024 * 1024))
+        return fit_model
+
     def _measure_affine_trio(
         self,
         design: int,
@@ -832,9 +792,10 @@ class VramBudget:
             return None
         pool1 = r1["kv"] + r1["rs"]
         slot_mib = max((r2["kv"] + r2["rs"]) - pool1, 0.0)
-        compute_mib = int(max(r1["compute"], r2["compute"], r3["compute"]))
+        compute_mib = int(r1["compute"]) if r1.get("compute") else int(
+            max(r1["compute"], r2["compute"], r3["compute"]))
         return FitParams(
-            model_mib=int(r1["model"]),
+            model_mib=self._weight_mib(int(r1["model"])),
             kv_per_token_mib=kv_per_token,
             slot_mib=slot_mib,
             compute_mib=compute_mib,
@@ -849,20 +810,11 @@ class VramBudget:
         cache_type: str,
         llama_args: str = "",
     ) -> FitParams | None:
-        """Serve-shaped estimate from the fast fit-params trio (+ corrections).
+        """Serve-shaped estimate from the fast fit-params trio.
 
-        The trio (:meth:`_measure_affine_trio`) is exact for ``c`` and
-        ``D``; the MTP draft and the allocator-level terms are not
-        observable this way, so the measured per-arch correction
-        (``--probe-memory``, machine-local cache) closes the gap:
-
-            c   = c_kv                       (+ delta_c)
-            D   = D_fit + per_cell * (mtp ? 2 : 1)   (+ delta_d)
-            fix = model + compute + per_cell * (mtp ? 1 : 0)  (+ delta_fixed)
-
-        Normal packer runs never start a server; this is the only
-        measurement they do.  Not persisted — persistence belongs to
-        :meth:`fit_params_static`.
+        ``c`` and ``D`` are exact (derived from pool lines); ``model`` and
+        ``compute`` come from fit-params and are unsound until a
+        ``--probe-memory`` run persists a ``llama-server`` block.
         """
         shape = (llama_args or "").strip()
         params = self._measure_affine_trio(self._design_ctx(), cache_type,
@@ -870,41 +822,30 @@ class VramBudget:
                                            fit_bin=fit_bin)
         if params is None:
             return None
-        # The correction's mtp dimension means "a draft is baked into the
-        # main GGUF" — that is what the witness measured and what delta_d
-        # prices.  A separate draft companion does not qualify (its cost
-        # is folded in by effective_static instead).  Model.mtp_baked_in is
-        # the same predicate memory_probe files the row under.
         mtp_on = self.model.mtp_baked_in
-        corr = get_serve_correction(self.model.arch or "unknown", cache_type,
-                                    mtp_on, shape)
-        if corr is not None:
-            # Corrections are measured at witness scale; clamp so a much
-            # smaller model of the same arch can't go negative (from_dict
-            # would reject the block and re-measure on every run).
-            params = FitParams(
-                model_mib=params.model_mib,
-                kv_per_token_mib=max(1e-6, params.kv_per_token_mib
-                                     + corr["delta_c"]),
-                slot_mib=max(0.0, params.slot_mib + corr["delta_d"]),
-                compute_mib=max(0, params.compute_mib
-                                + int(corr["delta_fixed"])),
-                source="fit-estimate",
-                cache_type=cache_type,
-                shape=shape,
-            )
-        else:
-            # Uncorrected — never an error, so one note per arch, not per
-            # model.  Probes are opt-in calibration, not a requirement.
-            key = f"{self.model.arch}|{cache_type}|{int(mtp_on)}"
-            if key not in _CORR_WARNED:
-                _CORR_WARNED.add(key)
-                logger.warning(
-                    "estimate uncorrected for arch %r (mtp=%s) — ctx/fit "
-                    "may undercount draft and allocator terms; optional: "
-                    "--probe-memory %s calibrates",
-                    self.model.arch, mtp_on, self.model.arch)
+        key = f"{self.model.arch}|{cache_type}|{int(mtp_on)}"
+        if key not in _CORR_WARNED:
+            _CORR_WARNED.add(key)
+            logger.warning("estimate uncorrected for arch %r (mtp=%s) — "
+                           "--probe-memory %s calibrates",
+                           self.model.arch, mtp_on, self.model.arch)
         return params
+
+    def _fit_params_compute(self, fit_bin: str, cache_type: str,
+                            llama_args: str = "") -> int | None:
+        """Measure only the shape-bound compute term.
+
+        The invariant terms (model, c, D) are reused from the saved block, so
+        a batch/flash change costs one ``llama-fit-params`` run instead of
+        the whole trio.  The compute buffer is largest at the design context
+        (p=1), which is the max the trio's three-run max would return.
+        """
+        r = self.fit_params(fit_bin=fit_bin, fit_ctx=self._design_ctx(),
+                            cache_type=cache_type, parallel=1,
+                            llama_args=llama_args)
+        if r is None:
+            return None
+        return int(r["compute"])
 
     def _fit_params_fast(self, cache_type: str, fit_bin: str,
                          llama_args: str = "") -> FitParams | None:
@@ -970,6 +911,25 @@ class VramBudget:
                 self._persist(saved)
             self._static_cache[(cache_type, shape)] = saved
             return saved
+
+        # 1b. The saved block's shape does not match (batch/flash changed).
+        #     Its invariant terms (model, c, D) are flag-independent, so reuse
+        #     them and measure only the shape-bound compute term — one
+        #     fit-params run instead of the whole trio.
+        if not self.remeasure:
+            raw = self.model.measured_block()
+            inv = FitParams.invariant_from_dict(raw, cache_type) \
+                if raw is not None else None
+            if inv is not None:
+                comp = self._fit_params_compute(fit_bin, cache_type, llama_args)
+                if comp is not None:
+                    saved = FitParams(
+                        model_mib=inv[0], kv_per_token_mib=inv[1],
+                        slot_mib=inv[2], compute_mib=comp,
+                        source=inv[3], cache_type=cache_type, shape=shape)
+                    self._persist(saved)
+                    self._static_cache[(cache_type, shape)] = saved
+                    return saved
 
         # 2. vLLM backends: estimate from the HF repo (vllm-memory-estimator)
         #    or a local safetensors header — the server measures GGUF only.

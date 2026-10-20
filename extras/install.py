@@ -150,7 +150,7 @@ def gpu_vendor() -> str | None:
     return None
 
 
-def newest_build(src: Path, pattern: str = "llama-b*") -> Path | None:
+def newest_installed_build(src: Path, pattern: str = "llama-b*") -> Path | None:
     """Highest-numbered ``llama-bNNNNN`` directory in *src*, or None.
 
     Numbered by the digits, not by name: ``llama-b9999`` must sort below
@@ -265,13 +265,54 @@ def prepare_dir(r: Runner, dir_: Path, group: str) -> None:
     print(f"  {dir_}  root:{group}  2775 (setgid, group-writable)")
 
 
+def tools_dir(dir_: Path) -> Path:
+    """Where a deployment keeps its engine binaries: ``<run dir>/tools``."""
+    return dir_ / "tools"
+
+
+def llama_swap_binary(dir_: Path) -> Path:
+    """The llama-swap this deployment actually has, ``tools/`` preferred.
+
+    Returned even when nothing is installed yet, so the unit can be rendered
+    before the binaries land -- which is the order install.py works in.
+    """
+    for candidate in (tools_dir(dir_) / "llama-swap", dir_ / "llama-swap"):
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+    return tools_dir(dir_) / "llama-swap"
+
+
+def newest_build(dir_: Path) -> Path | None:
+    """Newest installed ``llama-bNNNN`` with a llama-server: ``tools/`` or flat.
+
+    Delegates to :func:`newest_installed_build` for each layout in turn. The
+    check is on the binary, not the directory name, because a build dir that
+    exists but has no llama-server is a truncated extraction and must not pass
+    for an install.
+    """
+    for directory in (tools_dir(dir_), dir_):
+        if build := newest_installed_build(directory):
+            return build
+    return None
+
+
 def install_binaries(r: Runner, dir_: Path, mode: str) -> None:
     """Put ``llama-swap`` and a llama.cpp build under *dir_*.
 
     Delegates to ``extras/update.py``, which already owns downloading,
-    checksumming and pruning, and installs into its own cwd. Reimplementing
-    that here would give two copies of the same logic to keep in step --
-    so this step runs the updater rather than duplicating it.
+    checksumming and pruning. Reimplementing that here would give two copies
+    of the same logic to keep in step -- so this step runs the updater rather
+    than duplicating it.
+
+    Engines go in ``<dir>/tools``, so a deployment directory holds its
+    generated config and a tree of binaries rather than both mixed together at
+    the top level.
+
+    Every engine's directory is pinned with ``--dir``. ``update.py`` otherwise
+    updates each engine *where it finds it*, searching outwards from the cwd --
+    which is right for an operator running it by hand and wrong here: a
+    fresh deployment into a new directory must install into *that* directory,
+    not adopt the engines of whatever parent it happens to sit under.
 
     It runs *before* the config is generated, and that ordering is load
     bearing rather than cosmetic: ``find_bin_dir`` resolves the llama
@@ -281,25 +322,34 @@ def install_binaries(r: Runner, dir_: Path, mode: str) -> None:
     if mode == "skip":
         print("  binaries: skipped (--binaries skip)")
     else:
+        target = tools_dir(dir_)
         logger.info("fetching binaries into %s via extras/update.py "
-                    "(set GITHUB_TOKEN for the API rate limit)", dir_)
-        r.run([sys.executable, str(REPO / "extras" / "update.py")], cwd=dir_)
+                    "(set GITHUB_TOKEN for the API rate limit)", target)
+        target.mkdir(parents=True, exist_ok=True)
+        pinned: list[str] = []
+        for engine in ("cpp", "swap", "audio", "whisper", "sd"):
+            pinned += ["--dir", f"{engine}={target}"]
+        r.run([sys.executable, str(REPO / "extras" / "update.py"), *pinned],
+              cwd=dir_)
     require_binaries(r, dir_)
+
 
 def require_binaries(r: Runner, dir_: Path) -> None:
     """Fail early when the config would have nothing to point at.
 
     Checked here so the error names the missing piece, instead of surfacing
     as llama-packer's ``no llama-b#### directory found here`` from inside the
-    config-generation step.
+    config-generation step. Both layouts count: ``tools/`` and flat.
     """
-    if newest_build(dir_) is None or not (dir_ / "llama-swap").exists():
+    if newest_build(dir_) is None or not llama_swap_binary(dir_).exists():
         if r.dry_run:
             return
         raise InstallError(
             f"{dir_} has no llama-b* build with a llama-server and no "
-            "llama-swap; run ./extras/install.py without --binaries skip, "
-            f"or populate it with: (cd {dir_} && {REPO / 'extras' / 'update.py'})")
+            "llama-swap (looked in the directory and in its tools/ "
+            f"subdirectory); run ./extras/install.py without --binaries skip, "
+            f"or populate it with: ({REPO / 'extras' / 'update.py'} --dir "
+            f"cpp={tools_dir(dir_)} --dir swap={tools_dir(dir_)})")
 
 
 def backup(path: Path, dry_run: bool) -> Path | None:
@@ -450,6 +500,11 @@ def render_unit(args: argparse.Namespace, dir_: Path) -> str:
         ("@USER@", args.user),
         ("@GROUP@", args.group),
         ("@DIR@", str(dir_)),
+        # The binary path is resolved, not assumed: a fresh install puts every
+        # engine in <dir>/tools/, but an existing deployment may still have
+        # llama-swap directly in the run directory, and a unit pointing at a
+        # file that is not there fails in the least legible way available.
+        ("@SWAP@", str(llama_swap_binary(dir_))),
         ("@LISTEN@", args.listen),
         ("@MEM_HIGH@", args.memory_high),
         ("@MEM_MAX@", args.memory_max),

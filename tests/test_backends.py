@@ -114,7 +114,8 @@ def test_llama_server_cmd_has_mmap_layers_and_cache(make_model):
     b = LlamaServerBackend()
     cmd, meta = b.build_cmd(m, 32768, 1, "q8_0", _tvars())
     assert cmd.startswith("/opt/llama-server --port ${PORT} -m ")
-    assert "--n-gpu-layers 999" in cmd
+    # GPU-resident models rely on llama-server's "auto" default.
+    assert "--n-gpu-layers" not in cmd
     assert "--cache-type-k q8_0 --cache-type-v q8_0" in cmd
     assert meta == {"mtp_enabled": False}
 
@@ -522,10 +523,13 @@ def test_llama_server_batch_ubatch_render_and_defaults(make_model):
     assert "-b 2048 -ub 512" in cmd
     assert "-b 512" not in cmd and "-ub 512" in cmd
     assert "--flash-attn on" in cmd
-    # Role defaults: embed/rerank keep their tuned batch depth; an unset
-    # half is None = "render nothing", so llama.cpp's builtin applies.
-    assert be.default_batch_ubatch("embeddings") == (4096, None)
-    assert be.default_batch_ubatch("rerank") == (4096, None)
+    # Role defaults: nothing configured means nothing rendered. embed/rerank
+    # used to declare `-b 4096`, but llama-server forces n_batch = n_ubatch
+    # when embeddings are on ("setting n_batch = n_ubatch = 512 to avoid
+    # assertion failure"), so that number never took effect. Throughput there
+    # is the ubatch, pinned fleet-wide.
+    assert be.default_batch_ubatch("embeddings") == (None, None)
+    assert be.default_batch_ubatch("rerank") == (None, None)
     assert be.default_batch_ubatch("chat") == (None, None)
     # cli_args -b/-ub warn once (shadowed + invisible to measurement).
     cmd2, _ = be.build_cmd(make_model("w", cli_args="-b 4096"), 32768, 1,
@@ -1121,7 +1125,7 @@ def test_audio_cpp_cmd_shape(make_model):
     assert '"port":${PORT}' in cmd            # unquoted -> JSON number
     assert "\n" in cmd                            # heredoc newlines are load-bearing
     assert "\nJSON\n" in cmd                      # heredoc terminator on its own line
-    assert '"id":"chatterbox"' in cmd             # audio.cpp id == llama-swap entry id
+    assert '"id":"chatterbox"' in cmd             # bare stem: no tail passed here
     assert '"family":"chatterbox"' in cmd
     assert '"task":"tts"' in cmd
     assert '"backend":"cuda"' in cmd
@@ -1129,6 +1133,22 @@ def test_audio_cpp_cmd_shape(make_model):
     assert '"default_request_options":{"temperature":0.8,"top_p":0.8}' in cmd
     assert str(m.gguf_path) in cmd
     assert meta == {}
+
+
+def test_audio_cpp_embeds_the_entry_id_the_router_uses(make_model):
+    """The engine id must be the id llama-swap publishes the entry under.
+
+    audio.cpp validates the requested model against its own `server.json`
+    `models[].id` and answers "unknown model id" on a mismatch — so a server
+    id that is not the entry id makes every audio request fail at the router.
+    Audio entries always carry a flags tail (`.s` speech-out, `.a`
+    audio-in), which is why passing the bare stem was never enough.
+    """
+    m = make_model("chatterbox", role="t2s", audio_cpp={"family": "chatterbox"})
+    cmd, _ = get_backend("audio-cpp").build_cmd(
+        m, 0, 1, "q8_0", {"audio_cpp_bin": "/opt/audiocpp_server"},
+        entry_id="chatterbox.s")
+    assert '"id":"chatterbox.s"' in cmd
 
 
 def test_audio_cpp_task_defaults_by_role(make_model):

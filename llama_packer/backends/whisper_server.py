@@ -41,6 +41,7 @@ class WhisperServerBackend(BaseBackend):
         include_mmproj: bool = True,
         batch: int | None = None,
         ubatch: int | None = None,
+        entry_id: str | None = None,
     ) -> tuple[str, dict]:
         assert model.gguf_path is not None
         flags = [

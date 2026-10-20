@@ -1,15 +1,14 @@
 # Installing llama-swap under systemd
 
-`extras/install.py` deploys a packed fleet: it creates the service account,
-installs the binaries into a run directory, regenerates `config.yaml` with
-llama-packer, writes a hardened systemd unit, and starts it.
+`extras/install.py` creates the service account, installs the binaries, 
+regenerates `config.yaml`, writes a hardened systemd unit, and starts it.
 
 ```sh
 sudo ./extras/install.py --user lemonade --group models --models-dir /mnt/ai/models
 ```
 
-Re-running is safe. It refreshes the binaries, the config and the unit; it
-never recreates the user and never drops an existing config.
+Idempotent: it refreshes the binaries, the config and the unit;
+it never recreates the user and never drops an existing config.
 
 ## What it does
 
@@ -18,7 +17,7 @@ never recreates the user and never drops an existing config.
 | Preflight | root, systemd, at least one GPU device node |
 | Account | `useradd --system --no-create-home --shell /usr/sbin/nologin` if absent; added to `render`, `video` and `--group` |
 | Run directory | `<dir>` as `root:<group>` mode `2775` |
-| Binaries | `extras/update.py all` run with `<dir>` as its cwd |
+| Binaries | `extras/update.py all`, every engine pinned with `--dir <engine>=<dir>` |
 | Config | llama-packer run **as the service user** from `<dir>`, writing `<dir>/config.yaml` and the sibling `config.env` |
 | Unit | [`extras/llama-swap.service.in`](../extras/llama-swap.service.in) rendered, `systemd-analyze verify`-ed, written to `/etc/systemd/system/llama-swap.service` |
 | Start | `llama-swap -validate` first, then `systemctl enable --now`, then a `/v1/models` probe |
@@ -99,9 +98,12 @@ config was built with to reproduce it.
 ## The updater is the installer for binaries
 
 `extras/update.py` already owns downloading, sha256 verification and
-pruning, and installs into its own cwd — so `install.py` runs it rather
-than keeping a second copy of that logic in step. `--binaries skip` leaves
-the binaries alone if you have already populated the directory.
+pruning, so `install.py` runs it rather than keeping a second copy of that
+logic in step. `--binaries skip` leaves the binaries alone if you have already
+populated the directory. `install.py` passes an explicit `--dir` per engine so
+a fresh deployment installs into *its* run directory rather than adopting
+engines it finds in a parent — see below for how a hand-run update decides
+where to put things.
 
 That does mean **an update needs the GitHub API** (and `GITHUB_TOKEN` for
 the rate limit). There is deliberately no systemd timer for it. A new
@@ -113,6 +115,57 @@ swap would not even be visible as a reload. If you want this automated, the
 safe shape is a timer that updates **and** re-packs together, and refuses
 the swap when `llama-swap -validate` rejects the result; that is a separate
 piece of work from this installer.
+
+## Where an update installs
+
+An engine is updated **in the directory it is already installed in**, not in
+the directory you happened to run the command from. `update.py` searches
+outwards from the cwd for an existing install — a `llama-b*/` build, an
+`audiocpp_server`, a `whisper-server`, and for the hand-made layouts that
+predate it, one of those nested one or two levels down — and updates the one
+it finds. Running it from `$HOME` and from the engine's own directory now
+produce the same result, and running it from the wrong place no longer
+installs a second copy of an engine you already have. Where two directories
+in one root both hold the same engine, it says so and refuses to guess.
+
+Each engine keeps its history beside the live one and is reached through a
+stable name, so moving forward or rolling back is a single symlink:
+
+```
+tools/llama-swap       -> llama-swap-v266
+tools/llama-server     -> ./llama-b12345/llama-server
+tools/whisper-server   -> ./whisper-server-b4938/whisper-server
+tools/audiocpp_server  -> audiocpp_server-v0.9.2
+tools/sd-server        -> ./sd-server-master-968-abc/sd-server
+```
+
+In a deployment that is the `tools/` subdirectory of the run directory:
+
+```
+/opt/llama/
+├── config.yaml  config.env          generated, replaced on every pack
+└── tools/                            engines; update.py owns this tree
+```
+
+`llama-packer` looks in `tools/` before the run directory itself
+(`llama_packer/utils.py:binary_search_dirs`), so a deployment can keep several
+hundred megabytes of binaries out of the directory that holds its config, and
+a run directory installed before this layout — binaries flat, as a repo
+checkout still has them — keeps resolving unchanged.
+
+`--print-paths` prints that resolution, with the reason for each choice, and
+downloads nothing:
+
+```bash
+./extras/update.py --print-paths all
+```
+
+To settle a directory explicitly, in order of precedence: `--dir
+audio=/path` for one run, an `[engines]` entry in `extras/engines.ini`, or
+`$AUDIOCPP_BIN_DIR` and its equivalents — the same variables llama-packer
+resolves with, so one export configures both tools. Engines with no existing
+install and no configuration go to `[engines] root`, then `$LLAMA_DIR`, then
+the cwd.
 
 ## Engines not fetched by a bare run
 
@@ -189,6 +242,11 @@ loss.
 pinned `/dev/dri/card0` is wrong the moment the card enumerates as `card1`,
 and systemd refuses to start on a `DeviceAllow` that does not resolve. The
 connector symlinks beside the real nodes (`card1-DP-1`) are filtered out.
+The block uses `DevicePolicy=closed` rather than `PrivateDevices=true`:
+verified on systemd 259, the private `/dev` behind `PrivateDevices` never
+materialises the allowlisted DRI/kfd nodes (open → ENOENT), so the GPU
+silently vanishes from every Vulkan backend; `closed` keeps the cgroup-v2
+BPF device blocklist without touching `/dev`.
 
 **Vendor environment.** `/dev/kfd` selects the ROCm variables
 (`HIP_VISIBLE_DEVICES`, `ROCBLAS_USE_HIPBLASLT`), `/dev/nvidia*` the CUDA

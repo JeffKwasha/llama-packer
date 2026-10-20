@@ -177,20 +177,52 @@ than a build. Point the backend at whichever you end up with; resolution is
 It is **opt-in** because upstream publishes no `checksums.txt`: the install
 prints an unverified warning rather than pretending to a sha256 check it
 cannot do. The asset naming follows llama.cpp's
-(`audio-v0.9.2-bin-ubuntu-x64-vulkan.tar.gz`), and there is **no ROCm/HIP
-build** — the AMD path is the Vulkan one, which is what this box runs. The
-release tarball also carries a source tree; only the binary is installed, and
-it is self-contained (no `RUNPATH`, links only system libraries).
+(`audio-v0.9.2-bin-ubuntu-x64-vulkan-portable.tar.gz`), and there is **no
+ROCm/HIP build** — the AMD path is the Vulkan one, which is what this box runs.
+
+**Install the `-portable` build, and treat it as a bundle.** Two measured
+facts, both from this host:
+
+- The plain `ubuntu-x64-vulkan` build of v0.9.2 answers `/health` and then
+  dies with **SIGILL on the first synthesis request**. The `-vulkan-portable`
+  build of the same tag returns a valid 24 kHz WAV. The portable builds
+  target a baseline instruction set, so they cannot be what dies there.
+  `update.py` therefore selects `-portable`; an earlier version of it
+  deliberately excluded that variant, which is how a hand-copied portable
+  build ended up serving while the updater installed the crashing one.
+- The portable tarball's `audiocpp_server` loads `libggml-vulkan.so` and the
+  CPU backend variants **from its own directory** (`libggml-cpu-haswell.so`
+  et al), so the whole directory is installed beside the versioned name and
+  the stable `audiocpp_server` symlink points *into* it. Copying out the
+  binary alone yields a server that starts and cannot find a backend. The
+  release tarball also carries a source tree, which is not installed.
+
+**Backend on this fleet: `cpu`, not `vulkan`.** Under the service namespace
+audio.cpp's Vulkan backend enumerates zero devices —
+
+```
+Vulkan backend requested but registry 'Vulkan' has no device 0
+(available: CPU:0 "CPU" [CPU])
+```
+
+— while llama.cpp offloads normally from the same account, the same `/dev`
+and the same unit (verified: `/sys/class/drm/card1/.../mem_info_vram_used`
+shows a resident model), so it is audio.cpp's device enumeration rather than
+a permission problem. Measured CPU cost: parakeet ASR RTF 0.076, kokoro
+synthesis comfortably under real time. To settle it properly, watch
+`journalctl -u llama-swap -f` (as a user in `systemd-journal`) while making a
+TTS request and compare audio.cpp's device-init line with llama-server's
+`ggml_vulkan: Found N Vulkan devices`.
 
 - **Source build (operator-managed):** upstream `docs/build/linux.md` — GCC 13+,
   CMake; `-DENGINE_ENABLE_CUDA=ON` (NVIDIA), `-DENGINE_ENABLE_VULKAN=ON`
   (portable AMD path), `-DENGINE_ENABLE_HIP=ON` (ROCm, mutually exclusive
   with CUDA), CPU always on. On GB10, pin `CUDAToolkit_ROOT` +
   `CMAKE_CUDA_COMPILER` to avoid a mixed-toolkit build.
-- **Prebuilt:** `./extras/update.py audio`, or the llama-swap unified
-  image (`unified-cuda13`, `unified-cuda`, `unified-vulkan`) which bundles
-  it; official ubuntu-x64 packages ship CPU+Vulkan (the 0.8.0 one on this
-  box reports `cpu,vulkan`).
+- **Prebuilt:** `./extras/update.py audio` (the `-portable` bundle above), or
+  the llama-swap unified image (`unified-cuda13`, `unified-cuda`,
+  `unified-vulkan`) which bundles it; official ubuntu-x64 packages ship
+  CPU+Vulkan.
 
 A container transport (podman/docker) may be added later; it is not part of the
 current host-only support.

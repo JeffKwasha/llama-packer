@@ -92,7 +92,10 @@ def test_render_unit_substitutes_directives_only(monkeypatch):
     body = ins.render_unit(_args(), Path("/opt/llama"))
     assert "User=svc" in body and "Group=grp" in body
     assert "WorkingDirectory=/opt/llama" in body
-    assert "ExecStart=/opt/llama/llama-swap --listen 127.0.0.1:8123" in body
+    # No binaries exist under /opt/llama in the test, so the unit names where
+    # install.py puts them rather than a path it found.
+    assert ("ExecStart=/opt/llama/tools/llama-swap --listen 127.0.0.1:8123"
+            in body)
     # No placeholder survives on a directive. (Comments keep their mentions
     # on purpose: the header documents the tokens it expects.)
     directives = [ln for ln in body.splitlines() if not ln.lstrip().startswith("#")]
@@ -252,6 +255,85 @@ def test_require_binaries_passes_once_populated(tmp_path):
     (build / "llama-server").write_text("x")
     (tmp_path / "llama-swap").write_text("x")
     ins.require_binaries(ins.Runner(False), tmp_path)
+
+
+def test_install_binaries_pins_every_engine_to_the_run_dir(tmp_path):
+    """A fresh deployment must not adopt a parent directory's engines.
+
+    update.py updates each engine where it finds it, searching outwards from
+    the cwd. Install is the case where that default is wrong: a new run
+    directory under an existing tools root would otherwise be handed the
+    engines already installed above it, and the new deployment would ship a
+    config pointing at somebody else's binaries.
+    """
+    seen: dict = {}
+
+    class Recorder(ins.Runner):
+        def run(self, cmd, **kwargs):
+            seen["cmd"] = cmd
+
+    build = ins.tools_dir(tmp_path) / "llama-b11658"
+    build.mkdir(parents=True)
+    (build / "llama-server").write_text("x")
+    make = ins.tools_dir(tmp_path) / "llama-swap"
+    make.write_text("x")
+
+    ins.install_binaries(Recorder(False), tmp_path, "update")
+
+    cmd = seen["cmd"]
+    for engine in ("cpp", "swap", "audio", "whisper", "sd"):
+        assert f"{engine}={ins.tools_dir(tmp_path)}" in cmd, engine
+
+
+def test_binaries_go_in_the_tools_subdirectory(tmp_path):
+    """The deployment layout: config at the top, engines under tools/."""
+    build = ins.tools_dir(tmp_path) / "llama-b11714"
+    build.mkdir(parents=True)
+    (build / "llama-server").write_text("x")
+    (ins.tools_dir(tmp_path) / "llama-swap").write_text("x")
+
+    assert ins.require_binaries(ins.Runner(False), tmp_path) is None
+    assert ins.newest_build(tmp_path).name == "llama-b11714"
+    assert ins.llama_swap_binary(tmp_path) == ins.tools_dir(tmp_path) / "llama-swap"
+
+
+def test_a_flat_run_directory_still_resolves(tmp_path):
+    """Installs made before the tools/ layout must keep working."""
+    (build := tmp_path / "llama-b11714").mkdir()
+    (build / "llama-server").write_text("x")
+    (tmp_path / "llama-swap").write_text("x")
+
+    ins.require_binaries(ins.Runner(False), tmp_path)
+    assert ins.newest_build(tmp_path).name == "llama-b11714"
+    assert ins.llama_swap_binary(tmp_path) == tmp_path / "llama-swap"
+
+
+def test_tools_wins_over_a_stale_flat_copy(tmp_path):
+    """Both layouts present: the deployment one is the live one."""
+    for base in (tmp_path, ins.tools_dir(tmp_path)):
+        (build := base / "llama-b11714").mkdir(parents=True)
+        (build / "llama-server").write_text("x")
+        (base / "llama-swap").write_text("x")
+
+    assert ins.llama_swap_binary(tmp_path) == ins.tools_dir(tmp_path) / "llama-swap"
+
+
+def test_unit_execstart_names_the_installed_swap(tmp_path):
+    """The unit must not point at a file this deployment does not have."""
+    import argparse as _argparse
+
+    args = _argparse.Namespace(
+        user="llama", group="models", listen="127.0.0.1:8123",
+        memory_high="30G", memory_max="32G", swap_max="0")
+    (build := ins.tools_dir(tmp_path) / "llama-b11714").mkdir(parents=True)
+    (build / "llama-server").write_text("x")
+    (ins.tools_dir(tmp_path) / "llama-swap").write_text("x")
+
+    unit = ins.render_unit(args, tmp_path)
+
+    assert f"ExecStart={ins.tools_dir(tmp_path) / 'llama-swap'} " in unit
+    assert f"WorkingDirectory={tmp_path}" in unit
+    assert "@" not in unit.split("[Service]")[1].replace("@system-service", "")
 
 
 def test_backup_keeps_the_previous_config(tmp_path):

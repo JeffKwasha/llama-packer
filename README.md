@@ -192,6 +192,42 @@ Serve a model with vLLM instead of llama-server via an override rule in `profile
 
 DGX Spark (GB10/Blackwell, unified memory) is a supported vLLM target: VRAM detection falls back to the unified pool, and per-model recipe keys (`vllm_quantization`, `moe_backend`, `mamba:`, `tool_call_parser`, `reasoning_parser`) cover the Blackwell model recipes. Docker entries are self-contained: HF_HOME root mounted read-only at `/root/.cache/huggingface` (offline — models must be pre-staged), `cmdStop`/`unloadTimeout` for container lifecycle, explicit `proxy`.
 
+## Calibrating VRAM estimates (`--probe-memory`)
+
+Normal packing uses `llama-fit-params` (header-only, ~2 s/model) which is fast but
+blind to the MTP draft, recurrent-state cache, and allocator overhead. For tighter
+estimates, run a real `llama-server` measurement grid once per architecture family:
+
+```sh
+# Probe all arch families found in the models dir
+python -m llama_packer --probe-memory --models-dir ~/models
+
+# Probe specific families only (faster, good for resuming)
+python -m llama_packer --probe-memory qwen35 gemma4 --models-dir ~/models
+```
+
+**Requirements:**
+- No resident `llama` processes (the probe refuses otherwise)
+- GPU visible as device 0 (run from a normal shell, not under the hardened
+  systemd unit)
+- Enough VRAM for `(design, 2)` points at the cap context
+
+The probe measures `(weights, compute, c, D)` directly from the server's
+`-lv 5` buffer lines, fits the affine law, and persists the constants to each
+representative's sidecar (`derived:` block, `source: llama-server`). Partial
+runs are safe — completed models are written atomically and only the in-flight
+model is lost. Re-run with the missing arches listed to resume.
+
+Once the sidecar carries a measured block, packing answers VRAM from it with
+one `stat` per model — no GGUF header reads, no fit-params runs. Measuring
+near-instantly is the point of the block: it is invalidated only by a file
+change (size/mtime) or a serve-flag change (the compute term re-measures via
+one `llama-fit-params` run).
+
+For an unattended nightly calibration, wrap it in a script that checks
+`gpu_state.llama_residents()` is empty, then fires `--probe-memory`. The
+probe itself refuses to start beside a resident process.
+
 ## See also
 
 - [docs/glossary.md](docs/glossary.md) — the vocabulary, if a word in a commit message or a PR does not mean what you think it means

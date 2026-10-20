@@ -309,6 +309,7 @@ class VllmBackend(BaseBackend):
         include_mmproj: bool = True,
         batch: int | None = None,
         ubatch: int | None = None,
+        entry_id: str | None = None,
     ) -> tuple[str, dict]:
         transport = self.transport
         is_container = transport.container

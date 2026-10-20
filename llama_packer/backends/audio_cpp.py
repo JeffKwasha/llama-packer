@@ -156,6 +156,7 @@ class AudioCppBackend(BaseBackend):
         include_mmproj: bool = True,
         batch: int | None = None,
         ubatch: int | None = None,
+        entry_id: str | None = None,
     ) -> tuple[str, dict]:
         cfg = model.frontmatter.get("audio_cpp") or {}
         if not isinstance(cfg, dict):
@@ -176,10 +177,18 @@ class AudioCppBackend(BaseBackend):
         path = str(model.gguf_path) if model.gguf_path else (model.hf_repo or "")
 
         # audio.cpp routes requests by its model `id`; llama-swap routes by
-        # the llama-swap entry id (model.template_id). They must match or the
-        # proxied request dies with "unknown model id".
+        # the llama-swap entry id. They must match or the proxied request
+        # dies with "unknown model id".
+        #
+        # The writer passes the *final* entry id (stem + profile-group,
+        # category and flags tail, already disambiguated). Never
+        # ``model.template_id`` here: audio entries always carry a flags
+        # segment (`.s` speech-out, `.a` audio-in), so the bare stem can
+        # never be the id llama-swap routes. The fallback is for direct
+        # build_cmd callers (tests) that do not thread an id down.
+        audio_id = entry_id or model.template_id
         model_entry: dict = {
-            "id": model.template_id,
+            "id": audio_id,
             "family": family,
             "path": path,
             "task": task,

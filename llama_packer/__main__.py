@@ -543,8 +543,12 @@ def resolve_host_binary(
         candidates.append(env_value)
     if default_name:
         base = Path(run_dir) if run_dir is not None else Path.cwd()
-        if (in_run_dir := base / default_name).is_file():
-            candidates.append(str(in_run_dir))
+        # tools/ before the run directory itself, for the same reason
+        # binary_search_dirs does: the deployment layout is the current one,
+        # and a stale flat leftover must not win over it.
+        for directory in utils.binary_search_dirs(base):
+            if (in_run_dir := directory / default_name).is_file():
+                candidates.append(str(in_run_dir))
         if (on_path := shutil.which(default_name)) is not None:
             candidates.append(on_path)
     for raw in candidates:
@@ -566,8 +570,7 @@ def main(argv: list[str] | None = None) -> None:
     written back into every sidecar it measures.
     """
     args = parse_args(argv)
-    setup_logging(args.verbose,
-                  floor=logging.INFO if args.dry_run else None)
+    setup_logging(args.verbose, floor=logging.INFO)
 
     # One pack per process, so this is the whole lifetime of the setting.
     # Must happen before discovery and measurement, both of which write.
@@ -633,7 +636,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.llama_server:
         llama_bin = str(Path(args.llama_server).resolve())
-        bin_dir = str(Path(args.llama_server).parent)
+        # resolve() follows a symlinked llama-server into the versioned
+        # build dir, the home of its llama.cpp siblings (fit-params, ...).
+        bin_dir = str(Path(args.llama_server).resolve().parent)
     else:
         bin_dir = find_bin_dir(args.version, Path.cwd())
         llama_bin = str(Path.cwd() / bin_dir / "llama-server")

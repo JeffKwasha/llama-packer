@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from _gguf import write_gguf
 from llama_packer.model import (
     GGUFModel,
     Model,
@@ -29,17 +30,7 @@ def clean_registry():
 
 
 def _gguf(path: Path, arch="qwen3", ctx=131072) -> Path:
-    kb = b""
-    for k, v in (("general.architecture", arch),
-                 (f"{arch}.context_length", ctx)):
-        kb += struct.pack("<Q", len(k)) + k.encode()
-        if isinstance(v, str):
-            kb += struct.pack("<I", 8) + struct.pack("<Q", len(v)) + v.encode()
-        else:
-            kb += struct.pack("<I", 4) + struct.pack("<I", v)
-    path.write_bytes(b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
-                     + struct.pack("<Q", 2) + kb)
-    return path
+    return write_gguf(path, arch=arch, context_length=ctx)
 
 
 def test_from_file_identity_and_subclass(tmp_path):
@@ -117,7 +108,7 @@ def test_header_read_once_shared_across_claimants(tmp_path, caplog):
         m1 = Model(md1, {"model": "shared.gguf"})
         m2 = Model(md2, {"model": "shared.gguf"})
         assert m1.arch == "qwen3" == m2.arch
-        assert m1.gguf_context_length == 131072 == m2.gguf_context_length
+        assert m1.max_context == 131072 == m2.max_context
     reads = [r for r in caplog.records if "reading GGUF header" in r.message]
     # one probe walk + one context walk, shared by both claimants
     assert len(reads) == 2
@@ -186,6 +177,79 @@ def test_measured_file_sync_and_validity(tmp_path, caplog):
     # touching the file invalidates the block
     g.write_bytes(g.read_bytes() + b"\x00")
     assert not m2.measured_file_valid()
+
+
+def test_valid_block_answers_without_header_io(tmp_path, caplog, monkeypatch):
+    """A matching ``file:`` block answers arch/context/kind with no GGUF read."""
+    from llama_packer import utils
+
+    g = _gguf(tmp_path / "v.gguf")
+    md = tmp_path / "v.md"
+    md.write_text("---\nname: v\n---\n")
+    m = Model(md, {"name": "v", "model": "v.gguf"})
+    m.sync_measured_file()
+    assert m.measured_file_valid()
+
+    def _boom(_path):
+        raise AssertionError("GGUF header re-read despite a valid block")
+
+    monkeypatch.setattr(utils, "gguf_header_probe", _boom)
+    monkeypatch.setattr(utils, "read_gguf_context_length", _boom)
+    monkeypatch.setattr(utils, "gguf_has_mtp_layers", _boom)
+    assert m.arch == "qwen3"
+    assert m.max_context == 131072
+    assert m.kind == "text"
+    assert m.design_context == 131072
+
+
+def test_broken_frontmatter_fails_persist_loudly(tmp_path, caplog):
+    """Dup keys mean measurements cannot be written back — say so at WARNING.
+
+    The round-trip failure used to die in debug silence, so a hand-broken
+    sidecar stalled every future persist with no trace in the log.
+    """
+    from llama_packer import model as modelmod
+    from llama_packer import utils
+
+    g = _gguf(tmp_path / "v.gguf")
+    md = tmp_path / "v.md"
+    md.write_text(
+        "---\nname: v\nmodel: v.gguf\n"
+        "derived:\n  model_mib: 1\n  model_mib: 2\n---\nbody\n")
+
+    modelmod._SIDECA_PARSE_WARNED.clear()
+    m = Model(md, utils.parse_frontmatter(md))
+    with caplog.at_level(logging.WARNING, logger="llama_packer.model"):
+        m.persist_measured({"ts": "2026-01-01T00:00:00+0000"})
+        m.persist_measured()
+    msgs = [r.message for r in caplog.records
+            if "does not survive a YAML round-trip" in r.message]
+    assert len(msgs) == 1
+    assert str(md) in msgs[0]
+
+
+def test_stamp_serves_later_runs(tmp_path, monkeypatch):
+    """The MTP tensor scan is recorded, so later runs skip the read."""
+    from llama_packer import utils
+
+    calls = []
+    monkeypatch.setattr(utils, "gguf_has_mtp_layers",
+                        lambda p: (calls.append(p), True)[1])
+    g = _gguf(tmp_path / "mtp.gguf")
+    md = tmp_path / "mtp.md"
+    md.write_text("---\nname: mtp\nmtp: true\n---\n")
+    m = Model(md, utils.parse_frontmatter(md))
+    m.sync_measured_file()
+    assert m.mtp_baked_in is True
+    block = m.measured_block()
+    assert isinstance(block, dict)
+    assert block.get("file", {}).get("mtp_baked") is True
+
+    # A fresh instance over the same sidecar reads the verdict from the
+    # ``derived:`` block: no new tensor scan.
+    m2 = Model(md, utils.parse_frontmatter(md))
+    assert m2.mtp_baked_in is True
+    assert len(calls) == 1
 
 
 def test_legacy_fit_params_block_still_read(make_model, fit_params_block):

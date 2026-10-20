@@ -37,7 +37,7 @@ from llama_packer import gpu_state
 from llama_packer.consts import _MEASURE_CTX_CAP, _MIN_CTX_SIZE
 from llama_packer.profiles import Profiles
 from llama_packer.vram import (
-    save_serve_correction,
+    FitParams,
 )
 
 if TYPE_CHECKING:
@@ -114,17 +114,26 @@ def pick_family_representatives(
 def _probe_grid(design: int) -> tuple[tuple[int, int], ...]:
     """The (pool ctx, parallel) validation points for a model.
 
-    Three pool sizes (design capped at ``_MEASURE_CTX_CAP``, then halves)
-    at p ∈ {1, 2}: three C points check that ``c`` is constant across
-    context (draft KV and the C-linear compute included), two p values
-    check ``D`` — five runs leaving ``n − 3`` residual degrees of freedom.
+    The top p=1 point is the **design** context: the correction must be
+    fitted where the model is actually served, not extrapolated from a small
+    cap (a 64k fit applied at 262k mis-prices any C-dependent term).  The
+    p=2 point stays at ``_MEASURE_CTX_CAP`` because ``D`` is
+    context-independent and ``(design, 2)`` does not fit at long context
+    (Dirk needs ~39 GB at p=2).
+
+    Two p=1 C points at design (and its half) pin ``c`` at the target; the
+    small-context p pair pins ``D``; the extra small p=1 point leaves
+    residual degrees of freedom for the falsifiability check.
     """
-    c1 = min(design, _MEASURE_CTX_CAP)
-    c2 = max(c1 // 2, _MIN_CTX_SIZE)
-    c3 = max(c1 // 4, _MIN_CTX_SIZE)
+    c1 = design
+    c2 = max(design // 2, _MIN_CTX_SIZE)
+    c3 = max(design // 4, _MIN_CTX_SIZE)
+    c_small = min(design, _MEASURE_CTX_CAP)
+    c_small2 = max(c_small // 2, _MIN_CTX_SIZE)
     return tuple(dict.fromkeys(
         (c, p)
-        for c, p in ((c1, 1), (c1, 2), (c2, 1), (c2, 2), (c3, 1))
+        for c, p in ((c1, 1), (c2, 1), (c3, 1),
+                     (c_small, 2), (c_small2, 2), (c_small, 1))
     ))
 
 
@@ -202,15 +211,21 @@ def affine_report(
     if len(bufs) < 4:
         return None
     big = max(ctx for ctx, p in bufs if p == 1)
-    if (big, 2) not in bufs or (big // 2, 1) not in bufs:
+    p2_ctxs = [ctx for ctx, p in bufs if p == 2]
+    if not p2_ctxs or (big // 2, 1) not in bufs:
         return None
+    # D is context-independent, so measure it at the largest p=2 context
+    # that fits (the cap), not at `big` — (design, 2) does not fit at long
+    # context.  c is measured at `big` (the design context), where the
+    # correction will actually be applied.
+    small = max(p2_ctxs)
 
     def pool(key: tuple[int, int]) -> float:
         buf = bufs[key]
         return buf["kv"] + buf["rs"]
 
     c = 2.0 * (pool((big, 1)) - pool((big // 2, 1))) / big
-    d = pool((big, 2)) - pool((big, 1))
+    d = pool((small, 2)) - pool((small, 1))
     if c <= 0:
         return None
     fixed = bufs[(big, 1)]["weights"] + bufs[(big, 1)]["compute"] \
@@ -235,28 +250,46 @@ def affine_report(
         # companion's own weights/KV in its delta, and the reader adds those
         # separately via effective_static, so filing it would double-count
         # here and over-reserve every baked-in model of the same arch.
-        if model.mtp_baked_in:
-            save_serve_correction(model.arch or "unknown", cache_type,
-                                  True, corr)
-        else:
-            logger.info("%s: draft companion %s measured but not filed as a "
-                        "serve correction — the table's mtp dimension is "
-                        "baked-in drafts only; arch %r stays uncorrected "
-                        "for this shape",
-                        model.stem, model.mtp.stem, model.arch or "unknown")
-    residuals: dict[str, float] = {}
-    max_abs = 0.0
-    max_total_abs = 0.0
-    for key, buf in bufs.items():
-        ctx, parallel = key
-        err = pool(key) - (c * ctx + d * parallel)
-        residuals[f"{ctx}/{parallel}"] = abs(err) / pool(key)
-        max_abs = max(max_abs, abs(err))
-        predicted_total = fixed + c * ctx + d * parallel
-        total = sum(buf.values())
-        max_total_abs = max(max_total_abs,
-                            abs(predicted_total - total) / total)
-    max_residual = max(residuals.values(), default=0.0)
+        # Compute the law's residuals first, so the correction is filed only
+        # when the grid actually passed the law check (C6): a failed fit
+        # produces a confidently wrong row.
+        residuals: dict[str, float] = {}
+        max_abs = 0.0
+        max_total_abs = 0.0
+        for key, buf in bufs.items():
+            ctx, parallel = key
+            err = pool(key) - (c * ctx + d * parallel)
+            residuals[f"{ctx}/{parallel}"] = abs(err) / pool(key)
+            max_abs = max(max_abs, abs(err))
+            predicted_total = fixed + c * ctx + d * parallel
+            total = sum(buf.values())
+            max_total_abs = max(max_total_abs,
+                                abs(predicted_total - total) / total)
+        max_residual = max(residuals.values(), default=0.0)
+        ok = (max_residual <= tolerance
+              or max_abs <= AFFINE_ABS_TOLERANCE_MIB)
+        if model.mtp_baked_in and ok and corr is not None:
+            measured = FitParams(
+                model_mib=int(bufs[(big, 1)]["weights"]),
+                kv_per_token_mib=c,
+                slot_mib=d,
+                compute_mib=int(bufs[(big, 1)]["compute"]),
+                source="llama-server",
+                cache_type=cache_type,
+                shape=(llama_args or "").strip(),
+            )
+            persist = getattr(model, "persist_measured", None)
+            if callable(persist):
+                persist(measured.to_dict())
+            else:
+                logger.debug("%s: no persist_measured", model.stem)
+        elif model.mtp_baked_in and not ok:
+            logger.warning(
+                "%s: measured block not persisted — grid fit failed the law check",
+                model.stem)
+        elif not model.mtp_baked_in:
+            logger.info("%s: companion %s not persisted (baked-in only)",
+                        model.stem, model.mtp.stem)
     return {
         "model": model,
         "kv_per_token_mib": c,
@@ -269,7 +302,7 @@ def affine_report(
         "max_residual": max_residual,
         "max_abs_mib": max_abs,
         "max_total_residual": max_total_abs,
-        "ok": max_residual <= tolerance or max_abs <= AFFINE_ABS_TOLERANCE_MIB,
+        "ok": ok,
     }
 
 

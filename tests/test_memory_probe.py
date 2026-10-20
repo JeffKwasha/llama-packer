@@ -18,7 +18,6 @@ from llama_packer.memory_probe import (
     pick_family_representatives,
     run_probe,
 )
-from llama_packer.vram import affine_from_pair
 
 
 def _fake(stem, tmp, arch="qwen3", size=100, suffix=".gguf",
@@ -32,17 +31,6 @@ def _fake(stem, tmp, arch="qwen3", size=100, suffix=".gguf",
     kw.setdefault("mtp_baked_in", True)
     return SimpleNamespace(
         stem=stem, arch=arch, size_mb=size, gguf_path=path, **kw)
-
-
-def test_affine_from_pair_exact():
-    # ctx(1)=2879, ctx(2)=3038 at C=262144 -> c=0.010376, D=159 (gemma4-26B)
-    c, d = affine_from_pair(2879, 3038, 262144)
-    assert d == 159.0
-    assert abs(c - (2879 - 159) / 262144) < 1e-12
-    # negative measurement noise clamps D to 0
-    c, d = affine_from_pair(1000, 999, 32768)
-    assert d == 0.0
-    assert abs(c - 1000 / 32768) < 1e-12
 
 
 def test_picks_largest_per_family(tmp_path):
@@ -116,12 +104,13 @@ def test_skips_unmeasurable(tmp_path):
 
 def test_probe_grid_spans_both_axes(tmp_path):
     grid = _probe_grid(262144)
-    # three C points (C-linearity check) x two p values, deduplicated
-    assert grid == ((65536, 1), (65536, 2), (32768, 1), (32768, 2),
-                    (16384, 1))
-    # small design: collapses onto its own scales, still spans C
-    assert _probe_grid(32768) == ((32768, 1), (32768, 2), (16384, 1),
-                                  (16384, 2), (8192, 1))
+    # top p=1 point is the design context (c measured at target); p=2 stays
+    # at the cap (D is context-independent, and (design,2) does not fit)
+    assert grid == ((262144, 1), (131072, 1), (65536, 1),
+                    (65536, 2), (32768, 2))
+    # small design: the design point and the cap coincide, still spans C
+    assert _probe_grid(32768) == ((32768, 1), (16384, 1), (8192, 1),
+                                  (32768, 2), (16384, 2))
 
 
 def test_fit_affine_exact_and_overdetermined():
@@ -165,9 +154,6 @@ def test_affine_report_exact_law_passes(tmp_path, monkeypatch):
     m.design_context = 32000
     m._mtp_info = lambda: (False, 0)
     m.vram = FakeVram()
-    monkeypatch.setattr(
-        "llama_packer.memory_probe.save_serve_correction",
-        lambda *a, **k: None)
     # estimate is the truth minus a known correction: fit-params sees
     # c=C64/2, D=100, fixed=1000 -> correction closes to (C64, 150, 1100)
     m.vram._fit_params_serve = lambda *a, **k: SimpleNamespace(
@@ -277,9 +263,6 @@ def test_run_probe_end_to_end(tmp_path, monkeypatch):
         m.design_context = 32768
         m._mtp_info = lambda: (False, 0)
         m.vram = FakeVram()
-    monkeypatch.setattr(
-        "llama_packer.memory_probe.save_serve_correction",
-        lambda *a, **k: None)
     text = run_probe([a, b], "/bin/fit", "/bin/llama-server", "q8_0")
     assert "qb" in text and "qa" not in text  # largest represents qwen3
     assert "PASS" in text and "FAIL" not in text
@@ -304,26 +287,27 @@ def test_probe_does_not_file_companion_draft_as_baked_in(tmp_path, monkeypatch):
             return SimpleNamespace(model_mib=1000, compute_mib=100,
                                    kv_per_token_mib=1 / 64, slot_mib=100.0)
 
-    saved = []
-    monkeypatch.setattr(
-        "llama_packer.memory_probe.save_serve_correction",
-        lambda *a, **k: saved.append(a))
-
+    persisted = []
+    def _persist(d):
+        persisted.append(d)
     companion = _fake("dirk", arch="qwen35", size=400, tmp=tmp_path)
     companion.design_context = 32768
     companion.mtp = _fake("dspark", arch="qwen35", size=50, tmp=tmp_path)
     companion.mtp_baked_in = False          # the companion shape
+    companion.persist_measured = _persist
     companion.vram = FakeVram()
     run_probe([companion], "/bin/fit", "/bin/llama-server", "q8_0")
-    assert saved == []
+    assert persisted == []
 
-    # The same model without a companion files the row normally.
+    # The same model without a companion persists the measured block.
     baked = _fake("baked", arch="qwen35", size=400, tmp=tmp_path)
     baked.design_context = 32768
     baked.mtp = None
     baked.mtp_baked_in = True
+    baked.persist_measured = lambda d: persisted.append(d)
     baked.vram = FakeVram()
     run_probe([baked], "/bin/fit", "/bin/llama-server", "q8_0")
-    assert len(saved) == 1
-    arch, cache_type, mtp_dim = saved[0][:3]
-    assert (arch, cache_type, mtp_dim) == ("qwen35", "q8_0", True)
+    assert len(persisted) == 1
+    block = persisted[0]
+    assert block["source"] == "llama-server"
+    assert block["cache_type"] == "q8_0"

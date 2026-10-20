@@ -1,92 +1,115 @@
-"""Minimal GGUF metadata reader for vision geometry.
+"""GGUF metadata and tensor-footprint reads, via the public ``gguf`` module.
 
-Reads only the key/value header — a few kilobytes at the start of the file,
-never the tensors — so it is cheap even on platter storage. The GGUF KV
-format is small and stable, so this needs no dependency; pulling in a full
-GGUF library to read four integers would not earn its keep.
+Every GGUF parse in this project goes through ``gguf.GGUFReader`` — the
+well-maintained public module — so the byte-level format (KV value types,
+tensor-info layout, offset semantics) is never hand-rolled.  The ``gguf``
+module is the only GGUF reader/writer here.
 
-What we actually need lives in the mmproj (the vision projector's GGUF):
+What llama-packer needs from a GGUF header:
 
-    clip.vision.patch_size          — side of one ViT patch, e.g. 16
-    clip.vision.spatial_merge_size  — patches merged per output token, e.g. 2
-    clip.projector_type             — e.g. qwen3vl_merger, minicpmv4_6
-
-For a pixel-proportional projector (the Qwen-VL family) each output token
-covers ``(patch_size * spatial_merge_size) ** 2`` pixels, which is how a
-megapixel figure becomes a token count. Projectors that resample to a fixed
-token count (MiniCPM-V, Gemma 3, LLaVA) do not carry a merge size, and the
-megapixel knob cannot be honoured for them — see docs/models/vision-context.md.
+    clip.vision.patch_size / spatial_merge_size / projector_type   — mmproj
+    general.architecture / <arch>.context_length                   — discovery
+    every tensor name carrying ``nextn``                           — MTP detection
+    the data-section span (``file_size − data_offset``)           — weight term
 """
 from __future__ import annotations
 
 import logging
-import struct
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+try:
+    from gguf import GGUFReader
+except ImportError:  # pragma: no cover - gguf is a declared dependency
+    GGUFReader = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
-_MAGIC = b"GGUF"
-
-# GGUF metadata value type tags.
-_UINT8, _INT8, _UINT16, _INT16, _UINT32, _INT32 = 0, 1, 2, 3, 4, 5
-_FLOAT32, _BOOL, _STRING, _ARRAY = 6, 7, 8, 9
-_UINT64, _INT64, _FLOAT64 = 10, 11, 12
-
-_SCALAR = {
-    _UINT8: ("<B", 1), _INT8: ("<b", 1),
-    _UINT16: ("<H", 2), _INT16: ("<h", 2),
-    _UINT32: ("<I", 4), _INT32: ("<i", 4),
-    _FLOAT32: ("<f", 4), _BOOL: ("<B", 1),
-    _UINT64: ("<Q", 8), _INT64: ("<q", 8), _FLOAT64: ("<d", 8),
-}
+_GGUF_WARNED = False
 
 
-class _Reader:
-    """Sequential reader over the GGUF header."""
+def _gguf_available() -> bool:
+    global _GGUF_WARNED
+    if GGUFReader is None and not _GGUF_WARNED:
+        _GGUF_WARNED = True
+        logger.warning("gguf module missing — pip install gguf")
+    return GGUFReader is not None
 
-    def __init__(self, fh):
-        self._fh = fh
 
-    def raw(self, n: int) -> bytes:
-        b = self._fh.read(n)
-        if len(b) != n:
-            raise ValueError("truncated GGUF header")
-        return b
+_READER_CACHE: dict[tuple[str, int], "GGUFReader | None"] = {}
 
-    def u32(self) -> int:
-        return struct.unpack("<I", self.raw(4))[0]
 
-    def u64(self) -> int:
-        return struct.unpack("<Q", self.raw(8))[0]
+def gguf_reader(path: Path | str) -> GGUFReader | None:
+    """Open *path* as a GGUF, or None when it is not a readable GGUF.
 
-    def string(self) -> str:
-        return self.raw(self.u64()).decode("utf-8", "replace")
-
-    def value(self, t: int):
-        if t in _SCALAR:
-            fmt, size = _SCALAR[t]
-            v = struct.unpack(fmt, self.raw(size))[0]
-            return bool(v) if t == _BOOL else v
-        if t == _STRING:
-            return self.string()
-        if t == _ARRAY:
-            et = self.u32()
-            return [self.value(et) for _ in range(self.u64())]
-        raise ValueError(f"unknown GGUF value type {t}")
+    ``GGUFReader`` raises a handful of error types for a truncated or
+    non-GGUF file; the caller-facing contract is a single None.  The reader
+    is cached per (path, mtime) so a model's header is parsed only once per
+    run even when several helpers (context length, arch probe, MTP detection,
+    tensor footprint) read it.
+    """
+    if not _gguf_available():
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns)
+    if key not in _READER_CACHE:
+        try:
+            _READER_CACHE[key] = GGUFReader(str(path))
+        except Exception:
+            _READER_CACHE[key] = None
+    return _READER_CACHE[key]
 
 
 def read_metadata(path: Path | str) -> dict:
-    """Return every key/value in a GGUF file's header (tensors are skipped)."""
-    with open(path, "rb") as fh:
-        r = _Reader(fh)
-        if r.raw(4) != _MAGIC:
-            raise ValueError("not a GGUF file")
-        r.u32()                      # version
-        r.u64()                      # tensor count
-        n_kv = r.u64()
-        return {r.string(): r.value(r.u32()) for _ in range(n_kv)}
+    """Return every metadata KV pair as plain Python values.
+
+    The synthetic ``GGUF.version`` / ``GGUF.tensor_count`` fields the reader
+    exposes are header fields, not file KV pairs, so they are excluded.
+    Raises ValueError for a non-GGUF or unreadable file — the historical
+    contract of this function.
+    """
+    reader = gguf_reader(path)
+    if reader is None:
+        raise ValueError(f"cannot read GGUF header: {path}")
+    return {key: field.contents() for key, field in reader.fields.items()
+            if not key.startswith("GGUF.")}
+
+
+def tensor_names(path: Path | str) -> list[str]:
+    """Every tensor name in the file, in header order (metadata only)."""
+    reader = gguf_reader(path)
+    if reader is None:
+        raise ValueError(f"cannot read GGUF header: {path}")
+    return [tensor.name for tensor in reader.tensors]
+
+
+def gguf_tensor_bytes(path: Path | str) -> int | None:
+    """On-disk byte footprint of the file's tensors, or None.
+
+    ``GGUFReader.data_offset`` is the start of the tensor data section, so
+    the footprint is ``file_size − data_offset``: the span the loader maps,
+    inter-tensor padding included, with no GGUF type-size table needed.
+
+    This is the ``model_mib`` term.  ``llama-fit-params`` reports a
+    header-derived *logical* size that drops layers it does not count
+    (baked-in MTP/nextn heads and the CPU-mapped split), under-reporting the
+    real weight buffer by ~1.3 GB on such models (measured: fit 18569 vs
+    real 19899.31 MiB on Dirk).
+    """
+    p = Path(path)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    reader = gguf_reader(p)
+    if reader is None:
+        return None
+    return max(0, size - reader.data_offset)
 
 
 @dataclass(frozen=True)

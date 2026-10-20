@@ -14,7 +14,7 @@ from llama_packer.model import Model
 def make_model(tmp_path):
     """Factory: build a Model backed by a dummy GGUF file in ``tmp_path``.
 
-    The GGUF file is not a real GGUF, so ``gguf_context_length`` reads None and
+    The GGUF file is not a real GGUF, so ``max_context`` reads None and
     ``_design_ctx`` falls back to the sidecar ``context_length``.  No
     subprocess is invoked because tests seed a ``llama-server`` block.
     """

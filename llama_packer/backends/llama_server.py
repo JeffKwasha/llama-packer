@@ -49,13 +49,25 @@ class LlamaServerBackend(BaseBackend):
     # (batch, ubatch) per role when nothing is configured.  ``None`` renders
     # nothing, so llama.cpp's own builtin stands (verified against the local
     # build: ``-b`` 2048, ``-ub`` 512) and a future upstream default change
-    # is picked up for free.  embed/rerank keep their tuned batch depth —
-    # ``batch`` is throughput-only and does not move the VRAM estimate, so
-    # declaring it costs nothing and stays out of the measurement shape.
+    # is picked up for free.
+    #
+    # embed/rerank no longer pin a batch depth, because the value they pinned
+    # was never in effect.  llama-server forces ``n_batch = n_ubatch`` when
+    # embeddings are enabled, logging
+    #
+    #     embeddings enabled with n_batch (4096) > n_ubatch (512)
+    #     setting n_batch = n_ubatch = 512 to avoid assertion failure
+    #
+    # so a declared 4096 is silently replaced by the ubatch before a single
+    # token is processed: 4096 was a number in the config and nothing else.
+    # The physical batch is the one that decides embedding throughput, and
+    # that is ``ubatch`` — pinned fleet-wide in profiles.yaml, and measured
+    # (llama-bench, this host): 512 doubles prompt throughput over 256 and
+    # 1024 adds nothing.
     _ROLE_BATCH: dict[str, tuple[int | None, int | None]] = {
         "chat": (None, None),
-        "embeddings": (4096, None),
-        "rerank": (4096, None),
+        "embeddings": (None, None),
+        "rerank": (None, None),
     }
 
     def default_batch_ubatch(self, role: str) -> tuple[int | None, int | None]:
@@ -123,6 +135,7 @@ class LlamaServerBackend(BaseBackend):
         include_mmproj: bool = True,
         batch: int | None = None,
         ubatch: int | None = None,
+        entry_id: str | None = None,
     ) -> tuple[str, dict]:
         # First-class batch keys render explicitly in the per-role slot
         # (named flags win over conflicting fleet args, lose to cli_args —
@@ -153,8 +166,11 @@ class LlamaServerBackend(BaseBackend):
             "--parallel", str(parallel),
             "--cache-type-k", cache_type,
             "--cache-type-v", cache_type,
-            "--n-gpu-layers", ("0" if model.on_cpu else "999"),
         ]
+        # llama-server defaults --n-gpu-layers to "auto" (offload all);
+        # only pin "0" for CPU-resident models.
+        if model.on_cpu:
+            flags += ["--n-gpu-layers", "0"]
 
         mtp_args, meta = self._mtp_args(model)
         flags += mtp_args

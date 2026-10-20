@@ -78,8 +78,19 @@ def llama_residents(ps_bin: str = "ps") -> list[str]:
         # points that could not fit device memory.
         logger.warning("resident scan failed (%s); proceeding unguarded", e)
         return []
-    return [line.strip() for line in out.stdout.splitlines()
-            if _RESIDENT_RE.search(line)]
+    # Exclude self "llama-packer" to prevent false-positive.
+    own_pids = {str(os.getpid()), str(os.getppid())}
+    out_lines = []
+    for line in out.stdout.splitlines():
+        parts = line.split(None, 2)
+        pid = parts[0] if parts else ""
+        if pid in own_pids:
+            continue
+        if "llama-packer" in line or "probe-memory" in line:
+            continue
+        if _RESIDENT_RE.search(line):
+            out_lines.append(line.strip())
+    return out_lines
 
 
 def kill_process_group(proc: subprocess.Popen) -> None:
@@ -109,6 +120,33 @@ def kill_process_group(proc: subprocess.Popen) -> None:
     except ProcessLookupError:
         return
     logger.error("kill_process_group: pid %s survived SIGKILL", proc.pid)
+    # The group, not just the leader: descendants that outlived the lead
+    # process (audio children, grandchildren spawned after our last look)
+    # hold VRAM too, and our own uid sees all of them.
+    if _wait_group_empty(proc.pid, _KILL_GRACE_S):
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    if not _wait_group_empty(proc.pid, _KILL_GRACE_S):
+        logger.error("kill_process_group: process group %s outlived SIGKILL",
+                     proc.pid)
+
+
+def _wait_group_empty(pid: int, timeout: float) -> bool:
+    """Wait until the process group *pid* has no remaining member.
+
+    Returns True when the group is gone. ``os.killpg(pid, 0)`` is the
+    check: it raises ProcessLookupError exactly when no member is left,
+    without touching any of them.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _pid_alive(pid: int) -> bool:

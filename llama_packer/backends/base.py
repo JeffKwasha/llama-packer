@@ -134,6 +134,7 @@ class BaseBackend(ABC):
         include_mmproj: bool = True,
         batch: int | None = None,
         ubatch: int | None = None,
+        entry_id: str | None = None,
     ) -> tuple[str, dict]:
         """Compose the launch command.
 
@@ -141,6 +142,16 @@ class BaseBackend(ABC):
         (sidecar > profile > fleet > role); llama-server renders them
         explicitly (and stamps ``ubatch`` into the VRAM measurement shape);
         other backends ignore them.
+
+        ``entry_id`` is the **final** llama-swap entry id this variant will be
+        emitted under — the stem plus the profile-group, category and flags
+        tail, already disambiguated.  It is passed in (rather than recomputed)
+        because the writer only knows it after resolving the tail, which
+        happens before the command is built.  A backend that *routes* on the
+        requested model id must embed exactly this string: audio.cpp validates
+        ``POST /v1/audio/speech``'s model against its own ``server.json``
+        ``models[].id``, so a mismatch is a 500.  Backends that ignore the
+        requested model name (llama-server and friends) ignore it too.
 
         Returns ``(cmd, metadata_contributions)``.  ``metadata_contributions``
         is merged into the entry's ``metadata`` block by the writer.

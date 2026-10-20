@@ -285,7 +285,6 @@ class Macros:
       * each ``profiles.yaml:profiles.<name>``
       * explicit ``profiles.yaml:macros`` (string values)
       * per-directory ``models.yaml`` ``defaults``/``overrides``
-      * builtin ``COMMON_GPU``
 
     *sub* is the placeholder substitution callable (``utils.make_subst``)
     used to turn absolute template/lora paths into ``${MODELS_DIR}`` form
@@ -398,5 +397,6 @@ class Macros:
                 if agg_flags:
                     Macro(mname, f"{cfg_path}:defaults+overrides", agg_flags)
 
-        # 5. Builtin common GPU flag
-        Macro("COMMON_GPU", "builtin:gpu", {"--n-gpu-layers": "999"})
+        # 5. Builtin common GPU flag — llama-server defaults --n-gpu-layers
+        #    to "auto" (offload everything), so nothing needs pinning; a
+        #    CPU-resident model gets its explicit "0" from the backend itself.
