@@ -617,6 +617,9 @@ class Model:
         "parameters", "quantization", "hf_url", "license", "base_model",
         "architecture", "family", "finetune", "type", "mtp_accuracy",
         "strengths", "weaknesses", "freethought",
+        # optional client-facing generation ceiling (writer clamps it to the
+        # served window; absent = the window itself)
+        "max_output_tokens",
         # per-model calibration / quality metrics (kept for now, low signal)
         "quant_layout", "calibration_tokens", "top1_agreement_vs_bf16", "kld_vs_bf16",
     })

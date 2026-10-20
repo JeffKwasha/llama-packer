@@ -46,21 +46,47 @@ def test_cpu_resident_uses_cpu_layers(make_model):
 
 
 def test_capabilities_context_is_served_window(make_model):
-    # capabilities.context is what clients use for compaction and output
-    # room, so it must be the served per-slot window, not the trained max.
-    # The trained max is preserved in metadata.context_max.
+    # Validates: SPEC.md, 'Derived fields': capabilities.context is the
+    # served per-slot window, not the trained maximum, which stays in
+    # metadata.context_max. Clients size compaction and output room from it.
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
         profiles_group=[("default", {})], profiles_defaults={},
         template_vars={"llama_bin": "/opt/llama-server"},
-        context_length=32768, ctx_size=4096,
+        context_length=262144, ctx_size=131072,
     )
-    assert entry["capabilities"]["context"] == 4096
-    assert entry["metadata"]["ctx_size"] == 4096
-    assert entry["metadata"]["context_max"] == 32768
-    assert entry["metadata"]["max_output_tokens"] == 4096
-    assert "--kv-unified-per-slot 4096" in entry["cmd"]
+    assert entry["capabilities"]["context"] == 131072
+    assert entry["metadata"]["ctx_size"] == 131072
+    assert entry["metadata"]["context_max"] == 262144
+    assert entry["metadata"]["max_output_tokens"] == 131072
+    assert "--kv-unified-per-slot 131072" in entry["cmd"]
+
+
+def test_sidecar_lowers_max_output_tokens(make_model):
+    # Validates: SPEC.md, 'Model Metadata': a sidecar may lower the
+    # generation ceiling below the served window.
+    model = make_model("m", backend="llama-server", max_output_tokens=32768)
+    _, entry = _build_entry(
+        model, parallel=1, cache_type="q8_0",
+        profiles_group=[("default", {})], profiles_defaults={},
+        template_vars={"llama_bin": "/opt/llama-server"},
+        context_length=131072, ctx_size=131072,
+    )
+    assert entry["metadata"]["max_output_tokens"] == 32768
+
+
+def test_max_output_tokens_never_exceeds_the_served_window(make_model):
+    # Validates: SPEC.md, 'Model Metadata': the emitted ceiling is clamped
+    # to the served window even when the sidecar asks for more.
+    model = make_model("m", backend="llama-server", max_output_tokens=262144)
+    _, entry = _build_entry(
+        model, parallel=1, cache_type="q8_0",
+        profiles_group=[("default", {})], profiles_defaults={},
+        template_vars={"llama_bin": "/opt/llama-server"},
+        context_length=262144, ctx_size=65536,
+    )
+    assert entry["metadata"]["max_output_tokens"] == 65536
 
 
 def test_no_context_max_or_token_limits_when_nothing_is_folded(make_model):

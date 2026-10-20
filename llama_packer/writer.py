@@ -52,12 +52,6 @@ logger = logging.getLogger(__name__)
 _REASONING_FORMATS = frozenset({"none", "deepseek", "deepseek-legacy", "auto"})
 _REASONING_FLAG_KEYS = ("reasoning-format", "reasoning-preserve")
 
-# Client-facing generation ceiling. Clients (OpenCode's model discovery) turn
-# this into max_tokens and clamp it to the room the prompt leaves, so it
-# bounds a reply without ever exceeding the served window.
-_MAX_OUTPUT_TOKENS = 65_536
-
-
 def _model_can_reason(model: Model) -> bool:
     """True when the model is a chat model that advertises reasoning support."""
     if model.role != "chat":
@@ -528,7 +522,19 @@ def _build_entry(
     # trained maximum when the entry is folded below it.
     metadata["ctx_size"] = ctx_size
     if model.role == "chat":
-        metadata["max_output_tokens"] = min(ctx_size, _MAX_OUTPUT_TOKENS)
+        # The served window is the true generation ceiling: llama-server
+        # allows a reply up to n_ctx minus the prompt, and clients clamp to
+        # the room a prompt leaves. A sidecar may lower it for a model whose
+        # long replies degrade, but it can never exceed the window.
+        ceiling = metadata.get("max_output_tokens")
+        if ceiling is not None and (
+                not isinstance(ceiling, int) or isinstance(ceiling, bool)
+                or ceiling <= 0):
+            logger.warning(
+                "%s: max_output_tokens=%r is not a positive integer; using "
+                "the served window", model.label, ceiling)
+            ceiling = None
+        metadata["max_output_tokens"] = min(ceiling or ctx_size, ctx_size)
     if context_length != ctx_size:
         metadata["context_max"] = context_length
     # The blessed usage categories this serving actually satisfies — the same

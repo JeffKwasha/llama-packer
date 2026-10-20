@@ -41,8 +41,9 @@ SPEC.md "Model Discovery".
 Three separate causes — check in order:
 
 1. **Low context is usually the ceiling, not the budget.** Served context
-   never exceeds the GGUF architectural max (`capabilities.context` in the
-   entry tells you the ceiling). A 4B quant capped at 40960 in its header
+   never exceeds the GGUF architectural max (`metadata.context_max` in the
+   entry tells you that ceiling when it binds; `capabilities.context` is the
+   window actually served). A 4B quant capped at 40960 in its header
    serves 40960 no matter how much VRAM is free — small weights buy *slots*,
    never more context than the file allows.
 2. **`parallel: 1` means the solve skipped the model.** Auto-parallel only
