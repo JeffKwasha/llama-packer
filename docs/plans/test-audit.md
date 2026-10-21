@@ -36,7 +36,10 @@ The sweep is a screen, not a proof. It cannot reach:
 - **dunder methods** (`Macro.__init__`),
 - **file content** (the systemd unit template),
 - a **negative** rule ("the CPU backend is exempt", "an unrelated unit's
-  failure is not ours"), where doing nothing is also correct.
+  failure is not ours"), where doing nothing is also correct,
+- code that runs in **another process** — a test that drives the CLI as a
+  subprocess is measured at 0% coverage, so the sweep finds only what the
+  import did.
 
 Every candidate the sweep produced was therefore checked by hand, with the
 mutation that breaks the rule the test claims to hold.
@@ -60,6 +63,7 @@ mutation that breaks the rule the test claims to hold.
 | tests/test_gpu_state.py | 5 | 9 | 5 | 0 | the measurement guardrails (residents, group kill, lock, journal) |
 | tests/test_hardware.py | 36 | 14 | 36 | 0 | the vendor probes, the pool, the GpuProfile precedence |
 | tests/test_install.py | 39 | 24 | 36 | 3 | the unit rendering, the atomic install, the tools/ layout |
+| tests/test_logging.py | 3 | 3 † | 3 | 0 | the log levels: quiet by default, `-v` lifts it, a preview lifts it |
 | tests/test_macros.py | 29 | 21 | 28 | 1 | the observable macro contract |
 | tests/test_main.py | 26 | 18 | 25 | 1 | the CLI helpers (health timeout, macro substitution, matrix vars) |
 | tests/test_mem_tag.py | 18 | 120 | 18 | 0 | the memory tag grammar and the emitted VRAM number |
@@ -80,7 +84,14 @@ mutation that breaks the rule the test claims to hold.
 | tests/test_vram_budget.py | 54 | 97 | 54 | 0 | the VRAM terms, the context solve, the allocation guard |
 | tests/test_vram_log.py | 13 | 13 | 13 | 0 | the GPU probe, the tenant counts, the report, the accumulator |
 | tests/test_writer.py | 43 | 185 | 43 | 0 | the entry shape, the capabilities block, the client metadata |
-| **total** | **1,062** | **2,144** | **1,037** | **25** | |
+| **total** | **1,065** | **2,147** | **1,040** | **25** | |
+
+† `tests/test_logging.py` drives the CLI as a **subprocess**, so the
+sweep's coverage never sees the code it runs: it found only the three
+import-time functions, and the three mutants it tried are trivial. Its proof
+is the mutation gate instead — three anchors in `extras/check_mutation.py`,
+one for each direction the rule can break (the floor always lifted, never
+lifted, and the `-v` ladder broken).
 
 The 25 candidates are the sweep's blind spots. Each was broken by hand; each
 failed, which is the proof that the test holds its rule.

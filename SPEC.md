@@ -1706,8 +1706,9 @@ would write: config.env
 One flag (`utils.DRY_RUN`) and one reporting function
 (`utils.note_fs_op`) serve all of it, so a new writer cannot silently bypass
 the report. `--dry-run` lifts the log floor to INFO, since the report is the
-point of the run. It also composes with `--agents` and `--create-stubs`:
-those previews report what they would write rather than being refused.
+point of the run (see [Log Levels](#log-levels)). It also composes with
+`--agents` and `--create-stubs`: those previews report what they would write
+rather than being refused.
 
 ```yaml
 derived:
@@ -1748,6 +1749,19 @@ This block is:
   size or mtime changes (then re-read once and re-persisted).
 - Updated when new values are computed.
 - Preserved alongside all other frontmatter keys.
+
+## Log Levels
+
+The pack's output is `config.yaml`; the log on stderr says what happened on
+the way there. The default level is **WARNING** — a run that goes well says
+nothing, and anything that went wrong is reported without a flag.
+
+`-v` lifts the level to INFO, `-vv` to DEBUG, `-vvv` to whatever the
+libraries log. It only ever lifts: asking for more detail never silences a
+warning.
+
+`--dry-run` lifts the floor to INFO whatever the verbosity, because its
+report — every write it withheld — *is* the output of the run.
 
 ## Constants
 

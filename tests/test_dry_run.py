@@ -13,13 +13,7 @@ paths write independently of the config output:
 Every one of those funnels through ``Model.persist_measured`` or the
 stub writer, and each gate is tested here directly.
 
-There is deliberately no test that drives ``main()`` end to end. A pack
-needs a real llama.cpp build *and* a parseable gguf -- llama-fit-params
-aborts on a stub file -- so against a fixture tree the run dies in the VRAM
-solve and never reaches the output stage. A test that tolerated that would
-pass just as happily against a ``main()`` that crashed on entry, which is
-worse than no test at all. The whole-CLI behaviour is verified by running
-the real binary.
+The whole-CLI behaviour is driven in ``tests/test_logging.py``.
 """
 
 from __future__ import annotations
@@ -224,14 +218,18 @@ def test_note_fs_op_carries_the_detail(caplog):
     assert msg == "would update derived: in: /m.md (stem)"
 
 
-def test_dry_run_lifts_the_log_floor_to_info():
-    # Validates: SPEC.md, 'Measured-Block Persistence': --dry-run lifts the log floor to INFO, since the report is the point of the run
-    """The report goes to the log, so a preview must not need -v to show it."""
+def test_verbosity_ladder_and_floor():
+    # Validates: SPEC.md, 'Log Levels': -v lifts the level to INFO, -vv to DEBUG, -vvv to whatever the libraries log. The floor is never lowered: -v adds detail, it never silences a warning.
     from llama_packer.__main__ import setup_logging
     import logging as _logging
-    setup_logging(0, floor=_logging.INFO)
     try:
+        setup_logging(0)
+        assert _logging.getLogger().getEffectiveLevel() == _logging.WARNING
+        setup_logging(1)
+        assert _logging.getLogger().getEffectiveLevel() == _logging.INFO
+        setup_logging(2)
+        assert _logging.getLogger().getEffectiveLevel() == _logging.DEBUG
+        setup_logging(0, floor=_logging.INFO)
         assert _logging.getLogger().getEffectiveLevel() == _logging.INFO
     finally:
         setup_logging(0)
-    assert _logging.getLogger().getEffectiveLevel() == _logging.WARNING

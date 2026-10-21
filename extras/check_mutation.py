@@ -49,6 +49,18 @@ MUTATIONS = {
         "llama_packer/writer.py",
         'metadata["max_output_tokens"] = min(ceiling or ctx_size, ctx_size)',
         'metadata["max_output_tokens"] = ceiling or ctx_size'),
+    "test_pack_run_is_quiet_by_default": (
+        "llama_packer/__main__.py",
+        "floor=logging.INFO if args.dry_run else None",
+        "floor=logging.INFO"),
+    "test_dry_run_preview_is_visible_without_a_flag": (
+        "llama_packer/__main__.py",
+        "floor=logging.INFO if args.dry_run else None",
+        "floor=None"),
+    "test_verbosity_ladder_and_floor": (
+        "llama_packer/__main__.py",
+        "level = max(0, logging.WARNING - 10 * max(0, verbosity))",
+        "level = logging.WARNING"),
 }
 
 

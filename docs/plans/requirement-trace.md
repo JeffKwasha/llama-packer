@@ -114,3 +114,9 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 56 | `capabilities.context` is the served per-slot window, not the trained maximum | `test_capabilities_context_is_served_window` |
 | 57 | The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window | `test_sidecar_lowers_max_output_tokens`, `test_max_output_tokens_never_exceeds_the_served_window` |
+
+## Log levels
+
+| # | Requirement | Test |
+|---|---|---|
+| 58 | A pack run logs at WARNING unless asked: `-v` lifts it to INFO, and only `--dry-run` lifts the floor on its own | `test_pack_run_is_quiet_by_default`, `test_verbose_flag_lifts_the_level`, `test_dry_run_preview_is_visible_without_a_flag`, `test_verbosity_ladder_and_floor` |
