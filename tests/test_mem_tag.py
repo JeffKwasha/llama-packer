@@ -37,6 +37,7 @@ def _entry(make_model, stem="m", mem_vram=None, mem_ram=None, **frontmatter):
 
 
 def test_fmt_mib_gb_and_mb():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a size is printed in GB or MB, and a small but nonzero value stays visible.
     assert _fmt_mib(9318.0) == "9.1GB"
     assert _fmt_mib(1024.0) == "1.0GB"
     assert _fmt_mib(64.4) == "64MB"
@@ -50,24 +51,29 @@ def test_fmt_mib_gb_and_mb():
 
 
 def test_format_gpu_fit():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a GPU entry is tagged with its VRAM and its RAM.
     assert format_mem_tag(9318.0, 1228.0) == "[VRAM 9.1GB RAM 1.2GB]"
 
 
 def test_format_gpu_small_ram_uses_mb():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a small RAM figure is printed in MB.
     assert format_mem_tag(9318.0, 64.0) == "[VRAM 9.1GB RAM 64MB]"
 
 
 def test_format_cpu_only_is_ram_only():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a CPU-resident entry is tagged with RAM only.
     assert format_mem_tag(None, 2355.0) == "[RAM 2.3GB]"
 
 
 def test_format_verbatim_no_capping():
     # The decided number is reported even when physically impossible —
     # the tag never re-solves or caps.
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': the tag reports the decided numbers; it never re-solves or caps them.
     assert format_mem_tag(73.0 * 1024, 512.0) == "[VRAM 73.0GB RAM 512MB]"
 
 
 def test_format_reserved_spill_ssd_grammar():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a spilling entry names the VRAM it keeps, the RAM it spills to and the SSD.
     tag = format_mem_tag(22.0 * 1024, 512.0, spill_mib=1.2 * 1024, ssd_mib=50.0 * 1024)
     assert tag == "[VRAM 22.0GB + 1.2GB RAM 512MB SSD 50.0GB]"
 
@@ -76,6 +82,7 @@ def test_format_reserved_spill_ssd_grammar():
 
 
 def test_with_mem_tag_appends_and_idempotent():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': the tag is appended, and re-tagging replaces it instead of doubling it.
     first = _with_mem_tag("Abliterated Gemma 3 12B.", "[VRAM 9.1GB RAM 1.2GB]")
     assert first == "Abliterated Gemma 3 12B. [VRAM 9.1GB RAM 1.2GB]"
     # Re-tagging (e.g. description copied back into a sidecar) replaces.
@@ -85,10 +92,12 @@ def test_with_mem_tag_appends_and_idempotent():
 
 
 def test_with_mem_tag_no_description():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': with no description the tag is the whole description.
     assert _with_mem_tag(None, "[RAM 2.3GB]") == "[RAM 2.3GB]"
 
 
 def test_with_mem_tag_none_passthrough():
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': no tag leaves the description alone.
     assert _with_mem_tag("text", None) == "text"
     assert _with_mem_tag(None, None) is None
 
@@ -97,6 +106,7 @@ def test_with_mem_tag_none_passthrough():
 
 
 def test_entry_description_gets_tag(make_model):
+    # Validates: SPEC.md, 'Output Format': the entry description carries the memory tag.
     _, entry = _entry(
         make_model, description="Some model.", mem_vram=9318.0, mem_ram=64.0
     )
@@ -104,6 +114,7 @@ def test_entry_description_gets_tag(make_model):
 
 
 def test_entry_cpu_description_ram_only(make_model):
+    # Validates: SPEC.md, 'Output Format': a CPU-resident entry is tagged with RAM only.
     _, entry = _entry(
         make_model,
         device="cpu",
@@ -116,11 +127,13 @@ def test_entry_cpu_description_ram_only(make_model):
 
 def test_entry_no_tag_without_mem(make_model):
     # Existing behavior preserved: no numbers → description untouched.
+    # Validates: SPEC.md, 'Output Format': without measured memory the description is untouched.
     _, entry = _entry(make_model, description="Some model.")
     assert entry["description"] == "Some model."
 
 
 def test_entry_no_tag_when_unestimated(make_model):
+    # Validates: SPEC.md, 'Output Format': an entry whose VRAM could not be measured is not tagged with numbers.
     model = make_model("m", description="Some model.")
     _, entry = _build_entry(
         model,
@@ -139,12 +152,15 @@ def test_entry_no_tag_when_unestimated(make_model):
 
 
 def test_entry_tag_without_sidecar_description(make_model):
+    # Validates: SPEC.md, 'Output Format': without a sidecar description the tag is the whole description.
     _, entry = _entry(make_model, mem_vram=9318.0, mem_ram=64.0)
     # make_model sets no description → the tag is the whole description.
     assert entry["description"] == "[VRAM 9.1GB RAM 64MB]"
 
 
 def test_entry_vram_note_appended_after_mem_tag(make_model):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': the
+    # over-budget note follows the memory tag.
     _, entry = _build_entry(
         make_model("mn", description="Some model."),
         parallel=1,
@@ -167,6 +183,8 @@ def test_entry_vram_note_appended_after_mem_tag(make_model):
 
 def test_entry_vram_note_without_mem_tag_or_description(make_model):
     # The note alone still yields a description (entry is visibly flagged).
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': the note
+    # alone still yields a description, so the entry is visibly flagged.
     _, entry = _build_entry(
         make_model("bare"),
         parallel=1,
@@ -222,6 +240,7 @@ def _profiles():
 
 
 def test_planner_mem_numbers_and_tag(make_model, tmp_path):
+    # Validates: SPEC.md, 'Output Format': the emitted VRAM number is weights + compute + context KV + slots.
     m = make_model("m", parallel=1, context_length=32768)
     (tmp_path / "m.gguf").write_bytes(b"x" * 2 * 1024 * 1024)
     quad = (1, 0.001, 10, 20)  # model_mib=1: 2MB file leaves 1MB residue
@@ -241,6 +260,7 @@ def test_planner_mem_numbers_and_tag(make_model, tmp_path):
 
 
 def test_planner_cpu_model_ram_only_tag(make_model):
+    # Validates: SPEC.md, 'Output Format': a CPU-resident model is sized in RAM and carries no VRAM number.
     m = make_model("c", device="cpu", parallel=1, context_length=32768)
     quad = (5000, 0.5, 100, 500)
     _scripted(m, 32768, {True: quad, False: quad})

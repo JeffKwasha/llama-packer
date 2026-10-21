@@ -42,6 +42,7 @@ def test_gpu_nodes_skips_drm_connectors(tmp_path):
     # /dev/dri holds connector symlinks (card1-DP-1, card1-HDMI-A-1) beside
     # the real nodes; a bare glob would hand systemd a path that is not a
     # device handle.
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': GPU device nodes this host actually has (render + card + kfd). Roots are parameters so the scan is testable against a fake ``/dev``.
     dri = tmp_path / "dri"
     dri.mkdir()
     for name in ("renderD128", "card1", "card1-DP-1", "card1-HDMI-A-1"):
@@ -58,6 +59,7 @@ def test_gpu_nodes_skips_drm_connectors(tmp_path):
 def test_gpu_nodes_omits_absent_paths(tmp_path):
     # Only nodes that exist may reach DeviceAllow: systemd refuses to start
     # on one that does not resolve.
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': GPU device nodes this host actually has (render + card + kfd). Roots are parameters so the scan is testable against a fake ``/dev``.
     dri = tmp_path / "dri"
     dri.mkdir()
     (dri / "renderD128").touch()
@@ -68,6 +70,7 @@ def test_gpu_nodes_omits_absent_paths(tmp_path):
 def test_newest_build_orders_numerically(tmp_path):
     # llama-b9999 must lose to llama-b11658; lexicographic order gets this
     # backwards, and picking the wrong build means deploying a stale binary.
+    # Validates: docs/install.md, 'Where an update installs': Newest installed ``llama-bNNNN`` with a llama-server.
     for name in ("llama-b9999", "llama-b11658", "llama-b11539"):
         d = tmp_path / name
         d.mkdir()
@@ -77,6 +80,7 @@ def test_newest_build_orders_numerically(tmp_path):
 
 
 def test_newest_build_none_without_builds(tmp_path):
+    # Validates: docs/install.md, 'Where an update installs': Newest installed ``llama-bNNNN`` with a llama-server.
     (tmp_path / "llama-b1").mkdir()
     assert ins.newest_build(tmp_path) is None
 
@@ -87,6 +91,7 @@ def test_newest_build_none_without_builds(tmp_path):
 def test_render_unit_substitutes_directives_only(monkeypatch):
     # The template header names the placeholders it expects. Substituting
     # those mentions would turn the documentation into a copy of this host.
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': Fill the unit template for this host. The hardening block comes from the template verbatim; what is.
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/dri/renderD128"])
     body = ins.render_unit(_args(), Path("/opt/llama"))
@@ -104,6 +109,7 @@ def test_render_unit_substitutes_directives_only(monkeypatch):
 
 
 def test_render_unit_gpu_env_follows_hardware(monkeypatch):
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': Fill the unit template for this host. The hardening block comes from the template verbatim; what is.
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     assert "HIP_VISIBLE_DEVICES=0" in ins.render_unit(_args(), Path("/d"))
@@ -116,6 +122,7 @@ def test_render_unit_gpu_env_follows_hardware(monkeypatch):
 def test_render_unit_lists_only_present_gpu_nodes(monkeypatch):
     # A pinned /dev/dri/card0 is wrong the moment the card enumerates as
     # card1 — systemd refuses to start on a DeviceAllow for a missing path.
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': Fill the unit template for this host. The hardening block comes from the template verbatim; what is.
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes",
                         lambda: ["/dev/dri/renderD128", "/dev/dri/card1", "/dev/kfd"])
@@ -130,6 +137,7 @@ def test_render_unit_lists_only_present_hidden_dirs(monkeypatch):
     # service never starts. Only what exists may be listed.
     #
     # Validates: docs/install.md, the systemd unit the installer writes.
+    # Validates: docs/plans/requirement-trace.md #53: `InaccessiblePaths=` lists only directories present on this host
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
     monkeypatch.setattr(ins, "inaccessible_paths",
@@ -154,6 +162,7 @@ def test_unit_is_enableable():
     # never comes back after a reboot.
     #
     # Validates: docs/install.md, the systemd unit the installer writes.
+    # Validates: docs/plans/requirement-trace.md #52: The unit is enableable: it carries `[Install] WantedBy=`
     body = ins.TEMPLATE.read_text()
     assert "[Install]" in body
     assert "WantedBy=multi-user.target" in body
@@ -162,6 +171,7 @@ def test_unit_is_enableable():
 def test_render_unit_rejects_untouched_token(monkeypatch, tmp_path):
     # A placeholder nobody filled is a silent misconfiguration, not a
     # cosmetic issue: the directive would reach systemd verbatim.
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': Fill the unit template for this host. The hardening block comes from the template verbatim; what is.
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
     tmpl = tmp_path / "t.in"
@@ -175,6 +185,7 @@ def test_no_trailing_comments_on_directives():
     # systemd reads the whole rest of the line as the value, so
     # `MemoryHigh=32G  # cap` is an invalid limit and is dropped without an
     # error. Prose belongs on its own line.
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': a directive may not carry a trailing comment: systemd drops the whole line.
     for ln in ins.TEMPLATE.read_text().splitlines():
         if ln.lstrip().startswith("#"):
             continue
@@ -194,6 +205,7 @@ def test_verify_unit_fails_on_our_unit_even_when_exit_zero(monkeypatch, tmp_path
     # systemd-analyze exits 0 for a directive it merely "ignored" — the
     # exact shape of the trailing-comment bug. The verdict comes from the
     # messages, not the status.
+    # Validates: docs/install.md, 'What it does': Run ``systemd-analyze verify`` and fail on any complaint about.
     _fake_verify(monkeypatch,
                  "/etc/systemd/system/llama-swap.service:50: Invalid memory "
                  "limit '32G  # cap', ignoring: Invalid argument\n", 0)
@@ -204,6 +216,7 @@ def test_verify_unit_fails_on_our_unit_even_when_exit_zero(monkeypatch, tmp_path
 def test_verify_unit_ignores_unrelated_unit_failures(monkeypatch):
     # The command audits the whole system and reports the worst finding
     # anywhere; a broken timer on the host must not fail every install.
+    # Validates: docs/install.md, 'What it does': a complaint about another unit is not this install's business.
     _fake_verify(monkeypatch,
                  "/etc/systemd/system/logrotate.timer:7: Failed to parse\n",
                  1)
@@ -217,6 +230,7 @@ def test_user_supplementary_reports_memberships(monkeypatch):
     # Reading gr_mem off the primary group returns that group's *members*,
     # not this user's memberships, and reports every group as missing —
     # which would re-run usermod on every install.
+    # Validates: docs/install.md, 'What it does': Names of the groups *user* belongs to, supplementary or primary.
     import grp as _grp
     monkeypatch.setattr(ins.os, "getgrouplist", lambda u, g: [10, 20, 30])
     monkeypatch.setattr(ins.grp, "getgrgid",
@@ -231,6 +245,7 @@ def test_user_supplementary_reports_memberships(monkeypatch):
 def test_dry_run_prints_without_executing(tmp_path, capsys):
     # A dry run that touched the filesystem would be worse than no dry run:
     # the operator's first reaction to the output is to trust it.
+    # Validates: docs/install.md, 'What it does': run.
     marker = tmp_path / "side-effect"
     ins.Runner(True).run(["touch", str(marker)])
     assert not marker.exists()
@@ -244,12 +259,14 @@ def test_require_binaries_fails_when_config_would_point_nowhere(tmp_path):
     # find_bin_dir resolves relative to the cwd, so a config generated
     # before the binaries land is a config that points nowhere. Better to
     # say so here than as llama-packer's "no llama-b#### directory found".
+    # Validates: docs/install.md, 'What it does': Fail early when the config would have nothing to point at. Checked here so the error names the missing piece, instead of surfacing.
     r = ins.Runner(False)
     with pytest.raises(ins.InstallError, match="no llama-b"):
         ins.require_binaries(r, tmp_path)
 
 
 def test_require_binaries_passes_once_populated(tmp_path):
+    # Validates: docs/install.md, 'The updater is the installer for binaries': The llama-swap this deployment actually has.
     build = tmp_path / "llama-b11658"
     build.mkdir()
     (build / "llama-server").write_text("x")
@@ -258,6 +275,7 @@ def test_require_binaries_passes_once_populated(tmp_path):
 
 
 def test_install_binaries_pins_every_engine_to_the_run_dir(tmp_path):
+    # Validates: docs/install.md, 'The updater is the installer for binaries': Put ``llama-swap`` and a llama.cpp build under *dir_*. Delegates to ``extras/update.py``, which already owns downloading,.
     """A fresh deployment must not adopt a parent directory's engines.
 
     update.py updates each engine where it finds it, searching outwards from
@@ -286,6 +304,7 @@ def test_install_binaries_pins_every_engine_to_the_run_dir(tmp_path):
 
 
 def test_binaries_go_in_the_tools_subdirectory(tmp_path):
+    # Validates: docs/install.md, 'The updater is the installer for binaries': The llama-swap this deployment actually has.
     """The deployment layout: config at the top, engines under tools/."""
     build = ins.tools_dir(tmp_path) / "llama-b11714"
     build.mkdir(parents=True)
@@ -298,6 +317,7 @@ def test_binaries_go_in_the_tools_subdirectory(tmp_path):
 
 
 def test_a_flat_run_directory_still_resolves(tmp_path):
+    # Validates: docs/install.md, 'The updater is the installer for binaries': The llama-swap this deployment actually has.
     """Installs made before the tools/ layout must keep working."""
     (build := tmp_path / "llama-b11714").mkdir()
     (build / "llama-server").write_text("x")
@@ -309,6 +329,7 @@ def test_a_flat_run_directory_still_resolves(tmp_path):
 
 
 def test_tools_wins_over_a_stale_flat_copy(tmp_path):
+    # Validates: docs/install.md, 'The updater is the installer for binaries': The llama-swap this deployment actually has.
     """Both layouts present: the deployment one is the live one."""
     for base in (tmp_path, ins.tools_dir(tmp_path)):
         (build := base / "llama-b11714").mkdir(parents=True)
@@ -319,6 +340,7 @@ def test_tools_wins_over_a_stale_flat_copy(tmp_path):
 
 
 def test_unit_execstart_names_the_installed_swap(tmp_path):
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': Fill the unit template for this host. The hardening block comes from the template verbatim; what is.
     """The unit must not point at a file this deployment does not have."""
     import argparse as _argparse
 
@@ -339,6 +361,7 @@ def test_unit_execstart_names_the_installed_swap(tmp_path):
 def test_backup_keeps_the_previous_config(tmp_path):
     # Both are gitignored and machine-local, so an install that overwrites
     # them has no other way back: a regeneration can move every context.
+    # Validates: docs/install.md, 'Two orderings that are load-bearing': Copy *path* aside to ``<name>.bak-<n>`` before overwriting it. An install replaces a working config and a working unit in one step.
     live = tmp_path / "config.yaml"
     live.write_text("models: {}\n")
     made = ins.backup(live, dry_run=False)
@@ -352,6 +375,7 @@ def test_backup_keeps_the_previous_config(tmp_path):
 
 
 def test_backup_noop_without_file(tmp_path):
+    # Validates: docs/install.md, 'Two orderings that are load-bearing': Copy *path* aside to ``<name>.bak-<n>`` before overwriting it. An install replaces a working config and a working unit in one step.
     assert ins.backup(tmp_path / "absent", dry_run=False) is None
 
 
@@ -359,6 +383,7 @@ def test_config_is_generated_from_the_run_directory(tmp_path, monkeypatch):
     # LLAMA_DIR is derived from wherever find_bin_dir located the binary,
     # so generating from the repo would emit a config pointing back at the
     # repo and leave everything in the run directory unused.
+    # Validates: docs/install.md, 'Running llama-packer afterwards': Run llama-packer as the service user to (re)write the config. As the service user rather than root, so the ``derived:`` blocks it.
     seen = {}
     monkeypatch.setattr(ins, "REPO", tmp_path / "repo")
     monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
@@ -389,6 +414,7 @@ def test_install_does_not_invent_hf_home(monkeypatch, tmp_path):
     # (Path.home()/".cache") resolves to *root's* cache and every hf_repo
     # model silently stops resolving. llama-packer already has a chain for
     # this; install.py must not add a fourth mechanism over it.
+    # Validates: docs/install.md, 'Running llama-packer afterwards': Run llama-packer as the service user to (re)write the config. As the service user rather than root, so the ``derived:`` blocks it.
     monkeypatch.setenv("HF_HOME", "/should/not/be/used")
     seen = {}
     monkeypatch.setattr(ins, "REPO", Path("/repo"))
@@ -416,6 +442,7 @@ def test_install_does_not_invent_hf_home(monkeypatch, tmp_path):
 
 
 def test_install_passes_hf_home_through(monkeypatch, tmp_path):
+    # Validates: docs/install.md, 'Running llama-packer afterwards': Run llama-packer as the service user to (re)write the config. As the service user rather than root, so the ``derived:`` blocks it.
     seen = {}
     monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
 
@@ -437,6 +464,7 @@ def test_install_passes_hf_home_through(monkeypatch, tmp_path):
 
 
 def test_report_resolved_warns_on_missing_hf_home(tmp_path, caplog):
+    # Validates: docs/install.md, 'Two things the unit discovers rather than hardcodes': Print the path macros the emitted config actually resolved to. Read back from ``config.env`` rather than predicted, because these are.
     (tmp_path / "config.env").write_text(
         "LLAMA_DIR=/opt/llama/llama-b11669\nHF_HOME=/root/.cache/huggingface\n")
     ins.report_resolved(tmp_path)
@@ -445,6 +473,7 @@ def test_report_resolved_warns_on_missing_hf_home(tmp_path, caplog):
 
 
 def test_report_resolved_quiet_when_hf_home_exists(tmp_path, caplog):
+    # Validates: docs/plans/requirement-trace.md #51: an unreadable HF_HOME warns instead of crashing the installer
     existing = tmp_path / "hfcache"
     existing.mkdir()
     (tmp_path / "config.env").write_text(f"HF_HOME={existing}\n")
@@ -605,6 +634,7 @@ def test_probe_gives_up_after_the_deadline(monkeypatch):
 
 
 def test_repack_does_not_repoint_home(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Running llama-packer afterwards': Run llama-packer as the service user to (re)write the config. As the service user rather than root, so the ``derived:`` blocks it.
     """HOME=dir_ made the HF cache fallback resolve under the run dir.
 
     Path.home() honours HOME, so with no --hf-home the fallback became
@@ -634,6 +664,7 @@ def test_repack_does_not_repoint_home(tmp_path, monkeypatch):
 
 
 def test_missing_group_is_fatal_and_creates_nothing(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'What it does': Create the service account if absent; add the GPU + config groups.
     """It used to be a warning.
 
     prepare_dir chowns the run directory to that group, so the run created
@@ -653,6 +684,7 @@ def test_missing_group_is_fatal_and_creates_nothing(tmp_path, monkeypatch):
 
 
 def test_existing_group_proceeds(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'What it does': Create the service account if absent; add the GPU + config groups.
     ran = []
     monkeypatch.setattr(ins, "group_exists", lambda _g: True)
     monkeypatch.setattr(ins, "user_exists", lambda _u: True)

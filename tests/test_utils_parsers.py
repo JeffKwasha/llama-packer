@@ -1,5 +1,15 @@
 # tests/test_utils_parsers.py
-"""Memory string parsers."""
+"""Memory string parsers, HF cache layout, header-only model-kind guard.
+
+The design parts these tests hold up:
+
+- `llama_packer/utils.py:parse_mem_mb` / `parse_context_length` — the string
+  grammar for `--spare` and `context_length`.
+- SPEC.md, 'Path Macros and HF_HOME' — `--hf-home` / `HF_HOME` name the
+  *root* (the dir containing `hub/`), never the hub itself.
+- SPEC.md, 'Derived fields', model-kind guard — a file is classified from its
+  header, never from its name.
+"""
 
 from __future__ import annotations
 
@@ -10,36 +20,44 @@ from llama_packer.utils import parse_context_length, parse_mem_mb
 
 
 def test_resolve_spare_suffixed_gigabytes():
+    # Validates: SPEC.md, 'Context calculation formula': a suffixed value resolves directly, "2G" is 2048 MiB.
     assert parse_mem_mb("2G", 32768) == 2048
 
 
 def test_resolve_spare_suffixed_megabytes():
+    # Validates: SPEC.md, 'Context calculation formula': the suffix is case-insensitive, "512m" is 512 MiB.
     assert parse_mem_mb("512m", 32768) == 512
 
 
 def test_resolve_spare_bare_gb_hint():
     # bare number < 3 * VRAM(GB) -> treated as GB
+    # Validates: SPEC.md, 'Context calculation formula': a bare number below 3x VRAM(GB) is read as gigabytes.
     assert parse_mem_mb("2", 32768) == 2048
 
 
 def test_resolve_spare_bare_mb_hint():
     # bare number >= 3 * VRAM(GB) -> treated as MB
+    # Validates: SPEC.md, 'Context calculation formula': a bare number at or above 3x VRAM(GB) is read as megabytes.
     assert parse_mem_mb("512", 32768) == 512
 
 
 def test_resolve_spare_invalid_returns_zero():
+    # Validates: SPEC.md, 'Context calculation formula': an unparseable value warns and counts as 0, never as a silent default.
     assert parse_mem_mb("nonsense", 32768) == 0
 
 
 def test_parse_context_length_k():
+    # Validates: SPEC.md, 'Context Tiers': a context size is written as a positive integer or as a 128k / 1M string
     assert parse_context_length("128k") == 131072
 
 
 def test_parse_context_length_m():
+    # Validates: SPEC.md, 'Context Tiers': a context size is written as a positive integer or as a 128k / 1M string
     assert parse_context_length("1m") == 1048576
 
 
 def test_parse_context_length_bare():
+    # Validates: SPEC.md, 'Context Tiers': a context size is written as a positive integer or as a 128k / 1M string
     assert parse_context_length("65536") == 65536
 
 
@@ -47,6 +65,7 @@ def test_parse_context_length_bare():
 
 
 def test_compute_env_prefixes_hf_grouping(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a weight and a chat template are grouped under their own roots; the template's path must not widen MODELS_DIR.
     from llama_packer.utils import compute_env_prefixes, hf_cache_root
     models = tmp_path / "models"
     hf = tmp_path / "hf"
@@ -66,6 +85,7 @@ def test_compute_env_prefixes_hf_grouping(tmp_path, monkeypatch):
 
 
 def test_compute_env_prefixes_hf_home_override(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': an explicit hf_home overrides the environment.
     from llama_packer.utils import compute_env_prefixes
     monkeypatch.delenv("HF_HOME", raising=False)
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -84,6 +104,9 @@ def test_compute_env_prefixes_hf_home_override(tmp_path, monkeypatch):
 def test_hf_home_override_is_root_not_hub(tmp_path):
     # hf_home / --hf-home name the HF_HOME root (the dir containing hub/);
     # the hub is always <root>/hub.
+    # Validates: SPEC.md, 'Path Macros and HF_HOME': hf_home / --hf-home
+    # name the HF_HOME root (the dir containing hub/); the hub is always
+    # <root>/hub.
     from pathlib import Path
     from llama_packer.utils import hf_cache_root, hf_hub_cache
     root = tmp_path / "hf"
@@ -97,6 +120,8 @@ def test_hf_home_hub_dir_is_not_guessed(tmp_path, monkeypatch):
     # The old code treated an override with no hub/ child as the hub itself.
     # Per the HF_HOME invariant that is wrong: the override is the root, so
     # the hub is <override>/hub and does not resolve.
+    # Validates: SPEC.md, 'Path Macros and HF_HOME': the override is the
+    # root, so the hub is <override>/hub and does not resolve.
     from llama_packer.utils import hf_hub_cache, hf_snapshot_dir
     monkeypatch.delenv("HF_HOME", raising=False)
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -108,6 +133,7 @@ def test_hf_home_hub_dir_is_not_guessed(tmp_path, monkeypatch):
 
 def test_hf_hub_cache_honours_huggingface_hub_cache(tmp_path, monkeypatch):
     # $HUGGINGFACE_HUB_CACHE is HF's own *hub* variable (not a root).
+    # Validates: SPEC.md, 'Path Macros and HF_HOME':     # $HUGGINGFACE_HUB_CACHE is HF's own hub variable, not a root.
     from llama_packer.utils import hf_hub_cache
     monkeypatch.delenv("HF_HOME", raising=False)
     monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "custom-hub"))
@@ -118,6 +144,7 @@ def test_hf_hub_cache_honours_huggingface_hub_cache(tmp_path, monkeypatch):
 
 
 def test_classify_gguf_text_architecture(tmp_path):
+    # Validates: SPEC.md, 'Derived fields (computed, not authored)': a model's kind is derived from its header architecture, never from its name
     from llama_packer.utils import classify_file, gguf_header_probe
     p = write_gguf(tmp_path / "m.gguf", arch="qwen3vl",
                    context_length=262144)
@@ -126,6 +153,7 @@ def test_classify_gguf_text_architecture(tmp_path):
 
 
 def test_classify_gguf_diffusion_architecture(tmp_path):
+    # Validates: SPEC.md, 'Derived fields (computed, not authored)': a model's kind is derived from its header architecture, never from its name
     from llama_packer.utils import classify_file, gguf_header_probe
     p = write_gguf(tmp_path / "flux.gguf", arch="flux1",
                context_length=None)
@@ -136,6 +164,9 @@ def test_classify_gguf_diffusion_architecture(tmp_path):
 def test_classify_ignores_filename_llm_named_like_media(tmp_path):
     # MiniMax H3-style case: a text model whose *filename* looks media-ish is
     # still classified by its header architecture, never the name.
+    # Validates: SPEC.md, 'Derived fields', model-kind guard: a text model
+    # whose *filename* looks media-ish is still classified by its header
+    # architecture, never the name.
     from llama_packer.utils import classify_file
     p = write_gguf(tmp_path / "MiniMax-H3-video-sounding-name.gguf",
                    arch="minimaxh3", context_length=1000000)
@@ -143,6 +174,7 @@ def test_classify_ignores_filename_llm_named_like_media(tmp_path):
 
 
 def test_classify_gguf_unknown(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a file that is not a GGUF at all is "unknown", never guessed from its extension.
     from llama_packer.utils import classify_file
     p = tmp_path / "x.gguf"
     p.write_bytes(b"x")  # not GGUF at all
@@ -159,6 +191,7 @@ def _safetensors_bytes(names: list[str]) -> bytes:
 
 
 def test_sniff_safetensors_diffusion_blocks(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': diffusion tensor names mean an image model.
     from llama_packer.utils import classify_file, sniff_safetensors
     p = tmp_path / "flux.safetensors"
     p.write_bytes(_safetensors_bytes([
@@ -170,6 +203,7 @@ def test_sniff_safetensors_diffusion_blocks(tmp_path):
 
 
 def test_sniff_safetensors_text_transformer(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': transformer tensor names mean a text model.
     from llama_packer.utils import sniff_safetensors
     p = tmp_path / "llm.safetensors"
     p.write_bytes(_safetensors_bytes([
@@ -181,6 +215,7 @@ def test_sniff_safetensors_text_transformer(tmp_path):
 
 
 def test_sniff_safetensors_unknown(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': tensor names that match neither shape are "unknown".
     from llama_packer.utils import sniff_safetensors
     p = tmp_path / "odd.safetensors"
     p.write_bytes(_safetensors_bytes(["some.random.tensor.weight"]))
@@ -189,6 +224,8 @@ def test_sniff_safetensors_unknown(tmp_path):
 
 def test_hf_readme_kind_from_cached_card(tmp_path, monkeypatch):
     # Offline signal: pipeline_tag in the snapshot README.md frontmatter.
+    # Validates: SPEC.md, 'Derived fields', model-kind guard: a cached HF
+    # card's pipeline_tag is the offline fallback signal.
     from llama_packer.utils import hf_readme_kind
     hub = tmp_path / "hub"
     snap = hub / "models--org--repo" / "snapshots" / "abc123"
@@ -200,6 +237,7 @@ def test_hf_readme_kind_from_cached_card(tmp_path, monkeypatch):
 
 
 def test_hf_readme_kind_text_tag_returns_none(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a text-generation card names no media kind, so the answer is None.
     from llama_packer.utils import hf_readme_kind
     hub = tmp_path / "hub"
     snap = hub / "models--org--text" / "snapshots" / "abc123"
@@ -210,6 +248,7 @@ def test_hf_readme_kind_text_tag_returns_none(tmp_path):
 
 
 def test_make_fast_storage_predicate(tmp_path):
+    # Validates: SPEC.md, 'Health-Check Timeout': drive speed is detected per model, and the slowest drive among the model files bounds the timeout
     from llama_packer.utils import make_fast_storage_predicate
 
     # a merged view (/ai) over two branches; mergerfs keeps directory
@@ -276,6 +315,7 @@ def _safetensors_file(tmp_path, dtype: str):
 def test_estimate_safetensors_fp8_dtype_names(tmp_path):
     # FP8 checkpoints carry F8_E4M3 in the header (the safetensors spec
     # spelling) — 1 B/elem, the same density as a Q8_0 GGUF.
+    # Validates: SPEC.md, 'vLLM Backend': FP8 checkpoints (F8_E4M3 / F8_E5M2) carry 1 byte per element, the same density as a Q8_0 GGUF.
     from llama_packer.utils import estimate_safetensors
 
     p = _safetensors_file(tmp_path, "F8_E4M3")
@@ -289,6 +329,7 @@ def test_estimate_safetensors_fp8_dtype_names(tmp_path):
 
 
 def test_estimate_safetensors_bf16_control(tmp_path):
+    # Validates: SPEC.md, 'vLLM Backend': a safetensors checkpoint is sized from its header: BF16 carries 2 bytes per element
     from llama_packer.utils import estimate_safetensors
 
     p = _safetensors_file(tmp_path, "BF16")

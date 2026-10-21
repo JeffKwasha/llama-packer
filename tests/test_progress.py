@@ -1,5 +1,10 @@
 # tests/test_progress.py
-"""Progress bar no-op behavior + slow-op logging guards."""
+"""Progress bar no-op behavior + slow-op logging guards.
+
+Design parts: SPEC.md, 'Measured-Block Persistence' — the measurement the bar
+announces is the one that is persisted; the bar itself is a UI detail with no
+requirement behind it.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ from llama_packer.progress import PackerProgress
 
 
 def test_progress_noop_when_disabled():
+    # Pins an implementation contract; no requirement states it: a disabled bar still counts, it just draws nothing.
     p = PackerProgress(enabled=False)
     p.start(3, "budgeting")
     assert p._progress is None
@@ -24,6 +30,7 @@ def test_progress_noop_when_disabled():
 
 def test_progress_noop_under_pytest():
     # PYTEST_CURRENT_TEST is set by the runner, so the bar never activates.
+    # Pins an implementation contract; no requirement states it: under the test runner the bar never activates.
     assert os.environ.get("PYTEST_CURRENT_TEST")
     p = PackerProgress(enabled=True)
     p.start(3, "budgeting")
@@ -33,6 +40,7 @@ def test_progress_noop_under_pytest():
 
 
 def test_active_bar_routes_logs_through_console(monkeypatch):
+    # Pins an implementation contract; no requirement states it: while the bar is live, log records print above it, and the previous handlers come back on stop.
     """While the bar is live, log records render through the bar's rich
     console (which prints them ABOVE the bar) and the previous handlers are
     restored on stop."""
@@ -61,6 +69,7 @@ def test_active_bar_routes_logs_through_console(monkeypatch):
 
 
 def test_active_bar_restores_handlers_even_on_stop_error(monkeypatch):
+    # Pins an implementation contract; no requirement states it: a failing stop still restores the log handlers.
     pytest.importorskip("rich")
     import llama_packer.progress as prog
 
@@ -78,6 +87,7 @@ def test_active_bar_restores_handlers_even_on_stop_error(monkeypatch):
 
 
 def test_estimator_forces_offline_and_restores(monkeypatch):
+    # Validates: SPEC.md, 'Memory estimation': vLLM's VRAM params are sourced separately but flow through the same FitParams pipeline
     from llama_packer import vllm_estimate
 
     seen = {}
@@ -114,6 +124,7 @@ def test_estimator_forces_offline_and_restores(monkeypatch):
 def test_estimate_vllm_kv_scales_with_cache_type(monkeypatch):
     # The estimator prices KV at the native (auto) dtype ~2 B/elem; the
     # cache_type decision (q8_0 -> --kv-cache-dtype fp8) must rescale it.
+    # Validates: docs/backends/vllm.md, 'Memory estimation': the KV term is rescaled to the chosen cache type, not the native dtype.
     from llama_packer import vllm_estimate
 
     class FakeOne:
@@ -142,6 +153,7 @@ def test_estimate_vllm_kv_scales_with_cache_type(monkeypatch):
 
 
 def test_fit_params_logs_before_run(make_model, fit_params_block, monkeypatch, caplog):
+    # Validates: SPEC.md, 'Measurement via `llama-fit-params`': the measurement is announced before it runs, so a slow box is explainable.
     import subprocess
 
     m = make_model("pl")
@@ -160,6 +172,7 @@ def test_fit_params_logs_before_run(make_model, fit_params_block, monkeypatch, c
 
 def test_fit_params_cache_hit_is_silent(make_model, fit_params_block,
                                         monkeypatch, caplog):
+    # Validates: docs/plans/estimation-functions-facts.md, 'FitParams sources (in priority order)': a cached measurement re-runs nothing and says nothing
     import subprocess
 
     m = make_model("pc", **{"derived": fit_params_block})

@@ -30,11 +30,13 @@ from llama_packer.writer import (
     (65536.0, 65536),
 ])
 def test_parse_ctx_size_accepts_ints_and_suffixes(raw, expected):
+    # Validates: SPEC.md, 'Context Tiers': min_context states a floor, as a positive int or a 128k/1M string
     assert _parse_ctx_size(raw) == expected
 
 
 @pytest.mark.parametrize("raw", [0, -1, "abc", "", None, True, [], {}])
 def test_parse_ctx_size_rejects_junk(raw):
+    # Validates: SPEC.md, 'Context Tiers': a context size is a positive integer or a 128k / 1M string; anything else is rejected
     assert _parse_ctx_size(raw) is None
 
 
@@ -42,6 +44,7 @@ def test_parse_ctx_size_rejects_junk(raw):
 
 
 def test_catalogue_parses_full_spec():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': the usage: catalogue is parsed from profiles.yaml.
     cat = UsageCatalogue.from_cfg({
         "coding": {"min_context": "128k", "min_parallel": 1,
                    "sacrifice": ["vision", "draft"]},
@@ -59,12 +62,14 @@ def test_catalogue_parses_full_spec():
 
 
 def test_catalogue_int_shorthand_is_min_context():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a bare integer is the category's min_context.
     cat = UsageCatalogue.from_cfg({"chat": 65536})
     assert cat.get("chat").min_context == 65536
     assert cat.get("chat").min_parallel == 1
 
 
 def test_catalogue_warns_and_drops_malformed_categories(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a malformed category is warned about and dropped.
     with caplog.at_level("WARNING"):
         cat = UsageCatalogue.from_cfg({
             "good": {"min_context": "32k"},
@@ -80,6 +85,7 @@ def test_catalogue_warns_and_drops_malformed_categories(caplog):
 
 
 def test_catalogue_warns_on_unknown_capability(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': an unknown capability is warned about and dropped.
     with caplog.at_level("WARNING"):
         cat = UsageCatalogue.from_cfg(
             {"qa": {"require": ["vision", "telepathy"]}})
@@ -89,11 +95,13 @@ def test_catalogue_warns_on_unknown_capability(caplog):
 
 
 def test_catalogue_empty_config_is_falsy():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': an empty catalogue is falsy, so no category is ever invented.
     assert not UsageCatalogue.from_cfg(None)
     assert not UsageCatalogue.from_cfg({})
 
 
 def test_known_capabilities_are_the_ladder_axes():
+    # Validates: docs/plans/category-semantics.md, 'Degradation': the ladder's axes are vision and draft
     assert KNOWN_CAPABILITIES == frozenset({"vision", "draft"})
 
 
@@ -101,6 +109,7 @@ def test_known_capabilities_are_the_ladder_axes():
 
 
 def test_resolve_usage_accepts_blessed_tags():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': only the tags the catalogue declares become demands.
     cat = UsageCatalogue.from_cfg({"coding": {"min_context": "128k"},
                                    "chat": {"min_context": "64k"}})
     got = resolve_usage(["coding", "chat"], cat)
@@ -108,11 +117,13 @@ def test_resolve_usage_accepts_blessed_tags():
 
 
 def test_resolve_usage_dedupes_repeats():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a repeated tag is one demand.
     cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
     assert [d.name for d in resolve_usage(["chat", "chat"], cat)] == ["chat"]
 
 
 def test_resolve_usage_ignores_unblessed_tag_with_warning(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': an undeclared tag is warned about and ignored.
     cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
     with caplog.at_level("WARNING"):
         got = resolve_usage(["chat", "code"], cat)
@@ -124,11 +135,13 @@ def test_resolve_usage_ignores_unblessed_tag_with_warning(caplog):
 
 
 def test_resolve_usage_accepts_bare_string():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a bare string is one tag.
     cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
     assert [d.name for d in resolve_usage("chat", cat)] == ["chat"]
 
 
 def test_resolve_usage_no_tags_means_no_demands(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': no tags means no demands.
     cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
     assert resolve_usage(None, cat) == ()
     with caplog.at_level("WARNING"):
@@ -170,6 +183,7 @@ _CO = frozenset({"s2t", "s2t2"})
 
 
 def test_split_top_respects_parentheses():
+    # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the split is at parenthesis depth zero.
     assert _split_top("a & b & c", "&") == ["a", "b", "c"]
     assert _split_top("a | b & c", "|") == ["a", "b & c"]
     # a term fully wrapped in parens yields the bare term
@@ -189,12 +203,14 @@ def test_split_top_respects_parentheses():
     ("__CHAT_VARS__", 0),
 ])
 def test_set_overhead_sums_coresidents(expr, expected):
+    # Validates: SPEC.md, 'VRAM Allocation': a co-resident set is charged the sum of its members
     assert set_overhead_mb(expr, _MB, _CH, _CO) == expected
 
 
 def test_set_overhead_charges_priciest_or_branch_only():
     # emb and rnk2 are alternatives -- only one is ever resident, and the
     # entry must survive the heavier one.
+    # Validates: docs/plans/opportunistic-coload.md, 'Design': an OR branch charges only the pricier side.
     assert set_overhead_mb("__CHAT_VARS__ & (emb | rnk2)", _MB, _CH, _CO) == 5766
     assert set_overhead_mb("((c1 | c2)) & emb & (rnk | rnk2)",
                            _MB, _CH, _CO) == 749 + 5766
@@ -202,16 +218,19 @@ def test_set_overhead_charges_priciest_or_branch_only():
 
 def test_set_overhead_sums_coloads():
     # co-loads genuinely stack with each other, unlike OR branches
+    # Validates: docs/plans/opportunistic-coload.md, 'Design': co-loads stack with each other.
     assert set_overhead_mb("__CHAT_VARS__ & __COLOAD_VARS__",
                            _MB, _CH, _CO) == 2814 + 1914
 
 
 def test_set_overhead_ignores_explicit_chat_vars():
+    # Validates: SPEC.md, 'VRAM Allocation': an explicit chat var is not charged as a co-resident
     assert set_overhead_mb("(c1 | c2) & emb", _MB, _CH, _CO) == 749
     assert set_overhead_mb("c1 & emb & stt", _MB, _CH, _CO) == 749 + 1898
 
 
 def test_set_coresident_vars_names_the_residents():
+    # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the vars a set can co-reside with.
     assert set_coresident_vars("__CHAT_VARS__ & emb & rnk", _CH, _CO) == \
         frozenset({"emb", "rnk"})
     assert set_coresident_vars("__CHAT_VARS__ & __COLOAD_VARS__", _CH, _CO) == _CO
@@ -220,6 +239,7 @@ def test_set_coresident_vars_names_the_residents():
 
 def test_set_overhead_ignores_unknown_vars():
     # an unresolvable var charges nothing rather than exploding the solve
+    # Validates: docs/plans/opportunistic-coload.md, 'Design': an unknown var is charged nothing.
     assert set_overhead_mb("__CHAT_VARS__ & mystery", _MB, _CH, _CO) == 0
 
 
@@ -239,18 +259,21 @@ from llama_packer.writer import ctx_label  # noqa: E402
     (2097152, "2M"),
 ])
 def test_ctx_label(ctx, expected):
+    # Validates: docs/plans/category-semantics.md, 'Ids carry no context': the served context is labelled compactly.
     assert ctx_label(ctx) == expected
 
 
 def test_ctx_label_never_exceeds_four_characters():
     # A client scans the id list; an id that wanders past four characters
     # stops being comparable at a glance.
+    # Validates: docs/plans/category-semantics.md, 'Ids carry no context': the label is compact enough for an id.
     for ctx in range(0, 4 * 1024 * 1024, 4096):
         assert len(ctx_label(ctx)) <= 4, ctx
 
 
 def test_ctx_labels_below_the_mega_threshold_are_unique():
     # Exact contexts must not collide, or two entries would share an id.
+    # Validates: docs/plans/category-semantics.md, 'Ids carry no context': the labels are unique below the mega threshold.
     seen = {}
     for ctx in range(0, 1000 * 1024, 1024):
         lbl = ctx_label(ctx)
@@ -287,6 +310,7 @@ def _auto_par(table, **kw):
 def test_min_parallel_is_honoured_when_a_candidate_qualifies():
     # Every slot count clears the 64k chat floor, so a demand for 4 slots
     # must not be quietly served with fewer.
+    # Validates: docs/plans/auto-parallel.md, 'Design': a candidate that meets min_parallel is taken.
     table = {p: 262144 for p in range(1, 9)}
     p, ctx = _auto_par(table, floor=65536, min_parallel=4)
     assert p >= 4, (p, ctx)
@@ -298,6 +322,7 @@ def test_context_floor_outranks_min_parallel():
     # window is served instead. Concurrency is a preference; the context is
     # what the entry id advertises, and a client that cannot fit its prompt
     # gains nothing from a spare slot.
+    # Validates: docs/plans/auto-parallel.md, 'Design': the context floor outranks min_parallel.
     table = {1: 262144, 2: 40000}
     p, ctx = _auto_par(table, floor=65536, min_parallel=2)
     assert (p, ctx) == (1, 262144), (p, ctx)
@@ -308,6 +333,7 @@ def test_demand_never_trades_below_its_context_floor():
     # coding demand is unreachable: no candidate qualifies and the solver
     # falls back rather than inventing a context. Dropping the model from
     # the sets it cannot serve is the admission pass's job, not this one's.
+    # Validates: docs/plans/auto-parallel.md, 'Design': a demand is never served below its own context floor.
     table = {p: 98304 for p in range(1, 9)}
     p, ctx = _auto_par(table, floor=131072, min_parallel=1)
     assert (p, ctx) == (1, 98304), (p, ctx)
@@ -350,11 +376,13 @@ def _id_cat() -> UsageCatalogue:
     (None, ""),
 ])
 def test_flags_label_subset_and_order(caps, expected):
+    # Validates: SPEC.md, 'Entry ids name the task, not the solve': the flag segment is the served capability set as first letters, in the fixed order t, i, v, a, s
     assert flags_label(caps) == expected
 
 
 
 def test_served_flags_drops_image_and_demoted_tools(make_model, tmp_path):
+    # Validates: SPEC.md, 'VRAM Allocation': the flag segment is what is served, not what was declared.
     (tmp_path / "vis-mmproj.gguf").write_bytes(b"x")
     m = make_model("vis", capabilities=["tools", "image", "video"],
                    mmproj={"file": "vis-mmproj.gguf", "capabilities": ["image"]})
@@ -381,6 +409,7 @@ def _profiles_with_usage() -> Profiles:
 
 
 def test_emit_id_names_heaviest_category_with_flags(make_model):
+    # Validates: SPEC.md, 'Output Format': the id names the heaviest satisfied category and the served flags.
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     cat = UsageCatalogue.from_cfg(_profiles_with_usage().usage_cfg)
@@ -397,6 +426,7 @@ def test_emit_id_names_heaviest_category_with_flags(make_model):
 def test_ids_stable_when_context_changes(make_model):
     # The whole point: a repack that moves the solve must not rename the id,
     # because opencode/hermes cache model ids at startup.
+    # Validates: SPEC.md, 'Output Format': the id does not move when the served context changes.
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
@@ -469,6 +499,7 @@ def test_duplicate_ids_do_not_move_when_context_moves(make_model):
 def test_category_slugged_for_the_id(make_model):
     # Operator category names must not leak invalid characters into the id
     # (opencode excludes '#', llama-swap needs routeable/YAML-safe keys).
+    # Validates: SPEC.md, 'Output Format': the category is slugged for the id.
     m = make_model("m", context_length=262144, capabilities=["tools"])
     profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
                          "usage": {"My Code!": {"min_context": "64k"}}})
@@ -497,6 +528,7 @@ def test_dump_yaml_annotates_set_memory():
     # The config documents its own memory split: a comment above each set.
     # Only direct children of `sets:` are annotated, so a var that happens to
     # share a set's name is left alone.
+    # Validates: SPEC.md, 'Output Format': the emitted YAML carries the memory set it was built with.
     from llama_packer.writer import dump_yaml
     text = dump_yaml(
         {"routing": {"router": {"settings": {"matrix": {

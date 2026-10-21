@@ -36,23 +36,27 @@ def _tvars():
 
 
 def test_registry_names():
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     for name in ("llama-server", "vllm", "vllm-docker"):
         assert get_backend(name).name == name
 
 
 def test_registry_unknown_raises():
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     import pytest
     with pytest.raises(KeyError):
         get_backend("nope")
 
 
 def test_llama_server_roles_and_formats():
+    # Validates: SPEC.md, 'Backend Selection': the engine's formats and the roles it serves.
     b = LlamaServerBackend()
     assert b.formats == {".gguf"}
     assert b.roles == {"chat", "embeddings", "rerank"}
 
 
 def test_supports_role_and_format(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Return why this backend cannot serve *model*, or None if it can.
     b = LlamaServerBackend()
     assert b.unsupported_reason(make_model("m")) is None
     assert b.unsupported_reason(make_model("e", role="embeddings")) is None
@@ -60,6 +64,7 @@ def test_supports_role_and_format(make_model):
 
 
 def test_llama_server_rejects_safetensors(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Return why this backend cannot serve *model*, or None if it can.
     b = LlamaServerBackend()
     # A model with no local .gguf and no hf_repo cannot be served by llama-server.
     m = make_model("x", hf_repo="org/some-safetensors-model")
@@ -69,6 +74,7 @@ def test_llama_server_rejects_safetensors(make_model):
 
 
 def test_vllm_requires_safetensors_or_hf_repo(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("vllm")
     # local .gguf only -> unsupported by vllm
     assert b.unsupported_reason(make_model("m")) is not None
@@ -77,11 +83,13 @@ def test_vllm_requires_safetensors_or_hf_repo(make_model):
 
 
 def test_vllm_rejects_embeddings_role(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("vllm")
     assert b.unsupported_reason(make_model("e", role="embeddings")) is not None
 
 
 def test_llama_server_mtp_args(make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': MTP is detected from the sidecar or the file name, and the command carries --spec-type, --spec-draft-n-max and --draft-p-min
     m = make_model("m", mtp=True, mtp_draft_n_max=4)
     b = LlamaServerBackend()
     args, meta = b._mtp_args(m)
@@ -92,6 +100,7 @@ def test_llama_server_mtp_args(make_model):
 
 
 def test_llama_server_mtp_draft_p_min_override(make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': mtp_draft_p_min overrides the default acceptance probability
     m = make_model("m", mtp=True, mtp_draft_p_min=0.9)
     args, meta = LlamaServerBackend()._mtp_args(m)
     assert "--draft-p-min" in args
@@ -100,6 +109,7 @@ def test_llama_server_mtp_draft_p_min_override(make_model):
 
 
 def test_llama_server_mtp_draft_p_min_invalid_falls_back(make_model, caplog):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': an invalid mtp_draft_p_min falls back to the module default instead of emitting a bad flag
     import logging
     m = make_model("m", mtp=True, mtp_draft_p_min=1.5)
     with caplog.at_level(logging.WARNING):
@@ -110,6 +120,7 @@ def test_llama_server_mtp_draft_p_min_invalid_falls_back(make_model, caplog):
 
 
 def test_llama_server_cmd_has_mmap_layers_and_cache(make_model):
+    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers is emitted only for a CPU-resident model, and the cache type as --cache-type-k/--cache-type-v
     m = make_model("m")
     b = LlamaServerBackend()
     cmd, meta = b.build_cmd(m, 32768, 1, "q8_0", _tvars())
@@ -121,6 +132,7 @@ def test_llama_server_cmd_has_mmap_layers_and_cache(make_model):
 
 
 def test_vllm_host_cmd(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the host command is vllm serve --model <ref> --served-model-name ${MODEL_ID} with --max-model-len and --gpu-memory-utilization
     m = make_model("v", hf_repo="org/model")
     cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert cmd.startswith("vllm serve")
@@ -130,6 +142,7 @@ def test_vllm_host_cmd(make_model):
 
 
 def test_vllm_baked_in_mtp_emits_speculative_config(make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': under vLLM the baked-in draft is passed as --speculative-config, on chat entries only
     m = make_model("v", hf_repo="org/model", mtp=True)
     cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert '--speculative-config {"method":"mtp","num_speculative_tokens":2}' in cmd
@@ -138,6 +151,7 @@ def test_vllm_baked_in_mtp_emits_speculative_config(make_model):
 
 
 def test_vllm_mtp_depth_override(make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': the draft depth override reaches the vLLM speculative config
     m = make_model("v", hf_repo="org/model", mtp=True, **{"mtp_draft_n_max": 3})
     cmd, meta = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert '"num_speculative_tokens":3' in cmd
@@ -145,6 +159,7 @@ def test_vllm_mtp_depth_override(make_model):
 
 
 def test_vllm_explicit_speculative_config_wins(make_model):
+    # Validates: docs/backends/vllm.md, 'Recipe keys (opt-in, verbatim)': an explicit speculative_config is passed through verbatim
     cfg = {"method": "eagle3", "model": "org/eagle-head",
            "num_speculative_tokens": 4}
     m = make_model("v", hf_repo="org/model", mtp=True,
@@ -158,6 +173,7 @@ def test_vllm_explicit_speculative_config_wins(make_model):
 
 
 def test_vllm_gguf_speculative_companion_warned_and_skipped(make_model, caplog):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': a GGUF draft companion is not a vLLM draft: the pairing is warned about and skipped
     m = make_model("v", hf_repo="org/model", speculative="v.mtp.gguf",
                    backend="vllm")
     with caplog.at_level(logging.WARNING):
@@ -168,6 +184,7 @@ def test_vllm_gguf_speculative_companion_warned_and_skipped(make_model, caplog):
 
 
 def test_vllm_docker_mtp_flag(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the speculative config is chat-only in the container command as well
     m = make_model("v", hf_repo="org/model", mtp=True)
     cmd, meta = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--speculative-config" in cmd
@@ -176,6 +193,7 @@ def test_vllm_docker_mtp_flag(make_model):
 
 def test_vllm_cache_type_maps_to_kv_cache_dtype(make_model):
     # q8_* -> fp8 (single configuration: same precision decision both backends)
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("v", hf_repo="org/model")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--kv-cache-dtype fp8" in cmd
@@ -185,6 +203,7 @@ def test_vllm_cache_type_maps_to_kv_cache_dtype(make_model):
 
 
 def test_vllm_sub_byte_cache_type_warned_and_skipped(make_model, caplog):
+    # Validates: docs/backends/vllm.md, 'Command shape': the cache type maps to --kv-cache-dtype fp8|nvfp4, and a type vLLM cannot price is warned about and skipped
     m = make_model("v", hf_repo="org/model")
     with caplog.at_level(logging.WARNING):
         cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q4_0", _tvars())
@@ -198,6 +217,7 @@ def test_vllm_nvfp4_flag_emitted_and_sized(make_model):
     # supports it (experimental, hardware-gated) is the operator's call —
     # we translate and size, we don't police.
 
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     from llama_packer.consts import _KV_CACHE_BYTES
     assert _KV_CACHE_BYTES["nvfp4"] == pytest.approx(0.5625)
     m = make_model("v", hf_repo="org/model")
@@ -206,6 +226,7 @@ def test_vllm_nvfp4_flag_emitted_and_sized(make_model):
 
 
 def test_vllm_parallel_maps_to_max_num_seqs(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': parallel maps to --max-num-seqs, omitted when the count is uncapped
     m = make_model("v", hf_repo="org/model")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 4, "q8_0", _tvars())
     assert "--max-num-seqs 4" in cmd
@@ -216,6 +237,7 @@ def test_vllm_parallel_maps_to_max_num_seqs(make_model):
 def test_vllm_uncapped_omits_max_num_seqs(make_model):
     # parallel 0 = uncapped: vLLM owns admission (elastic queueing), so the
     # cap flag is omitted entirely.
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("v", hf_repo="org/model", parallel=0)
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 0, "q8_0", _tvars())
     assert "--max-num-seqs" not in cmd
@@ -225,6 +247,7 @@ def test_vllm_uncapped_omits_max_num_seqs(make_model):
 def test_vllm_batch_flag_and_llama_only_strip(make_model):
     # --max-num-batched-tokens renders from the batch key; llama.cpp-only
     # flags leaking via sidecar cli_args are stripped with their values.
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("v", hf_repo="org/model",
                    cli_args="--flash-attn on -b 2048 -ub 512 "
                             "--reasoning-format deepseek")
@@ -241,6 +264,7 @@ def test_vllm_batch_flag_and_llama_only_strip(make_model):
 
 def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
                                                           monkeypatch):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     from llama_packer import writer
 
     chat = make_model("chat", context_length=32768)
@@ -278,6 +302,7 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
 def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
     # A declared non-RAG category (e.g. tts) is reserved as fixed overhead:
     # the solver sees fixed_overhead_mb > 0 for it.
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     from llama_packer import writer
 
     chat = make_model("chat", context_length=32768)
@@ -310,6 +335,7 @@ def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
 
 
 def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': the HF_HOME root is bind-mounted at /root/.cache/huggingface and the entry runs with HF_HUB_OFFLINE=1
     tpl = tmp_path / "qwen.jinja"
     tpl.write_text("x")
     m = make_model("v", hf_repo="org/model")
@@ -321,6 +347,7 @@ def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
 
 
 def test_warn_unhandled(caplog):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     import logging
     b = get_backend("vllm")
     with caplog.at_level(logging.WARNING):
@@ -332,6 +359,7 @@ def test_warn_unhandled(caplog):
 def test_setting_keys_partition():
     # framework-consumed and metadata-only keys are disjoint from each other
     # and from what a backend would render.
+    # Validates: SPEC.md, 'Backend Selection': Yield one bound backend per valid (engine, transport) pair.
     assert FRAMEWORK_CONSUMED == {"backend", "hf_repo"}
     assert METADATA_ONLY == {"chat_template_kwargs"}
     assert VLLM_BACKENDS == {"vllm", "vllm-podman", "vllm-docker"}
@@ -340,6 +368,7 @@ def test_setting_keys_partition():
 
 
 def test_audio_cpp_handles_its_block(caplog):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     import logging
     with caplog.at_level(logging.WARNING):
         get_backend("audio-cpp").warn_unhandled({"audio_cpp"})
@@ -351,12 +380,14 @@ def test_audio_cpp_handles_its_block(caplog):
 
 
 def test_basebackend_is_abstract():
+    # Validates: SPEC.md, 'Backend Selection': the base backend cannot be instantiated.
     import pytest
     with pytest.raises(TypeError):
         BaseBackend()  # type: ignore[abstract]
 
 
 def test_filter_supported_skips_bad_format(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Final validation before any backend renders a command. Single place where a resolved model is validated (and, when an *option* is.
     from llama_packer.writer import _filter_supported
 
     # a local .gguf under vLLM is unsupported -> skipped
@@ -367,6 +398,7 @@ def test_filter_supported_skips_bad_format(make_model):
 
 
 def test_filter_supported_skips_flagged_override(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Final validation before any backend renders a command. Single place where a resolved model is validated (and, when an *option* is.
     from llama_packer.writer import _filter_supported
 
     m = make_model("q", backend="vllm", hf_repo="org/model")
@@ -375,6 +407,7 @@ def test_filter_supported_skips_flagged_override(make_model):
 
 
 def test_filter_supported_warn_unhandled(make_model, caplog):
+    # Validates: SPEC.md, 'Backend Selection': Final validation before any backend renders a command. Single place where a resolved model is validated (and, when an *option* is.
     import logging
     from llama_packer.writer import _filter_supported
 
@@ -388,11 +421,13 @@ def test_filter_supported_warn_unhandled(make_model, caplog):
 
 
 def test_infer_backend_gguf_prefers_llama_server(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     assert infer_backend(make_model("g"), {"llama_bin": "/opt/llama-server"}) == "llama-server"
 
 
 def test_infer_backend_safetensors_prefers_host_then_container(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = Path("/models/s.safetensors")
@@ -407,6 +442,7 @@ def test_infer_backend_safetensors_prefers_host_then_container(make_model):
 
 
 def test_infer_backend_hf_repo_only(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     m = make_model("h", hf_repo="org/model")
     m.gguf_path = None  # no local file
@@ -414,6 +450,7 @@ def test_infer_backend_hf_repo_only(make_model):
 
 
 def test_docker_cmd_uses_per_model_image(make_model):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': a per-model vllm_image overrides the fleet image
     m = make_model("d", hf_repo="org/model", vllm_image="custom/img:v2")
     cmd, _ = get_backend("vllm-docker").build_cmd(m, 8192, 1, "q8_0", _tvars())
     assert "custom/img:v2" in cmd
@@ -421,6 +458,7 @@ def test_docker_cmd_uses_per_model_image(make_model):
 
 
 def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
+    # Validates: docs/transports/docker.md, 'Transport: docker': a host path under the models dir maps into the container's /models
     tpl = tmp_path / "qwen.jinja"
     tpl.write_text("x")
     tvars = {**_tvars(), "models_dir": str(tmp_path)}
@@ -433,6 +471,7 @@ def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
 # ── vllm podman pair (one engine, container transport) ────────────────────
 
 def test_vllm_podman_pair_cmd(make_model):
+    # Validates: docs/transports/podman.md, 'Transport: podman': the podman pair is the same engine with podman's device flags and lifecycle
     b = get_backend("vllm-podman")
     assert b.roles == {"chat", "embeddings", "rerank"}
     assert b.stop_cmd == "podman stop ${MODEL_ID}"
@@ -450,6 +489,7 @@ def test_vllm_podman_pair_cmd(make_model):
 
 
 def test_vllm_container_runtime_gating(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("vllm-podman")
     assert b.is_available({"vllm_image": "img"})          # not probed -> ok
     assert b.is_available({"vllm_image": "img", "podman": True})
@@ -461,12 +501,14 @@ def test_vllm_container_runtime_gating(make_model):
 
 
 def test_llama_server_reasoning_format(make_model):
+    # Validates: docs/backends/llama-server.md, 'Roles and flags': reasoning flags are chat-only, and skipped elsewhere with a warning when a declaration cannot apply
     m = make_model("m", **{"reasoning-format": "deepseek"})
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
     assert "--reasoning-format deepseek" in cmd
 
 
 def test_llama_server_reasoning_preserve(make_model):
+    # Validates: docs/backends/llama-server.md, 'Roles and flags': reasoning flags are chat-only, and skipped elsewhere with a warning when a declaration cannot apply
     m = make_model("m", **{"reasoning-preserve": True})
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
     assert "--reasoning-preserve" in cmd
@@ -474,6 +516,7 @@ def test_llama_server_reasoning_preserve(make_model):
 
 def test_llama_server_reasoning_flags_chat_only(make_model):
     # embeddings/rerank never get reasoning flags (gated to the chat role).
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     m = make_model("e", role="embeddings", **{"reasoning-format": "deepseek"})
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
     assert "--reasoning-format" not in cmd
@@ -482,6 +525,7 @@ def test_llama_server_reasoning_flags_chat_only(make_model):
 def test_cli_args_duplicate_flag_collapses(make_model):
     # A flag set both structurally and in cli_args is emitted exactly once
     # (the flag dict refuses duplicate keys); cli_args wins on value.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     m = make_model("m", cli_args="--reasoning-format none",
                    **{"reasoning-format": "deepseek"})
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
@@ -494,6 +538,7 @@ def test_cli_args_duplicate_flag_collapses(make_model):
 
 def test_llama_server_global_args_chat(make_model):
     # Chat models get the fleet-wide performance flags as-is.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
     cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", tv)
     assert "--flash-attn on -b 512 -ub 512" in cmd
@@ -503,6 +548,7 @@ def test_llama_server_global_args_role_flags_win(make_model):
     # Global args render BEFORE the per-role slot, and the resolved batch
     # keys ride in that slot: named -b/-ub win over conflicting fleet args;
     # non-conflicting flags still apply.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
     cmd, _ = LlamaServerBackend().build_cmd(
         make_model("e", role="embeddings"), 32768, 1, "q8_0", tv,
@@ -516,6 +562,7 @@ def test_llama_server_global_args_role_flags_win(make_model):
 def test_llama_server_batch_ubatch_render_and_defaults(make_model):
     # The resolved batch keys render explicitly in the per-role slot:
     # they win over conflicting fleet args, lose to cli_args (warned).
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     be = LlamaServerBackend()
     tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
     cmd, _ = be.build_cmd(make_model("c"), 32768, 1, "q8_0", tv,
@@ -541,6 +588,7 @@ def test_llama_server_unset_batch_ubatch_renders_no_flag(make_model):
     # The whole point of the None tier: with nothing configured the command
     # carries no -b/-ub at all, so llama.cpp's own defaults (-b 2048,
     # -ub 512) stand and a future upstream default change is picked up free.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     be = LlamaServerBackend()
     cmd, _ = be.build_cmd(make_model("c"), 32768, 1, "q8_0", _tvars())
     assert " -b " not in cmd and "-ub " not in cmd
@@ -554,6 +602,7 @@ def test_llama_server_unset_batch_ubatch_renders_no_flag(make_model):
 
 
 def test_llama_server_batch_ubatch_resolution_cascade(make_model):
+    # Validates: SPEC.md, 'Measurement via `llama-fit-params`': The exact flag string VRAM constants are measured (and shape-stamped).
     from llama_packer.profiles import Profiles
     from llama_packer.writer import measurement_args, resolve_batch_ubatch
     profiles = Profiles({"defaults": {"cache_type": "q8_0"},
@@ -581,6 +630,7 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
     # *effective* ubatch is still llama.cpp's 512, so the shape must stamp it.
     # Dropping it would change every derived: shape key and force a
     # fleet-wide re-measurement for a flag that never moved.
+    # Validates: SPEC.md, 'Measurement via `llama-fit-params`': The exact flag string VRAM constants are measured (and shape-stamped).
     from llama_packer.profiles import Profiles
     from llama_packer.writer import measurement_args
     profiles = Profiles({"defaults": {"cache_type": "q8_0"},
@@ -593,6 +643,7 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
 def test_batch_ubatch_malformed_falls_through_to_builtin(make_model, caplog):
     # A garbage value is warned about and falls through to the next tier —
     # which for an unset fleet is None (emit nothing), not a magic number.
+    # Validates: SPEC.md, 'Cache precision (`cache_type`)': Resolved ``(batch, ubatch)`` for *model*: sidecar keys > profile.
     from llama_packer.profiles import Profiles
     from llama_packer.writer import resolve_batch_ubatch
     profiles = Profiles({"defaults": {"cache_type": "q8_0"},
@@ -604,6 +655,7 @@ def test_batch_ubatch_malformed_falls_through_to_builtin(make_model, caplog):
 
 def test_llama_server_global_args_per_model_cli_args_win(make_model):
     # Per-model cli_args beat the global args per flag, emitted once.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     tv = {**_tvars(), "llama_args": "--flash-attn on -b 512"}
     m = make_model("m", cli_args="-b 2048")
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", tv)
@@ -614,11 +666,13 @@ def test_llama_server_global_args_per_model_cli_args_win(make_model):
 
 def test_llama_server_global_args_absent_no_leak(make_model):
     # No llama_args configured -> nothing changes.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", _tvars())
     assert "--flash-attn" not in cmd
 
 
 def test_vllm_global_args_host_and_docker(make_model):
+    # Validates: SPEC.md, 'Global backend args': each backend owns its own args string, appended to every command it renders
     tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
     m = make_model("v", hf_repo="org/model")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", tv)
@@ -628,6 +682,7 @@ def test_vllm_global_args_host_and_docker(make_model):
 
 
 def test_vllm_global_args_per_model_cli_args_win(make_model):
+    # Validates: SPEC.md, 'Global backend args': per-model cli_args win over the fleet args, per flag
     tv = {**_tvars(), "vllm_args": "--max-num-batched-tokens 512"}
     m = make_model("v", hf_repo="org/model", cli_args="--max-num-batched-tokens 1024")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", tv)
@@ -636,6 +691,7 @@ def test_vllm_global_args_per_model_cli_args_win(make_model):
 
 
 def test_whisper_server_global_args(make_model):
+    # Validates: SPEC.md, 'Global backend args': whisper.cpp's fleet args are its own spelling, appended to every command
     tv = {"whisper_bin": "/opt/whisper-server", "whisper_args": "--flash-attn on"}
     m = make_model("w", role="s2t")
     m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
@@ -644,6 +700,7 @@ def test_whisper_server_global_args(make_model):
 
 
 def test_sd_server_global_args(make_model):
+    # Validates: SPEC.md, 'Global backend args': the sd-server's fleet args are appended to every command
     tv = {"sd_bin": "/opt/sd-server", "sd_args": "--diffusion-fa"}
     m = make_model("i", role="image")
     m.gguf_path = Path("/models/img/flux-4b.gguf")
@@ -653,6 +710,7 @@ def test_sd_server_global_args(make_model):
 
 def test_whisper_global_args_per_model_cli_args_win(make_model):
     # Parity with llama/vllm: per-model cli_args beat the global args per flag.
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     tv = {"whisper_bin": "/opt/whisper-server", "whisper_args": "--flash-attn on"}
     m = make_model("w", role="s2t", cli_args="--flash-attn off")
     m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
@@ -662,6 +720,7 @@ def test_whisper_global_args_per_model_cli_args_win(make_model):
 
 
 def test_sd_global_args_per_model_cli_args_win(make_model):
+    # Validates: SPEC.md, 'Global backend args': per-model cli_args win over the fleet args, per flag
     tv = {"sd_bin": "/opt/sd-server", "sd_args": "--diffusion-fa --steps 20"}
     m = make_model("i", role="image", cli_args="--steps 30")
     m.gguf_path = Path("/models/img/flux-4b.gguf")
@@ -675,6 +734,7 @@ def test_sd_global_args_per_model_cli_args_win(make_model):
 
 def test_render_command_precedence_order():
     # Later sources overwrite earlier ones per flag; each flag emitted once.
+    # Validates: SPEC.md, 'Writer module': Compose ``<head> <flags>`` from precedence-ordered sources. Every source is reduced to one ordered flag→value map (a flag can only.
     from llama_packer.utils import render_command
     # Later sources overwrite earlier values per flag; each flag emitted once
     # (at its first-seen position).
@@ -688,18 +748,21 @@ def test_render_command_precedence_order():
 
 
 def test_render_command_empty_sources():
+    # Validates: SPEC.md, 'Writer module': Compose ``<head> <flags>`` from precedence-ordered sources. Every source is reduced to one ordered flag→value map (a flag can only.
     from llama_packer.utils import render_command
     assert render_command(["srv"], []) == "srv"
     assert render_command(["srv"], ["-x"], global_args="", role_flags="") == "srv -x"
 
 
 def test_render_command_flag_order_preserved_within_source():
+    # Validates: SPEC.md, 'Writer module': Compose ``<head> <flags>`` from precedence-ordered sources. Every source is reduced to one ordered flag→value map (a flag can only.
     from llama_packer.utils import render_command
     cmd = render_command(["srv"], ["--z-last", "1", "--a-first", "2"])
     assert cmd == "srv --z-last 1 --a-first 2"
 
 
 def test_llama_server_multiple_loras_comma_joined(make_model):
+    # Validates: docs/backends/llama-server.md, 'Command shape': several LoRAs are one --lora flag with a comma-joined list
     m = make_model("m")
     m._resolved_loras = [Path("/a/x.gguf"), Path("/a/y.gguf")]
     cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
@@ -711,6 +774,7 @@ def test_llama_server_multiple_loras_comma_joined(make_model):
 
 def test_llama_server_image_token_flags(make_model, tmp_path):
     # Declared image token bounds on a vision model are emitted as CLI flags.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     m = make_model("v", mmproj={"file": "v-mmproj.gguf",
                                 "capabilities": ["image"],
@@ -725,12 +789,14 @@ def test_llama_server_image_token_flags(make_model, tmp_path):
 
 def test_llama_server_no_image_flags_without_declaration(make_model):
     # No sidecar declaration -> no flags (defaults come from the model).
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     cmd, _ = LlamaServerBackend().build_cmd(make_model("m"), 32768, 1, "q8_0", _tvars())
     assert "--image-min-tokens" not in cmd
     assert "--image-max-tokens" not in cmd
 
 
 def test_llama_server_image_tokens_without_mmproj_warned(make_model, caplog):
+    # Validates: docs/backends/llama-server.md, 'Roles and flags': image-token flags need the projector, and are warned about and skipped without one
     m = make_model("m", **{"image_min_tokens": 1024})
     with caplog.at_level(logging.WARNING):
         cmd, _ = LlamaServerBackend().build_cmd(m, 32768, 1, "q8_0", _tvars())
@@ -742,6 +808,7 @@ def test_llama_server_image_tokens_static_arch_skipped(make_model, tmp_path,
                                                        monkeypatch, caplog):
     # Static-resolution vision archs (Gemma/SigLIP, ~256 tokens/image fixed)
     # ignore the flags — declared bounds are warned about and skipped.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     (tmp_path / "g-mmproj.gguf").write_bytes(b"mm")
     m = make_model("g", mmproj={"file": "g-mmproj.gguf",
                                 "capabilities": ["image"],
@@ -757,6 +824,7 @@ def test_llama_server_image_tokens_static_arch_skipped(make_model, tmp_path,
 
 def test_llama_server_image_tokens_text_variant_skipped(make_model, tmp_path):
     # The -text variant serves no vision: flags dropped without a warning.
+    # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     m = make_model("v", mmproj={"file": "v-mmproj.gguf",
                                 "capabilities": ["image"],
@@ -769,6 +837,7 @@ def test_llama_server_image_tokens_text_variant_skipped(make_model, tmp_path):
 
 
 def test_vllm_warns_on_reasoning_format(make_model, caplog):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     import logging
     m = make_model("v", hf_repo="org/model", **{"reasoning-format": "deepseek"})
     with caplog.at_level(logging.WARNING):
@@ -779,6 +848,7 @@ def test_vllm_warns_on_reasoning_format(make_model, caplog):
 
 
 def test_infer_backend_allowed_reorders_and_disables(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = Path("/models/s.safetensors")
@@ -792,6 +862,7 @@ def test_infer_backend_allowed_reorders_and_disables(make_model):
 
 
 def test_apply_overrides_pinned_backend_disabled(make_model):
+    # Validates: SPEC.md, 'Override Rules': Backend selection/inference + external file resolution for *model*. Runs after defaults and rules are fully applied, so inference sees the.
     from llama_packer.scope import ScopeStack
     m = make_model("p", backend="vllm-docker")
     stack = ScopeStack(avail={"llama_bin": "/opt/llama-server",
@@ -803,6 +874,7 @@ def test_apply_overrides_pinned_backend_disabled(make_model):
 
 
 def test_vllm_role_task_flags(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the role sets the vLLM task flag: embed for embeddings, score for rerank
     host = get_backend("vllm")
     rerank = make_model("r", hf_repo="org/reranker", role="rerank")
     cmd, _ = host.build_cmd(rerank, 8192, 1, "q8_0", _tvars())
@@ -816,6 +888,7 @@ def test_vllm_role_task_flags(make_model):
 
 
 def test_vllm_docker_rerank_task_flag(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the rerank task flag reaches the container command as well
     m = make_model("dr", hf_repo="org/reranker", role="rerank")
     cmd, _ = get_backend("vllm-docker").build_cmd(m, 8192, 1, "q8_0", _tvars())
     assert "--task score" in cmd
@@ -823,6 +896,7 @@ def test_vllm_docker_rerank_task_flag(make_model):
 
 def test_vllm_speculative_suppressed_off_chat(make_model):
     # mtp: true must not leak --speculative-config into a pooling model's cmd.
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     r = make_model("mr", hf_repo="org/reranker", role="rerank", mtp=True)
     cmd, meta = get_backend("vllm").build_cmd(r, 8192, 1, "q8_0", _tvars())
     assert "--speculative-config" not in cmd
@@ -835,6 +909,7 @@ def test_vllm_speculative_suppressed_off_chat(make_model):
 
 
 def test_unsupported_reason_accepts_vllm_rerank(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     m = make_model("r3", role="rerank")
     m.gguf_path = None
@@ -855,6 +930,7 @@ def _safetensors_model(tmp_path, stem="st", **fm):
 
 
 def test_vllm_quantization_flag(make_model):
+    # Validates: docs/backends/vllm.md, 'Recipe keys (opt-in, verbatim)': vllm_quantization is emitted only when declared, as --quantization
     m = make_model("v", hf_repo="org/model", vllm_quantization="modelopt_mixed")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--quantization modelopt_mixed" in cmd
@@ -867,6 +943,7 @@ def test_vllm_quantization_flag(make_model):
 
 
 def test_vllm_moe_backend_flag(make_model):
+    # Validates: docs/backends/vllm.md, 'Recipe keys (opt-in, verbatim)': moe_backend is emitted only when declared, as --moe-backend
     m = make_model("v", hf_repo="org/moe", moe_backend="marlin")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--moe-backend marlin" in cmd
@@ -876,6 +953,7 @@ def test_vllm_moe_backend_flag(make_model):
 
 
 def test_vllm_mamba_flags(make_model, caplog):
+    # Validates: docs/backends/vllm.md, 'Recipe keys (opt-in, verbatim)': the mamba keys are emitted only when declared, as --mamba-* flags
     full = {
         "backend": "flashinfer",
         "ssm_cache_dtype": "float16",
@@ -912,6 +990,7 @@ def test_vllm_mamba_flags(make_model, caplog):
 
 
 def test_vllm_tool_call_parser(make_model):
+    # Validates: docs/backends/vllm.md, 'Recipe keys (opt-in, verbatim)': tool_call_parser is emitted as --enable-auto-tool-choice with --tool-call-parser
     m = make_model("v", hf_repo="org/chat", tool_call_parser="qwen3_coder")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--enable-auto-tool-choice" in cmd
@@ -926,6 +1005,7 @@ def test_vllm_tool_call_parser(make_model):
 def test_vllm_reasoning_parser(make_model):
     # Distinct from llama.cpp's --reasoning-format (which _strip_llama_only_flags
     # removes from vllm args): --reasoning-parser is a different string and stays.
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("v", hf_repo="org/chat", reasoning_parser="nemotron_v3")
     cmd, _ = get_backend("vllm").build_cmd(m, 65536, 1, "q8_0", _tvars())
     assert "--reasoning-parser nemotron_v3" in cmd
@@ -948,6 +1028,7 @@ def _hf_snapshot(tmp_path, repo_dir="models--org--draft", snap="d1"):
 
 
 def test_vllm_spec_draft_local_path_docker(make_model, tmp_path):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': a draft model inside the mounted tree is mounted into the container, not copied
     hf, snap = _hf_snapshot(tmp_path)
     m = make_model("v", hf_repo="org/model",
                    speculative_config={"method": "draft_model",
@@ -969,6 +1050,7 @@ def test_vllm_spec_draft_local_path_docker(make_model, tmp_path):
 
 
 def test_vllm_spec_draft_models_dir_docker(make_model, tmp_path):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': a draft model under the models dir maps into the container's /models
     (tmp_path / "draft.safetensors").write_bytes(b"x")
     m = make_model("v", hf_repo="org/model",
                    speculative_config={"method": "draft_model",
@@ -982,6 +1064,7 @@ def test_vllm_spec_draft_models_dir_docker(make_model, tmp_path):
 
 
 def test_vllm_spec_draft_elsewhere_docker(make_model, tmp_path):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': a draft model outside the mapped trees is mounted under the container's own path
     other = tmp_path / "elsewhere"
     other.mkdir()
     (other / "draft.safetensors").write_bytes(b"x")
@@ -995,6 +1078,7 @@ def test_vllm_spec_draft_elsewhere_docker(make_model, tmp_path):
 
 def test_vllm_docker_model_ref_mapped(make_model, tmp_path):
     # Local safetensors refs are container-path rewritten (the old host-path leak).
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = _safetensors_model(tmp_path)
     tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
     cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
@@ -1012,6 +1096,7 @@ def test_vllm_docker_model_ref_mapped(make_model, tmp_path):
 
 
 def test_vllm_docker_hf_mount_offline(make_model, caplog):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': the HF cache is bind-mounted at /root/.cache/huggingface, and the entry runs with HF_HUB_OFFLINE=1
     tv = {**_tvars(), "hf_cache": "/nas/hf"}
     m = make_model("v", hf_repo="org/model")
     cmd, _ = get_backend("vllm-docker").build_cmd(m, 65536, 1, "q8_0", tv)
@@ -1031,6 +1116,7 @@ def test_vllm_docker_hf_mount_offline(make_model, caplog):
 
 def test_vllm_docker_local_file_no_hf_warning(make_model, tmp_path, caplog):
     # A local-file model needs no hub; empty hf_cache must not warn.
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = _safetensors_model(tmp_path)
     tv = {**_tvars(), "models_dirs": [str(tmp_path)]}
     with caplog.at_level(logging.WARNING):
@@ -1043,6 +1129,7 @@ def test_vllm_docker_local_file_no_hf_warning(make_model, tmp_path, caplog):
 # ── whisper-server backend ────────────────────────────────────────────────
 
 def test_whisper_server_registered():
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("whisper-server")
     assert b.formats == {".bin"}
     assert b.roles == {"s2t"}
@@ -1050,12 +1137,14 @@ def test_whisper_server_registered():
 
 
 def test_whisper_server_requires_binary(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("whisper-server")
     assert not b.is_available({})
     assert b.is_available({"whisper_bin": "/opt/whisper-server"})
 
 
 def test_whisper_server_cmd(make_model):
+    # Validates: docs/backends/whisper-server.md, 'Command shape': the whisper command is <bin> --host --port --model --parallel, with the language flag from the fleet args
     m = make_model("w", role="s2t")
     m.gguf_path = Path("/models/s2t/ggml-large-v3.bin")
     cmd, meta = get_backend("whisper-server").build_cmd(
@@ -1067,6 +1156,7 @@ def test_whisper_server_cmd(make_model):
 
 
 def test_whisper_server_cli_args_pass_through(make_model):
+    # Validates: docs/backends/whisper-server.md, 'Command shape': per-model cli_args reach the whisper command
     m = make_model("w", role="s2t", cli_args="--language en")
     m.gguf_path = Path("/models/s2t/ggml-base.bin")
     cmd, _ = get_backend("whisper-server").build_cmd(
@@ -1075,6 +1165,7 @@ def test_whisper_server_cli_args_pass_through(make_model):
 
 
 def test_infer_backend_whisper(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     m = make_model("w", role="s2t")
     m.gguf_path = Path("/models/s2t/ggml-base.bin")
@@ -1086,6 +1177,7 @@ def test_infer_backend_whisper(make_model):
 
 
 def test_fixed_overhead_backends_include_whisper():
+    # Validates: SPEC.md, 'Backend Selection': Yield one bound backend per valid (engine, transport) pair.
     from llama_packer.backends import FIXED_OVERHEAD_BACKENDS
     assert FIXED_OVERHEAD_BACKENDS == {"sd-server", "whisper-server", "audio-cpp"}
 
@@ -1093,6 +1185,7 @@ def test_fixed_overhead_backends_include_whisper():
 # ── audio-cpp backend (audio.cpp TTS/ASR) ─────────────────────────────────
 
 def test_audio_cpp_registered():
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("audio-cpp")
     assert b.formats == {".gguf", ".safetensors", "hf_repo"}
     assert b.roles == {"t2s", "s2t"}
@@ -1102,12 +1195,14 @@ def test_audio_cpp_registered():
 
 
 def test_audio_cpp_requires_binary():
+    # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("audio-cpp")
     assert not b.is_available({})
     assert b.is_available({"audio_cpp_bin": "/opt/audiocpp_server"})
 
 
 def test_audio_cpp_cmd_shape(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'Emitted entry': the entry is a sh -c heredoc that writes a server.json and execs the binary
     m = make_model("chatterbox", role="t2s", audio_cpp={
         "family": "chatterbox", "task": "tts",
         "options": {"temperature": 0.8, "top_p": 0.8}})
@@ -1136,6 +1231,7 @@ def test_audio_cpp_cmd_shape(make_model):
 
 
 def test_audio_cpp_embeds_the_entry_id_the_router_uses(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'Emitted entry': the server.json names the entry id the router routes on
     """The engine id must be the id llama-swap publishes the entry under.
 
     audio.cpp validates the requested model against its own `server.json`
@@ -1152,6 +1248,7 @@ def test_audio_cpp_embeds_the_entry_id_the_router_uses(make_model):
 
 
 def test_audio_cpp_task_defaults_by_role(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'Roles': the audio.cpp task comes from the role: tts for t2s, asr for s2t
     tts = make_model("t", role="t2s")
     cmd, _ = get_backend("audio-cpp").build_cmd(tts, 0, 1, "q8_0",
                                                 {"audio_cpp_bin": "x"})
@@ -1163,6 +1260,7 @@ def test_audio_cpp_task_defaults_by_role(make_model):
 
 
 def test_infer_backend_audio_cpp_vs_whisper(make_model):
+    # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
     # audio t2s GGUF -> audio-cpp
     a = make_model("a", role="t2s")
@@ -1186,6 +1284,7 @@ def _audio_cmd(m, tvars):
 
 
 def test_audio_cpp_rocm_alias_and_best_rejected(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': rocm normalises to hip, and a backend the binary does not offer falls back to cpu
     m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
     # rocm normalizes to hip
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
@@ -1202,6 +1301,7 @@ def test_audio_cpp_rocm_alias_and_best_rejected(make_model):
 
 
 def test_audio_cpp_sidecar_backend_wins_over_tvars(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': the sidecar's audio_cpp.backend wins over the CLI, the profile and the vendor default
     m = make_model("c", role="t2s", audio_cpp={
         "family": "kokoro_tts", "backend": "cpu"})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
@@ -1221,6 +1321,7 @@ def test_audio_cpp_sidecar_backend_wins_over_tvars(make_model):
 
 
 def test_audio_cpp_probe_warning(caplog, make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': a backend missing from the binary's own probe is warned about, not refused
     m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
     with caplog.at_level(logging.WARNING, logger="llama_packer.backends.audio_cpp"):
         cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
@@ -1231,6 +1332,7 @@ def test_audio_cpp_probe_warning(caplog, make_model):
 
 
 def test_audio_cpp_device_threads_sidecar_wins(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': the device and thread settings come from the sidecar's audio_cpp block
     m = make_model("c", role="t2s", audio_cpp={
         "family": "kokoro_tts", "device": 1, "threads": 8})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
@@ -1246,6 +1348,7 @@ def test_audio_cpp_device_threads_sidecar_wins(make_model):
 
 
 def test_audio_cpp_lazy_load_always(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'Emitted entry': the emitted server.json sets lazy_load
     m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
                                                 {"audio_cpp_bin": "x"})
@@ -1254,6 +1357,7 @@ def test_audio_cpp_lazy_load_always(make_model):
 
 def test_audio_cpp_voice_mapping(make_model):
     # voice_ref -> object form (reference_text alongside)
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("cb", role="t2s", audio_cpp={
         "family": "chatterbox", "voice_ref": "voices/jk.wav",
         "reference_text": "reference transcript"})
@@ -1278,6 +1382,7 @@ def test_audio_cpp_voice_mapping(make_model):
 
 
 def test_audio_cpp_voice_presets_pass_through(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': the voice presets are applied to every emitted server.json
     m = make_model("cb", role="t2s", audio_cpp={
         "family": "pocket_tts",
         "voice_presets": {"narrator": {"voice_id": "alba"}}})
@@ -1287,6 +1392,7 @@ def test_audio_cpp_voice_presets_pass_through(make_model):
 
 
 def test_audio_cpp_load_and_session_options(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': the load and session options are applied to every emitted server.json
     m = make_model("p", role="t2s", audio_cpp={
         "family": "pocket_tts",
         "load_options": {"language": "english"},
@@ -1299,6 +1405,7 @@ def test_audio_cpp_load_and_session_options(make_model):
 
 def test_audio_cpp_model_spec_override(make_model):
     # per-model sidecar key
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("m", role="t2s", audio_cpp={
         "family": "qwen3_tts", "model_spec_override": "/specs/qwen3_tts.json"})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
@@ -1313,6 +1420,7 @@ def test_audio_cpp_model_spec_override(make_model):
 
 def test_audio_cpp_family_task_defaults_and_warnings(caplog, make_model):
     # family default task map (verified 0.8.0 loader table)
+    # Validates: SPEC.md, 'Backend Selection': build_cmd.
     m = make_model("kk", role="t2s", audio_cpp={"family": "kokoro_tts"})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",
                                                 {"audio_cpp_bin": "x"})
@@ -1334,6 +1442,7 @@ def test_audio_cpp_family_task_defaults_and_warnings(caplog, make_model):
 
 
 def test_audio_cpp_missing_family_warns(caplog, make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': a voice family the binary does not have is warned about, not silently dropped
     m = make_model("nofam", role="t2s")
     with caplog.at_level(logging.WARNING,
                          logger="llama_packer.backends.audio_cpp"):
@@ -1343,6 +1452,7 @@ def test_audio_cpp_missing_family_warns(caplog, make_model):
 
 
 def test_audio_cpp_tmpdir_env_shield(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'profiles.yaml': the tmpdir setting is emitted as TMPDIR in the entry's env
     m = make_model("c", role="t2s", audio_cpp={"family": "kokoro_tts"})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0", {
         "audio_cpp_bin": "x", "audio_cpp_tmpdir": "/tmp/audiocpp-tmp"})
@@ -1357,6 +1467,7 @@ def test_audio_cpp_tmpdir_env_shield(make_model):
 
 
 def test_audio_cpp_mode_streaming(make_model):
+    # Validates: docs/backends/audio-cpp.md, 'Roles': the streaming mode is what the t2s role asks for
     m = make_model("nm", role="s2t", audio_cpp={
         "family": "nemotron_asr", "mode": "streaming"})
     cmd, _ = get_backend("audio-cpp").build_cmd(m, 0, 1, "q8_0",

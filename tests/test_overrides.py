@@ -21,12 +21,14 @@ def _run(models, profiles_cfg=None, avail=None):
 
 
 def test_rule_matches_regex_on_base_model(make_model):
+    # Validates: SPEC.md, 'Override Rules': a rule's when: is a map of field: regex; the model matches only if every field regex matches
     m = make_model("q", base_model="qwen3.8")
     assert rule_matches({"base_model": "qwen3\\.[68]"}, m)
     assert not rule_matches({"base_model": "llama"}, m)
 
 
 def test_rule_matches_requires_all_fields(make_model):
+    # Validates: SPEC.md, 'Override Rules': a model matches only if every field regex in when: matches
     m = make_model("q", base_model="qwen3.6", parameters="35B-A3B")
     # both fields must match
     assert rule_matches({"base_model": "qwen3\\.6", "parameters": "35B"}, m)
@@ -35,6 +37,7 @@ def test_rule_matches_requires_all_fields(make_model):
 
 
 def test_rule_matches_invalid_regex(make_model, caplog):
+    # Validates: SPEC.md, 'Override Rules': an invalid regex logs a warning and that rule matches nothing
     import logging
     m = make_model("q", base_model="qwen3.6")
     with caplog.at_level(logging.WARNING):
@@ -43,6 +46,7 @@ def test_rule_matches_invalid_regex(make_model, caplog):
 
 
 def test_apply_overrides_last_wins_per_key(make_model, tmp_path):
+    # Validates: SPEC.md, 'Layer merge rule': override rules are applied last-match-wins per key
     profiles = {
         "overrides": [
             {"when": {"base_model": "qwen3\\.6"}, "backend": "vllm-docker",
@@ -58,6 +62,7 @@ def test_apply_overrides_last_wins_per_key(make_model, tmp_path):
 
 def test_apply_overrides_sidecar_seed(make_model, tmp_path):
     # A sidecar-declared setting survives when no rule overrides it.
+    # Validates: SPEC.md, 'Override Rules': a setting the sidecar declared survives when no rule overrides it.
     profiles = {"overrides": [{"when": {"base_model": "qwen"}, "backend": "vllm"}]}
     m = make_model("q", base_model="qwen3.8", name="qwen3-8", cli_args="--seed 1")
     _run([m], profiles)
@@ -66,6 +71,7 @@ def test_apply_overrides_sidecar_seed(make_model, tmp_path):
 
 
 def test_apply_overrides_unknown_backend_skips(make_model, tmp_path, caplog):
+    # Validates: SPEC.md, 'Override Rules': a rule that names an unknown backend is skipped, and says so.
     import logging
     profiles = {"overrides": [{"when": {"base_model": "qwen"}, "backend": "bogus"}]}
     m = make_model("q", base_model="qwen3.8", name="qwen3-8")
@@ -76,6 +82,7 @@ def test_apply_overrides_unknown_backend_skips(make_model, tmp_path, caplog):
 
 
 def test_rule_matches_when_true_matches_all(make_model):
+    # Validates: SPEC.md, 'Override Rules': when: true matches every model
     assert rule_matches(True, make_model("a"))
     assert rule_matches(True, make_model("b", base_model="whatever"))
 
@@ -83,6 +90,7 @@ def test_rule_matches_when_true_matches_all(make_model):
 def test_missing_when_stops_run(make_model, tmp_path):
     # A rule without 'when' is a config error that must abort the run —
     # silently ignoring it would compound the misconfiguration.
+    # Validates: SPEC.md, 'Override Rules': a rule with no when: stops the run instead of matching everything.
     for bad in (
         {"backend": "vllm"},                       # no when at all
         {"when": None, "backend": "vllm"},         # null when
@@ -93,6 +101,7 @@ def test_missing_when_stops_run(make_model, tmp_path):
 
 
 def test_non_mapping_when_stops_run(make_model):
+    # Validates: SPEC.md, 'Override Rules': a when: that is not a mapping stops the run
     with pytest.raises(SystemExit, match="'when' must be a mapping"):
         _run(
         [make_model("q")],
@@ -101,6 +110,7 @@ def test_non_mapping_when_stops_run(make_model):
 
 
 def test_infer_backend_gguf_defaults_llama_server(make_model, tmp_path):
+    # Validates: SPEC.md, 'Backend Selection': a GGUF weights llama-server when no backend is declared.
     m = make_model("g")
     _run([m], avail={"llama_bin": "/opt/llama-server"})
     assert m.backend == "llama-server"
@@ -110,6 +120,7 @@ def test_infer_backend_gguf_defaults_llama_server(make_model, tmp_path):
 def test_infer_backend_safetensors_prefers_podman(make_model, tmp_path):
     # Transport preference host > podman > docker: with only an image
     # configured, podman wins (no runtime probed in this unit avail).
+    # Validates: SPEC.md, 'Backend Selection': safetensors prefer the container transport when it is available.
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".safetensors")
     _run([m], avail={"vllm_image": "img:1"})
@@ -117,6 +128,7 @@ def test_infer_backend_safetensors_prefers_podman(make_model, tmp_path):
 
 
 def test_infer_backend_safetensors_falls_back_to_host(make_model, tmp_path):
+    # Validates: SPEC.md, 'Backend Selection': without a container runtime the host transport serves it.
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".safetensors")
     _run([m], avail={"vllm_bin": "vllm"})
@@ -124,6 +136,7 @@ def test_infer_backend_safetensors_falls_back_to_host(make_model, tmp_path):
 
 
 def test_infer_backend_no_available_backend_skips(make_model, tmp_path, caplog):
+    # Validates: SPEC.md, 'Backend Selection': with no backend able to load the format the model is skipped, and says so.
     import logging
     m = make_model("s", hf_repo="org/model")
     m.gguf_path = m.gguf_path.with_suffix(".onnx")
@@ -139,6 +152,7 @@ def test_infer_backend_no_available_backend_skips(make_model, tmp_path, caplog):
 
 
 def test_declared_backend_beats_inference(make_model, tmp_path):
+    # Validates: SPEC.md, 'Backend Selection': a declared backend is never overridden by inference.
     profiles = {"overrides": [{"when": True, "backend": "vllm",
                                "hf_repo": "org/m"}]}
     m = make_model("g")  # local gguf would infer llama-server
@@ -147,6 +161,7 @@ def test_declared_backend_beats_inference(make_model, tmp_path):
 
 
 def test_resolve_setting_paths_missing_file(make_model, tmp_path):
+    # Validates: SPEC.md, 'Override Rules': a chat template or lora ref that resolves to nothing is an error, not a drop
     m = make_model("q", chat_template="does-not-exist.jinja")
     errors = resolve_setting_paths(m)
     assert any("chat_template" in e for e in errors)
@@ -154,6 +169,7 @@ def test_resolve_setting_paths_missing_file(make_model, tmp_path):
 
 
 def test_resolve_setting_paths_finds_files(make_model, tmp_path):
+    # Validates: SPEC.md, 'Override Rules': chat template and lora refs resolve to absolute files.
     tpl = tmp_path / "qwen.jinja"
     tpl.write_text("x")
     lora = tmp_path / "lora.gguf"
@@ -166,6 +182,7 @@ def test_resolve_setting_paths_finds_files(make_model, tmp_path):
 
 
 def test_invalid_reasoning_format_ignored(make_model, caplog):
+    # Validates: SPEC.md, 'Backend Selection': an option the backend does not support is dropped, with a warning.
     import logging
     from llama_packer.writer import _filter_supported
     m = make_model("q", backend="llama-server", capabilities=["reasoning"],
@@ -178,6 +195,7 @@ def test_invalid_reasoning_format_ignored(make_model, caplog):
 
 
 def test_reasoning_flags_ignored_on_non_reasoning_model(make_model, caplog):
+    # Validates: SPEC.md, 'Reasoning': reasoning flags need the reasoning capability, and are dropped elsewhere
     import logging
     from llama_packer.writer import _filter_supported
     # embeddings role is never reasoning-capable
@@ -190,6 +208,7 @@ def test_reasoning_flags_ignored_on_non_reasoning_model(make_model, caplog):
 
 
 def test_reasoning_flags_ignored_on_chat_without_capability(make_model, caplog):
+    # Validates: SPEC.md, 'Reasoning': reasoning flags need the reasoning capability, not just the chat role
     import logging
     from llama_packer.writer import _filter_supported
     # a chat model that does not advertise reasoning support
@@ -202,6 +221,7 @@ def test_reasoning_flags_ignored_on_chat_without_capability(make_model, caplog):
 
 
 def test_reasoning_flags_kept_on_reasoning_model(make_model):
+    # Validates: SPEC.md, 'Reasoning': a reasoning model keeps its reasoning flags
     from llama_packer.writer import _filter_supported
     m = make_model("q", backend="llama-server", capabilities=["tools", "reasoning"],
                    **{"reasoning-format": "deepseek", "reasoning-preserve": True})
@@ -212,6 +232,7 @@ def test_reasoning_flags_kept_on_reasoning_model(make_model):
 
 
 def test_unknown_cache_type_skips_model(make_model, caplog):
+    # Validates: SPEC.md, 'Cache precision (`cache_type`)': a cache type the VRAM model cannot price skips the model
     import logging
     from llama_packer.writer import _filter_supported
     m = make_model("q", backend="llama-server", cache_type="q9_0")
@@ -222,12 +243,14 @@ def test_unknown_cache_type_skips_model(make_model, caplog):
 
 
 def test_known_cache_type_kept(make_model):
+    # Validates: SPEC.md, 'Cache precision (`cache_type`)': a known cache type is kept
     from llama_packer.writer import _filter_supported
     m = make_model("q", backend="llama-server", cache_type="f16")
     assert [x.stem for x in _filter_supported([m])] == ["q"]
 
 
 def test_infer_backend_respects_allowed_list(make_model):
+    # Validates: SPEC.md, 'Backend Selection': the allowed-backends list bounds what inference may pick.
     from llama_packer.backends import infer_backend
     m = make_model("g")
     # gguf + only llama-server enabled -> served
@@ -241,6 +264,7 @@ def test_vllm_recipe_keys_settable_by_override_rule(make_model):
     # override rule (not just a sidecar), and must not be rejected as unknown
     # keys by compile_rule_list.  Regression for the "override-rule capable"
     # claim in docs/plans/gb10-support-plan.md.
+    # Validates: SPEC.md, 'Override Rules': the vLLM recipe keys are ordinary frontmatter and can be set by a rule.
     from llama_packer.backends.base import SETTING_KEYS
     recipe_keys = {"vllm_quantization", "moe_backend", "mamba",
                    "tool_call_parser", "reasoning_parser"}

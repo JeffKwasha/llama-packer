@@ -34,6 +34,7 @@ def _gguf(path: Path, arch="qwen3", ctx=131072) -> Path:
 
 
 def test_from_file_identity_and_subclass(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Canonical Model for a weight file (built once.
     g = _gguf(tmp_path / "a.gguf")
     s = tmp_path / "b.safetensors"
     s.write_bytes(struct.pack("<Q", 2) + b"{}")
@@ -48,6 +49,7 @@ def test_from_file_identity_and_subclass(tmp_path):
 
 
 def test_zero_io_backend_via_register_file_class(tmp_path):
+    # Validates: SPEC.md, 'Backend Selection': a backend registers the file class it serves, so the registry is the only place that decides.
     g = _gguf(tmp_path / "z.gguf")
 
     class FakeGGUF(GGUFModel):
@@ -72,6 +74,7 @@ def test_zero_io_backend_via_register_file_class(tmp_path):
 
 
 def test_getitem_exact_and_pattern(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': models are looked up by exact name or by pattern.
     g1 = _gguf(tmp_path / "qwen3-8b-q4.gguf")
     g2 = _gguf(tmp_path / "qwen3-32b-q4.gguf")
     Model.from_file(g1)
@@ -85,6 +88,7 @@ def test_getitem_exact_and_pattern(tmp_path):
 
 
 def test_getitem_dedups_sidecar_and_canonical(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the sidecar-bound and the canonical instance are one model.
     g = _gguf(tmp_path / "dup.gguf")
     md = tmp_path / "dup.md"
     md.write_text("---\nmodel: dup.gguf\n---\n")
@@ -95,6 +99,7 @@ def test_getitem_dedups_sidecar_and_canonical(tmp_path):
 
 
 def test_header_read_once_shared_across_claimants(tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the header is read once; every claimant shares the one canonical model.
     from llama_packer import utils
 
     utils._GGUF_PROBE_CACHE.clear()
@@ -115,6 +120,7 @@ def test_header_read_once_shared_across_claimants(tmp_path, caplog):
 
 
 def test_from_ref_with_stub_finder(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve a sidecar ``model:``/companion ref to a Model. Any file-ref form (see :meth:`WeightFinder.resolve_path`), matched.
     d = tmp_path / "models"
     d.mkdir()
     g = _gguf(d / "m.gguf")
@@ -144,6 +150,7 @@ def test_from_ref_with_stub_finder(tmp_path):
 
 
 def test_sidecar_model_string_uses_from_ref(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a sidecar's model: string is resolved as a file ref.
     _gguf(tmp_path / "w.gguf")
     md = tmp_path / "w.md"
     md.write_text("---\nmodel: w.gguf\n---\n")
@@ -153,6 +160,7 @@ def test_sidecar_model_string_uses_from_ref(tmp_path):
 
 
 def test_measured_file_sync_and_validity(tmp_path, caplog):
+    # Validates: SPEC.md, 'Measured-Block Persistence': the file: block is refreshed when it is stale and left alone when it is not.
     g = _gguf(tmp_path / "v.gguf")
     md = tmp_path / "v.md"
     md.write_text("---\nname: v\n---\n")
@@ -180,6 +188,7 @@ def test_measured_file_sync_and_validity(tmp_path, caplog):
 
 
 def test_valid_block_answers_without_header_io(tmp_path, caplog, monkeypatch):
+    # Validates: SPEC.md, 'Measured-Block Persistence': a valid persisted block answers without reading the header again.
     """A matching ``file:`` block answers arch/context/kind with no GGUF read."""
     from llama_packer import utils
 
@@ -203,6 +212,7 @@ def test_valid_block_answers_without_header_io(tmp_path, caplog, monkeypatch):
 
 
 def test_broken_frontmatter_fails_persist_loudly(tmp_path, caplog):
+    # Validates: SPEC.md, 'Measured-Block Persistence': Write the ``measured:`` block to the sidecar.
     """Dup keys mean measurements cannot be written back — say so at WARNING.
 
     The round-trip failure used to die in debug silence, so a hand-broken
@@ -229,6 +239,7 @@ def test_broken_frontmatter_fails_persist_loudly(tmp_path, caplog):
 
 
 def test_stamp_serves_later_runs(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'Measured-Block Persistence': Refresh the ``file:`` intrinsics when stale/missing. Steady state is a no-op (one stat per run): header I/O happens only.
     """The MTP tensor scan is recorded, so later runs skip the read."""
     from llama_packer import utils
 
@@ -253,12 +264,14 @@ def test_stamp_serves_later_runs(tmp_path, monkeypatch):
 
 
 def test_legacy_fit_params_block_still_read(make_model, fit_params_block):
+    # Validates: SPEC.md, 'Measured-Block Persistence': Return the persisted measured block when it matches the *requested*.
     m = make_model("lp", **{"derived": fit_params_block})
     saved = m.vram.saved_for("q8_0")
     assert saved is not None and saved.model_mib == 10000
 
 
 def test_snapshot_listing_cached_by_mtime(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the snapshot listing is cached by mtime, not re-listed every run.
     snap = tmp_path / "snap"
     snap.mkdir()
     (snap / "a.gguf").write_bytes(b"x")
@@ -282,6 +295,7 @@ def test_snapshot_listing_cached_by_mtime(tmp_path):
 
 
 def test_fit_params_round_trip_through_measured(make_model):
+    # Validates: SPEC.md, 'Measured-Block Persistence': Persist measured VRAM constants via the single sidecar writer. Delegates to :meth:`Model.persist_measured`: the only place that.
     m = make_model("rt", context_length=32768)
     params = FitParams(1000, 0.5, 150.0, 100, "llama-server", "q8_0")
     m.vram._persist(params)
@@ -293,6 +307,7 @@ def test_fit_params_round_trip_through_measured(make_model):
 def test_min_context_is_a_consumed_field(make_model):
     # documented sidecar key: consumed by the builder, never leaked to
     # clients as metadata
+    # Validates: SPEC.md, 'Model Metadata': a builder-consumed key never reaches the client as metadata.
     m = make_model("mc", min_context=65536)
     assert m.frontmatter["min_context"] == 65536
     assert "min_context" not in m.pass_through_metadata()
@@ -302,6 +317,7 @@ def test_audio_keys_are_consumed_fields(make_model, caplog):
     # documented sidecar keys (models_AGENTS.md): vram_mb pins fixed-overhead
     # VRAM (vram.py/writer.py), audio_cpp drives AudioCppBackend.build_cmd.
     # Neither may warn nor leak to clients as metadata.
+    # Validates: SPEC.md, 'Model Metadata': the audio-cpp keys are consumed by the builder.
     import logging
     m = make_model("a", vram_mb=4096,
                    audio_cpp={"family": "qwen3_asr", "task": "asr"})
@@ -316,6 +332,7 @@ def test_removed_keys_warn_and_pass_through(make_model, caplog):
     # attention/kv_cache/tool_args/targets/sidecar-spare are accepted but
     # unread: using one warns (fail loud) and the value flows to metadata
     # rather than silently doing nothing.
+    # Validates: SPEC.md, 'Model Metadata': a key the builder no longer consumes warns and still reaches the client.
     import logging
     m = make_model("r", targets=["x"], spare="1G")
     with caplog.at_level(logging.WARNING):
@@ -325,6 +342,7 @@ def test_removed_keys_warn_and_pass_through(make_model, caplog):
 
 
 def test_mtp_draft_p_min_consumed(make_model, caplog):
+    # Validates: SPEC.md, 'Model Metadata': the MTP draft probability is consumed by the builder.
     import logging
     m = make_model("p", mtp_draft_p_min=0.8)
     assert m.mtp_draft_p_min == 0.8

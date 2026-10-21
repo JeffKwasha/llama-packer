@@ -30,16 +30,19 @@ def _model(tmp_path, size_mb=0, backend="llama-server"):
 
 
 def test_health_check_floor_and_formula(tmp_path):
+    # Validates: SPEC.md, 'Health-Check Timeout': Auto-calculated healthCheckTimeout when not set explicitly.
     models = [_model(tmp_path, 1000)]  # 1000 MiB at 500 MB/s -> 2.4s -> floor
     assert _health_check_timeout(models, _args()) == 120
 
 
 def test_health_check_scales_with_model(tmp_path):
+    # Validates: SPEC.md, 'Health-Check Timeout': Auto-calculated healthCheckTimeout when not set explicitly.
     models = [_model(tmp_path, 100000)]  # 100000/500*1.2 = 240s
     assert _health_check_timeout(models, _args()) == 240
 
 
 def test_health_check_vllm_backend_raises_floor(tmp_path):
+    # Validates: SPEC.md, 'Health-Check Timeout': Auto-calculated healthCheckTimeout when not set explicitly.
     models = [_model(tmp_path, 1000), _model(tmp_path, 10, backend="vllm")]
     assert _health_check_timeout(models, _args()) == 300
 
@@ -48,6 +51,7 @@ def test_health_check_vllm_size_floor(tmp_path):
     # vLLM loads at an assumed 100 MB/s: floor = largest vLLM model size / 100.
     # 60000 MiB -> 600 s (a ~60 GB NVFP4 model loads in ~10 min on DGX Spark);
     # the 1.2 * size / drive_speed term (144 s here) must not undercut it.
+    # Validates: SPEC.md, 'Health-Check Timeout': Auto-calculated healthCheckTimeout when not set explicitly.
     models = [_model(tmp_path, 60000, backend="vllm")]
     assert _health_check_timeout(models, _args()) == 600
     # Non-vLLM models are unaffected by the vLLM size floor.
@@ -56,6 +60,7 @@ def test_health_check_vllm_size_floor(tmp_path):
 
 
 def test_health_check_explicit_speed_and_env(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'Health-Check Timeout': Auto-calculated healthCheckTimeout when not set explicitly.
     models = [_model(tmp_path, 100000)]
     assert _health_check_timeout(models, _args(drive_speed=1000)) == 120
     monkeypatch.setenv("GEN_CONFIG_DRIVE_SPEED", "1000")
@@ -66,6 +71,7 @@ def test_health_check_explicit_speed_and_env(tmp_path, monkeypatch):
 def test_apply_env_subst_longest_prefix_wins():
     # Manual prefix map: compute_env_prefixes groups by mount, which is
     # environment-dependent; this test targets substitution ordering only.
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Replace each raw emitted path in the generated cmds with its ${VAR} macro form.
     sub = make_subp = make_subst({"/opt/bin": "LLAMA_DIR",
                                   "/data/models": "MODELS_DIR"})
     config = {"models": {
@@ -78,6 +84,7 @@ def test_apply_env_subst_longest_prefix_wins():
 
 
 def test_apply_env_subst_leaves_unmatched_paths_alone():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Replace each raw emitted path in the generated cmds with its ${VAR} macro form.
     sub = make_subst({})
     config = {"models": {"m": {"cmd": "run /elsewhere/m.gguf"}}}
     out = _apply_env_subst(config, sub, [])
@@ -85,6 +92,7 @@ def test_apply_env_subst_leaves_unmatched_paths_alone():
 
 
 def test_backend_args_validation(caplog):
+    # Validates: SPEC.md, 'Global backend args': Validate and return a backend section's free-form ``args`` string. Performance/tuning flags shared by every command that backend renders.
     import logging
     from llama_packer.__main__ import backend_args
 
@@ -111,6 +119,7 @@ def test_backend_args_validation(caplog):
 
 
 def test_build_matrix_vars_includes_text_variants():
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
     import logging
     from llama_packer.__main__ import _build_matrix_vars
 
@@ -133,6 +142,7 @@ def test_build_matrix_vars_includes_text_variants():
 
 
 def test_build_matrix_vars_includes_coloads():
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
     import logging
     from llama_packer.__main__ import _build_matrix_vars
 
@@ -155,6 +165,7 @@ def test_build_matrix_vars_includes_coloads():
 
 
 def test_expand_matrix_sets_placeholders():
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs. Placeholders expand to parenthesized OR-lists of VAR NAMES (not model.
     import logging
     from llama_packer.__main__ import _expand_matrix_sets
 
@@ -168,6 +179,7 @@ def test_expand_matrix_sets_placeholders():
 
 
 def test_expand_matrix_sets_no_coloads_drops_placeholder(caplog):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs. Placeholders expand to parenthesized OR-lists of VAR NAMES (not model.
     import logging
     from llama_packer.__main__ import _expand_matrix_sets
 
@@ -189,6 +201,7 @@ def _stub_model(stem, role):
 
 
 def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -206,6 +219,7 @@ def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
 
 
 def test_detect_matrix_silent_without_rag_models(caplog):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -221,6 +235,7 @@ def test_detect_matrix_silent_without_rag_models(caplog):
 
 
 def test_detect_matrix_selects_when_section_present(caplog):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -242,6 +257,7 @@ def test_detect_matrix_selects_when_section_present(caplog):
 
 
 def test_detect_matrix_custom_categories(caplog):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -271,6 +287,7 @@ def test_detect_matrix_custom_categories(caplog):
 
 
 def test_detect_matrix_warns_unknown_evict_cost(caplog):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -285,6 +302,7 @@ def test_detect_matrix_warns_unknown_evict_cost(caplog):
 
 
 def test_build_matrix_vars_includes_categories():
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
     import logging
 
     from llama_packer.__main__ import _build_matrix_vars
@@ -340,6 +358,7 @@ def test_host_binary_found_in_run_directory(tmp_path, monkeypatch):
     # entry, no env var, and no PATH edit is needed. llama.cpp has always
     # worked this way (a cwd scan for llama-b[0-9]*); every other backend
     # used to require its own *_BIN_DIR to match.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
     monkeypatch.delenv("AUDIOCPP_BIN_DIR", raising=False)
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "audiocpp_server")
@@ -351,6 +370,7 @@ def test_host_binary_found_in_run_directory(tmp_path, monkeypatch):
 
 def test_host_binary_precedence_cli_then_profiles_then_env_then_run_dir(
         tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
     monkeypatch.setenv("AUDIOCPP_BIN_DIR", str(tmp_path / "from-env"))
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "audiocpp_server")
@@ -374,6 +394,7 @@ def test_host_binary_precedence_cli_then_profiles_then_env_then_run_dir(
 
 def test_host_binary_env_var_may_name_a_directory(tmp_path, monkeypatch):
     # Mirrors LLAMA_BIN_DIR: a directory expands to <dir>/<name>.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
     monkeypatch.setenv("WHISPER_BIN_DIR", str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "whisper-server")
@@ -383,6 +404,7 @@ def test_host_binary_env_var_may_name_a_directory(tmp_path, monkeypatch):
 
 
 def test_host_binary_path_used_when_nothing_resolves(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
     monkeypatch.setattr(shutil, "which", lambda n: None)
     got = resolve_host_binary(None, None, "SD_BIN_DIR", "sd-server",
                               run_dir=tmp_path)
@@ -397,6 +419,7 @@ def test_host_binary_stale_explicit_path_is_not_silently_replaced(
     # A stale `bin:` must keep pointing there: is_available then reports
     # False and the operator gets a message naming what is wrong, rather
     # than a different binary being used without their knowledge.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "sd-server")
     got = resolve_host_binary(None, str(tmp_path / "gone"), "SD_BIN_DIR",
@@ -406,7 +429,12 @@ def test_host_binary_stale_explicit_path_is_not_silently_replaced(
 
 def test_every_backend_uses_the_same_chain():
     # The point of the helper: one rule, not three copies of it.
+    # Validates: SPEC.md, 'Host binary resolution': Resolve one host-only server binary.
     import inspect
     src = inspect.getsource(resolve_host_binary)
+    # the source of the *body*, not the docstring: the docstring names the
+    # tiers, so a search over the whole source would pass even with a tier
+    # gone from the code.
+    body = src.split('"""', 2)[-1]
     for tier in ("run_dir", "shutil.which", "env_var"):
-        assert tier in src
+        assert tier in body

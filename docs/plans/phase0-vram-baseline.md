@@ -73,6 +73,18 @@ Method: `amd-smi metric -m --json`, 1 Hz for 40 s, no model resident,
 `radeontop` at the same time: `vram 1748mb, gtt 334mb` at ~0 % GPU load — the
 footprint is resident buffers, not active work.
 
+### The log format
+
+`llama_packer/vram_log.py` writes the campaign's samples as a CSV: **one
+header, then a row per sample**, appended rather than rewritten. Rows that
+collapse into one (the accumulator compresses samples within a threshold) keep
+their count, because **the envelope is a slow sawtooth and a plateau must not
+be outvoted by a single spike**.
+
+The report names the floor, the maximum and the spread, and the median used
+per tenant. **With no usable sample it says so** rather than printing empty
+numbers, and the rows are weighted by their count.
+
 ### What drives each part
 
 - **Base (always resident):** driver page tables + connected-display scanout +

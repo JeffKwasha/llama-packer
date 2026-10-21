@@ -1,5 +1,10 @@
 # tests/test_utils_paths.py
-"""Contract tests for filesystem/version helpers in utils."""
+"""Contract tests for filesystem/version helpers in utils.
+
+Design parts: SPEC.md, 'llama.cpp Build Selection' — the tools/ layout (engines live
+in <run dir>/tools), the build-number resolution, and the drive-speed
+classification that bounds a load-time estimate.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ class Completed:
 # ── get_available_versions / find_bin_dir ─────────────────────────────────
 
 def test_get_available_versions_lists_sorted_dirs_only(tmp_path):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': only llama-b#### directories count, and the list is sorted.
     for n in (100, 99, 101):
         (tmp_path / f"llama-b{n}").mkdir()
     (tmp_path / "llama-b102").write_text("not a dir")
@@ -34,11 +40,13 @@ def test_get_available_versions_lists_sorted_dirs_only(tmp_path):
 
 
 def test_find_bin_dir_env_override_wins(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': LLAMA_BIN_DIR overrides the run directory.
     monkeypatch.setenv("LLAMA_BIN_DIR", "/custom/bin")
     assert utils.find_bin_dir("latest", tmp_path) == "/custom/bin"
 
 
 def test_find_bin_dir_latest_and_explicit(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': "latest" is the highest build number, an explicit version is that build.
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     (tmp_path / "llama-b7").mkdir()
     (tmp_path / "llama-b12").mkdir()
@@ -47,6 +55,7 @@ def test_find_bin_dir_latest_and_explicit(tmp_path, monkeypatch):
 
 
 def test_find_bin_dir_unknown_version_exits(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': an unknown version stops with a message naming the version and what is available.
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     (tmp_path / "llama-b7").mkdir()
     with pytest.raises(SystemExit) as exc:
@@ -70,12 +79,14 @@ def _build(base: Path, name: str = "llama-b11714") -> Path:
 
 
 def test_find_bin_dir_resolves_inside_tools(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': llama-packer looks in tools/ before the run directory itself
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     _build(tmp_path / utils.TOOLS_SUBDIR)
     assert utils.find_bin_dir("latest", tmp_path) == "tools/llama-b11714"
 
 
 def test_tools_wins_over_a_stale_flat_build(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': the tools/ layout is the deployment; a stale flat copy never wins.
     """Both layouts present: tools/ is the deployment, the flat copy is old."""
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     _build(tmp_path, "llama-b11539")
@@ -84,12 +95,14 @@ def test_tools_wins_over_a_stale_flat_build(tmp_path, monkeypatch):
 
 
 def test_available_versions_span_both_layouts(tmp_path):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': both layouts are listed, so an old install still resolves.
     _build(tmp_path, "llama-b11539")
     _build(tmp_path / utils.TOOLS_SUBDIR, "llama-b11714")
     assert utils.get_available_versions(tmp_path) == [11539, 11714]
 
 
 def test_no_builds_anywhere_names_both_places_it_looked(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': the failure names both places that were searched.
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     with pytest.raises(SystemExit) as exc:
         utils.find_bin_dir("latest", tmp_path)
@@ -99,12 +112,14 @@ def test_no_builds_anywhere_names_both_places_it_looked(tmp_path, monkeypatch):
 
 
 def test_binary_search_dirs_puts_tools_first(tmp_path):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': the search order is tools/ first, the run directory last.
     dirs = utils.binary_search_dirs(tmp_path)
     assert dirs[0] == tmp_path / utils.TOOLS_SUBDIR
     assert dirs[-1] == tmp_path
 
 
 def test_find_bin_dir_latest_with_no_builds_exits(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'llama.cpp Build Selection': no build at all is a stop, not a silent default.
     monkeypatch.delenv("LLAMA_BIN_DIR", raising=False)
     with pytest.raises(SystemExit):
         utils.find_bin_dir("latest", tmp_path)
@@ -113,6 +128,7 @@ def test_find_bin_dir_latest_with_no_builds_exits(tmp_path, monkeypatch):
 # ── get_model_size_mb ─────────────────────────────────────────────────────
 
 def test_get_model_size_mb_rounds_down(tmp_path):
+    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': the size is whole MiB, rounded down.
     f = tmp_path / "m.bin"
     f.write_bytes(b"x" * (2 * 1024 * 1024 + 5))
     assert utils.get_model_size_mb(str(f)) == 2
@@ -131,6 +147,7 @@ def _lsblk(mount_to_line: dict[str, str]):
 
 
 def test_drive_speed_classifies_and_returns_slowest(monkeypatch):
+    # Validates: SPEC.md, 'VRAM Allocation': the slowest drive holding a model bounds the read-speed estimate.
     monkeypatch.setattr(utils, "mount_root", lambda p: p)
     monkeypatch.setattr(utils.subprocess, "run", _lsblk({
         "nvme": "nvme0n1     0\n",
@@ -143,6 +160,7 @@ def test_drive_speed_classifies_and_returns_slowest(monkeypatch):
 
 
 def test_drive_speed_nvme_and_ssd(monkeypatch):
+    # Validates: SPEC.md, 'VRAM Allocation': the device type sets the read speed: NVMe, SATA SSD, or HDD.
     monkeypatch.setattr(utils, "mount_root", lambda p: p)
     monkeypatch.setattr(utils.subprocess, "run",
                         _lsblk({"nvme": "nvme0n1 0\n", "ssd": "sdb 0\n"}))
@@ -151,6 +169,7 @@ def test_drive_speed_nvme_and_ssd(monkeypatch):
 
 
 def test_drive_speed_unknown_on_tool_failure(monkeypatch):
+    # Validates: SPEC.md, 'VRAM Allocation': a failed probe is the unknown speed, never a fast one.
     monkeypatch.setattr(utils, "mount_root", lambda p: "/x")
     monkeypatch.setattr(utils.subprocess, "run",
                         lambda *a, **k: Completed(1, ""))
@@ -158,4 +177,5 @@ def test_drive_speed_unknown_on_tool_failure(monkeypatch):
 
 
 def test_drive_speed_no_paths_is_unknown():
+    # Validates: SPEC.md, 'VRAM Allocation': with no paths there is no drive to measure.
     assert utils._detect_drive_speed([]) == _UNKNOWN_READ_MBPS

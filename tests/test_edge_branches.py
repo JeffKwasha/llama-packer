@@ -33,6 +33,7 @@ def test_filter_supported_rejects_audio_image_roles_on_llama_server(
         make_model, caplog, role):
     # Non-chat roles are rejected before they can reach llama-server (via the
     # engine's role set).  The audible contract is rejection + an error log.
+    # Validates: SPEC.md, 'Backend Selection': a role the engine does not serve is dropped, with the reason logged.
     m = make_model("m", role=role, backend="llama-server")
     with caplog.at_level("ERROR"):
         out = writer._filter_supported([m], "q8_0")
@@ -41,6 +42,7 @@ def test_filter_supported_rejects_audio_image_roles_on_llama_server(
 
 
 def test_filter_supported_allows_role_on_matching_backend(make_model):
+    # Validates: SPEC.md, 'Backend Selection': the same role passes on the backend that serves it.
     m = _stub_vram(make_model("m", role="t2s", backend="audio-cpp"))
     assert writer._filter_supported([m], "q8_0") != []
 
@@ -48,6 +50,7 @@ def test_filter_supported_allows_role_on_matching_backend(make_model):
 # ── shared matrix solve: degenerate inputs ────────────────────────────────
 
 def test_solve_matrix_no_chat_participants_returns_none(make_model):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a matrix with no chat participant has no shared solve.
     embed = _stub_vram(make_model("e", role="embeddings"))
     rerank = _stub_vram(make_model("r", role="rerank"))
     profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
@@ -76,6 +79,7 @@ def _matrix_fixture(make_model, monkeypatch, chat_backend, chat_parallel):
 
 
 def test_matrix_parallel_zero_vllm_is_treated_as_single_seq(make_model, monkeypatch):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a vLLM entry with parallel 0 is one sequence, not zero.
     result, captured = _matrix_fixture(make_model, monkeypatch, "vllm", 0)
     assert result is not None
     # vLLM uncapped -> the shared solve evaluates one max-length sequence.
@@ -83,6 +87,7 @@ def test_matrix_parallel_zero_vllm_is_treated_as_single_seq(make_model, monkeypa
 
 
 def test_matrix_parallel_zero_llama_cpp_falls_back_to_default(make_model, monkeypatch):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a llama.cpp entry with parallel 0 falls back to the default count.
     result, captured = _matrix_fixture(make_model, monkeypatch, "llama-server", 0)
     assert result is not None
     assert captured["chat_models"][0][5] == 4
@@ -91,6 +96,8 @@ def test_matrix_parallel_zero_llama_cpp_falls_back_to_default(make_model, monkey
 # ── declared matrix category reservation failures ─────────────────────────
 
 def test_matrix_category_unsizable_is_skipped(make_model, caplog, monkeypatch):
+    # Validates: SPEC.md, 'VRAM Allocation': a category that cannot be
+    # sized is skipped, never reserved.
     chat = _stub_vram(make_model("c", context_length=32768))
     embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
     rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
@@ -113,6 +120,8 @@ def test_matrix_category_unsizable_is_skipped(make_model, caplog, monkeypatch):
 
 def test_matrix_category_that_does_not_fit_is_not_reserved(make_model, caplog,
                                                            monkeypatch):
+    # Validates: SPEC.md, 'VRAM Allocation': a category that does not fit
+    # is not charged against the chat context.
     chat = _stub_vram(make_model("c", context_length=32768))
     embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
     rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
@@ -137,6 +146,7 @@ def test_matrix_category_that_does_not_fit_is_not_reserved(make_model, caplog,
 # ── audio-cpp config fallbacks ────────────────────────────────────────────
 
 def test_audio_cpp_invalid_backend_falls_back_to_cpu(make_model, caplog):
+    # Validates: docs/backends/audio-cpp.md, 'Emitted entry': an invalid audio-cpp backend falls back to cpu, and says so.
     m = make_model("a", role="t2s")
     with caplog.at_level("WARNING"):
         cmd, _ = get_backend("audio-cpp").build_cmd(
@@ -147,6 +157,7 @@ def test_audio_cpp_invalid_backend_falls_back_to_cpu(make_model, caplog):
 
 
 def test_audio_cpp_non_mapping_block_is_ignored(make_model, caplog):
+    # Validates: docs/backends/audio-cpp.md, 'Emitted entry': a non-mapping audio_cpp block is ignored and the defaults still apply.
     m = make_model("a", role="t2s", audio_cpp="not-a-mapping")
     with caplog.at_level("WARNING"):
         cmd, _ = get_backend("audio-cpp").build_cmd(
@@ -158,6 +169,7 @@ def test_audio_cpp_non_mapping_block_is_ignored(make_model, caplog):
 # ── vLLM container args override ──────────────────────────────────────────
 
 def test_vllm_explicit_container_args_replace_default_device_flags(make_model):
+    # Validates: docs/backends/vllm.md, 'Container launch (docker/podman)': container_args replaces the device-flag set entirely
     m = make_model("v", hf_repo="org/model")
     cmd, _ = get_backend("vllm-docker").build_cmd(
         m, 4096, 1, "q8_0",
@@ -170,6 +182,7 @@ def test_vllm_explicit_container_args_replace_default_device_flags(make_model):
 # ── macros / utils small branches ─────────────────────────────────────────
 
 def test_macros_root_models_yaml_named_after_root(tmp_path):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a models.yaml at the models root is named after that root.
     Macro.clear()
     root = tmp_path / "models"
     root.mkdir()
@@ -181,6 +194,7 @@ def test_macros_root_models_yaml_named_after_root(tmp_path):
 
 
 def test_macros_apply_whitespace_only_is_identity():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a value with no macro in it comes back unchanged.
     Macro.clear()
     Macro("A", "s", {"--a": "1"})
     assert Macro.apply("   ") == "   "
@@ -188,6 +202,7 @@ def test_macros_apply_whitespace_only_is_identity():
 
 
 def test_parse_mem_mb_kilobyte_unit():
+    # Validates: SPEC.md, 'Context calculation formula': the k suffix floors at 1 MiB.
     from llama_packer import utils
     assert utils.parse_mem_mb("2048k") == 2
     assert utils.parse_mem_mb("64k") == 1          # floor at 1 MiB

@@ -26,11 +26,13 @@ def _entry(make_model, stem="m", backend="llama-server", **frontmatter):
 def test_cli_args_emitted_once(make_model):
     # Regression: cli_args used to be injected twice (template `extra` hole
     # plus the trailing frontmatter append).
+    # Validates: SPEC.md, 'Output Format': cli_args appear once in the command, never twice.
     _, entry = _entry(make_model, cli_args="--seed 42")
     assert entry["cmd"].count("--seed 42") == 1
 
 
 def test_chat_cmd_shape(make_model):
+    # Validates: SPEC.md, 'Output Format': cmd is the llama-server invocation, with the port placeholder, the model path and the cache flags
     _, entry = _entry(make_model)
     cmd = entry["cmd"]
     assert cmd.startswith("/opt/llama-server --port ${PORT} -m ")
@@ -41,14 +43,13 @@ def test_chat_cmd_shape(make_model):
 
 
 def test_cpu_resident_uses_cpu_layers(make_model):
+    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers 0 is emitted only when the model is CPU-resident
     _, entry = _entry(make_model, device="cpu")
     assert "--n-gpu-layers 0" in entry["cmd"]
 
 
 def test_capabilities_context_is_served_window(make_model):
-    # Validates: SPEC.md, 'Derived fields': capabilities.context is the
-    # served per-slot window, not the trained maximum, which stays in
-    # metadata.context_max. Clients size compaction and output room from it.
+    # Validates: docs/plans/requirement-trace.md #56: capabilities.context is the served per-slot window, not the trained maximum
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -66,6 +67,7 @@ def test_capabilities_context_is_served_window(make_model):
 def test_sidecar_lowers_max_output_tokens(make_model):
     # Validates: SPEC.md, 'Model Metadata': a sidecar may lower the
     # generation ceiling below the served window.
+    # Validates: docs/plans/requirement-trace.md #57: The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window
     model = make_model("m", backend="llama-server", max_output_tokens=32768)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -79,6 +81,7 @@ def test_sidecar_lowers_max_output_tokens(make_model):
 def test_max_output_tokens_never_exceeds_the_served_window(make_model):
     # Validates: SPEC.md, 'Model Metadata': the emitted ceiling is clamped
     # to the served window even when the sidecar asks for more.
+    # Validates: docs/plans/requirement-trace.md #57: The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window
     model = make_model("m", backend="llama-server", max_output_tokens=262144)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -92,6 +95,7 @@ def test_max_output_tokens_never_exceeds_the_served_window(make_model):
 def test_no_context_max_or_token_limits_when_nothing_is_folded(make_model):
     # At full design context there is no fold to report, and non-chat roles
     # have no token-generation limits to advertise.
+    # Validates: SPEC.md, 'Output Format': Build a single llama-swap config entry for a model+profile group.
     model = make_model("m", backend="llama-server", role="embedding")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -105,6 +109,7 @@ def test_no_context_max_or_token_limits_when_nothing_is_folded(make_model):
 
 
 def test_vllm_binary_cmd(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the vLLM entry serves the repo with --max-model-len.
     _, entry = _entry(
         make_model, "v", backend="vllm", hf_repo="org/model", context_length=65536,
     )
@@ -116,6 +121,7 @@ def test_vllm_binary_cmd(make_model):
 
 
 def test_vllm_docker_cmd(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the vLLM container entry runs the image, not the host binary.
     _, entry = _entry(
         make_model, "d", backend="vllm-docker", hf_repo="org/model",
     )
@@ -131,6 +137,7 @@ def test_vllm_docker_lifecycle_fields(make_model):
     # docker run client), unloadTimeout exceeds the stop grace, and the
     # explicit proxy field (upstream: "the single most common configuration
     # error" for containers).
+    # Validates: docs/backends/vllm.md, 'Command shape': the container entry carries its lifecycle fields.
     _, entry = _entry(make_model, "d", backend="vllm-docker", hf_repo="org/model")
     assert entry["cmdStop"] == "docker stop ${MODEL_ID}"
     assert entry["unloadTimeout"] == 30
@@ -143,16 +150,19 @@ def test_vllm_docker_lifecycle_fields(make_model):
 
 
 def test_embeddings_role_flags(make_model):
+    # Validates: docs/backends/llama-server.md, 'Roles and flags': the embeddings role adds --embedding --embd-normalize 2
     _, entry = _entry(make_model, "e", role="embeddings")
     assert "--embedding --embd-normalize 2" in entry["cmd"]
 
 
 def test_rerank_role_flags(make_model):
+    # Validates: docs/backends/llama-server.md, 'Roles and flags': the rerank role adds --rerank --pooling rank
     _, entry = _entry(make_model, "r", role="rerank")
     assert "--rerank --pooling rank" in entry["cmd"]
 
 
 def test_chat_template_emitted(make_model, tmp_path):
+    # Validates: docs/backends/llama-server.md, 'Command shape': the chat template is passed as --chat-template-file, with --jinja
     tpl = tmp_path / "qwen.jinja"
     tpl.write_text("x")
     model = make_model("q", backend="llama-server")
@@ -168,6 +178,7 @@ def test_chat_template_emitted(make_model, tmp_path):
 
 
 def test_chat_template_kwargs_exposed(make_model, tmp_path):
+    # Validates: SPEC.md, 'Override Rules': the chat template's declared kwargs are exposed to clients for per-request control
     tpl = tmp_path / "qwen.jinja"
     tpl.write_text("x")
     model = make_model("q", backend="llama-server",
@@ -184,6 +195,7 @@ def test_chat_template_kwargs_exposed(make_model, tmp_path):
 
 def test_image_token_metadata_exposed(make_model, tmp_path):
     # Declared image token bounds flow to metadata (client-facing) and cmd.
+    # Validates: SPEC.md, 'Output Format': the image token bounds are exposed to clients.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     _, entry = _entry(make_model, "v",
                       mmproj={"file": "v-mmproj.gguf",
@@ -196,6 +208,7 @@ def test_image_token_metadata_exposed(make_model, tmp_path):
 
 
 def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
+    # Validates: SPEC.md, 'Writer module': build_config composes filter, plan and emit, so a rejected model never reaches the output
     from llama_packer.writer import build_config
 
     llama = make_model("chat", backend="llama-server", context_length=8192,
@@ -226,6 +239,7 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     # The unsupported-model filter must run BEFORE the mmproj VRAM pre-pass:
     # rejected models must never reach calc_ctx.  The model gets an mmproj
     # companion so the pre-pass would otherwise consult it.
+    # Validates: SPEC.md, 'Output Format': Build llama-swap config from list of Model objects. Composes the pipeline.
     from llama_packer.writer import build_config
 
     bad_vllm = make_model("bad", backend="vllm", mmproj="bad-mmproj.gguf")
@@ -249,6 +263,7 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
 
 
 def test_build_config_disables_over_budget_model(make_model, monkeypatch):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': a model whose every rung is over budget produces no entry at all
     """A model whose weights exceed the budget must not be emitted —
     it would be a load-time OOM landmine."""
     from llama_packer.writer import build_config
@@ -275,6 +290,7 @@ def test_build_config_disables_over_budget_model(make_model, monkeypatch):
 def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
     # A sidecar cache_type overrides the profile default for both the emitted
     # flags and the VRAM calc (which the grouped cache_type threads through).
+    # Validates: SPEC.md, 'Output Format': the sidecar's cache type reaches the command.
     from llama_packer.writer import build_config
 
     m = make_model("chat", backend="llama-server", context_length=8192,
@@ -293,6 +309,7 @@ def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
 
 
 def test_cache_type_and_parallel_not_in_metadata(make_model):
+    # Validates: SPEC.md, 'Model Metadata': the builder-consumed keys - cache_type, parallel - are not passed through to the client
     _, entry = _entry(make_model, cache_type="f16", parallel=2)
     assert "cache_type" not in entry["metadata"]
     assert "parallel" not in entry["metadata"]
@@ -322,6 +339,7 @@ def _entry_of(model):
 def test_image_is_input_only(make_model, tmp_path):
     # Regression: in/out used to share one modality list, so every VLM also
     # showed llama-swap's "Image Gen" and "Img→Img" badges.
+    # Validates: SPEC.md, 'Output Format': image is an input modality, never an output one.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
     model = make_model("v", mmproj="v-mmproj.gguf", capabilities=["image"])
     caps = _entry_of(model)["capabilities"]
@@ -331,6 +349,7 @@ def test_image_is_input_only(make_model, tmp_path):
 
 def test_vision_capability_removed(make_model, caplog):
     # `vision` is not a llama-swap modality: it errors and adds no badge.
+    # Validates: SPEC.md, 'Output Format': the removed vision capability is not advertised.
     model = make_model("v", capabilities=["vision"])
     with caplog.at_level(logging.ERROR, logger="llama_packer.writer"):
         _filter_supported([model], "q8_0")
@@ -343,12 +362,14 @@ def test_vision_capability_removed(make_model, caplog):
 
 def test_video_is_input_only(make_model):
     # video input without a video-generating arch stays input-only.
+    # Validates: SPEC.md, 'Output Format': video is an input modality.
     caps = _entry_of(make_model("d", capabilities=["video"]))["capabilities"]
     assert caps["in"] == ["text", "video"]
     assert caps["out"] == ["text"]
 
 
 def test_video_omni_outputs_video(make_model):
+    # Validates: SPEC.md, 'Output Format': the capabilities block advertises the output modalities the serving actually has
     caps = _entry_of(make_model("o", architecture="omni",
                                 capabilities=["video"]))["capabilities"]
     assert caps["in"] == ["text", "video"]
@@ -356,6 +377,7 @@ def test_video_omni_outputs_video(make_model):
 
 
 def test_dropped_mmproj_removes_video_input(make_model, tmp_path):
+    # Validates: SPEC.md, 'Entry ids name the task, not the solve': a no-mmproj serving drops the i and v flags
     (tmp_path / "d-mmproj.gguf").write_bytes(b"x")
     model = make_model("d", mmproj={"file": "d-mmproj.gguf",
                                     "capabilities": ["image", "video"]})
@@ -378,6 +400,7 @@ def test_dropped_mmproj_removes_video_input(make_model, tmp_path):
 
 def test_mmproj_without_capability_warns(make_model, tmp_path, caplog):
     # Projection costs VRAM but is not advertised — must warn.
+    # Validates: SPEC.md, 'Output Format': a projector without the image capability is warned about.
     (tmp_path / "w-mmproj.gguf").write_bytes(b"x")
     model = make_model("w", mmproj={"file": "w-mmproj.gguf"})
     with caplog.at_level(logging.WARNING, logger="llama_packer.writer"):
@@ -389,6 +412,7 @@ def test_mmproj_without_capability_warns(make_model, tmp_path, caplog):
 def test_image_without_mmproj_no_warning(make_model, caplog):
     # Baked-in image support is common (no mmproj file) — no warning:
     # we don't warn about things that might be wrong.
+    # Validates: SPEC.md, 'Output Format': an image capability without a projector is not warned about.
     model = make_model("b", capabilities=["image"])
     with caplog.at_level(logging.WARNING, logger="llama_packer.writer"):
         supported = _filter_supported([model], "q8_0")
@@ -398,18 +422,21 @@ def test_image_without_mmproj_no_warning(make_model, caplog):
 
 def test_audio_capability_is_input_only(make_model):
     # audio → Transcription badge only; Speech requires an explicit output.
+    # Validates: SPEC.md, 'Output Format': audio is an input modality.
     caps = _entry_of(make_model("a", capabilities=["audio"]))["capabilities"]
     assert caps["in"] == ["text", "audio"]
     assert caps["out"] == ["text"]
 
 
 def test_speech_capability_adds_audio_output(make_model):
+    # Validates: SPEC.md, 'Output Format': the speech capability adds audio to the output modalities
     caps = _entry_of(make_model("s", capabilities=["speech"]))["capabilities"]
     assert caps["in"] == ["text"]
     assert caps["out"] == ["text", "audio"]
 
 
 def test_dropped_mmproj_removes_image_input_not_output(make_model, tmp_path):
+    # Validates: SPEC.md, 'Entry ids name the task, not the solve': a no-mmproj serving drops the image input but keeps the output modalities
     (tmp_path / "t-mmproj.gguf").write_bytes(b"x")
     model = make_model("t", mmproj={"file": "t-mmproj.gguf",
                                     "capabilities": ["image"]})
@@ -433,6 +460,7 @@ def test_dropped_mmproj_removes_image_input_not_output(make_model, tmp_path):
 # ── s2t (whisper-server) role ─────────────────────────────────────────────
 
 def test_s2t_role_is_audio_in_text_out(make_model):
+    # Validates: SPEC.md, 'Audio Backend (whisper-server)': the s2t role is audio in, text out
     model = make_model("w", role="s2t")
     caps = _entry_of(model)["capabilities"]
     assert caps["in"] == ["audio"]
@@ -442,6 +470,7 @@ def test_s2t_role_is_audio_in_text_out(make_model):
 def test_s2t_entry_gets_proxy_fields(make_model):
     # Proxied backends (whisper-server) must emit proxy + checkEndpoint "/"
     # — llama-swap's default /health never returns 200 for them.
+    # Validates: SPEC.md, 'Output Format': an s2t entry is proxied and carries its health check.
     model = make_model("w", role="s2t", backend="whisper-server")
     entry = _entry_of(model)
     assert entry["proxy"] == "http://127.0.0.1:${PORT}"
@@ -449,6 +478,7 @@ def test_s2t_entry_gets_proxy_fields(make_model):
 
 
 def test_chat_models_still_have_no_proxy_fields(make_model):
+    # Validates: docs/backends/llama-server.md, 'Backend: llama-server': llama-server is not proxied: llama-swap manages the process and proxies by port
     entry = _entry_of(make_model("m"))
     assert "proxy" not in entry
     assert "checkEndpoint" not in entry
@@ -457,6 +487,7 @@ def test_chat_models_still_have_no_proxy_fields(make_model):
 # ── t2s role capabilities (serving backend: audio-cpp) ───────────────────
 
 def test_t2s_role_is_text_in_audio_out(make_model):
+    # Validates: SPEC.md, 'Audio Backend (audio-cpp)': the t2s role is text in, audio out
     model = make_model("k", role="t2s")
     caps = _entry_of(model)["capabilities"]
     assert caps["in"] == ["text"]
@@ -466,6 +497,7 @@ def test_t2s_role_is_text_in_audio_out(make_model):
 def test_audio_cpp_entry_proxy_and_health(make_model):
     # audio.cpp is a proxied HTTP service: llama-swap needs proxy + its own
     # health path (/health), unlike sd-server/whisper-server which answer "/".
+    # Validates: SPEC.md, 'Output Format': Build a single llama-swap config entry for a model+profile group.
     model = make_model("a", role="t2s", backend="audio-cpp")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -484,6 +516,7 @@ def test_audio_cpp_entry_proxy_and_health(make_model):
 # ── config serialization contract ─────────────────────────────────────────
 
 def test_emitted_config_plain_is_a_plain_dict():
+    # Validates: SPEC.md, 'Output Format': the emitted config is a plain dict, with no YAML tags in it
     from llama_packer.writer import EmittedConfig
 
     ec = EmittedConfig({"models": {"m": {"cmd": "x"}}},
@@ -496,6 +529,7 @@ def test_emitted_config_plain_is_a_plain_dict():
 
 
 def test_write_yaml_round_trips_without_python_tags(tmp_path):
+    # Validates: SPEC.md, 'llama-swap YAML (`write_yaml()`)': the YAML is written with literal block scalars, not Python tags
     import yaml
 
     from llama_packer.writer import EmittedConfig, write_yaml
@@ -511,6 +545,7 @@ def test_write_yaml_round_trips_without_python_tags(tmp_path):
 
 
 def test_write_yaml_accepts_plain_dict(tmp_path):
+    # Validates: SPEC.md, 'llama-swap YAML (`write_yaml()`)': each model entry produces cmd, name, description, filters.setParamsByID, metadata, capabilities, env and concurrencyLimit
     import yaml
 
     from llama_packer.writer import write_yaml
@@ -524,6 +559,7 @@ def test_write_yaml_accepts_plain_dict(tmp_path):
 def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
     # Regression: multi-line cmd (audio-cpp heredoc) must round-trip with
     # newlines intact — PyYAML's default folded style collapses them.
+    # Validates: SPEC.md, 'Output Format': a heredoc keeps its newlines in the emitted YAML.
     import yaml
 
     from llama_packer.backends import get_backend
@@ -608,6 +644,7 @@ def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,
 
 
 def test_audio_entry_id_matches_the_id_the_engine_validates(make_model):
+    # Validates: SPEC.md, 'Entry ids name the task, not the solve': anything that references an entry must resolve through the emitted ids
     """The whole point, end to end: one string, both sides.
 
     llama-swap routes on the entry id (`kokoro-82m.s`); audio.cpp validates the
@@ -645,6 +682,7 @@ def test_audio_entry_id_matches_the_id_the_engine_validates(make_model):
 
 
 def test_a_plain_text_entry_carries_no_tail(make_model):
+    # Validates: SPEC.md, 'Entry ids name the task, not the solve': the flag segment is omitted entirely for a plain text-in/text-out serving
     """No flags segment means no suffix, and the id stays the bare stem."""
     _, entry = _build_entry(
         make_model("qwen3-8b", backend="llama-server"),

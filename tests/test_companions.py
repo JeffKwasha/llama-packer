@@ -28,6 +28,9 @@ def fit_params_block():
 
 def test_effective_static_folds_mmproj_and_mtp(tmp_path, make_model, fit_params_block):
     # Companion files must exist before Model construction resolves them.
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': a
+    # companion's weights and compute are folded into the main model's
+    # budget, and the draft's KV terms scale with its size ratio.
     (tmp_path / "main-mmproj.gguf").write_bytes(b"x" * 3 * MIB)
     (tmp_path / "main.mtp.gguf").write_bytes(b"x" * 2 * MIB)
     m = make_model("main",
@@ -48,6 +51,8 @@ def test_effective_static_folds_mmproj_and_mtp(tmp_path, make_model, fit_params_
 
 def test_effective_static_mmproj_only_has_zero_kv_contribution(
         tmp_path, make_model, fit_params_block):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': a
+    # projector adds weights and compute, never per-token or per-slot cost.
     (tmp_path / "solo-mmproj.gguf").write_bytes(b"x" * 3 * MIB)
     m = make_model("solo", **{"derived": dict(fit_params_block),
                               "mmproj": {"file": "solo-mmproj.gguf"}})
@@ -61,6 +66,7 @@ def test_effective_static_mmproj_only_has_zero_kv_contribution(
 
 def test_effective_static_vllm_skips_companions(tmp_path, make_model,
                                                 fit_params_block):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': the llama.cpp companion folding does not apply to the vLLM backend.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x" * 3 * MIB)
     m = make_model("v", backend="vllm", hf_repo="org/model",
                    mmproj={"file": "v-mmproj.gguf"},
@@ -71,6 +77,7 @@ def test_effective_static_vllm_skips_companions(tmp_path, make_model,
 
 def test_effective_static_result_is_cached(tmp_path, make_model,
                                            fit_params_block, monkeypatch):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': the folded result is computed once, not per call.
     (tmp_path / "c1-mmproj.gguf").write_bytes(b"x" * 2 * MIB)
     m = make_model("c1", **{"derived": dict(fit_params_block),
                             "mmproj": {"file": "c1-mmproj.gguf"}})
@@ -97,12 +104,14 @@ def _mini_gguf(path, tensor_names):
 
 
 def test_mtp_gate_blocks_stripped_gguf(tmp_path, make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': a sidecar that declares MTP but whose GGUF carries no nextn layers serves without MTP.
     m = make_model("a", mtp=True)
     _mini_gguf(m.gguf_path, ["blk.0.attn_q.weight"])
     assert m._mtp_info() == (False, 0)  # declared, but no nextn → off
 
 
 def test_mtp_gate_keeps_real_nextn(tmp_path, make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': nextn layers in the header are what turns the declared MTP on, with the declared n_max.
     m = make_model("b", mtp=True, mtp_draft_n_max=6)
     _mini_gguf(m.gguf_path, ["blk.0.attn_q.weight",
                              "blk.1.nextn_eh_proj.weight"])
@@ -110,6 +119,7 @@ def test_mtp_gate_keeps_real_nextn(tmp_path, make_model):
 
 
 def test_mtp_gate_undecidable_keeps_declared(tmp_path, make_model):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': an unreadable header leaves the declared intent alone rather than silently disabling MTP.
     (tmp_path / "c.gguf").write_bytes(b"dummy")
     m = make_model("c", mtp=True)
     assert m._mtp_info() == (True, 2)  # unparseable header: declared intent
@@ -120,6 +130,7 @@ def test_mtp_baked_in_distinguishes_companion_from_nextn(tmp_path, make_model):
     # main GGUF".  A `speculative:` companion overrides a baked-in nextn
     # draft, so the same model is False for that dimension — which is why
     # the probe must not file a companion witness under it.
+    # Validates: SPEC.md, 'MTP Speculative Decoding': the baked-in-draft shape is the nextn layers in the main GGUF, never a companion file.
     baked = make_model("baked", mtp=True)
     _mini_gguf(baked.gguf_path, ["blk.1.nextn_eh_proj.weight"])
     assert baked.mtp is None
@@ -139,6 +150,7 @@ def test_mtp_baked_in_distinguishes_companion_from_nextn(tmp_path, make_model):
 
 
 def test_gguf_has_mtp_layers(tmp_path):
+    # Validates: SPEC.md, 'MTP Speculative Decoding': the probe reads the header's tensor names, and an absent file answers None.
     from llama_packer.utils import gguf_has_mtp_layers
     _mini_gguf(tmp_path / "with.gguf", ["blk.1.nextn_eh_proj.weight"])
     _mini_gguf(tmp_path / "without.gguf", ["blk.0.attn_q.weight"])
