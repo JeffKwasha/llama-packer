@@ -570,7 +570,9 @@ def main(argv: list[str] | None = None) -> None:
     written back into every sidecar it measures.
     """
     args = parse_args(argv)
-    setup_logging(args.verbose, floor=logging.INFO)
+    # The floor belongs to the dry run alone (SPEC.md, 'Log Levels').
+    setup_logging(args.verbose,
+                  floor=logging.INFO if args.dry_run else None)
 
     # One pack per process, so this is the whole lifetime of the setting.
     # Must happen before discovery and measurement, both of which write.

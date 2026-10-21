@@ -47,4 +47,7 @@ llama-swap-v*
 build/
 
 # Local node_modules (machine-local tooling deps)
+
+# Sweep output (extras/find_decorated_tests.py)
+extras/decorated-tests.json
 node_modules
