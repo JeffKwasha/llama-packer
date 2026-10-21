@@ -47,9 +47,8 @@ the only one that gets a real sha256 check — see
 you get a warning saying so. Copy `profiles.yaml.example` to `profiles.yaml`
 next (see [Profiles](#profiles-profilesyaml)) to start tuning.
 
-For development, `uv pip install -e .` puts `llama-packer` on `PATH` and tracks
-your edits. To pin an older tree, clone with `--branch v0.3.0`, or install
-without cloning via
+For development, `uv pip install -e .`. To pin an older tree, clone with
+`--branch v0.3.0`, or install without cloning via
 `uv pip install git+https://github.com/JeffKwasha/llama-packer.git@v0.3.0`.
 There is no PyPI package — `uvx llama-packer` will not resolve; use the
 clone-and-`uv run` path above.
@@ -95,7 +94,7 @@ mv profiles.yaml.example profiles.yaml
 - **A packed matrix.** Keep small models (embedders, rerankers, a quick draft model) loaded simultaneously alongside your main chat model, with VRAM budgeted across all of them so nothing OOMs. Each gets its own context sized to what actually fits.
 - **Auto-parallel.** Unpinned chat models automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
-- **Opencode plugin.** Model info flows straight off the running server, so you never hand-edit Opencode config when you add a model (`extras/llamaswap.ts`).
+- **Standard discovery.** Model info flows straight off the running server, so you never hand-edit your client config when you add a model. A maintained discovery plugin works against the config unchanged.
 - **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a vision-less variant that drops the projection to reclaim VRAM for a much larger context (plus a vision companion entry keeping image input available at reduced context). The `i`/`v` capability flags on the id tell them apart; the exact context is in the display name and metadata.
 - **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. `--idle-unload SECONDS` emits `globalTTL` so llama-swap unloads idle models.
 

@@ -493,9 +493,9 @@ below `tools_min_ctx` gets the capability demoted: `capabilities.tools:
 false` and `metadata.tools_demoted: true` (the sidecar declaration is
 untouched, so re-packing at a higher served context restores it). This keeps
 `/v1/models` consumers (hermes, opencode, UIs) from sending tool calls to a
-window too small to serve them. `capabilities.context` reports the max
-*trained* context (`design_context`) regardless; the VRAM-served limit lives
-in `metadata.ctx_size`.
+window too small to serve them. `capabilities.context` reports the VRAM-served
+per-slot window, the same number as `metadata.ctx_size`; the trained maximum
+stays in `metadata.context_max` when the entry serves below it.
 
 ## Context Tiers
 
@@ -1584,7 +1584,7 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 - **`metadata`** — the agent-choice descriptor: `freethought`, `strengths`, `weaknesses`,
   `license`, `base_model`, `finetune`, `type`, `parameters`, `quantization`, `hf_url`,
-  `ctx_size`, `mtp_enabled`, `mtp_draft_max`, `mtp_accuracy`, `throughput_factor`,
+  `ctx_size`, `context_max`, `max_output_tokens`, `mtp_enabled`, `mtp_draft_max`, `mtp_accuracy`, `throughput_factor`,
   `image_min_tokens`, `image_max_tokens` (vision variants only).
 - **Native `capabilities`** — `in`/`out` modalities, `tools`, `reranker`, `context` (derived, see below).
 - **Native `name` / `description`** — display fields in `/v1/models`.
@@ -1638,10 +1638,11 @@ else flows into the per-model `metadata` dict (→ `meta.llamaswap` in `/v1/mode
 
 ### Derived fields (computed, not authored)
 
-- **`capabilities`** (native block): directional modalities, matching llama-swap's badge derivation — `in` = `["text"]` + `"image"` if `image` + `"video"` if `video` + `"audio"` if `audio`; `out` = `["text"]` + `"audio"` if `speech` + `"video"` if `video` + omni/video-arch (architecture `omni`/`video`/`wan`/`h3` etc). Output stays text unless `speech`/`video` output is declared, so a vision model never advertises text→image (`Image Gen`) unless `role:image`. `tools`/`reranker` boolean flags; `context` = design context (the model's maximum trained context: GGUF architectural max > sidecar `context_length` > default). `architecture` guides image vs video output for `role:image` (`out:[video]` when `video` in capabilities or `architecture` contains `video`/`wan`/`hunyuan-video`/`h3`).
+- **`capabilities`** (native block): directional modalities, matching llama-swap's badge derivation — `in` = `["text"]` + `"image"` if `image` + `"video"` if `video` + `"audio"` if `audio`; `out` = `["text"]` + `"audio"` if `speech` + `"video"` if `video` + omni/video-arch (architecture `omni`/`video`/`wan`/`h3` etc). Output stays text unless `speech`/`video` output is declared, so a vision model never advertises text→image (`Image Gen`) unless `role:image`. `tools`/`reranker` boolean flags; `context` = the served per-slot window (`ctx_size`, the same number clients size compaction and output room against). The trained maximum stays in `metadata.context_max` when the entry serves below it. `architecture` guides image vs video output for `role:image` (`out:[video]` when `video` in capabilities or `architecture` contains `video`/`wan`/`hunyuan-video`/`h3`).
 - **Model-kind guard**: every candidate in a served role is classified header-only (`general.architecture` + `<arch>.context_length` for GGUF; tensor-name blocks for safetensors; cached HF card `pipeline_tag` as offline fallback). Weights classified as diffusion/image-generation are excluded with an error log instead of being served.
 - **`throughput_factor`**: Heuristic relative speed index = `54 / (active_B × quant_bits)` × `(1 + draft_n × mtp_accuracy)` when MTP is on. Relative only — not real tok/s.
-- **`ctx_size`**: The VRAM-served context limit (`-c` / `--max-model-len`), exposed via `metadata.ctx_size`. Distinct from `capabilities.context`, which advertises the model's max trained context rather than what the deployment can currently fit.
+- **`ctx_size`**: The VRAM-served per-slot context limit (`-c` / `--max-model-len`), exposed via `metadata.ctx_size`. `capabilities.context` repeats it because that is what `/v1/models` consumers read; `metadata.context_max` keeps the trained maximum when the deployment serves below it.
+- **`max_output_tokens`**: The client-facing generation ceiling for chat entries. Defaults to the served window (`ctx_size`, the true llama-server limit); a sidecar may set a lower positive integer for a model whose long replies degrade, and the emitted value is clamped to the window.
 
 ### GGUF architectural context
 

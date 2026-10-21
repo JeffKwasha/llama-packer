@@ -107,3 +107,10 @@ and every one of them carries a `Validates:` citation.
 | 53 | `InaccessiblePaths=` lists only directories present on this host | `test_render_unit_lists_only_present_hidden_dirs`, `test_inaccessible_paths_omits_absent` |
 | 54 | The health probe waits for the socket instead of racing it | `test_probe_waits_for_a_slow_start` |
 | 55 | The probe fails, with the journal hint, only after the deadline | `test_probe_gives_up_after_the_deadline` |
+
+## Model listing limits
+
+| # | Requirement | Test |
+|---|---|---|
+| 56 | `capabilities.context` is the served per-slot window, not the trained maximum | `test_capabilities_context_is_served_window` |
+| 57 | The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window | `test_sidecar_lowers_max_output_tokens`, `test_max_output_tokens_never_exceeds_the_served_window` |

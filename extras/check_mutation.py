@@ -20,7 +20,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TRACE = ROOT / "docs/plans/requirement-trace.md"
-# requirement -> (file, substring) whose deletion should break the tests
+# requirement -> (file, substring[, replacement]) whose removal/replacement
+# should break the tests
 MUTATIONS = {
     "test_every_category_gets_an_entry": ("llama_packer/writer.py", "for demand in (*self.demands_for(model), FALLBACK):"),
     "test_untagged_gets_a_bare_id": ("llama_packer/writer.py", "if demand is FALLBACK:\n            self.set_admission"),
@@ -38,6 +39,16 @@ MUTATIONS = {
     "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
     "test_set_admission_is_per_entry_not_per_stem": ("llama_packer/writer.py", "def record_admission(self, model, demand"),
     "test_fallback_slot_exponent_is_zero": ("llama_packer/writer.py", "power=0.0 if is_null else None,"),
+    "test_capabilities_context_is_served_window": (
+        "llama_packer/writer.py", '"context": ctx_size,',
+        '"context": context_length,'),
+    "test_sidecar_lowers_max_output_tokens": (
+        "llama_packer/writer.py", 'ceiling = metadata.get("max_output_tokens")',
+        'ceiling = None'),
+    "test_max_output_tokens_never_exceeds_the_served_window": (
+        "llama_packer/writer.py",
+        'metadata["max_output_tokens"] = min(ceiling or ctx_size, ctx_size)',
+        'metadata["max_output_tokens"] = ceiling or ctx_size'),
 }
 
 
@@ -49,7 +60,7 @@ def tests_for(req: int, trace: str) -> list[str]:
 def main() -> int:
     trace = TRACE.read_text()
     bad = 0
-    for test_name, (rel, needle) in sorted(MUTATIONS.items()):
+    for test_name, (rel, needle, *replacement) in sorted(MUTATIONS.items()):
         row = next((ln for ln in trace.splitlines() if f"`{test_name}`" in ln), "")
         names = [test_name] + [n for n in re.findall(r"`(test_[A-Za-z0-9_]+)`", row) if n != test_name]
         if not names:
@@ -66,7 +77,7 @@ def main() -> int:
                 print(f"  {test_name} MUTATION STALE - anchor not found in {rel}")
                 bad += 1
                 continue
-            target.write_text(text.replace(needle, "", 1))
+            target.write_text(text.replace(needle, replacement[0] if replacement else "", 1))
             # Map each test name to the file that defines it.
             files = set()
             for n in names:

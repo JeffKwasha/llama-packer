@@ -46,5 +46,5 @@ llama-swap-v*
 # uv / setuptools build artifacts
 build/
 
-# Local node_modules (e.g. extras/node_modules symlink for opencode plugin deps)
+# Local node_modules (machine-local tooling deps)
 node_modules
