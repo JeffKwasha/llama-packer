@@ -539,7 +539,7 @@ def _build_entry(
         metadata["context_max"] = context_length
     # The blessed usage categories this serving actually satisfies — the same
     # set the id's category segment names.  Client-facing so a metadata-aware
-    # picker (or the opencode plugin) can filter without parsing the id.
+    # client can filter without parsing the id.
     if usage:
         metadata["usage"] = [d.name for d in usage]
     # Client-facing estimate health: when no VRAM estimate source worked,
