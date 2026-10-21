@@ -161,10 +161,8 @@ of the sidecar declaration — a model declared `capabilities: [tools]`
 advertises tool calling even when the planner serves it at a solved ctx far
 below what tool calling needs. Clients (`/v1/models` consumers: hermes,
 opencode, UIs) cannot tell the difference from `tools` alone;
-`capabilities.context` now reports the served per-slot window and
-`metadata.context_max` the trained maximum (fixed 2026-10-20, before that
-`capabilities.context` reported the trained max while the served limit lived
-only in `metadata.ctx_size`).
+`capabilities.context` reports the served per-slot window and
+`metadata.context_max` the trained maximum.
 
 **Where from.** The chain is: sidecar frontmatter `capabilities: [...]`
 (hand-authored; template at `templates/models_AGENTS.md:113`) →
