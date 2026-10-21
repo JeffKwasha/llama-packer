@@ -15,10 +15,12 @@ from llama_packer.writer import _build_mode_params
 # ── merge_layer ───────────────────────────────────────────────────────────
 
 def test_merge_scalars_upper_wins():
+    # Validates: SPEC.md, 'Layer merge rule': scalars are replaced by the upper value
     assert utils.merge_layer({"a": 1, "b": 2}, {"b": 3}) == {"a": 1, "b": 3}
 
 
 def test_merge_dicts_recurse():
+    # Validates: SPEC.md, 'Layer merge rule': dicts merge recursively, per sub-key, upper winning
     below = {"modes": {"coding": {"temperature": 0.5, "top_p": 0.9}}}
     above = {"modes": {"coding": {"temperature": 0.2}}}
     assert utils.merge_layer(below, above) == {
@@ -26,12 +28,14 @@ def test_merge_dicts_recurse():
 
 
 def test_merge_lists_union_append_dedup():
+    # Validates: SPEC.md, 'Layer merge rule': lists union-append: order-preserving, de-duplicated
     assert utils.merge_layer({"capabilities": ["tools"]},
                              {"capabilities": ["image", "tools"]}) == {
         "capabilities": ["tools", "image"]}
 
 
 def test_merge_list_removal_syntax():
+    # Validates: SPEC.md, 'Layer merge rule': string items starting with - remove instead; removing an absent item is a no-op
     assert utils.merge_layer({"capabilities": ["tools", "image"]},
                              {"capabilities": ["-image"]}) == {
         "capabilities": ["tools"]}
@@ -42,6 +46,7 @@ def test_merge_list_removal_syntax():
 
 
 def test_merge_none_deletes():
+    # Validates: SPEC.md, 'Override Rules': a None value deletes the key below it.
     assert utils.merge_layer({"top_p": 0.9, "temperature": 0.5},
                              {"top_p": None}) == {"temperature": 0.5}
     # Deleting a missing key is a no-op.
@@ -49,12 +54,14 @@ def test_merge_none_deletes():
 
 
 def test_merge_base_expression_against_below():
+    # Validates: SPEC.md, 'Override Rules': "base * 0.8" is evaluated against the value below.
     assert utils.merge_layer({"temperature": 1.0},
                              {"temperature": "base * 0.8"}) == {
         "temperature": 0.8}
 
 
 def test_merge_base_expression_missing_below_skipped(caplog):
+    # Validates: SPEC.md, 'Override Rules': a base expression with nothing below it is skipped, and says so.
     import logging
     with caplog.at_level(logging.WARNING, logger="llama_packer.utils"):
         assert utils.merge_layer({}, {"temperature": "base * 0.8"}) == {}
@@ -63,6 +70,7 @@ def test_merge_base_expression_missing_below_skipped(caplog):
 
 
 def test_merge_does_not_alias_inputs():
+    # Validates: SPEC.md, 'Layer merge rule': the merged result is a fresh structure; the layers are never aliased
     below = {"d": {"x": 1}, "l": ["a"]}
     above = {"d": {"y": 2}, "l": ["b"], "s": "v"}
     out = utils.merge_layer(below, above)
@@ -74,6 +82,7 @@ def test_merge_does_not_alias_inputs():
 
 def test_resolve_params_none_deletes():
     # profiles: coding: {top_p: None} drops the inherited top_p outright.
+    # Validates: SPEC.md, 'Override Rules': a None in the profile drops the inherited key outright.
     assert utils.resolve_params({"top_p": None, "temperature": 0.2},
                                 {"top_p": 0.9, "temperature": 0.5}) == {
         "temperature": 0.2}
@@ -82,6 +91,7 @@ def test_resolve_params_none_deletes():
 # ── ScopeStack wiring ─────────────────────────────────────────────────────
 
 def test_scope_defaults_lists_append():
+    # Validates: SPEC.md, 'Override Rules': defaults from scopes stack by appending to their lists.
     from llama_packer.scope import ScopeStack
     stack = ScopeStack()
     stack.push({"defaults": {"capabilities": ["tools"]}}, origin="t")
@@ -92,6 +102,7 @@ def test_scope_defaults_lists_append():
 
 
 def test_scope_rules_append_and_delete(make_model):
+    # Validates: SPEC.md, 'Layer merge rule': a rule appends to a list and deletes with None
     from llama_packer.scope import ScopeStack
     m = make_model("m", loras=["a.gguf"], cache_type="q8_0")
     stack = ScopeStack()
@@ -112,6 +123,7 @@ def test_scope_rules_append_and_delete(make_model):
 def test_sidecar_mode_inherits_profile_keys(make_model):
     # The bug: a partial sidecar mode dropped every uninherited profile key.
     # (Single declared mode becomes the default → bare ${MODEL_ID} key.)
+    # Validates: SPEC.md, 'Sampling Modes': a partial sidecar mode keeps the profile keys it does not mention.
     m = make_model("m", modes={"coding": {"temperature": 0.2}})
     group = [("coding", {"temperature": 0.5, "top_p": 0.9, "min_p": 0.05})]
     params = _build_mode_params(m, group, {})
@@ -122,6 +134,7 @@ def test_sidecar_mode_inherits_profile_keys(make_model):
 
 def test_sidecar_mode_falls_back_to_defaults(make_model):
     # No same-named profile: layer over the fleet defaults.
+    # Validates: SPEC.md, 'Sampling Modes': a mode with no same-named profile layers over the fleet defaults.
     m = make_model("m", modes={"custom": {"temperature": 0.3},
                                "other": {"temperature": 0.4}})
     group = [("other", {"temperature": 0.7})]
@@ -133,6 +146,7 @@ def test_sidecar_mode_falls_back_to_defaults(make_model):
 
 
 def test_sidecar_mode_none_deletes_profile_key(make_model):
+    # Validates: SPEC.md, 'Sampling Modes': a None in a sidecar mode deletes the profile key.
     m = make_model("m", modes={"coding": {"min_p": None}})
     group = [("coding", {"temperature": 0.5, "min_p": 0.05})]
     params = _build_mode_params(m, group, {})
@@ -143,6 +157,7 @@ def test_sidecar_mode_none_deletes_profile_key(make_model):
 # ── intrinsics warnings ───────────────────────────────────────────────────
 
 def test_scope_defaults_intrinsic_warns(caplog):
+    # Validates: SPEC.md, 'Layer merge rule': a scope's defaults setting an intrinsic key warns
     import logging
     from llama_packer.scope import ScopeStack
     stack = ScopeStack()
@@ -156,6 +171,7 @@ def test_scope_defaults_intrinsic_warns(caplog):
 
 
 def test_sidecar_capability_removal_warns(tmp_path, caplog):
+    # Validates: SPEC.md, 'Override Rules': a sidecar that removes a capability is warned about.
     import logging
     from llama_packer import discover
     from llama_packer.scope import ScopeStack
@@ -171,6 +187,7 @@ def test_sidecar_capability_removal_warns(tmp_path, caplog):
 # ── companion blocks ──────────────────────────────────────────────────────
 
 def test_block_resolves_and_views_split(make_model, tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': a companion block's overlay applies only to the serving that has the companion.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     m = make_model("v", mmproj={"file": "v-mmproj.gguf",
                                 "capabilities": ["image"]})
@@ -184,6 +201,7 @@ def test_block_resolves_and_views_split(make_model, tmp_path):
 
 
 def test_bare_string_mmproj_errors(make_model, tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': a companion block is a mapping; a bare string is an error, not a shorthand
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     m = make_model("v", mmproj="v-mmproj.gguf")
     assert m.mmproj is None
@@ -192,6 +210,7 @@ def test_bare_string_mmproj_errors(make_model, tmp_path):
 
 
 def test_block_denied_keys_error(make_model, tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': identity and backend keys stay model-level and cannot be set in a companion block
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     m = make_model("v", mmproj={"file": "v-mmproj.gguf", "role": "chat"})
     assert m.mmproj is None
@@ -199,6 +218,7 @@ def test_block_denied_keys_error(make_model, tmp_path):
 
 
 def test_block_missing_file_warns_without_overlay(make_model, tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': a companion whose file is missing warns and contributes no overlay.
     m = make_model("v", mmproj={"file": "absent.gguf",
                                 "capabilities": ["image"]})
     assert m.mmproj is None
@@ -207,6 +227,7 @@ def test_block_missing_file_warns_without_overlay(make_model, tmp_path):
 
 
 def test_block_list_appends_to_base(make_model, tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': a companion block's list appends to the base capabilities.
     (tmp_path / "v-mmproj.gguf").write_bytes(b"mm")
     m = make_model("v", capabilities=["tools"],
                    mmproj={"file": "v-mmproj.gguf",

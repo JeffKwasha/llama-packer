@@ -32,6 +32,7 @@ def _profiles(defaults=None, profiles=None) -> Profiles:
 # ── registry contract ─────────────────────────────────────────────────────
 
 def test_lookup_by_name_and_missing_returns_none():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a macro is looked up by name; an unknown name is None.
     m = Macro("X", "src", {"--a": "1"})
     assert Macro["X"] is m
     assert Macro.get("X") is m
@@ -39,6 +40,7 @@ def test_lookup_by_name_and_missing_returns_none():
 
 
 def test_duplicate_name_replaces_previous(caplog):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': the last registration of a name wins and the collision is surfaced.
     Macro("X", "first", {"--a": "1"})
     with caplog.at_level(logging.WARNING):
         Macro("X", "second", {"--b": "2"})
@@ -49,6 +51,7 @@ def test_duplicate_name_replaces_previous(caplog):
 
 
 def test_all_is_ordered_longest_first_then_name():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': All registered macros sorted longest-first (weight desc, then name).
     Macro("small", "s", {"--a": "1"})
     Macro("mid", "s", {"--a": "1", "--b": "2"})
     Macro("big", "s", {"--a": "1", "--b": "2", "--c": "3"})
@@ -56,6 +59,7 @@ def test_all_is_ordered_longest_first_then_name():
 
 
 def test_definitions_render_flags_and_preserve_order():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': {name: rendered} for inclusion in config ``macros:`` block.
     Macro("X", "s", {"--cache-type-k": "q8_0", "--cache-type-v": "q8_0"})
     Macro("Y", "s", {"--jinja": ""})
     Macro("E", "s", {})
@@ -68,6 +72,7 @@ def test_definitions_render_flags_and_preserve_order():
 # ── apply(): command rewriting contract ───────────────────────────────────
 
 def test_apply_replaces_matching_subset_at_first_occurrence():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("CACHE", "s", {"--cache-type-k": "q8_0", "--cache-type-v": "q8_0"})
     out = Macro.apply(
         "llama-server --parallel 4 --cache-type-k q8_0 --cache-type-v q8_0 --seed 1")
@@ -75,17 +80,20 @@ def test_apply_replaces_matching_subset_at_first_occurrence():
 
 
 def test_apply_requires_exact_value_match():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("CACHE", "s", {"--cache-type-k": "q8_0"})
     cmd = "llama-server --cache-type-k f16"
     assert Macro.apply(cmd) == cmd
 
 
 def test_apply_leaves_unmatched_flags_and_head_untouched():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("A", "s", {"--a": "1"})
     assert Macro.apply("bin --a 1 --flag val --bool") == "bin ${A} --flag val --bool"
 
 
 def test_apply_emits_each_macro_once():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("A", "s", {"--a": "1"})
     out = Macro.apply("bin --a 1 --b 2 --a 1")
     # Duplicate flags collapse in the flag map; the macro ref is emitted once.
@@ -94,6 +102,7 @@ def test_apply_emits_each_macro_once():
 
 
 def test_apply_greedy_longest_first_claims_overlapping_flags():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("BIG", "s", {"--a": "1", "--b": "2"})
     Macro("SMALL", "s", {"--b": "2"})
     out = Macro.apply("bin --a 1 --b 2 --c 3")
@@ -102,18 +111,21 @@ def test_apply_greedy_longest_first_claims_overlapping_flags():
 
 
 def test_apply_multiple_disjoint_macros():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("A", "s", {"--a": "1"})
     Macro("B", "s", {"--b": "2"})
     assert Macro.apply("bin --a 1 --b 2") == "bin ${A} ${B}"
 
 
 def test_apply_is_idempotent():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': applying the same macros twice changes nothing the second time.
     Macro("A", "s", {"--a": "1"})
     once = Macro.apply("bin --a 1 --b 2")
     assert Macro.apply(once) == once
 
 
 def test_apply_no_match_empty_and_no_registry_are_identity():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("A", "s", {"--a": "1"})
     assert Macro.apply("bin --b 2") == "bin --b 2"
     assert Macro.apply("") == ""
@@ -122,6 +134,7 @@ def test_apply_no_match_empty_and_no_registry_are_identity():
 
 
 def test_apply_unparsable_command_is_unchanged(caplog):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("A", "s", {"--a": "1"})
     bad = "bin --x 'unterminated"
     with caplog.at_level(logging.WARNING):
@@ -129,6 +142,7 @@ def test_apply_unparsable_command_is_unchanged(caplog):
 
 
 def test_apply_empty_flag_macro_never_matches():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': Return *cmd* with longest matching macro flag subsets replaced. Parses *cmd* into ``(head, flag_dict)`` via :func:`utils._pair_flags`,.
     Macro("EMPTY", "s", {})
     assert Macro.apply("bin --a 1") == "bin --a 1"
 
@@ -136,6 +150,7 @@ def test_apply_empty_flag_macro_never_matches():
 # ── apply_to_dict() contract ──────────────────────────────────────────────
 
 def test_apply_to_dict_reports_remaining_and_matched():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': the macro pass reports what it matched and what is left
     Macro("A", "s", {"--a": "1"})
     remaining, matched = Macro.apply_to_dict({"--a": "1", "--b": "2"})
     assert remaining == {"--b": "2"}
@@ -143,6 +158,7 @@ def test_apply_to_dict_reports_remaining_and_matched():
 
 
 def test_apply_to_dict_requires_exact_value():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a macro matches only the exact flag value it declares
     Macro("A", "s", {"--a": "1"})
     remaining, matched = Macro.apply_to_dict({"--a": "2"})
     assert remaining == {"--a": "2"}
@@ -154,16 +170,19 @@ def test_apply_to_dict_requires_exact_value():
 def test_no_builtin_common_gpu():
     # llama-server defaults --n-gpu-layers to "auto" (offload all); there
     # is nothing for a builtin to pin.
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': there is no built-in macro for the common GPU flags.
     Macros({})
     assert Macro.get("COMMON_GPU") is None
 
 
 def test_builder_parses_explicit_macro_strings():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': an explicit macro string is parsed into a registration.
     Macros({"macros": {"FAST": "--flash-attn on -b 512"}})
     assert Macro.get("FAST").flags == {"--flash-attn": "on", "-b": "512"}
 
 
 def test_builder_ignores_non_string_and_unparsable_macros(caplog):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a macro that is not a string, or does not parse, is ignored with a warning.
     with caplog.at_level(logging.WARNING):
         Macros({"macros": {"BADNUM": 123, "BADSH": "--a 'oops",
                            "GOOD": "--x 1"}})
@@ -174,12 +193,14 @@ def test_builder_ignores_non_string_and_unparsable_macros(caplog):
 
 
 def test_builder_profile_defaults_macro():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': the profile defaults can declare a macro.
     Macros({}, _profiles(defaults={"cache_type": "q8_0", "parallel": 4}))
     assert Macro.get("PROFILE_DEFAULTS").flags == {
         "--cache-type-k": "q8_0", "--cache-type-v": "q8_0", "--parallel": "4"}
 
 
 def test_builder_per_profile_names_are_normalised():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a per-profile macro name is normalised the same way everywhere.
     Macros({}, _profiles(profiles={
         "fast-tools": {"parallel": 8},
         "plain": {"cache_type": "f16"},
@@ -192,12 +213,14 @@ def test_builder_per_profile_names_are_normalised():
 
 
 def test_builder_last_registration_wins_across_builds():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': the last registration of a name wins across builds.
     Macros({"macros": {"X": "--a 1"}})
     Macros({"macros": {"X": "--b 2"}})
     assert Macro.get("X").flags == {"--b": "2"}
 
 
 def test_builder_models_yaml_macro_named_from_directory(tmp_path):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a models.yaml macro is named after the directory that carries it.
     d = tmp_path / "models" / "chat"
     d.mkdir(parents=True)
     (d / "models.yaml").write_text("defaults:\n  cache_type: f16\n")
@@ -208,6 +231,7 @@ def test_builder_models_yaml_macro_named_from_directory(tmp_path):
 
 
 def test_builder_chat_template_implies_jinja_and_resolves_relative(tmp_path):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a chat template implies its .jinja sibling and resolves relative to the sidecar.
     d = tmp_path / "models" / "chat"
     d.mkdir(parents=True)
     (d / "tpl.jinja").write_text("{{ x }}")
@@ -219,6 +243,7 @@ def test_builder_chat_template_implies_jinja_and_resolves_relative(tmp_path):
 
 
 def test_builder_chat_template_paths_pass_through_sub(tmp_path):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': a template path under the sidecar's directory passes through unchanged.
     d = tmp_path / "models" / "chat"
     d.mkdir(parents=True)
     (d / "tpl.jinja").write_text("{{ x }}")
@@ -230,6 +255,7 @@ def test_builder_chat_template_paths_pass_through_sub(tmp_path):
 
 
 def test_builder_loras_accepts_string_and_list(tmp_path):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': loras accept a single string or a list.
     d = tmp_path / "models" / "chat"
     d.mkdir(parents=True)
     (d / "a.lora").write_text("a")
@@ -248,6 +274,7 @@ def test_builder_loras_accepts_string_and_list(tmp_path):
 
 
 def test_builder_reasoning_flags(tmp_path):
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': the reasoning flags are registered like every other macro.
     d = tmp_path / "models" / "chat"
     d.mkdir(parents=True)
     (d / "models.yaml").write_text(
@@ -259,6 +286,7 @@ def test_builder_reasoning_flags(tmp_path):
 
 
 def test_builder_cli_args_win_over_other_settings(tmp_path):
+    # Validates: SPEC.md, 'Global backend args': per-model cli_args win over the settings that would otherwise set the same flag
     d = tmp_path / "models" / "chat"
     d.mkdir(parents=True)
     (d / "models.yaml").write_text(
@@ -270,6 +298,7 @@ def test_builder_cli_args_win_over_other_settings(tmp_path):
 
 
 def test_flags_from_cache_parallel_ignores_non_mappings():
+    # Validates: SPEC.md, 'Path Macros (`macros:` block and `config.env`)': the cache and parallel flags are read from the settings mapping
     assert _flags_from_cache_parallel(None) == {}
     assert _flags_from_cache_parallel("not-a-dict") == {}
     assert _flags_from_cache_parallel({"cache_type": None, "parallel": None}) == {}

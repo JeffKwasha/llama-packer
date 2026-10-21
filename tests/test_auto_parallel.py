@@ -52,6 +52,7 @@ def _view(stem="m", **fm):
 # ── score function: the doc's worked examples ─────────────────────────────
 
 def test_value_two_slots_beat_one_stretched():
+    # Validates: docs/plans/category-semantics.md, 'Parallel: the same search, a different exponent': Rank a (context.
     assert (parallel_value(131072, 131072, 2, 0.75)
             > parallel_value(262144, 131072, 1, 0.75))
 
@@ -59,12 +60,14 @@ def test_value_two_slots_beat_one_stretched():
 def test_value_bump_happens_on_less_than_half_cut():
     # 1x200k vs 2x128k: the 1->2 bump happens even though ctx is cut by
     # less than half.
+    # Validates: docs/plans/category-semantics.md, 'Parallel: the same search, a different exponent': Rank a (context.
     assert (parallel_value(131072, 131072, 2, 0.75)
             > parallel_value(204800, 131072, 1, 0.75))
 
 
 def test_value_big_stretch_beats_slots():
     # 1x512k vs 2x128k: the stretch wins — the math simply decides.
+    # Validates: docs/plans/category-semantics.md, 'Parallel: the same search, a different exponent': Rank a (context.
     assert (parallel_value(524288, 131072, 1, 0.75)
             > parallel_value(131072, 131072, 2, 0.75))
 
@@ -72,32 +75,38 @@ def test_value_big_stretch_beats_slots():
 # ── floor cascade ─────────────────────────────────────────────────────────
 
 def test_floor_explicit_min_context_wins():
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(min_context=65536, context_length=262144)
     assert resolve_min_ctx(v, pin_ctx=262144) == 65536
 
 
 def test_floor_pin_is_its_own_floor():
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(context_length=200000)
     assert resolve_min_ctx(v, pin_ctx=200000) == 200000
 
 
 def test_floor_pin_below_explicit_warns_and_honours_pin(caplog):
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(min_context=131072)
     assert resolve_min_ctx(v, pin_ctx=65536) == 131072
     assert any("floor unmet" in r.message for r in caplog.records)
 
 
 def test_floor_tools_get_agentic_floor():
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(capabilities=["tools"])
     assert resolve_min_ctx(v, tools_min_ctx=131072) == 131072
 
 
 def test_floor_non_tools_get_half_max():
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view()
     assert resolve_min_ctx(v) == 131072  # 262144 // 2
 
 
 def test_floor_explicit_cli_flag_overrides_defaults():
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(capabilities=["tools"])
     assert resolve_min_ctx(v, fallback_min_ctx=65536,
                            fallback_explicit=True) == 65536
@@ -107,12 +116,14 @@ def test_floor_explicit_cli_flag_overrides_defaults():
 
 
 def test_floor_explicit_cli_flag_never_beats_sidecar_key():
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(min_context=200000, capabilities=["tools"])
     assert resolve_min_ctx(v, fallback_min_ctx=65536,
                            fallback_explicit=True) == 200000
 
 
 def test_floor_garbage_min_context_ignored(caplog):
+    # Validates: SPEC.md, 'Context Tiers': Per-model minimum useful context: the hard floor of the (ctx, slots).
     v = _view(min_context="lots", capabilities=["tools"])
     assert resolve_min_ctx(v, tools_min_ctx=65536) == 65536
     assert any("not a positive integer" in r.message for r in caplog.records)
@@ -121,6 +132,7 @@ def test_floor_garbage_min_context_ignored(caplog):
 # ── knobs parsing ─────────────────────────────────────────────────────────
 
 def test_knobs_auto_parallel_defaults_on():
+    # Validates: docs/plans/auto-parallel.md, 'Design': auto-parallel is on unless the operator turns it off.
     k = MatrixKnobs.from_cfg({})
     assert k.auto_parallel is True
     assert k.auto_parallel_max == 8
@@ -128,11 +140,13 @@ def test_knobs_auto_parallel_defaults_on():
 
 
 def test_knobs_auto_parallel_disable():
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': auto_parallel defaults to true; false turns it off fleet-wide
     assert MatrixKnobs.from_cfg({"auto_parallel": False}).auto_parallel is False
     assert MatrixKnobs.from_cfg({"auto_parallel": "off"}).auto_parallel is False
 
 
 def test_knobs_auto_parallel_parsing():
+    # Validates: docs/plans/auto-parallel.md, 'Design': the knob is read from the matrix section.
     assert MatrixKnobs.from_cfg({"auto_parallel": True}).auto_parallel is True
     assert MatrixKnobs.from_cfg({"auto_parallel": "yes"}).auto_parallel is True
     assert MatrixKnobs.from_cfg({"auto_parallel": "off"}).auto_parallel is False
@@ -141,6 +155,7 @@ def test_knobs_auto_parallel_parsing():
 
 
 def test_knobs_auto_parallel_garbage_warns_and_defaults(caplog):
+    # Validates: docs/plans/auto-parallel.md, 'Design': a malformed value warns and falls back to the default.
     k = MatrixKnobs.from_cfg({"auto_parallel": "maybe",
                               "auto_parallel_max": 0,
                               "parallel_power": -1.0})
@@ -162,6 +177,7 @@ def _planner(model, matrix_extra=None):
 def test_plan_picks_two_slots_over_stretch(make_model):
     # floor 8k (explicit), cap = design default 32k. p1 affords 32k, p2
     # affords 32k, p3 affords 16k: 2x32k wins on score.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=8192)
     del m.frontmatter["context_length"]  # unpinned: no serving pin
@@ -173,6 +189,7 @@ def test_plan_picks_two_slots_over_stretch(make_model):
 
 
 def test_plan_stretch_wins_when_second_slot_too_thin(make_model):
+    # Validates: docs/plans/auto-parallel.md, 'Design': the slot score is (ctx/floor)^0.5 x slots^parallel_power, and the best feasible pair wins
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=8192)
     del m.frontmatter["context_length"]
@@ -185,6 +202,7 @@ def test_plan_stretch_wins_when_second_slot_too_thin(make_model):
 def test_plan_pinned_ctx_searches_slots_only(make_model):
     # Fixture default context_length=32768 is a serving pin: ctx is fixed,
     # the search runs over p alone. Both p1/p2 afford the pin → p2 wins.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     m = make_model("ap", backend="llama-server", role="chat")
     _scripted_by_parallel(m, {1: 32768, 2: 32768, 3: 16384})
     variants = _planner(m).plan()["ap"]
@@ -234,6 +252,7 @@ def test_explicit_max_context_still_pins_and_floors(make_model):
 
 
 def test_plan_floor_unreachable_falls_back(make_model):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': a rung that does not fit is not a candidate; the next along the order is tried
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=999999)
     del m.frontmatter["context_length"]
@@ -244,6 +263,7 @@ def test_plan_floor_unreachable_falls_back(make_model):
 
 
 def test_plan_floor_unreachable_solves_once(make_model):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': the solve runs once per model, not once per rung
     """An unaffordable model is not emitted, and not warned about twice.
 
     The probe count moved from one to one-per-axis -- solve_rung walks the
@@ -271,6 +291,7 @@ def test_plan_floor_unreachable_solves_once(make_model):
 
 
 def test_plan_sidecar_parallel_pin_skips_solve(make_model):
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': a sidecar parallel: pin opts that model out of the auto-parallel solve
     m = make_model("ap", backend="llama-server", role="chat", parallel=2)
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768, 3: 32768})
@@ -280,6 +301,7 @@ def test_plan_sidecar_parallel_pin_skips_solve(make_model):
 
 
 def test_plan_profile_parallel_pin_skips_solve(make_model):
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': a sidecar parallel: pin opts that model out of the auto-parallel solve
     m = make_model("ap", backend="llama-server", role="chat")
     del m.frontmatter["context_length"]
     # The planner now probes at the pinned slot count as well, so the fake
@@ -294,6 +316,7 @@ def test_plan_profile_parallel_pin_skips_solve(make_model):
 
 
 def test_plan_auto_parallel_off_keeps_today(make_model):
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': with auto_parallel off the model keeps today's serving
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=8192)
     del m.frontmatter["context_length"]
@@ -307,6 +330,7 @@ def test_plan_auto_parallel_off_keeps_today(make_model):
 
 
 def test_plan_non_chat_backend_untouched(make_model):
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': only unpinned chat models on llama-server and vLLM enter the auto-parallel solve
     m = make_model("ap", role="embeddings")
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768})
@@ -315,6 +339,7 @@ def test_plan_non_chat_backend_untouched(make_model):
 
 
 def test_emit_parallel_in_cmd_and_metadata(make_model):
+    # Validates: SPEC.md, 'Output Format': the served slot count reaches the command and the entry's metadata
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=8192)
     del m.frontmatter["context_length"]
@@ -329,6 +354,7 @@ def test_emit_parallel_in_cmd_and_metadata(make_model):
 
 
 def test_emit_vllm_max_num_seqs(make_model):
+    # Validates: docs/backends/vllm.md, 'Command shape': the slot count maps to --max-num-seqs
     m = make_model("ap", backend="vllm", hf_repo="org/model", role="chat",
                    min_context=8192)
     del m.frontmatter["context_length"]
@@ -347,6 +373,7 @@ def test_agentic_floor_default_unchanged():
 # ── pools config + ledger ───────────────────────────────────────────────
 
 def test_pools_cfg_parsing():
+    # Validates: docs/plans/auto-parallel.md, 'Configurable pools (operator escape hatch)': the pools section names each pool's vram, spare and reserve_extra
     p = Profiles({"defaults": {}, "profiles": {},
                   "pools": {"gpu0": {"vram": "24G", "spare": "2G",
                                      "reserve_extra": "8G",
@@ -359,6 +386,7 @@ def test_pools_cfg_parsing():
 
 
 def test_pools_cfg_garbage_tolerated(caplog):
+    # Validates: docs/plans/auto-parallel.md, 'Configurable pools (operator escape hatch)': a malformed pools entry warns and falls back to the default
     p = Profiles({"defaults": {}, "profiles": {},
                   "pools": {"gpu0": "huge", "gpu1": {"pins": ["x"]}}})
     assert p.pools_cfg == {"gpu1": {"vram": None, "spare": None,
@@ -367,6 +395,7 @@ def test_pools_cfg_garbage_tolerated(caplog):
 
 
 def test_buckets():
+    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': a pool is a size bucket, not a model type
     from llama_packer.writer import PoolLedger, footprint_bucket
     tiny = SimpleNamespace(role="s2t", backend="whisper-server")
     assert footprint_bucket(tiny) == "tiny"
@@ -380,6 +409,7 @@ def test_buckets():
 
 
 def test_ledger_extra_reserve_math():
+    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': the pool's reserve_extra is added to the solve's spare
     from llama_packer.writer import PoolLedger
     pools = {"default": {"vram": None, "spare": None,
                          "reserve_extra": "8G",
@@ -391,6 +421,7 @@ def test_ledger_extra_reserve_math():
 
 
 def test_ledger_spare_override_and_device_pools():
+    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': a model is assigned to the pool its device belongs to
     from llama_packer.writer import PoolLedger
     pools = {"gpu1": {"vram": "24G", "spare": "2G",
                       "reserve_extra": None, "pins": {}}}
@@ -416,6 +447,7 @@ def _planner_with_pools(model, pools):
 def test_plan_pools_reserve_extra_shrinks_ctx(make_model):
     # Same model, same fake: the only difference is an 8G unmodelled
     # resident on the default pool → 8192 MB × 2 tok = 16384 fewer tokens.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     def run(pools):
         m = make_model("ap", backend="llama-server", role="chat",
                        min_context=4096)
@@ -429,6 +461,7 @@ def test_plan_pools_reserve_extra_shrinks_ctx(make_model):
 
 
 def test_plan_pools_spare_override_applies(make_model):
+    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': the pool's spare is the model's spare for the solve
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=4096)
     del m.frontmatter["context_length"]
@@ -442,6 +475,7 @@ def test_plan_pools_spare_override_applies(make_model):
 def test_serving_pin_rejects_non_positive():
     # a 0/negative pin previously crashed auto-parallel (ZeroDivisionError
     # in parallel_value); treat it as absent instead
+    # Validates: SPEC.md, 'Context Tiers': Explicitly pinned serving ctx.
     p = Planner.__new__(Planner)
     p.max_context = None
     assert p._serving_pin(_view(context_length=0)) is None

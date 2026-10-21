@@ -1,6 +1,11 @@
 # tests/test_dirconfig.py
 """Directory-scoped models.yaml: frontmatter defaults, scoped overrides,
-precedence (inner > outer > global), and validation."""
+precedence (inner > outer > global), and validation.
+
+Design parts: SPEC.md, 'Directory-scoped models.yaml' — a directory
+config layers defaults and scoped rules over the sidecar, and a malformed
+rule stops the run by name.
+"""
 
 from __future__ import annotations
 
@@ -38,6 +43,9 @@ def _discover(root, profiles_cfg=None):
 # ── Frontmatter defaults inheritance ──────────────────────────────────────
 
 def test_defaults_inherit_inner_beats_outer_beats_sidecar(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a
+    # directory's defaults are inherited inner > outer, and the sidecar's
+    # own key wins over both.
     root = tmp_path / "models"
     sub = root / "chat" / "qwen3"
     sub.mkdir(parents=True)
@@ -58,6 +66,7 @@ def test_defaults_inherit_inner_beats_outer_beats_sidecar(tmp_path):
 
 
 def test_forbidden_default_keys_rejected(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a default that would set a per-model key is rejected by name.
     d = tmp_path / "sub"
     d.mkdir()
     (d / "models.yaml").write_text("defaults:\n  name: evil\n")
@@ -77,6 +86,7 @@ def _pair_in(tmp_path, rel: str):
 
 
 def test_scoped_rule_applies_only_within_subtree(tmp_path):
+    # Validates: SPEC.md, 'Override Rules': a scoped rule reaches its own subtree and nothing outside it.
     root = tmp_path / "models"
     qwen = root / "chat" / "qwen3"
     qwen.mkdir(parents=True)
@@ -93,6 +103,7 @@ def test_scoped_rule_applies_only_within_subtree(tmp_path):
 
 
 def test_inner_scope_and_global_precedence(tmp_path):
+    # Validates: SPEC.md, 'Override Rules': an inner scope beats the global one, and untouched global keys still land.
     root = tmp_path / "models"
     qwen = root / "chat" / "qwen3"
     qwen.mkdir(parents=True)
@@ -111,6 +122,7 @@ def test_inner_scope_and_global_precedence(tmp_path):
 
 
 def test_outer_scope_between_global_and_inner(tmp_path):
+    # Validates: SPEC.md, 'Override Rules': the order is sidecar, inner scope, outer scope, global scope.
     root = tmp_path / "models"
     outer = root / "chat"
     inner = root / "chat" / "qwen3"
@@ -129,6 +141,7 @@ def test_outer_scope_between_global_and_inner(tmp_path):
 
 
 def test_malformed_scoped_rule_names_models_yaml(tmp_path):
+    # Validates: SPEC.md, 'Directory-scoped models.yaml': a malformed rule stops the run and names the file that carries it
     d = tmp_path / "chat"
     d.mkdir()
     (d / "models.yaml").write_text(
@@ -140,6 +153,7 @@ def test_malformed_scoped_rule_names_models_yaml(tmp_path):
 def test_defaults_and_rules_both_support_mmproj_false(tmp_path):
     # The same key works at both precedence levels via the same engine:
     # directory defaults and pattern rules both disable the vision companion.
+    # Validates: SPEC.md, 'Override Rules': the same key works as a directory default and as a scoped rule.
     root = tmp_path / "models"
     for sub in ("d", "r"):
         (root / "vision" / sub).mkdir(parents=True)
@@ -159,6 +173,7 @@ def test_defaults_and_rules_both_support_mmproj_false(tmp_path):
 # ── validate_dir_roles ─────────────────────────────────────────────────────
 
 def test_validate_dir_roles():
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a directory role must be a known one.
     assert validate_dir_roles({"ocr": "chat"}) is None
     err = validate_dir_roles({"ocr": "vision"})
     assert err and "unknown role" in err
@@ -167,6 +182,9 @@ def test_validate_dir_roles():
 # ── Entry-id collision detection ───────────────────────────────────────────
 
 def test_emit_config_duplicate_id_raises(make_model):
+    # Validates: SPEC.md, 'Entry ids name the task, not the solve': two
+    # sidecars that slug to the same id are a duplicate, and the run
+    # stops.
     from llama_packer.writer import emit_config, Planner
 
     # template_id is slug of sidecar stem (not name). Two different stems that

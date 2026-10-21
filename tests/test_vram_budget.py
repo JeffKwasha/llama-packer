@@ -25,6 +25,7 @@ from llama_packer.vram import (FitParams, parse_device_buffers,
 # ── serve-shaped log parsing ──────────────────────────────────────────────
 
 def test_parse_device_buffers_sums_device_only():
+    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     """Real Dirk (-text) numbers: weights max, both contexts' KV/RS/compute,
     host-visible buffers excluded."""
     text = """\
@@ -48,6 +49,7 @@ def test_parse_device_buffers_sums_device_only():
 
 
 def test_parse_device_buffers_empty_log():
+    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     assert parse_device_buffers("garbage") == {
         "weights": 0.0, "kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
 
@@ -55,6 +57,7 @@ def test_parse_device_buffers_empty_log():
 # ── spill validity check (2026-09-07 post-mortem) ─────────────────────────
 
 def test_parse_spill_mib_host_kv_is_spill():
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib rejects host-KV capacity spills
     """Host KV = the capacity-spill signature; structural CPU-mapped
     weights (<= 2 GiB) and host compute/output staging are not spill."""
     text = """\
@@ -69,6 +72,7 @@ def test_parse_spill_mib_host_kv_is_spill():
 
 
 def test_parse_spill_mib_cpu_map_beyond_tolerance():
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib tolerates llama.cpp's structural CPU weight placement
     """CPU-mapped weights above the structural headroom = offload failure."""
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size =  8000.00 MiB
@@ -79,6 +83,7 @@ def test_parse_spill_mib_cpu_map_beyond_tolerance():
 
 
 def test_parse_spill_mib_clean_log_is_zero():
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib rejects host-KV capacity spills while tolerating llama.cpp's structural CPU weight placement
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB
 0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  8704.00 MiB
@@ -117,6 +122,7 @@ def guard_env(tmp_path, monkeypatch):
 
 
 def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     buffers = model.vram._run_measure_server(
         _stub_server(tmp_path, _OK_BODY), "q8_0", 8192, 1, "")
@@ -130,6 +136,7 @@ def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
 
 
 def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     body = ("echo '0.00 I llama_kv_cache: Vulkan_Host KV buffer size = "
             "8704.00 MiB'\necho listening on http://127.0.0.1:1\nexec sleep 30\n")
     model = make_model("a")
@@ -142,6 +149,7 @@ def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
 
 def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
                                                      monkeypatch):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     monkeypatch.setattr(vram.gpu_state, "llama_residents",
                         lambda: ["123 jk /x/llama-server -m y"])
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
@@ -156,6 +164,7 @@ def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
 
 def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
                                                    guard_env):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     stub = _stub_server(tmp_path, "echo starting\nexec sleep 60\n")
     buffers = model.vram._run_measure_server(stub, "q8_0", 8192, 1, "")
@@ -168,6 +177,7 @@ def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
 
 
 def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     stub = _stub_server(tmp_path, "exit 1\n")
     assert model.vram._run_measure_server(stub, "q8_0", 8192, 1, "") is None
@@ -180,6 +190,7 @@ def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
 
 
 def test_calc_ctx_fits_design(make_model, fit_params_block):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("a", **{"derived": fit_params_block})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
     # available = 32768 - 2048 = 30720; remaining = 30720 - 10000 - 1000 = 19720
@@ -188,6 +199,7 @@ def test_calc_ctx_fits_design(make_model, fit_params_block):
 
 
 def test_calc_ctx_scales_down_and_rounds(make_model):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b", **{"derived": fm})
@@ -199,6 +211,7 @@ def test_calc_ctx_scales_down_and_rounds(make_model):
 def test_calc_ctx_slot_mib_charged_per_slot(make_model):
     # A nonzero D is charged once per slot: at p=2 the KV pool doubles AND
     # the slot cost doubles, so the affordable per-slot context shrinks.
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 300.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b2", **{"derived": fm})
@@ -210,6 +223,7 @@ def test_calc_ctx_slot_mib_charged_per_slot(make_model):
     assert p2 == 4096
 
 def test_calc_ctx_floors_at_min(make_model, caplog):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     import logging
 
     fm = {"model_mib": 30000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
@@ -265,6 +279,7 @@ def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
 
 
 def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """One MiB more budget and the same model serves -- so the guard above
     is a threshold, not a blanket refusal."""
     fm = {"model_mib": 20471, "kv_per_token_mib": 0.02743133544921875,
@@ -278,6 +293,7 @@ def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
 
 
 def test_calc_ctx_applies_spare(make_model, fit_params_block):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("d", **{"derived": fit_params_block})
     ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=3072)
     # available = 32768 - 2048 - 3072 = 27648; remaining = 27648-11000 = 16648
@@ -289,6 +305,7 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
 
 
 def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     import logging
 
     fm = {"model_mib": 1000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
@@ -306,6 +323,7 @@ def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
 def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
     # Weights fit but the full 32768 design context does not: the solve
     # falls back smaller and flags the squeeze for the description note.
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 32000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 100, "cache_type": "q8_0",
           "source": "llama-server", "shape": ""}
@@ -319,6 +337,7 @@ def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
 
 
 def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """Flags are per-solve: a tight call's verdict must not leak into the
     next call's plan (groups may carry different spare)."""
     tight = make_model("r1", **{"derived": {
@@ -339,6 +358,7 @@ def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
 
 
 def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("mm", **{"derived": fm})
@@ -364,6 +384,7 @@ def test_calc_ctx_cpu_resident_returns_design(make_model):
 
 
 def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """No measurement source -> design ctx + unestimated flag, never raise."""
     import logging
 
@@ -382,6 +403,7 @@ def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
 
 def test_fit_params_undecodable_output_returns_none(make_model, monkeypatch,
                                                     caplog):
+    # Validates: SPEC.md, 'Measurement via `llama-fit-params`': Run llama-fit-params and parse its buffer report. Returns a dict with ``model``/``context``/``compute`` (the report.
     """fit-params logs can carry non-UTF-8 bytes; strict decoding must not
     blow up inside subprocess (LFM2.5-VL regression: UnicodeDecodeError)."""
     import logging
@@ -402,6 +424,7 @@ def test_fit_params_undecodable_output_returns_none(make_model, monkeypatch,
 
 def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
     # vLLM model with no estimator and no local safetensors: graceful fallback.
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("f", backend="vllm", hf_repo="org/model",
                        context_length=65536)
     ctx = model.vram.calc_ctx(32768, fit_bin="unused")
@@ -412,6 +435,7 @@ def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
 
 
 def test_fit_params_static_derives_affine_pair(make_model, monkeypatch):
+    # Validates: SPEC.md, 'Measured-Block Persistence': Machine-written ``derived:`` block (legacy names fall back). Holds llama-packer-calculated model requirements: the affine.
     model = make_model("ap", **{"derived": None})
 
     def fake_pair(fit_bin, cache_type, llama_args=""):
@@ -433,6 +457,7 @@ def test_fit_params_static_derives_affine_pair(make_model, monkeypatch):
 
 def test_fit_params_static_measure_failure_uses_transient_fit_params(
         make_model, monkeypatch):
+    # Validates: SPEC.md, 'Measured-Block Persistence': Machine-written ``derived:`` block (legacy names fall back). Holds llama-packer-calculated model requirements: the affine.
     model = make_model("ap2", **{"derived": None})
     c_true, d_true = 0.0332, 150.0
 
@@ -457,6 +482,7 @@ def test_fit_params_static_measure_failure_uses_transient_fit_params(
 
 
 def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
+    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     """The persisted constants predict memory for any (context, slots)."""
     model = make_model("pred", **{"derived": fit_params_block})
     fp = model.vram.fit_params_static("unused")
@@ -466,6 +492,7 @@ def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
 
 
 def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
+    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     model = make_model("pf", **{"derived": None})
     monkeypatch.setattr(model.vram, "fit_params", lambda *a, **k: None)
     assert model.vram.fit_params_static("/bin/fit") is None
@@ -475,6 +502,7 @@ def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
 
 
 def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
+    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     legacy = dict(fit_params_block)
     legacy.pop("kv_per_token_mib")
     legacy.pop("slot_mib")
@@ -488,6 +516,7 @@ def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
 
 def test_fit_params_static_cache_type_mismatch_remeasures(
         make_model, fit_params_block):
+    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     model = make_model("s", **{"derived": fit_params_block})
     assert model.vram.fit_params_static("unused", cache_type="q8_0") is not None
     # A different cache type has no readable block and no binary: None.
@@ -513,6 +542,7 @@ def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
     # A declared image budget plus the output reserve must fit the solved
     # context: the ctx is raised from the rounded-down value to the floor
     # when affordable.
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
@@ -525,6 +555,7 @@ def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
 
 
 def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
     import logging
 
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
@@ -558,6 +589,7 @@ def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
 
 def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
     # The -text variant serves no vision, so the floor must not apply.
+    # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
@@ -662,6 +694,7 @@ def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog)
 
 
 def test_solve_matrix_ctx_basic(make_model):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     chat = make_model("chat", context_length=32768)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768,
@@ -679,6 +712,7 @@ def test_solve_matrix_ctx_basic(make_model):
 
 
 def test_solve_matrix_ctx_no_chat_models():
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0, chat_models=[],
         embed_params=None, rerank_params=None,
@@ -687,6 +721,7 @@ def test_solve_matrix_ctx_no_chat_models():
 
 
 def test_solve_matrix_ctx_exhausted_budget(make_model):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     chat = make_model("chat", context_length=32768)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0,
@@ -698,6 +733,7 @@ def test_solve_matrix_ctx_exhausted_budget(make_model):
 
 
 def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     """An unestimable rider (zero-cost placeholder, kv_factor 0) rides the
     measurable models' solve — its native max must not inflate the shared
     chat context (which would suppress tools demotion fleet-wide and serve
@@ -718,6 +754,7 @@ def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
 
 
 def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     rider = make_model("rider", context_length=262144)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0,
@@ -732,6 +769,7 @@ def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
 
 
 def test_measure_affine_trio_small_design_exact(make_model):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': VRAM follows a validated affine law: model + kv x ctx x slots + slot + compute
     """The pool difference divides by the ACTUAL ctx delta: designs below
     8192 (the former r3 floor at 4096) previously mis-derived c by ~1.5x
     and persisted it as a trusted fit-estimate block."""
@@ -753,6 +791,7 @@ def test_measure_affine_trio_small_design_exact(make_model):
 
 
 def test_measure_affine_trio_sub4k_design_still_measures(make_model):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': VRAM follows a validated affine law, measured live over a (ctx, parallel) grid
     """Even a sub-4k design (an error or a testcase for text models) now
     measures exactly instead of returning None — no per-run retry tax."""
     model = make_model("t", context_length=4096)
@@ -771,6 +810,7 @@ def test_measure_affine_trio_sub4k_design_still_measures(make_model):
 
 
 def test_design_context_sub4k_text_warns(make_model, caplog):
+    # Validates: docs/plans/estimation-functions-facts.md, 'Context ceiling vs design context': the design context is the model's ceiling, and a sub-4k one is warned about
     """A text model with a sub-4k context ceiling is almost certainly a
     mislabeled/corrupt GGUF — one note, not a crash."""
     import logging
@@ -790,6 +830,7 @@ def test_design_context_sub4k_text_warns(make_model, caplog):
 
 
 def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     chat = make_model("chat", context_length=32768)
     chat_models = [(chat, 8000, 0.2, 0.0, 500, 1, 0)]
     # available = 14336; budget = 5836 -> 29180 -> round 24576
@@ -808,6 +849,7 @@ def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
 
 
 def test_vram_mb_pin_is_authoritative(make_model):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Combined affine VRAM constants for main model plus its companions. Returns (model_mib, kv_per_token_mib, slot_mib, compute_mib) where.
     model = make_model("s", backend="whisper-server", vram_mb=1280,
                        context_length=8192)
     # Pinned: the pin IS the sizing — weights, zero KV terms, zero compute.
@@ -815,6 +857,7 @@ def test_vram_mb_pin_is_authoritative(make_model):
 
 
 def test_vram_mb_pin_invalid_ignored(make_model):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Combined affine VRAM constants for main model plus its companions. Returns (model_mib, kv_per_token_mib, slot_mib, compute_mib) where.
     model = make_model("s", backend="whisper-server", vram_mb="big",
                        context_length=8192)
     quad = model.vram.effective_static("unused")
@@ -824,6 +867,7 @@ def test_vram_mb_pin_invalid_ignored(make_model):
 
 
 def test_whisper_fixed_compute_is_small(make_model):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Combined affine VRAM constants for main model plus its companions. Returns (model_mib, kv_per_token_mib, slot_mib, compute_mib) where.
     model = make_model("s", backend="whisper-server", context_length=8192)
     # Measured on Vulkan (nemo-speech): footprint ~= sum of files, so the
     # per-model buffer is small — not the 512 MB sd-server constant.

@@ -30,6 +30,7 @@ _spec.loader.exec_module(bench)
 
 
 def test_history_is_appended_and_read_back(tmp_path):
+    # Validates: docs/bench.md, 'The history is append-only': one JSON line per measurement, appended to the bench history
     path = tmp_path / "bench.jsonl"
     for i in range(3):
         bench.append_history({"ts": i, "tok_per_s": 10 + i}, path)
@@ -38,6 +39,7 @@ def test_history_is_appended_and_read_back(tmp_path):
 
 
 def test_an_existing_record_is_never_rewritten(tmp_path):
+    # Validates: docs/bench.md, 'The history is append-only': an existing record is never rewritten
     """Append-only: a benchmark history is evidence."""
     path = tmp_path / "bench.jsonl"
     bench.append_history({"ts": 1, "tok_per_s": 100}, path)
@@ -48,6 +50,7 @@ def test_an_existing_record_is_never_rewritten(tmp_path):
 
 
 def test_a_truncated_last_line_does_not_break_the_history(tmp_path):
+    # Validates: docs/bench.md, 'The history is append-only': a truncated last line does not break the history
     """A crash mid-write must cost one record, not the whole file."""
     path = tmp_path / "bench.jsonl"
     bench.append_history({"ts": 1, "tok_per_s": 100}, path)
@@ -59,6 +62,7 @@ def test_a_truncated_last_line_does_not_break_the_history(tmp_path):
 
 
 def test_missing_history_reads_as_empty_not_an_error(tmp_path):
+    # Validates: docs/bench.md, 'The history is append-only': a missing history reads as empty, not as an error
     assert bench.load_history(tmp_path / "nope.jsonl") == []
 
 
@@ -75,6 +79,7 @@ def _rec(**kw):
 
 
 def test_the_same_configuration_compares():
+    # Validates: docs/bench.md, 'What counts as the same measurement': the identity key is the configuration: engine, version, backend, device, model, batch, ubatch and metric
     old = _rec()
     assert bench.previous_for(_rec(ts=99, tok_per_s=900), [old]) is old
 
@@ -93,6 +98,7 @@ def test_a_changed_configuration_is_never_compared(field, value):
 
 
 def test_timestamp_and_repetitions_are_not_part_of_the_identity():
+    # Validates: docs/bench.md, 'What counts as the same measurement': the timestamp and the repetition count are not part of the identity
     """Otherwise nothing would ever be comparable to anything."""
     old = _rec(ts=1, samples=3)
     assert bench.previous_for(_rec(ts=9999, samples=10), [old]) is old
@@ -105,6 +111,7 @@ def test_delta_is_relative_to_the_previous_run():
 
 
 def test_the_most_recent_previous_run_is_the_one_compared():
+    # Validates: docs/bench.md, 'What counts as the same measurement': the comparison is against the most recent earlier record with the same key
     first = _rec(ts=1, tok_per_s=1000)
     second = _rec(ts=2, tok_per_s=800)
     third = _rec(ts=3, tok_per_s=700)
@@ -116,6 +123,7 @@ def test_the_most_recent_previous_run_is_the_one_compared():
 
 
 def test_device_lines_keep_the_card_name(tmp_path):
+    # Validates: docs/bench.md, 'What counts as the same measurement': the device identity is the card name and its architecture
     """Same binary and backend on two cards are two measurements."""
     binary = tmp_path / "srv"
     binary.write_text("#!/bin/sh\ncat <<'EOF'\nAvailable devices:\n"
@@ -130,6 +138,7 @@ def test_device_lines_keep_the_card_name(tmp_path):
 
 
 def test_a_binary_that_cannot_run_still_yields_a_version(tmp_path):
+    # Validates: docs/bench.md, 'Versions and builds': a binary that cannot run still yields a version
     """An unrunnable engine is exactly when a history entry matters most."""
     broken = tmp_path / "srv"
     broken.write_bytes(b"\x7fELF not really")
@@ -139,6 +148,7 @@ def test_a_binary_that_cannot_run_still_yields_a_version(tmp_path):
 
 
 def test_version_is_read_from_the_build_number(tmp_path):
+    # Validates: docs/bench.md, 'Versions and builds': the version is read from the build number
     binary = tmp_path / "llama-server"
     binary.write_text('#!/bin/sh\necho "version: 0.7.0-dev (build 11717, '
                       'commit c0fd78626)"\n')
@@ -150,6 +160,7 @@ def test_version_is_read_from_the_build_number(tmp_path):
 
 
 def test_a_prompt_row_is_never_reported_as_a_generation_row():
+    # Validates: docs/bench.md, 'Reading a row': a row is selected by its fields, never by its position
     """Selecting by position rather than by fields is how this goes wrong."""
     rows = [
         {"n_prompt": 512, "n_gen": 0, "avg_ts": 6400.0},
@@ -160,6 +171,7 @@ def test_a_prompt_row_is_never_reported_as_a_generation_row():
 
 
 def test_a_missing_row_is_an_error_not_a_zero():
+    # Validates: docs/bench.md, 'Reading a row': a missing row is an error, not a zero
     rows = [{"n_prompt": 512, "n_gen": 0, "avg_ts": 6400.0}]
     with pytest.raises(bench.BenchError, match="no row"):
         bench.pick_row(rows, 0, 64)
@@ -176,6 +188,7 @@ def test_stddev_travels_with_the_mean():
 
 
 def test_empty_bench_output_is_an_error():
+    # Validates: docs/bench.md, 'Reading a row': empty bench output is an error
     with pytest.raises(bench.BenchError, match="no output"):
         bench.llama_bench_rows(Path("/bin/false"), Path("/nonexistent.gguf"),
                                512, 512, 512, 64, 1)
@@ -185,6 +198,7 @@ def test_empty_bench_output_is_an_error():
 
 
 def test_old_builds_are_found_so_versions_can_be_compared(tmp_path):
+    # Validates: docs/bench.md, 'Versions and builds': old builds are found so versions can be compared
     """After an update the previous binary is still on disk — that is the
     only way "was it faster before" is answerable at all."""
     for build in ("llama-b11658", "llama-b11717"):
@@ -196,11 +210,13 @@ def test_old_builds_are_found_so_versions_can_be_compared(tmp_path):
 
 
 def test_the_stable_name_is_found_when_there_is_no_build_dir(tmp_path):
+    # Validates: docs/bench.md, 'Versions and builds': the stable name is found when there is no build directory
     (tmp_path / "llama-server").write_bytes(b"bin")
     assert bench.llama_binaries(tmp_path) == [tmp_path / "llama-server"]
 
 
 def test_the_default_is_the_model_the_fleet_actually_runs(tmp_path):
+    # Validates: docs/bench.md, 'Picking what to measure': the default is the model the fleet actually runs
     """Largest, not smallest.
 
     The default used to take the first small model in the config, which on
@@ -226,6 +242,7 @@ def test_the_default_is_the_model_the_fleet_actually_runs(tmp_path):
 
 
 def test_a_model_over_the_cap_falls_back_to_the_largest_that_fits(tmp_path):
+    # Validates: docs/bench.md, 'Picking what to measure': a model over the size cap falls back to the largest that fits
     config = tmp_path / "config.yaml"
     mid = tmp_path / "mid.gguf"
     mid.write_bytes(b"x")
@@ -240,6 +257,7 @@ def test_a_model_over_the_cap_falls_back_to_the_largest_that_fits(tmp_path):
 
 
 def test_indirect_paths_in_the_config_are_expanded(tmp_path, monkeypatch):
+    # Validates: docs/bench.md, 'Picking what to measure': indirect paths in the config are expanded
     """The config is the source of truth, indirection and all."""
     model = tmp_path / "m.gguf"
     model.write_bytes(b"x")
@@ -252,6 +270,7 @@ def test_indirect_paths_in_the_config_are_expanded(tmp_path, monkeypatch):
 
 
 def test_audio_entries_come_from_the_config_ids(tmp_path):
+    # Validates: docs/bench.md, 'Picking what to measure': the audio entries come from the config's own ids
     config = tmp_path / "config.yaml"
     config.write_text(
         "models:\n"
@@ -263,6 +282,7 @@ def test_audio_entries_come_from_the_config_ids(tmp_path):
 
 
 def test_the_audio_backend_is_read_out_of_the_emitted_payload(tmp_path):
+    # Validates: docs/bench.md, 'Picking what to measure': the audio backend is read out of the emitted payload
     config = tmp_path / "config.yaml"
     config.write_text(
         "models:\n"
@@ -276,12 +296,14 @@ def test_the_audio_backend_is_read_out_of_the_emitted_payload(tmp_path):
 
 
 def test_the_report_says_so_when_there_is_no_history(tmp_path, capsys):
+    # Validates: docs/bench.md, 'The report': with no history, the report says so rather than printing empty numbers
     bench.print_report([], )
     out = capsys.readouterr().out
     assert "no history yet" in out
 
 
 def test_the_report_lists_records_newest_last(tmp_path, capsys):
+    # Validates: docs/bench.md, 'The report': records are listed newest last
     bench.print_report([
         _rec(ts=0, model="a.gguf", metric="prompt_tok_s", tok_per_s=1000),
         _rec(ts=1, model="b.gguf", metric="gen_tok_s", tok_per_s=50),
@@ -292,6 +314,7 @@ def test_the_report_lists_records_newest_last(tmp_path, capsys):
 
 
 def test_rtf_records_print_as_rtf_not_as_tok_per_second(tmp_path, capsys):
+    # Validates: docs/bench.md, 'The report': the unit follows the metric name: an RTF record prints as RTF
     bench.print_report([{"ts": 0, "engine": "audiocpp_server",
                          "version": "v0.9.2", "backend": "cpu",
                          "model": "kokoro-82m.s", "metric": "tts_rtf",
@@ -300,11 +323,13 @@ def test_rtf_records_print_as_rtf_not_as_tok_per_second(tmp_path, capsys):
 
 
 def test_the_first_run_of_a_configuration_says_so(capsys):
+    # Validates: docs/bench.md, 'The report': the first run of a configuration says so
     bench.compare_and_print(_rec(ts=1, tok_per_s=1000), [])
     assert "first recorded run" in capsys.readouterr().out
 
 
 def test_the_free_memory_counter_is_not_part_of_a_device_identity():
+    # Validates: docs/bench.md, 'What counts as the same measurement': the free-memory counter changes every run and is not part of the device identity
     """The bug that made every run a first run.
 
     --list-devices ends its line with the card's free memory, which moves
@@ -321,6 +346,7 @@ def test_the_free_memory_counter_is_not_part_of_a_device_identity():
 
 
 def test_a_different_card_is_still_a_different_measurement():
+    # Validates: docs/bench.md, 'What counts as the same measurement': a different card is a different measurement
     r9700 = "Vulkan0: AMD Radeon AI Pro R9700 (RADV GFX1201) (32624 MiB, 29951 MiB free)"
     w7900 = "Vulkan0: NVIDIA GeForce RTX 7900 (32624 MiB, 29951 MiB free)"
     assert bench.measurement_key(_rec(device=r9700)) != \
@@ -328,12 +354,14 @@ def test_a_different_card_is_still_a_different_measurement():
 
 
 def test_a_later_run_prints_the_change(capsys):
+    # Validates: docs/bench.md, 'The report': the report prints the change since the previous run of the same configuration
     bench.compare_and_print(_rec(ts=2, tok_per_s=900),
                             [_rec(ts=1, tok_per_s=1000)])
     out = capsys.readouterr().out
     assert "-10.0%" in out
 
 def test_the_unit_follows_the_metric_name():
+    # Validates: docs/bench.md, 'The report': the unit follows the metric name
     """A prompt-throughput record must not print as an RTF."""
     assert bench.metric_unit("prompt_tok_s") == ("tok_per_s", "tok/s")
     assert bench.metric_unit("gen_tok_s") == ("tok_per_s", "tok/s")
@@ -342,6 +370,7 @@ def test_the_unit_follows_the_metric_name():
 
 
 def test_a_prompt_throughput_record_prints_its_number(capsys):
+    # Validates: docs/bench.md, 'The report': a prompt-throughput record prints its own number
     bench.compare_and_print(_rec(ts=2, metric="prompt_tok_s", tok_per_s=6400),
                             [_rec(ts=1, metric="prompt_tok_s",
                                   tok_per_s=6400)])

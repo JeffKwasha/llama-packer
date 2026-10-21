@@ -4,6 +4,9 @@
 The vLLM container tests exercise these paths end-to-end; these unit tests
 pin the seam itself so a new engine/transport cannot silently break the
 engine x transport model.
+
+Design parts: docs/transports/host.md — the engine x transport seam: pair registry
+and naming, runtime gating, path mapping, and the container command shape.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ class Dummy:
 
 def test_registry_pairs_are_engine_by_transport():
     # host keeps the bare engine name; every other transport suffixes it.
+    # Validates: SPEC.md, 'Backend Selection': one backend per valid (engine, transport) pair; the host transport keeps the bare engine name and llama.cpp is host-only.
     assert BACKENDS["vllm"].transport.name == "host"
     assert BACKENDS["vllm-podman"].engine.name == "vllm"
     assert BACKENDS["vllm-docker"].engine.name == "vllm"
@@ -41,6 +45,7 @@ def test_registry_pairs_are_engine_by_transport():
 
 
 def test_transport_preference_is_host_then_podman_then_docker():
+    # Validates: docs/transports/podman.md, 'Transport: podman': host first, then podman, then docker.
     assert TRANSPORT_PREFERENCE == ("host", "podman", "docker")
     names = [n for n in BACKENDS if BACKENDS[n].engine.name == "vllm"]
     assert names == ["vllm", "vllm-podman", "vllm-docker"]
@@ -57,10 +62,12 @@ def test_transport_preference_is_host_then_podman_then_docker():
     ("cpu", "podman", ""),
 ])
 def test_container_device_flags(vendor, runtime, expected):
+    # Validates: docs/transports/podman.md, 'Transport: podman': the GPU passthrough flags each vendor and runtime needs; cpu needs none.
     assert container_device_flags(vendor, runtime) == expected
 
 
 def test_host_transport_is_identity():
+    # Validates: docs/transports/host.md, 'Transport: host': the host transport maps nothing and wraps nothing.
     t = HostTransport()
     assert t.bind_name("vllm") == "vllm"
     p = Path("/models/a.gguf")
@@ -72,11 +79,13 @@ def test_host_transport_is_identity():
 
 
 def test_bind_name_suffixes_non_host():
+    # Validates: docs/transports/podman.md, 'Transport: podman': a non-host transport suffixes the engine name.
     assert ContainerTransport("podman").bind_name("vllm") == "vllm-podman"
     assert ContainerTransport("docker").bind_name("vllm") == "vllm-docker"
 
 
 def test_container_runtime_gating():
+    # Validates: docs/transports/podman.md, 'Transport: podman': a container pair is only inferred when its runtime is on PATH
     t = ContainerTransport("podman")
     assert t.is_available({}) is True            # not probed -> do not gate
     assert t.is_available({"podman": True}) is True
@@ -85,6 +94,7 @@ def test_container_runtime_gating():
 
 
 def test_path_map_prefers_hf_root_over_models_dir(tmp_path):
+    # Validates: docs/transports/host.md, 'Runtime config files': a file under the HF cache root maps into the container's HF home, not into /models.
     hf = tmp_path / "hf"
     snap = hf / "hub" / "models--org--m" / "snapshots" / "s1" / "m.safetensors"
     snap.parent.mkdir(parents=True)
@@ -100,6 +110,7 @@ def test_path_map_prefers_hf_root_over_models_dir(tmp_path):
 
 
 def test_path_map_models_dir_and_outside(tmp_path):
+    # Validates: docs/transports/host.md, 'Runtime config files': a file under a models dir maps to /models, anything else to its own /ext mount.
     models = tmp_path / "models"
     inside = models / "chat" / "m.gguf"
     inside.parent.mkdir(parents=True)
@@ -115,10 +126,12 @@ def test_path_map_models_dir_and_outside(tmp_path):
 
 
 def test_path_map_unmapped_falls_back_to_str():
+    # Validates: SPEC.md, 'Container (vllm-podman / vllm-docker)': a path that no mapping covers passes through unchanged
     assert PathMap({}).ref(Path("/x/y")) == "/x/y"
 
 
 def test_container_wrap_shape():
+    # Validates: docs/transports/docker.md, 'Transport: docker': the container command carries the init flag, the devices, the mounts, the env, the port and the image, in that order.
     pm = PathMap({}, mounts=["-v /m:/models"])
     launch = Launch(
         image="img:1", port=8000, args="--device x",
@@ -136,6 +149,7 @@ def test_container_wrap_shape():
 # ── backend-name validation contract ──────────────────────────────────────
 
 def test_validate_backend_names_accepts_registered_pairs():
+    # Validates: SPEC.md, 'Backend Selection': every registered engine/transport pair is an accepted name.
     from llama_packer.backends import validate_backend_names
 
     assert validate_backend_names([]) is None
@@ -145,6 +159,7 @@ def test_validate_backend_names_accepts_registered_pairs():
 
 
 def test_validate_backend_names_reports_unknown_name():
+    # Validates: SPEC.md, 'Backend Selection': an unknown backend name is reported, not ignored
     from llama_packer.backends import validate_backend_names
 
     err = validate_backend_names(["llama-server", "bogus"])
@@ -153,6 +168,7 @@ def test_validate_backend_names_reports_unknown_name():
 
 
 def test_validate_backend_names_rejects_removed_kokoro():
+    # Validates: SPEC.md, 'Backend Selection': a removed engine stays rejected by name.
     from llama_packer.backends import validate_backend_names
 
     err = validate_backend_names(["kokoro-podman"])

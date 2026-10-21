@@ -34,6 +34,7 @@ def _fake(stem, tmp, arch="qwen3", size=100, suffix=".gguf",
 
 
 def test_picks_largest_per_family(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One measurable GGUF model per architecture family. Only real local ``.gguf`` files with a readable arch qualify (CPU-resident.
     models = [
         _fake("small", arch="qwen3", size=100, tmp=tmp_path),
         _fake("big", arch="qwen3", size=500, tmp=tmp_path),
@@ -48,6 +49,7 @@ def test_picks_largest_per_family(tmp_path):
 def test_picks_fast_storage_over_larger_platter(tmp_path):
     # a fast-tier model wins the family even when a bigger file sits on
     # the slow branch (the SSD loads ~6x faster; (c, D) are arch-given)
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One measurable GGUF model per architecture family. Only real local ``.gguf`` files with a readable arch qualify (CPU-resident.
     ssd = tmp_path / "ssd"
     hdd = tmp_path / "hdd"
     ssd.mkdir()
@@ -75,6 +77,7 @@ def test_picks_fast_storage_over_larger_platter(tmp_path):
 
 
 def test_pick_family_representatives_only_archs(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One measurable GGUF model per architecture family. Only real local ``.gguf`` files with a readable arch qualify (CPU-resident.
     models = [
         _fake("a", arch="qwen35", size=100, tmp=tmp_path),
         _fake("b", arch="gemma4", size=200, tmp=tmp_path),
@@ -85,6 +88,7 @@ def test_pick_family_representatives_only_archs(tmp_path):
 
 
 def test_skips_unmeasurable(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One measurable GGUF model per architecture family. Only real local ``.gguf`` files with a readable arch qualify (CPU-resident.
     missing = SimpleNamespace(
         stem="ghost", arch="qwen3", size_mb=10,
         gguf_path=tmp_path / "ghost.gguf",
@@ -103,6 +107,7 @@ def test_skips_unmeasurable(tmp_path):
 
 
 def test_probe_grid_spans_both_axes(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': The (pool ctx.
     grid = _probe_grid(262144)
     # top p=1 point is the design context (c measured at target); p=2 stays
     # at the cap (D is context-independent, and (design,2) does not fit)
@@ -116,6 +121,7 @@ def test_probe_grid_spans_both_axes(tmp_path):
 def test_fit_affine_exact_and_overdetermined():
     # exactly-determined trio reproduces the law (real Dirk numbers:
     # totals 25435 / 26005 / 23891 at (65536,1), (65536,2), (32768,1))
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': Least-squares ``(fixed.
     fit = _fit_affine([(65536, 1, 25435), (65536, 2, 26005),
                        (32768, 1, 23891)])
     assert fit is not None
@@ -137,6 +143,7 @@ def test_fit_affine_exact_and_overdetermined():
 
 
 def test_affine_report_exact_law_passes(tmp_path, monkeypatch):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': The (pool ctx.
     from types import SimpleNamespace
 
     C64 = 1 / 64  # exact MiB/token: every grid pool is an integer
@@ -175,6 +182,7 @@ def test_affine_report_exact_law_passes(tmp_path, monkeypatch):
 
 
 def test_affine_report_nonlinear_fails(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': The (pool ctx.
     from types import SimpleNamespace
 
     class FakeVram:
@@ -199,6 +207,7 @@ def test_affine_report_nonlinear_fails(tmp_path):
 
 
 def test_affine_report_missing_baseline(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': The (pool ctx.
     class FakeVram:
         def _run_measure_server(self, *a, **k):
             return None
@@ -212,6 +221,7 @@ def test_affine_report_missing_baseline(tmp_path):
 
 
 def test_affine_report_insufficient_points(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': The (pool ctx.
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
                                 llama_args):
@@ -229,6 +239,7 @@ def test_affine_report_insufficient_points(tmp_path):
 
 
 def test_format_reports_shows_verdicts(tmp_path):
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': Render affine reports as an aligned text table.
     good = {"model": _fake("good", tmp=tmp_path, size=500),
             "kv_per_token_mib": 0.01, "slot_mib": 150.0, "fixed_mib": 1100,
             "corr": {"delta_fixed": 100, "delta_c": 0.002,
@@ -244,6 +255,7 @@ def test_format_reports_shows_verdicts(tmp_path):
 def test_run_probe_end_to_end(tmp_path, monkeypatch):
     # The probe pre-flight reads live processes; this repo's normal state is
     # a resident llama-swap, so the test stubs a clean GPU.
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': Full probe: pick representatives.
     monkeypatch.setattr("llama_packer.gpu_state.llama_residents", lambda: [])
 
     class FakeVram:
@@ -275,6 +287,7 @@ def test_probe_does_not_file_companion_draft_as_baked_in(tmp_path, monkeypatch):
     # double-count companion models and over-reserve every baked-in model
     # of the same arch.  Regression (2026-09-26): a DSpark companion probe
     # wrote qwen35|q8_0|1, a row the packer never reads for that model.
+    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': Full probe: pick representatives.
     monkeypatch.setattr("llama_packer.gpu_state.llama_residents", lambda: [])
 
     class FakeVram:

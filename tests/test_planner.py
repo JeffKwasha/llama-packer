@@ -103,6 +103,7 @@ def _gated_ctx(model, by_mmproj):
 
 
 def test_profiles_spare_precedence():
+    # Validates: SPEC.md, 'profiles.yaml': Fleet-wide spare VRAM in MB: ``defaults.spare`` > ``--spare`` > 0.
     p = Profiles({"defaults": {"spare": "2G"}, "profiles": {}})
     assert p.global_spare_mb(vram_total=48000) == 2048
     assert p.global_spare_mb("4G", vram_total=48000) == 2048  # defaults win
@@ -113,6 +114,7 @@ def test_profiles_spare_precedence():
 
 
 def test_profiles_groups_fallback_when_nothing_matches(profiles, make_model):
+    # Validates: SPEC.md, 'profiles.yaml': a model whose allowed profiles match nothing falls back to the default group
     m = make_model("m", allow_profiles="nomatch")
     groups = profiles.groups_for(m, vram_total=48000)
     # Single defaults-derived group; parallel_for(1)/cache_type_for(default)
@@ -122,6 +124,7 @@ def test_profiles_groups_fallback_when_nothing_matches(profiles, make_model):
 
 
 def test_profiles_groups_by_cache_type(make_model):
+    # Validates: SPEC.md, 'profiles.yaml': differing cache_type values split a model into separate profile groups
     m = make_model("m")
     p = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
                   "profiles": {"a": {"cache_type": "f16"},
@@ -134,6 +137,7 @@ def test_profiles_groups_by_cache_type(make_model):
 
 
 def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
     """view_for() rebuilds VramBudget per view: a measurement failure
     flagged on the companion-on view's budget must still surface as
     estimate_error metadata — the re-check reads the solving budget."""
@@ -149,6 +153,7 @@ def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path)
 
 
 def test_profiles_rag_parallel_pinned_to_one(make_model, profiles, caplog):
+    # Validates: SPEC.md, 'Residents': residents always serve single-slot: a declared parallel: on a resident is ignored
     """Embed/rerank serve single-slot: a declared parallel is ignored with
     a once-per-model note — resident parallelism must never shrink the
     main chat context it serves."""
@@ -168,6 +173,7 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
                                                    caplog):
     # Small design ctx: below min-context with AND without vision — dropping
     # buys nothing, so vision is kept and only an info line is logged.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     m = _vision_model(tmp_path, make_model, "tiny")
     _scripted_ctx(m, {True: 32768, False: 32768})
 
@@ -183,6 +189,7 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
 
 
 def test_bounded_ctx_clamps_design_then_cli(make_model, profiles):
+    # Validates: SPEC.md, 'Context Tiers': VRAM-solved context clamped to the model's max trained context.
     m = make_model("m")  # sidecar context_length 32768
     m.vram.calc_ctx = lambda *a, **k: 999999
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
@@ -201,6 +208,7 @@ FP_PARAMS = (1000.0, 0.5, 0.0, 100.0)
 
 def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
         make_model, profiles, monkeypatch):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     from llama_packer import writer
 
     chat_a = make_model("chat_a", role="chat")
@@ -252,6 +260,7 @@ def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
 
 
 def test_matrix_knobs_defaults_and_overrides():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': Parse ``usage:`` from profiles.yaml. A malformed category is warned about and dropped rather than.
     k = MatrixKnobs.from_cfg(None)
     assert (k.min_chat_ctx, k.tools_min_ctx, k.coload_min_ctx,
             k.embed_context, k.rerank_context,
@@ -263,6 +272,7 @@ def test_matrix_knobs_defaults_and_overrides():
 
 
 def test_matrix_knobs_rag_caps():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': Parse ``usage:`` from profiles.yaml. A malformed category is warned about and dropped rather than.
     k = MatrixKnobs.from_cfg({"embed_context": 8192, "rerank_context": 16384})
     assert (k.embed_context, k.rerank_context) == (8192, 16384)
     assert k.rag_cap("embeddings") == 8192
@@ -271,6 +281,7 @@ def test_matrix_knobs_rag_caps():
 
 
 def test_matrix_knobs_vllm_auto_parallel():
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': Parse ``usage:`` from profiles.yaml. A malformed category is warned about and dropped rather than.
     k = MatrixKnobs.from_cfg({})
     assert k.auto_parallel_max == 8
     assert k.vllm_auto_parallel_max == 16
@@ -284,6 +295,7 @@ def test_plan_vllm_uncapped_parallel_zero(make_model, profiles):
     # sidecar parallel 0 on a vLLM model = uncapped: ctx solves single-seq
     # (vLLM validates one max-length seq at startup), and the variant emits
     # parallel 0 so --max-num-seqs is omitted.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     m = make_model("uv", backend="vllm", parallel=0)
     _fake_vram(m, (1000, 0.5, 100))
     planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024)
@@ -296,6 +308,7 @@ def test_plan_llama_parallel_zero_warns_and_defaults(make_model, profiles,
                                                      caplog):
     # parallel 0 is a vLLM-only convention; on llama.cpp it's invalid and
     # falls back to the fleet default with a warning.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     m = make_model("m0", parallel=0)
     _fake_vram(m, (1000, 0.5, 100))
     planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024)
@@ -308,6 +321,7 @@ def test_plan_llama_parallel_zero_warns_and_defaults(make_model, profiles,
 
 
 def test_plan_disables_over_budget_model(make_model, profiles, caplog):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': a model whose every rung is over budget produces no entry at all
     """Weights exceed the budget: the model cannot load at any context and
     must be skipped — skipped stems never reach entry_ids_by_stem, so
     matrix vars/sets auto-prune (emission happens before var construction)."""
@@ -330,6 +344,7 @@ def test_plan_disables_over_budget_model(make_model, profiles, caplog):
 
 
 def test_plan_vram_note_with_spare(make_model, profiles):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': a solve squeezed below the design context under a declared spare gains the over-budget note
     """Squeezed below design ctx with --spare active → description note."""
     m = make_model("sq", context_length=32768)
     _fake_vram(m, (32000, 0.5, 100))
@@ -345,6 +360,7 @@ def test_plan_vram_note_with_spare(make_model, profiles):
 
 
 def test_plan_no_vram_note_without_spare(make_model, profiles):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': with no reservation, no note is emitted
     """Same squeeze with no spare/baseline → no note (normal operation
     must never carry over-budget noise)."""
     m = make_model("sq0", context_length=32768)
@@ -357,6 +373,7 @@ def test_plan_no_vram_note_without_spare(make_model, profiles):
 
 
 def test_emit_config_vram_note_reaches_description(make_model, profiles):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': the over-budget note lands in the entry description
     """End-to-end: plan → emit → the note lands in the entry description
     after the mem tag."""
     m = make_model("sqd", context_length=32768, description="Squeezed model.")
@@ -374,6 +391,7 @@ def test_emit_config_vram_note_reaches_description(make_model, profiles):
 
 
 def test_plan_no_vram_note_with_baseline_at_reserve_floor(make_model, profiles):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': a baseline at or below the fixed reserve floor never fires the note
     """hardware.baseline_mb: '128m' is swallowed by max(_RESERVE_VIDEO,
     baseline) — it does not change the reserve, so it must not fire notes."""
     m = make_model("b128", context_length=32768)
@@ -387,6 +405,7 @@ def test_plan_no_vram_note_with_baseline_at_reserve_floor(make_model, profiles):
 
 
 def test_plan_vram_note_with_baseline_above_floor(make_model, profiles):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': a baseline above the fixed reserve floor fires the note
     """An explicit baseline above the fixed floor is a real reservation —
     squeeze notes fire even with no --spare."""
     m = make_model("b2g", context_length=32768)
@@ -401,6 +420,7 @@ def test_plan_vram_note_with_baseline_above_floor(make_model, profiles):
 
 
 def test_plan_no_vram_note_when_served_equals_design(make_model, profiles):
+    # Validates: SPEC.md, 'VRAM gating and reservation notes': an equal-to-design solve stays silent
     """vram_squeezed can fire against the matrix chat_ctx target while the
     final clamp lands on the model's own context_length — equality must not
     produce a 'serving at N of N' note."""
@@ -426,6 +446,7 @@ def test_plan_no_vram_note_when_served_equals_design(make_model, profiles):
 
 def test_plan_vision_over_budget_falls_back_to_text(tmp_path, make_model,
                                                     profiles, caplog):
+    # Validates: SPEC.md, 'Vision is a rung, not a second entry': vision is a rung, not a fallback: there is no vision-to-text retry
     """Vision view cannot load, text-only can: serve text-only instead of
     disabling the whole model.  Drop-pass keeps vision (min-context floor
     equals the over-budget return), so the group solve is what falls back."""
@@ -488,6 +509,7 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
     # A declared category, so the entry runs the real slot solve
     # (parallel_power) rather than the null category's exponent-0 bias: this
     # test is about backend slot caps, not about the fallback's trade-off.
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     no_pin = Profiles({"defaults": {"cache_type": "q8_0"},
                        "profiles": {"default": {}},
                        "usage": {"qa": {"min_context": "4k",
@@ -509,6 +531,7 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
 
 
 def test_matrix_knobs_invalid_values_warn_and_default(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': Parse ``usage:`` from profiles.yaml. A malformed category is warned about and dropped rather than.
     with caplog.at_level(logging.WARNING):
         k = MatrixKnobs.from_cfg({"min_chat_ctx": -1, "coload_min_ctx": "big",
                                   "embed_context": 0, "rerank_context": "4k",
@@ -545,6 +568,7 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
     # reserving its VRAM against every chat solve buys nothing and only
     # shrinks context.  Regression (2026-09-26): two unreferenced ASR
     # co-loads charged 4725 MB and collapsed a 27B from 188416 to 32768.
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -576,6 +600,7 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
 
 
 def test_sets_reference_coloads():
+    # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the co-load pass only fires when a routing set can actually co-locate
     assert _sets_reference_coloads(COLOAD_SETS) is True
     assert _sets_reference_coloads({"rag": "__CHAT_VARS__ & emb & rnk"}) is False
     assert _sets_reference_coloads({}) is False
@@ -583,6 +608,7 @@ def test_sets_reference_coloads():
 
 
 def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -617,6 +643,7 @@ def test_solve_matrix_reads_block_tokens_from_on_view(
         tmp_path, make_model, profiles, monkeypatch):
     # image_max_tokens living only in the mmproj block must still reserve
     # the image floor in the matrix solve (read via the companion-on view).
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
     from llama_packer import writer
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x" * 1024)
     m = make_model("v", mmproj={"file": "v-mmproj.gguf",
@@ -650,6 +677,7 @@ def test_solve_matrix_reads_block_tokens_from_on_view(
 
 
 def test_solve_matrix_floor_blocks_all_coloads(profiles):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -675,6 +703,7 @@ def test_solve_matrix_floor_blocks_all_coloads(profiles):
 
 
 def test_solve_matrix_tools_floor_blocks_coload(profiles):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat", capabilities=["tools"])
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -700,6 +729,7 @@ def test_solve_matrix_tools_floor_blocks_coload(profiles):
 
 
 def test_solve_matrix_squeeze_adopted(profiles):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=32768)
     rerank = make("r", role="rerank", context_length=32768)
@@ -724,6 +754,7 @@ def test_solve_matrix_squeeze_adopted(profiles):
 
 
 def test_coload_on_cpu_costs_zero(profiles):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -757,6 +788,7 @@ def make(stem, **fm):
 
 
 def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
+    # Validates: SPEC.md, 'Output Format': the matrix result is threaded into the emitted variants
     chat = make("chat", role="chat", capabilities=["tools"])
     embed = make("e", role="embeddings", context_length=32768)
     rerank = make("r", role="rerank", context_length=32768)
@@ -846,6 +878,7 @@ def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
 def test_coload_estimate_gets_headroom(profiles):
     # No pin, no fit-params: the file-size + buffer estimate is padded by
     # estimate_headroom (1.25x default) so a bad guess errs toward reserving.
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -870,6 +903,7 @@ def test_coload_estimate_gets_headroom(profiles):
 
 
 def test_plan_unestimable_chat_floor_and_metadata(make_model, profiles):
+    # Validates: SPEC.md, 'Model Metadata': a model whose VRAM cannot be estimated is marked estimated: false with the reason, and falls back to the floor
     from llama_packer.consts import ESTIMATE_ERROR_REASON
 
     # No sidecar context_length: the floor cascade (no pin, no tools) is
@@ -891,6 +925,7 @@ def test_plan_unestimable_chat_floor_and_metadata(make_model, profiles):
 
 
 def test_matrix_unestimable_chat_rides_free(profiles, monkeypatch):
+    # Validates: SPEC.md, 'Remainder': the chat budget is what is left after the residents are charged
     from llama_packer import writer
 
     good = make("good", role="chat")
@@ -929,6 +964,7 @@ def test_matrix_unestimable_chat_rides_free(profiles, monkeypatch):
 
 
 def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
+    # Validates: SPEC.md, 'Remainder': a resident that cannot be estimated is clamped to its fixed context and flagged
     from llama_packer import writer
 
     chat = make("chat", role="chat")
@@ -965,6 +1001,7 @@ def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
 
 
 def test_solve_matrix_aborts_when_nothing_measurable(profiles):
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings")
     chat.vram.effective_static = lambda *a, **k: None
@@ -983,6 +1020,7 @@ def test_planner_skips_text_variant_that_gains_nothing(make_model, profiles,
     # A model already at its design cap cannot reclaim context by shedding
     # the projection, so the text rung earns no entry. Regression: ten
     # models shipped a -text twin at identical context (2026-09-26).
+    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     (tmp_path / "vis-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
     m = make_model("vis", mmproj={"file": "vis-mmproj.gguf",
                                   "capabilities": ["image"]},
@@ -1003,6 +1041,7 @@ def test_matrix_vars_point_at_emitted_entry_ids(make_model, profiles, tmp_path):
     # a var pointing at a missing id makes llama-swap reject the whole
     # config (caught 2026-09-26 by -validate: 'var key "rnk2" references
     # unknown model "zerank-2"').
+    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
     from llama_packer.__main__ import _build_matrix_vars
     emb = make_model("emb", role="embeddings")
     rnk = make_model("rnk", role="rerank")

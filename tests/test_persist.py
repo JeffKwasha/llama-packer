@@ -1,5 +1,9 @@
 # tests/test_persist.py
-"""Sidecar fit-params persistence preserves comments and body."""
+"""Sidecar fit-params persistence preserves comments and body.
+
+Design parts: SPEC.md, 'Measured-Block Persistence' — the measured constants land
+in the dynamic derived: branch and nothing else in the sidecar is rewritten.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ from llama_packer.vram import FitParams
 
 
 def test_persist_preserves_comments_and_body(make_model, tmp_path):
+    # Validates: SPEC.md, 'Measured-Block Persistence': writing the measured constants touches only the dynamic derived: branch; the sidecar's comments and body survive.
     model = make_model("p", context_length=32768)
     md = tmp_path / "p.md"
     md.write_text(
@@ -32,6 +37,7 @@ def test_persist_preserves_comments_and_body(make_model, tmp_path):
 
 
 def test_persist_migrates_legacy_fit_params_block(make_model, tmp_path):
+    # Validates: SPEC.md, 'Measured-Block Persistence': a legacy fit-params: block is migrated into derived:, never left beside it.
     model = make_model("p", context_length=32768)
     md = tmp_path / "p.md"
     md.write_text(

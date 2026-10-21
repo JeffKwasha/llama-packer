@@ -52,12 +52,14 @@ def boom(*_a, **_k):
 # ── detect_gpu_vendor ─────────────────────────────────────────────────────
 
 def test_vendor_prefers_amd_smi(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the GPU vendor: ``"amd"``.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(0, "{}"))))
     assert hardware.detect_gpu_vendor() == "amd"
 
 
 def test_vendor_falls_back_to_rocminfo(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the GPU vendor: ``"amd"``.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(1),
                                                rocm=Completed(0))))
@@ -65,6 +67,7 @@ def test_vendor_falls_back_to_rocminfo(monkeypatch):
 
 
 def test_vendor_falls_back_to_nvidia(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the GPU vendor: ``"amd"``.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(1),
                                                rocm=Completed(1),
@@ -73,6 +76,7 @@ def test_vendor_falls_back_to_nvidia(monkeypatch):
 
 
 def test_vendor_nvidia_without_output_is_cpu(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the GPU vendor: ``"amd"``.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(1),
                                                rocm=Completed(1),
@@ -81,6 +85,7 @@ def test_vendor_nvidia_without_output_is_cpu(monkeypatch):
 
 
 def test_vendor_nothing_available_is_cpu(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the GPU vendor: ``"amd"``.
     monkeypatch.setattr(hardware.subprocess, "run", stub_run(tool_dispatch()))
     assert hardware.detect_gpu_vendor() == "cpu"
 
@@ -88,12 +93,14 @@ def test_vendor_nothing_available_is_cpu(monkeypatch):
 # ── detect_gpu_env_var ────────────────────────────────────────────────────
 
 def test_env_var_amd(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Return the vendor env var used to pin a process to a GPU device. ROCm uses ROCR_VISIBLE_DEVICES; NVIDIA uses CUDA_VISIBLE_DEVICES.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(0, "{}"))))
     assert hardware.detect_gpu_env_var() == "ROCR_VISIBLE_DEVICES"
 
 
 def test_env_var_nvidia(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Return the vendor env var used to pin a process to a GPU device. ROCm uses ROCR_VISIBLE_DEVICES; NVIDIA uses CUDA_VISIBLE_DEVICES.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(1),
                                                nvidia=Completed(0, "8192"))))
@@ -101,6 +108,7 @@ def test_env_var_nvidia(monkeypatch):
 
 
 def test_env_var_inconclusive_defaults_to_rocm(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Return the vendor env var used to pin a process to a GPU device. ROCm uses ROCR_VISIBLE_DEVICES; NVIDIA uses CUDA_VISIBLE_DEVICES.
     monkeypatch.setattr(hardware.subprocess, "run", stub_run(tool_dispatch()))
     assert hardware.detect_gpu_env_var() == "ROCR_VISIBLE_DEVICES"
 
@@ -122,6 +130,7 @@ def test_nvidia_vram_sentinels(monkeypatch, out, expected):
 # ── _detect_vram_amd ──────────────────────────────────────────────────────
 
 def test_amd_vram_from_amd_smi_json(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect VRAM via AMD tools. Returns MiB or None.
     payload = '{"gpu_data":[{"mem_usage":{"total_vram":{"value":24576}}}]}'
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(0, payload))))
@@ -131,6 +140,7 @@ def test_amd_vram_from_amd_smi_json(monkeypatch):
 # ── detect_vram_baseline_mb ───────────────────────────────────────────────
 
 def test_baseline_from_amd_smi(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect baseline VRAM in MiB already consumed by the driver/compositor. This is the VRAM *used* before any model is loaded (kernel driver,.
     payload = '{"gpu_data":[{"mem_usage":{"used_vram":{"value":1234}}}]}'
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(0, payload))))
@@ -138,6 +148,7 @@ def test_baseline_from_amd_smi(monkeypatch):
 
 
 def test_baseline_from_nvidia(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect baseline VRAM in MiB already consumed by the driver/compositor. This is the VRAM *used* before any model is loaded (kernel driver,.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(1),
                                                nvidia=Completed(0, "512"))))
@@ -145,6 +156,7 @@ def test_baseline_from_nvidia(monkeypatch):
 
 
 def test_baseline_nvidia_not_supported_is_zero(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect baseline VRAM in MiB already consumed by the driver/compositor. This is the VRAM *used* before any model is loaded (kernel driver,.
     monkeypatch.setattr(hardware.subprocess, "run",
                         stub_run(tool_dispatch(amd=Completed(1),
                                                nvidia=Completed(0, "Not Supported"))))
@@ -152,6 +164,7 @@ def test_baseline_nvidia_not_supported_is_zero(monkeypatch):
 
 
 def test_baseline_no_tools_is_zero(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect baseline VRAM in MiB already consumed by the driver/compositor. This is the VRAM *used* before any model is loaded (kernel driver,.
     monkeypatch.setattr(hardware.subprocess, "run", stub_run(tool_dispatch()))
     assert hardware.detect_vram_baseline_mb() == 0
 
@@ -159,6 +172,7 @@ def test_baseline_no_tools_is_zero(monkeypatch):
 # ── _detect_system_ram_mb / _detect_pool_mb ───────────────────────────────
 
 def test_system_ram_parsed_from_free(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Get total system RAM in MiB (for unified memory fallback).
     out = ("              total        used        free\n"
            "Mem:          131072       1000       90000\n")
     monkeypatch.setattr(hardware.subprocess, "run",
@@ -167,18 +181,21 @@ def test_system_ram_parsed_from_free(monkeypatch):
 
 
 def test_pool_prefers_discrete_amd(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the memory pool available to models. Returns ``(pool_mb.
     monkeypatch.setattr(hardware, "_detect_vram_amd", lambda: 24576)
     monkeypatch.setattr(hardware, "_detect_vram_nvidia", lambda: 8192)
     assert hardware._detect_pool_mb() == (24576, False)
 
 
 def test_pool_uses_discrete_nvidia(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the memory pool available to models. Returns ``(pool_mb.
     monkeypatch.setattr(hardware, "_detect_vram_amd", lambda: None)
     monkeypatch.setattr(hardware, "_detect_vram_nvidia", lambda: 8192)
     assert hardware._detect_pool_mb() == (8192, False)
 
 
 def test_pool_unified_when_nvidia_reports_na(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the memory pool available to models. Returns ``(pool_mb.
     monkeypatch.setattr(hardware, "_detect_vram_amd", lambda: None)
     monkeypatch.setattr(hardware, "_detect_vram_nvidia", lambda: None)
     monkeypatch.setattr(hardware, "_detect_system_ram_mb", lambda: 122880)
@@ -188,6 +205,7 @@ def test_pool_unified_when_nvidia_reports_na(monkeypatch):
 
 
 def test_pool_falls_back_to_system_ram_without_tools(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the memory pool available to models. Returns ``(pool_mb.
     monkeypatch.setattr(hardware, "_detect_vram_amd", lambda: None)
     monkeypatch.setattr(hardware, "_detect_vram_nvidia", lambda: None)
     monkeypatch.setattr(hardware, "_detect_system_ram_mb", lambda: 65536)
@@ -196,6 +214,7 @@ def test_pool_falls_back_to_system_ram_without_tools(monkeypatch):
 
 
 def test_pool_raises_clean_systemexit_when_undetectable(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect the memory pool available to models. Returns ``(pool_mb.
     monkeypatch.setattr(hardware, "_detect_vram_amd", lambda: None)
     monkeypatch.setattr(hardware, "_detect_vram_nvidia", lambda: None)
     monkeypatch.setattr(hardware.subprocess, "run", stub_run(tool_dispatch()))
@@ -206,6 +225,7 @@ def test_pool_raises_clean_systemexit_when_undetectable(monkeypatch):
 
 
 def test_detect_vram_mb_returns_pool_total(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Detect VRAM budget in MiB (pool total, reserve folded by caller).
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (12345, True))
     assert hardware.detect_vram_mb() == 12345
 
@@ -213,16 +233,19 @@ def test_detect_vram_mb_returns_pool_total(monkeypatch):
 # ── GpuProfile.from_args precedence ───────────────────────────────────────
 
 def test_from_args_explicit_vram_skips_detection(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     monkeypatch.setattr(hardware, "_detect_pool_mb", boom)
     assert GpuProfile.from_args(vram="32G").vram_mb == 32 * 1024
 
 
 def test_from_args_yaml_vram_used_when_no_cli(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     monkeypatch.setattr(hardware, "_detect_pool_mb", boom)
     assert GpuProfile.from_args(yaml_hw={"vram": "16G"}).vram_mb == 16 * 1024
 
 
 def test_from_args_autodetects_when_unset(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (24576, False))
     p = GpuProfile.from_args()
     assert p.vram_mb == 24576
@@ -230,6 +253,7 @@ def test_from_args_autodetects_when_unset(monkeypatch):
 
 
 def test_from_args_family_precedence():
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     assert GpuProfile.from_args(vram="1G", gpu_family="rocm7",
                                 yaml_hw={"gpu_family": "cuda12"}).family == "rocm7"
     assert GpuProfile.from_args(vram="1G",
@@ -238,24 +262,28 @@ def test_from_args_family_precedence():
 
 
 def test_from_args_yaml_baseline_when_no_cli():
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     p = GpuProfile.from_args(vram="1G", yaml_hw={"baseline_mb": "4G"})
     assert p.baseline_mb == 4 * 1024
 
 
 def test_from_args_cli_baseline_beats_yaml():
     # Documented contract: explicit args > YAML > auto-detect.
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     p = GpuProfile.from_args(vram="1G", baseline="2G",
                              yaml_hw={"baseline_mb": "4G"})
     assert p.baseline_mb == 2 * 1024
 
 
 def test_from_args_unified_folds_default_system_reserve(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (122880, True))
     p = GpuProfile.from_args()
     assert p.baseline_mb == max(0, _UNIFIED_SYSTEM_RESERVE_DEFAULT - _RESERVE_SYSTEM)
 
 
 def test_from_args_unified_system_knob_cli_beats_yaml(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (122880, True))
     p = GpuProfile.from_args(unified_system_mb="16G",
                              yaml_hw={"unified_system_mb": "32G"})
@@ -263,6 +291,7 @@ def test_from_args_unified_system_knob_cli_beats_yaml(monkeypatch):
 
 
 def test_from_args_explicit_baseline_disables_unified_folding(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Construct profile with precedence: explicit args > YAML > auto-detect.
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (122880, True))
     p = GpuProfile.from_args(baseline="2G")
     assert p.baseline_mb == 2 * 1024
@@ -271,6 +300,7 @@ def test_from_args_explicit_baseline_disables_unified_folding(monkeypatch):
 # ── GpuProfile.detect ─────────────────────────────────────────────────────
 
 def test_detect_discrete_keeps_measured_baseline(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Auto-detect local GPU hardware.
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (24576, False))
     monkeypatch.setattr(hardware, "detect_vram_baseline_mb", lambda: 777)
     p = GpuProfile.detect()
@@ -278,6 +308,7 @@ def test_detect_discrete_keeps_measured_baseline(monkeypatch):
 
 
 def test_detect_unified_folds_system_reserve(monkeypatch):
+    # Validates: SPEC.md, 'Hardware Detection': Auto-detect local GPU hardware.
     monkeypatch.setattr(hardware, "_detect_pool_mb", lambda: (122880, True))
     monkeypatch.setattr(hardware, "detect_vram_baseline_mb", lambda: 0)
     p = GpuProfile.detect()

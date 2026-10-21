@@ -49,6 +49,7 @@ class FakeFinder(WeightFinder):
 # ── from_ref resolution ───────────────────────────────────────────────────
 
 def test_from_ref_absolute_path(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': an absolute path ref resolves to that file.
     f = tmp_path / "m.gguf"
     f.write_bytes(b"x")
     m = Model.from_ref(str(f))
@@ -56,10 +57,12 @@ def test_from_ref_absolute_path(tmp_path):
 
 
 def test_from_ref_missing_absolute_path_is_none(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': an absolute path that does not exist resolves to nothing.
     assert Model.from_ref(str(tmp_path / "nope.gguf")) is None
 
 
 def test_from_ref_searches_anchor_dirs(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a bare name is searched in the anchor directories.
     d = tmp_path / "sub"
     d.mkdir()
     (d / "w.gguf").write_bytes(b"x")
@@ -68,6 +71,7 @@ def test_from_ref_searches_anchor_dirs(tmp_path):
 
 
 def test_from_ref_hub_form_and_malformed(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the hub: form resolves; a malformed ref resolves to nothing.
     f = tmp_path / "w.gguf"
     f.write_bytes(b"x")
     assert Model.from_ref("hub:org/repo:w.gguf",
@@ -76,6 +80,7 @@ def test_from_ref_hub_form_and_malformed(tmp_path):
 
 
 def test_from_ref_glob_requires_single_match(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a glob must match exactly one file; zero or many resolve to nothing.
     f = tmp_path / "w.gguf"
     f.write_bytes(b"x")
     assert Model.from_ref("*.gguf", hf_repo="org/repo",
@@ -85,12 +90,14 @@ def test_from_ref_glob_requires_single_match(tmp_path):
 
 
 def test_from_ref_unresolvable_is_none():
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a ref that resolves nowhere is None, not an error.
     assert Model.from_ref("nope.gguf", finder=FakeFinder()) is None
 
 
 # ── canonical registry ────────────────────────────────────────────────────
 
 def test_find_by_gguf_returns_canonical_instance(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the weight file maps back to the one canonical model instance.
     f = tmp_path / "m.gguf"
     f.write_bytes(b"x")
     m = Model.from_file(f)
@@ -99,6 +106,7 @@ def test_find_by_gguf_returns_canonical_instance(tmp_path):
 
 
 def test_find_by_gguf_resolves_symlink_to_canonical(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a symlink resolves to the same canonical instance.
     real = tmp_path / "real.gguf"
     real.write_bytes(b"x")
     link = tmp_path / "link.gguf"
@@ -108,6 +116,7 @@ def test_find_by_gguf_resolves_symlink_to_canonical(tmp_path):
 
 
 def test_get_or_create_companion_is_idempotent(tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': the same companion file is one model, however often it is asked for.
     f = tmp_path / "mmproj.gguf"
     f.write_bytes(b"x")
     assert Model._get_or_create_companion(f) is Model._get_or_create_companion(f)
@@ -116,6 +125,7 @@ def test_get_or_create_companion_is_idempotent(tmp_path):
 # ── _resolve_ref / _resolve_hub_ref wrappers ──────────────────────────────
 
 def test_resolve_ref_finds_file_beside_sidecar(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a bare file name resolves beside the sidecar that names it.
     m = make_model("m")
     (tmp_path / "aux.gguf").write_bytes(b"x")
     p = m._resolve_ref("aux.gguf")
@@ -124,6 +134,7 @@ def test_resolve_ref_finds_file_beside_sidecar(make_model, tmp_path):
 
 
 def test_resolve_ref_searches_parent_dir(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the search walks up from the sidecar's directory.
     sub = tmp_path / "sub"
     sub.mkdir()
     (tmp_path / "aux.gguf").write_bytes(b"x")
@@ -136,6 +147,7 @@ def test_resolve_ref_searches_parent_dir(tmp_path):
 
 
 def test_resolve_hub_ref_falls_back_to_pattern_hint(make_model, monkeypatch):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a hub ref with a pattern hint resolves through the snapshot listing.
     m = make_model("m", hf_repo="org/repo")
     seen: list[str] = []
 
@@ -153,12 +165,14 @@ def test_resolve_hub_ref_falls_back_to_pattern_hint(make_model, monkeypatch):
 
 
 def test_resolve_hub_ref_without_hint_returns_none(make_model, monkeypatch):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a hub ref with no hint and no exact file resolves to nothing.
     m = make_model("m", hf_repo="org/repo")
     monkeypatch.setattr(Model, "from_ref", classmethod(lambda cls, *a, **k: None))
     assert m._resolve_hub_ref("missing.bin") is None
 
 
 def test_resolve_hub_ref_hint_requires_repo(make_model, monkeypatch):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the pattern hint only applies to a named repo.
     m = make_model("m")  # no hf_repo
     seen: list[str] = []
 
@@ -177,12 +191,14 @@ def test_resolve_hub_ref_hint_requires_repo(make_model, monkeypatch):
 # ── write_md ──────────────────────────────────────────────────────────────
 
 def test_write_md_round_trips_all_frontmatter(make_model):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the sidecar keeps every frontmatter key it was given.
     m = make_model("m", strengths=["fast"], custom_meta={"a": 1})
     m.write_md()
     assert utils.parse_frontmatter(m.md_path) == m.frontmatter
 
 
 def test_write_md_to_alternate_path(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the sidecar can be written to another path.
     m = make_model("m", license="apache-2.0")
     out = tmp_path / "copy.md"
     m.write_md(output_path=out)
@@ -193,6 +209,7 @@ def test_write_md_to_alternate_path(make_model, tmp_path):
 # ── value accessors ───────────────────────────────────────────────────────
 
 def test_context_length_override_and_default(make_model):
+    # Validates: SPEC.md, 'Context Tiers': the sidecar's context_length is the design maximum; without one there is a default.
     assert make_model("a", context_length=8192).context_length == 8192
     bare = object.__new__(Model)
     bare.frontmatter = {}
@@ -200,17 +217,20 @@ def test_context_length_override_and_default(make_model):
 
 
 def test_cli_args_defaults_empty(make_model):
+    # Validates: SPEC.md, 'Model Metadata': a model without cli_args has none.
     assert make_model("m").cli_args == ""
     assert make_model("n", cli_args="--x 1").cli_args == "--x 1"
 
 
 def test_freethought_coercion(make_model):
+    # Validates: SPEC.md, 'Model Metadata': the sidecar value is coerced to a number.
     assert make_model("a").freethought is None
     assert make_model("b", freethought=0.7).freethought == 0.7
     assert make_model("c", freethought="not-a-number").freethought is None
 
 
 def test_size_mb_and_vram_mb_track_file(make_model):
+    # Validates: SPEC.md, 'Model Metadata': the reported size follows the file on disk.
     m = make_model("m")
     m.gguf_path.write_bytes(b"x" * (3 * 1024 * 1024))
     assert m.size_mb == 3
@@ -218,18 +238,21 @@ def test_size_mb_and_vram_mb_track_file(make_model):
 
 
 def test_size_mb_zero_without_file():
+    # Validates: SPEC.md, 'Model Metadata': a model with no file has no size.
     m = object.__new__(Model)
     m.gguf_path = None
     assert m.size_mb == 0
 
 
 def test_mmproj_size_mb_zero_without_companion(make_model):
+    # Validates: SPEC.md, 'Model Metadata': without a companion file the companion's size is zero.
     assert make_model("m").mmproj_size_mb == 0
 
 
 # ── SafetensorsModel path ─────────────────────────────────────────────────
 
 def test_safetensors_kind_and_numeric_estimate(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'vLLM Backend': a safetensors checkpoint yields a kind and a numeric estimate from its header
     monkeypatch.setattr(utils, "sniff_safetensors", lambda p: "text")
     calls: list[str] = []
     monkeypatch.setattr(utils, "estimate_safetensors",
@@ -248,6 +271,7 @@ def test_safetensors_kind_and_numeric_estimate(tmp_path, monkeypatch):
 
 
 def test_safetensors_numbers_none_on_estimate_failure(tmp_path, monkeypatch):
+    # Validates: SPEC.md, 'vLLM Backend': a header that cannot be read yields no numbers, not wrong ones
     monkeypatch.setattr(utils, "sniff_safetensors", lambda p: "unknown")
 
     def boom(p, ct):
@@ -262,6 +286,7 @@ def test_safetensors_numbers_none_on_estimate_failure(tmp_path, monkeypatch):
 
 def test_base_model_safetensors_numbers_is_none():
     # A non-safetensors canonical file has no numeric estimate.
+    # Validates: SPEC.md, 'vLLM Backend': the numbers come from the model's own file, not from a base model's.
     m = object.__new__(Model)
     m._file = None
     assert m.safetensors_numbers() is None

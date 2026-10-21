@@ -116,6 +116,54 @@ safe shape is a timer that updates **and** re-packs together, and refuses
 the swap when `llama-swap -validate` rejects the result; that is a separate
 piece of work from this installer.
 
+## The updater command line
+
+`extras/update.py` takes its targets as positionals and its switches as
+flags. The rules below are the ones the tool's tests hold up.
+
+- **The tool's own help lists the targets, the flags and the precedence**, and
+  an unknown option or a bad value stops the run rather than being ignored.
+- **Targets are positional, first match wins.** `llama`/`ll`, `cpp`,
+  `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, and `all`. `all` must be
+  typed in full — a glob works too, and `s*` selects `swap` and `sd`.
+- **No target means llama.cpp and llama-swap**: the two that publish
+  `checksums.txt`. `all` adds the three that do not.
+- **A version positional belongs to the target it follows.** A bare `v<N>` is
+  a llama-swap version; a `bNNNN` is a llama.cpp build. `--cpp-only` ignores
+  a swap version, and `--swap-only` ignores a build number.
+- **`--swap-only` and `--cpp-only` are mutually exclusive**, and a selector
+  together with the legacy `--only` flag is refused rather than guessed at.
+- **When two version positionals are given, the last one wins**, and a
+  positional that is not a target is left to the version parser.
+- **`--keep-swap N` / `--keep-engine-versions N`** keep that many old
+  versions. A non-positive count is refused; `KEEP_SWAP_VERSIONS` and
+  `KEEP_ENGINE_VERSIONS` are the environment equivalents.
+- **`--arch`** overrides the detected architecture (`x64`/`amd64`/`linux_amd64`,
+  `arm64`/`aarch64`/`linux_arm64`, `s390x`). A bad value is refused at parse
+  time, and an architecture the tool does not know is refused rather than
+  guessed.
+- **`--dir engine=path`** settles a location for one run and overrides every
+  configured and discovered one. A bad `--dir` stops the run before anything
+  is downloaded.
+- **`--print-paths`** prints where each engine would be updated and why, and
+  downloads nothing.
+- **An asset is chosen by matching a pattern** over the release's download
+  URLs — the portable bundle, not the plain tarball, when the backend needs
+  one.
+- **A release tag the release list does not carry is an error**, not a
+  silent skip.
+- **`checksums.txt` is verified when the release publishes one.** When it does
+  not, the install says plainly that the download was unverified rather than
+  pretending to a check it could not do.
+- **`--require-checksums` refuses an archive the release did not checksum**,
+  where the default install warns that the download was unverified.
+- **The newest is kept by number, not by spelling**: `master-1000` outranks
+  `master-999`, so a text sort would keep the older build and delete the
+  newer one.
+- **A versioned file that a symlink still points at is never removed** — that
+  would leave a dangling link, and the previous release is what makes a
+  rollback possible.
+
 ## Where an update installs
 
 An engine is updated **in the directory it is already installed in**, not in

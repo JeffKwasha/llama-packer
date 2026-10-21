@@ -25,6 +25,7 @@ def _stamp(hf_home, repo, rev, mtime):
 
 
 def test_parse_pick_defaults():
+    # Validates: SPEC.md, 'Override Rules': no pick means the main ref, and not the snapshot root only.
     assert parse_pick(None) == ("main", False)
     assert parse_pick("newest,top") == ("newest", True)
     assert parse_pick(["oldest", "top"]) == ("oldest", True)
@@ -32,12 +33,15 @@ def test_parse_pick_defaults():
 
 
 def test_parse_pick_unknown_token_warns(caplog):
+    # Validates: SPEC.md, 'Override Rules': the pick token string disambiguates multiples: newest or oldest
     with caplog.at_level(logging.WARNING):
         assert parse_pick("newest,bogus") == ("newest", False)
     assert any("unknown pick token" in r.message for r in caplog.records)
 
 
 def test_dict_template_resolves_from_hub(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a file
+    # ref names a hub file and resolves to the snapshot revision.
     hf_home = _hf_tree(tmp_path, revs=("r1",), files=("chat_template.jinja",))
     m = make_model("q", chat_template={"hf_repo": "org/repo",
                                        "file": "chat_template.jinja"})
@@ -48,6 +52,7 @@ def test_dict_template_resolves_from_hub(make_model, tmp_path):
 
 
 def test_file_only_dict_equals_bare_string(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars':     # {file: x} is the same as the bare string x.
     (tmp_path / "local.jinja").write_text("x")
     m1 = make_model("a", chat_template="local.jinja")
     m2 = make_model("b", chat_template={"file": "local.jinja"})
@@ -57,6 +62,8 @@ def test_file_only_dict_equals_bare_string(make_model, tmp_path):
 
 
 def test_dict_template_tracks_refs_main(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a file ref
+    # follows the repo's main ref, so a re-resolution moves with it.
     hf_home = _hf_tree(tmp_path, revs=("r1", "r2"),
                        files=("chat_template.jinja",),
                        contents={("r1", "chat_template.jinja"): b"one",
@@ -73,6 +80,8 @@ def test_dict_template_tracks_refs_main(make_model, tmp_path):
 
 
 def test_pick_newest_oldest_without_ref(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': pick
+    # newest/oldest selects the snapshot by mtime when there is no ref.
     hf_home = _hf_tree(tmp_path, revs=("r1", "r2"), ref=None,
                        files=("chat_template.jinja",))
     _stamp(hf_home, "org/repo", "r1", 1000)
@@ -89,6 +98,8 @@ def test_pick_newest_oldest_without_ref(make_model, tmp_path):
 
 
 def test_pick_top_prefers_snapshot_root(make_model, tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': an
+    # ambiguous name fails loud, and pick: top takes the snapshot root.
     hf_home = _hf_tree(tmp_path, files=("chat_template.jinja",
                                         "archive/v1/chat_template.jinja"))
     ref = {"hf_repo": "org/repo", "file": "chat_template.jinja"}
@@ -106,6 +117,8 @@ def test_pick_top_prefers_snapshot_root(make_model, tmp_path, caplog):
 
 
 def test_hub_string_form_for_template(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the
+    # hub:org/repo:file spelling resolves like the dict form.
     hf_home = _hf_tree(tmp_path, revs=("r1",), files=("chat_template.jinja",))
     m = make_model("q", chat_template="hub:org/repo:chat_template.jinja")
     m._hf_home = hf_home
@@ -114,6 +127,8 @@ def test_hub_string_form_for_template(make_model, tmp_path):
 
 
 def test_dict_loras_mixed_local_and_hub(make_model, tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': local and
+    # hub loras resolve side by side.
     hf_home = _hf_tree(tmp_path, files=("hub-lora.gguf",))
     (tmp_path / "local-lora.gguf").write_bytes(b"x")
     m = make_model("q", loras=["local-lora.gguf",
@@ -125,6 +140,7 @@ def test_dict_loras_mixed_local_and_hub(make_model, tmp_path):
 
 
 def test_malformed_refs_are_errors_not_crashes(make_model, tmp_path):
+    # Validates: SPEC.md, 'Override Rules': a malformed ref is an error message, not a crash
     m = make_model("q", chat_template={"hf_repo": "org/repo"})
     errors = resolve_setting_paths(m)
     assert any("chat_template" in e for e in errors)

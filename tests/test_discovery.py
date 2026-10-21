@@ -16,6 +16,7 @@ def _sidecar(name: str) -> str:
 
 
 def test_from_dir_multiple_dirs(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     d1 = tmp_path / "m1"
     d2 = tmp_path / "m2"
     d1.mkdir(); d2.mkdir()
@@ -29,6 +30,7 @@ def test_from_dir_multiple_dirs(tmp_path):
 
 
 def test_from_dir_dedupes_symlinks_to_same_file(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     d1 = tmp_path / "m1"
     d2 = tmp_path / "m2"
     d1.mkdir(); d2.mkdir()
@@ -42,6 +44,7 @@ def test_from_dir_dedupes_symlinks_to_same_file(tmp_path):
 
 
 def test_role_dirs_whitelist_and_companions(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     for sub, files in {
         "": ["plain.gguf"],
@@ -70,6 +73,7 @@ def test_role_dirs_whitelist_and_companions(tmp_path):
 
 
 def test_dir_roles_override(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Walk *models_dirs* depth-first and return deduplicated Models.
     from llama_packer.discover import discover
     root = tmp_path / "models"
     (root / "ocr").mkdir(parents=True)
@@ -84,6 +88,7 @@ def test_dir_roles_override(tmp_path):
 
 
 def test_embed_rerank_orphans_get_role_stubs(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     (root / "embed").mkdir(parents=True)
     (root / "embed" / "e1.gguf").write_bytes(b"x")
@@ -101,6 +106,7 @@ def test_embed_rerank_orphans_get_role_stubs(tmp_path):
 
 
 def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "e.gguf").write_bytes(b"x")
@@ -112,6 +118,7 @@ def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
 
 
 def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Walk *models_dirs* depth-first and return deduplicated Models.
     import logging
     from llama_packer.discover import discover
     root = tmp_path / "models"
@@ -131,6 +138,7 @@ def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
 
 
 def test_snapshot_exact_refs_main(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Exact *name* inside the repo snapshot's weight index, or None.
     hf_home = _hf_tree(tmp_path)
     f = WeightFinder()
     hit = f.snapshot_exact("org/repo", "model.gguf", hf_home)
@@ -141,12 +149,14 @@ def test_snapshot_exact_refs_main(tmp_path):
 
 
 def test_snapshot_exact_no_ref_single_snapshot(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Exact *name* inside the repo snapshot's weight index, or None.
     hf_home = _hf_tree(tmp_path, ref=None)
     hit = WeightFinder().snapshot_exact("org/repo", "model.gguf", hf_home)
     assert hit is not None and hit.name == "model.gguf"
 
 
 def test_model_resolves_gguf_from_hf_cache(tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Resolve mmproj and MTP companions from final frontmatter. Idempotent.
     hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj-BF16.gguf"))
     md_path = tmp_path / "qwen.md"
     fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
@@ -159,6 +169,7 @@ def test_model_resolves_gguf_from_hf_cache(tmp_path):
 
 
 def test_model_explicit_model_missing_everywhere_raises(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve the main model file (.gguf or .safetensors): frontmatter.
     import pytest
     hf_home = _hf_tree(tmp_path)
     md_path = tmp_path / "qwen.md"
@@ -168,6 +179,7 @@ def test_model_explicit_model_missing_everywhere_raises(tmp_path):
 
 
 def test_snapshot_exact_bare_and_glob(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve a sidecar ``model:``/companion ref to a Model. Any file-ref form (see :meth:`WeightFinder.resolve_path`), matched.
     hf_home = _hf_tree(tmp_path, files=("model.gguf", "mmproj-F16.gguf"))
     f = WeightFinder()
     hit = f.snapshot_exact("org/repo", "model.gguf", hf_home)
@@ -179,6 +191,7 @@ def test_snapshot_exact_bare_and_glob(tmp_path):
 
 
 def test_snapshot_glob_ambiguous_is_none(tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve a sidecar ``model:``/companion ref to a Model. Any file-ref form (see :meth:`WeightFinder.resolve_path`), matched.
     from llama_packer.utils import hf_snapshot_dir
     hf_home = _hf_tree(tmp_path, files=("mmproj-F16.gguf", "mmproj-BF16.gguf"))
     f = WeightFinder()
@@ -192,6 +205,7 @@ def test_snapshot_glob_ambiguous_is_none(tmp_path, caplog):
 
 def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
     # Sidecar references the snapshot filename (not a local symlink name).
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Resolve mmproj and MTP companions from final frontmatter. Idempotent.
     hf_home = _hf_tree(tmp_path, files=("Dirk-Q4_K_M.gguf", "mmproj-F16.gguf"))
     md_path = tmp_path / "dirk.md"
     fm = {"name": "dirk", "model": "Dirk-Q4_K_M.gguf",
@@ -208,6 +222,7 @@ def test_model_companion_mmproj_from_hub_by_name_and_glob(tmp_path):
 
 
 def test_model_companion_fuzzy_from_hub_when_local_absent(tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Resolve mmproj and MTP companions from final frontmatter. Idempotent.
     hf_home = _hf_tree(tmp_path, files=("Qwen-x.Q4_K_M.gguf", "Qwen-x-mmproj-BF16.gguf"))
     md_path = tmp_path / "qwen.md"
     fm = {"name": "qwen", "model": "Qwen-x.Q4_K_M.gguf", "hf_repo": "org/repo"}
@@ -217,6 +232,7 @@ def test_model_companion_fuzzy_from_hub_when_local_absent(tmp_path):
 
 
 def test_model_companion_cross_repo_hub_ref(tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Resolve mmproj and MTP companions from final frontmatter. Idempotent.
     hf_home = _hf_tree(tmp_path, files=("model.gguf",))
     _hf_tree(tmp_path / "x", repo="other/vision-proj", files=("mmproj-F16.gguf",))
     import shutil
@@ -232,6 +248,7 @@ def test_model_companion_cross_repo_hub_ref(tmp_path):
 
 
 def test_model_speculative_from_hub(tmp_path):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Resolve mmproj and MTP companions from final frontmatter. Idempotent.
     hf_home = _hf_tree(tmp_path,
                        files=("big-Q4_K_M.gguf", "big-mtp.gguf"))
     md_path = tmp_path / "big.md"
@@ -243,6 +260,7 @@ def test_model_speculative_from_hub(tmp_path):
 
 
 def test_modelignore_excludes_files(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Walk *models_dirs* depth-first and return deduplicated Models.
     from llama_packer.discover import discover
     from llama_packer.utils import load_model_ignore
     root = tmp_path / "models"
@@ -266,6 +284,7 @@ def test_modelignore_excludes_files(tmp_path):
 def test_diffusion_weights_excluded_from_served_role(tmp_path, caplog):
     # A GGUF whose header architecture is a diffusion family is excluded from
     # a served chat role with an error log; the run itself continues.
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     chat = root / "chat"
     chat.mkdir(parents=True)
@@ -284,6 +303,7 @@ def test_diffusion_weights_excluded_from_served_role(tmp_path, caplog):
 
 def test_text_gguf_media_like_name_still_served(tmp_path):
     # Header classification only: an LLM whose filename mentions media stays.
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     chat = root / "chat"
     chat.mkdir(parents=True)
@@ -298,6 +318,7 @@ def test_text_gguf_media_like_name_still_served(tmp_path):
 def test_s2t_optin_serves_sidecar_bin_models(tmp_path):
     # Opt-in via dirs: {s2t: s2t}; each whisper .bin needs an authored
     # same-stem sidecar (no stubs are generated for .bin orphans).
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     (root / "s2t").mkdir(parents=True)
     (root / "s2t" / "ggml-large-v3.bin").write_bytes(b"x")
@@ -312,6 +333,7 @@ def test_s2t_optin_serves_sidecar_bin_models(tmp_path):
 
 
 def test_s2t_orphan_bin_without_sidecar_skipped_no_stub(tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     (root / "s2t").mkdir(parents=True)
     (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
@@ -326,6 +348,7 @@ def test_s2t_orphan_bin_without_sidecar_skipped_no_stub(tmp_path, caplog):
 
 
 def test_s2t_not_opted_in_is_skipped(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     (root / "s2t").mkdir(parents=True)
     (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
@@ -340,6 +363,7 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
     # last), but no backend supports .bin outside whisper-server's s2t role —
     # finalize flags it (info: expected in ordinary fleets, not an
     # operator error) and _filter_supported drops it from the config.
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "mysterious.bin").write_bytes(b"x")
@@ -364,6 +388,7 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
 
 
 def test_snapshot_exact_subdir_and_bare(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Exact *name* inside the repo snapshot's weight index, or None.
     hf_home = _hf_tree(tmp_path, files=("Sub/model.gguf", "README.md"))
     f = WeightFinder()
     hit = f.snapshot_exact("org/repo", "Sub/model.gguf", hf_home)
@@ -374,6 +399,7 @@ def test_snapshot_exact_subdir_and_bare(tmp_path):
 
 
 def test_snapshot_exact_bare_ambiguous_across_depths_warns(tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Exact *name* inside the repo snapshot's weight index, or None.
     hf_home = _hf_tree(tmp_path, files=("model.gguf", "Sub/model.gguf"))
     f = WeightFinder()
     with caplog.at_level(logging.WARNING):
@@ -385,6 +411,7 @@ def test_snapshot_exact_bare_ambiguous_across_depths_warns(tmp_path, caplog):
 
 
 def test_snapshot_nested_glob_via_from_ref(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve a sidecar ``model:``/companion ref to a Model. Any file-ref form (see :meth:`WeightFinder.resolve_path`), matched.
     hf_home = _hf_tree(tmp_path, files=("A/x-mmproj-F16.gguf", "B/y.gguf"))
     f = WeightFinder()
     hit = Model.from_ref("*mmproj*.gguf", hf_repo="org/repo",
@@ -398,6 +425,7 @@ def test_snapshot_nested_glob_via_from_ref(tmp_path):
 
 
 def test_model_resolves_subdir_model_from_hf_cache(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a model in a snapshot subdirectory resolves from the hub cache.
     hf_home = _hf_tree(tmp_path, files=("Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf",))
     md_path = tmp_path / "kokoro.md"
     fm = {"name": "kokoro", "model": "Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf",
@@ -408,6 +436,7 @@ def test_model_resolves_subdir_model_from_hf_cache(tmp_path):
 
 
 def test_model_resolves_unique_nested_bare_name(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a unique bare name in the snapshot resolves.
     hf_home = _hf_tree(tmp_path, files=("Sub/only.gguf",))
     md_path = tmp_path / "only.md"
     m = Model(md_path, {"name": "only", "model": "only.gguf",
@@ -416,6 +445,7 @@ def test_model_resolves_unique_nested_bare_name(tmp_path):
 
 
 def test_model_ambiguous_bare_name_across_depths_raises(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve the main model file (.gguf or .safetensors): frontmatter.
     import pytest
     hf_home = _hf_tree(tmp_path, files=("model.safetensors",
                                         "speech_tokenizer/model.safetensors"))
@@ -426,6 +456,7 @@ def test_model_ambiguous_bare_name_across_depths_raises(tmp_path):
 
 
 def test_snapshot_auto_detect_single_nested_model(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a snapshot with one model resolves to it without being named.
     hf_home = _hf_tree(tmp_path, files=("Sub/only.gguf",))
     md_path = tmp_path / "auto.md"
     m = Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
@@ -434,6 +465,7 @@ def test_snapshot_auto_detect_single_nested_model(tmp_path):
 
 
 def test_snapshot_auto_detect_prefers_top_level(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a top-level file is preferred over a nested one.
     hf_home = _hf_tree(tmp_path, files=("model.safetensors",
                                         "speech_tokenizer/model.safetensors"))
     md_path = tmp_path / "auto.md"
@@ -443,6 +475,7 @@ def test_snapshot_auto_detect_prefers_top_level(tmp_path):
 
 
 def test_snapshot_auto_detect_several_nested_models_errors(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Resolve the main model file (.gguf or .safetensors): frontmatter.
     import pytest
     hf_home = _hf_tree(tmp_path, files=("A/a.gguf", "B/b.gguf"))
     md_path = tmp_path / "auto.md"

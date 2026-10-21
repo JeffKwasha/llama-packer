@@ -506,6 +506,10 @@ Smallest to largest, for any served entry:
    `(ctx, parallel)` search will not trade below.
 3. `design_context` / `--max-context` — never raised, only clamped down.
 
+A context size is written as a positive integer or as a `128k` / `1M`
+string; anything else is not a context and is rejected rather than guessed
+at.
+
 `sidecar context_length:` is the model's **design maximum**, a ceiling applied
 when serving. It is never a floor: reading it as one made a 262144 design max
 an unreachable floor, forced the model to one slot, and left the only remedy

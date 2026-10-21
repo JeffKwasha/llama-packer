@@ -76,6 +76,7 @@ def stub_download(monkeypatch, files: dict[str, bytes]):
 
 
 def test_a_built_engine_is_named_apart_from_a_downloaded_one():
+    # Validates: docs/install.md, 'Where an update installs': ``audiocpp_server-src-v0.9.2-hip-gfx1201``. Marked ``src`` so a built engine is never mistaken for a verified download.
     """Same version, different artifact; conflating them breaks rollback.
 
     ``audiocpp_server-v0.9.2`` is what update.py installs from a release
@@ -90,6 +91,7 @@ def test_a_built_engine_is_named_apart_from_a_downloaded_one():
 
 
 def test_the_arch_is_in_the_name_only_when_there_is_one():
+    # Validates: docs/install.md, 'Where an update installs': ``audiocpp_server-src-v0.9.2-hip-gfx1201``. Marked ``src`` so a built engine is never mistaken for a verified download.
     assert bld.versioned_name(bld.AUDIO, "v0.9.2", "cpu") \
         == "audiocpp_server-src-v0.9.2-cpu"
     assert "gfx1201+gfx1100" in bld.versioned_name(bld.AUDIO, "v0.9.2",
@@ -100,6 +102,7 @@ def test_the_arch_is_in_the_name_only_when_there_is_one():
 
 
 def test_the_plan_pins_the_arch_and_asks_for_a_deployment_build(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': The upstream build invocation.
     argv = bld.build_argv(bld.AUDIO, "hip", "gfx1201", 8,
                           Path("/src"), Path("/src/build"))
     joined = " ".join(argv)
@@ -114,6 +117,7 @@ def test_the_plan_pins_the_arch_and_asks_for_a_deployment_build(tmp_path):
 
 
 def test_the_build_runs_the_upstream_script_not_a_reimplementation(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': The upstream build invocation.
     """Delegating keeps upstream's ROCm-clang and sticky-cache handling."""
     argv = bld.build_argv(bld.AUDIO, "vulkan", "", 0, Path("/src"),
                           Path("/src/build"))
@@ -122,6 +126,7 @@ def test_the_build_runs_the_upstream_script_not_a_reimplementation(tmp_path):
 
 
 def test_source_url_is_the_codeload_endpoint():
+    # Validates: docs/build-engine.md, 'The plan': the source URL is the codeload endpoint for the requested ref
     url = bld.source_url(bld.AUDIO, "v0.9.2")
     assert url == ("https://codeload.github.com/0xShug0/audio.cpp/"
                    "tar.gz/refs/tags/v0.9.2")
@@ -134,6 +139,7 @@ def test_source_url_is_the_codeload_endpoint():
 
 
 def test_targets_come_from_amdgpu_arch_when_present(tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': ``gfx1201`` from the local AMD device(s).
     rocm = tmp_path / "rocm"
     (rocm / "bin").mkdir(parents=True)
     make_binary(rocm / "bin" / "amdgpu-arch", "echo gfx1201")
@@ -143,6 +149,7 @@ def test_targets_come_from_amdgpu_arch_when_present(tmp_path, monkeypatch):
 
 def test_rocminfo_is_the_fallback_and_only_full_lines_count(tmp_path,
                                                              monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': ``gfx1201`` from the local AMD device(s).
     rocm = tmp_path / "rocm"
     (rocm / "bin").mkdir(parents=True)
     make_binary(rocm / "bin" / "rocminfo",
@@ -157,6 +164,7 @@ def test_rocminfo_is_the_fallback_and_only_full_lines_count(tmp_path,
 
 
 def test_no_device_means_no_target_rather_than_a_guess(tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': ``gfx1201`` from the local AMD device(s).
     rocm = tmp_path / "rocm"
     rocm.mkdir()
     monkeypatch.setenv("ROCM_PATH", str(rocm))
@@ -168,17 +176,20 @@ def test_no_device_means_no_target_rather_than_a_guess(tmp_path, monkeypatch):
 
 
 def test_probe_reads_the_backends_a_binary_enumerates(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Backend names the binary can actually enumerate a device on. This is the check that makes a source build safe to trust as an install: a.
     binary = make_binary(tmp_path / "srv",
                          'echo "Available devices:"; echo "  HIP0: AMD Radeon"')
     assert bld.probe_backends(binary) == {"hip"}
 
 
 def test_probe_sees_nothing_when_the_engine_finds_no_device(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Backend names the binary can actually enumerate a device on. This is the check that makes a source build safe to trust as an install: a.
     binary = make_binary(tmp_path / "srv", 'echo "Available devices:"')
     assert bld.probe_backends(binary) == set()
 
 
 def test_a_build_for_the_wrong_arch_is_refused(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Refuse a build that cannot serve the backend it was built for.
     """The gfx1201 failure this script exists for.
 
     A binary compiled without an offload binary for the target arch starts,
@@ -198,6 +209,7 @@ def test_a_cpu_build_is_exempt_from_the_device_check(tmp_path):
 
 
 def test_vulkan_and_hip_are_not_interchangeable(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Refuse a build that cannot serve the backend it was built for.
     binary = make_binary(tmp_path / "srv", "true")
     with pytest.raises(bld.BuildError, match="no VULKAN device"):
         bld.check_backends(binary, "vulkan", {"hip"})
@@ -208,12 +220,14 @@ def test_vulkan_and_hip_are_not_interchangeable(tmp_path):
 
 
 def test_a_build_tree_without_the_binary_is_an_error(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': The built tree to install.
     (tmp_path / "build" / "bin").mkdir(parents=True)
     with pytest.raises(bld.BuildError, match="no audiocpp_server"):
         bld.collect_artifact(tmp_path / "build", bld.AUDIO)
 
 
 def test_the_whole_tree_is_collected_because_libs_must_travel(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': The built tree to install.
     tree = fake_build_tree(tmp_path)
     artifact = bld.collect_artifact(tree / "build", bld.AUDIO)
     assert (artifact / "audiocpp_server").is_file()
@@ -237,6 +251,7 @@ def _stub_everything(monkeypatch, tmp_path, *, devices="HIP0: AMD Radeon",
 
 def test_a_good_build_installs_beside_the_prebuilt_one_and_moves_the_link(
         tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Build.
     _stub_everything(monkeypatch, tmp_path)
     install = tmp_path / "tools"
     install.mkdir()
@@ -253,6 +268,7 @@ def test_a_good_build_installs_beside_the_prebuilt_one_and_moves_the_link(
 
 
 def test_a_failed_build_leaves_the_live_symlink_alone(tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Build.
     _stub_everything(monkeypatch, tmp_path, build_rc=1)
     install = tmp_path / "tools"
     install.mkdir()
@@ -270,6 +286,7 @@ def test_a_failed_build_leaves_the_live_symlink_alone(tmp_path, monkeypatch):
 
 def test_a_build_that_cannot_see_the_card_is_never_installed(tmp_path,
                                                             monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Build.
     """Same guarantee, at the device level rather than the exit-code level."""
     _stub_everything(monkeypatch, tmp_path, devices="CPU0: CPU")
     monkeypatch.setattr(bld, "probe_backends", lambda binary: {"cpu"})
@@ -287,6 +304,7 @@ def test_a_build_that_cannot_see_the_card_is_never_installed(tmp_path,
 
 def test_an_existing_build_is_not_replaced_without_asking(tmp_path,
                                                           monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': ``audiocpp_server-src-v0.9.2-hip-gfx1201``. Marked ``src`` so a built engine is never mistaken for a verified download.
     _stub_everything(monkeypatch, tmp_path)
     install = tmp_path / "tools"
     install.mkdir()
@@ -302,6 +320,7 @@ def test_an_existing_build_is_not_replaced_without_asking(tmp_path,
 
 
 def test_rebuild_replaces_the_tree(tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Build.
     _stub_everything(monkeypatch, tmp_path)
     install = tmp_path / "tools"
     install.mkdir()
@@ -317,6 +336,7 @@ def test_rebuild_replaces_the_tree(tmp_path, monkeypatch):
 
 def test_a_real_file_where_the_symlink_belongs_is_not_overwritten(tmp_path,
                                                                   monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Build.
     _stub_everything(monkeypatch, tmp_path)
     install = tmp_path / "tools"
     install.mkdir()
@@ -334,6 +354,7 @@ def test_a_real_file_where_the_symlink_belongs_is_not_overwritten(tmp_path,
 
 def test_the_toolchain_check_accepts_a_rocm_that_keeps_clang_under_llvm(
         tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': ROCm's own clang++.
     """This box's layout: no $ROCM_HOME/bin/clang++, clang under llvm/.
 
     A check that only looked for bin/clang++ would refuse a build that works.
@@ -347,6 +368,7 @@ def test_the_toolchain_check_accepts_a_rocm_that_keeps_clang_under_llvm(
 
 
 def test_hipconfig_is_consulted_before_giving_up(tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': ROCm's own clang++.
     """Upstream's own resolution order, in the same order."""
     rocm = tmp_path / "rocm"
     libdir = rocm / "lib" / "llvm" / "bin"
@@ -360,6 +382,7 @@ def test_hipconfig_is_consulted_before_giving_up(tmp_path, monkeypatch):
 
 def test_a_missing_toolchain_is_reported_before_anything_is_fetched(tmp_path,
                                                                      monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': What is missing for this build.
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "nowhere"))
     problems = bld.toolchain_problems(bld.AUDIO, "hip")
     assert any("no ROCm" in p for p in problems)
@@ -367,6 +390,7 @@ def test_a_missing_toolchain_is_reported_before_anything_is_fetched(tmp_path,
 
 def test_dry_run_prints_the_plan_and_downloads_nothing(tmp_path, monkeypatch,
                                                        capsys):
+    # Validates: docs/build-engine.md, 'The plan': the same plan is what --dry-run prints, and a dry run downloads nothing
     monkeypatch.chdir(tmp_path)
     # A stub ROCm home — the plan must be a function of the arguments, not of
     # the host's rocm install (CI has none, and /opt/rocm on this box leaks
@@ -392,6 +416,7 @@ def test_dry_run_prints_the_plan_and_downloads_nothing(tmp_path, monkeypatch,
 
 
 def test_a_build_that_cannot_succeed_does_not_start(tmp_path, monkeypatch):
+    # Validates: docs/build-engine.md, 'The toolchain': the toolchain is checked before anything is fetched
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "nowhere"))
     monkeypatch.setattr(bld.upd, "load_engines_config", lambda: (None, {}))
     monkeypatch.setattr(bld, "install_built",
@@ -409,6 +434,7 @@ def test_a_build_that_cannot_succeed_does_not_start(tmp_path, monkeypatch):
 
 
 def test_the_clang_diagnostic_patch_is_needed_and_named(tmp_path):
+    # Validates: docs/build-engine.md, 'Patching': the patches are announced before the build
     """The build cannot compile without it, and that is a recorded fact.
 
     Upstream builds app/server/parallel_runtime.cpp as C++17 with
@@ -432,6 +458,7 @@ def test_the_clang_diagnostic_patch_is_needed_and_named(tmp_path):
 
 
 def test_a_patch_that_no_longer_matches_is_reported_not_fatal(tmp_path):
+    # Validates: docs/build-engine.md, 'Patching': a patch whose pattern no longer matches is reported, not fatal
     """Upstream fixing their own tree should make this a no-op, not a stop."""
     (tmp_path / "CMakeLists.txt").write_text("project(x)\n")
     applied = bld.apply_patches(tmp_path)
@@ -440,12 +467,14 @@ def test_a_patch_that_no_longer_matches_is_reported_not_fatal(tmp_path):
 
 
 def test_a_missing_file_is_reported_not_fatal(tmp_path):
+    # Validates: docs/build-engine.md, 'Patching': a patch file that has gone missing is reported, not fatal
     applied = bld.apply_patches(tmp_path)
     assert any("SKIPPED" in line and "is gone" in line for line in applied)
 
 
 def test_the_edits_are_recorded_next_to_the_installed_engine(tmp_path,
                                                             monkeypatch, capsys):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Build.
     _stub_everything(monkeypatch, tmp_path)
     install = tmp_path / "tools"
     install.mkdir()
@@ -469,6 +498,7 @@ def test_the_edits_are_recorded_next_to_the_installed_engine(tmp_path,
 
 
 def test_a_built_engine_says_it_was_patched_in_its_name(tmp_path):
+    # Validates: docs/install.md, 'Where an update installs': ``audiocpp_server-src-v0.9.2-hip-gfx1201``. Marked ``src`` so a built engine is never mistaken for a verified download.
     """-src- is the flag; the .patched file is the detail."""
     name = bld.versioned_name(bld.AUDIO, "v0.9.2", "hip", "gfx1201")
     assert name.startswith("audiocpp_server-src-")
@@ -478,6 +508,7 @@ def test_a_built_engine_says_it_was_patched_in_its_name(tmp_path):
 
 
 def test_both_device_line_spellings_are_recognised(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Backend names the binary can actually enumerate a device on. This is the check that makes a source build safe to trust as an install: a.
     """The check once reported a working HIP build as seeing no device.
 
     audio.cpp names a HIP device ``ROCm:0 "AMD Radeon AI PRO R9700" [GPU]`` —
@@ -499,6 +530,7 @@ def test_both_device_line_spellings_are_recognised(tmp_path):
 
 
 def test_the_llama_server_spelling_still_parses(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Backend names the binary can actually enumerate a device on. This is the check that makes a source build safe to trust as an install: a.
     vulkan = make_binary(
         tmp_path / "srv",
         'echo "Available devices:"; echo '
@@ -509,6 +541,7 @@ def test_the_llama_server_spelling_still_parses(tmp_path):
 
 
 def test_an_unknown_output_format_is_an_error_not_an_empty_result(tmp_path):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': Backend names the binary can actually enumerate a device on. This is the check that makes a source build safe to trust as an install: a.
     """A count with no parseable line means the format moved; say so."""
     binary = make_binary(tmp_path / "srv", 'echo "available_devices=2"; '
                                             'echo "device[0] yes"')
@@ -518,6 +551,7 @@ def test_an_unknown_output_format_is_an_error_not_an_empty_result(tmp_path):
 
 def test_installing_an_existing_build_tree_does_not_recompile(tmp_path,
                                                               monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': The built tree to install.
     """The compile is twenty minutes; re-checking it should not cost that."""
     _stub_everything(monkeypatch, tmp_path)
     monkeypatch.setattr(bld, "fetch_source",
@@ -538,6 +572,7 @@ def test_installing_an_existing_build_tree_does_not_recompile(tmp_path,
 
 
 def test_from_build_still_refuses_a_cardless_binary(tmp_path, monkeypatch):
+    # Validates: docs/backends/audio-cpp.md, 'Build / install': The built tree to install.
     _stub_everything(monkeypatch, tmp_path, devices="CPU0: CPU")
     monkeypatch.setattr(bld, "probe_backends", lambda binary: {"cpu"})
     install = tmp_path / "tools"
