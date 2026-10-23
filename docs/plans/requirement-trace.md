@@ -132,3 +132,12 @@ and every one of them carries a `Validates:` citation.
 | 63 | `parse_fit_log` falls back to the `Host` report row when no device row exists, so CPU quads derive without new tooling; a device row always wins | `test_parse_fit_log_host_row_fallback`, `test_parse_fit_log_prefers_device_row` |
 | 64 | The CPU-shaped affine trio derives the exact quad and persists it under the device-stamped shape | `test_measure_affine_trio_cpu_shape_persists_host_quad` |
 | 65 | The device parse stays whole-log: a device run's projection buffers measure 0, host sums never leak into it | `test_parse_device_buffers_whole_log_device_path` |
+
+## A diagnostic names its subject
+
+| # | Requirement | Test |
+|---|---|---|
+| 66 | A `usage:` warning leads with the sidecar's name | `test_usage_warnings_lead_with_the_sidecar_name` |
+| 67 | An unhandled-setting warning leads with the sidecar's name | `test_warn_unhandled_names_the_sidecar` |
+| 68 | An invalid `allow_profiles` regex warning leads with the sidecar's name | `test_allow_profiles_bad_regex_names_the_sidecar` |
+| 69 | A failed `base *` expression warning names the layer it came from | `test_merge_bad_base_expression_names_the_origin` |

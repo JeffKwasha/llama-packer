@@ -89,6 +89,22 @@ MUTATIONS = {
         ('    return not (dev.endswith("_Host") or dev.startswith("CPU")\n'
          '                or "Mapped" in dev)'),
         '    return True'),
+    "test_usage_warnings_lead_with_the_sidecar_name": (
+        "llama_packer/writer.py",
+        '    who = f"{stem}: usage:" if stem else "usage:"',
+        '    who = "usage:"'),
+    "test_warn_unhandled_names_the_sidecar": (
+        "llama_packer/backends/base.py",
+        '        who = f"{stem}: " if stem else ""',
+        '        who = ""'),
+    "test_allow_profiles_bad_regex_names_the_sidecar": (
+        "llama_packer/profiles.py",
+        '"all profiles", stem, allow_profiles)',
+        '"all profiles", allow_profiles)'),
+    "test_merge_bad_base_expression_names_the_origin": (
+        "llama_packer/utils.py",
+        'logger.warning("%s: failed to eval %r with base=%s, using base",',
+        'logger.warning("failed to eval %r with base=%s, using base",'),
 }
 
 

@@ -342,7 +342,7 @@ usage:
   qa:     {min_context: 32k,  min_parallel: 2, require: [vision]}
 ```
 
-A sidecar tags itself with `usage: [coding, chat]`. **The category is the operator's declaration, not an inference** — nothing about the model or the GPU chooses it or overrides it, exactly as `hf_url` and `context_length` are declarations. A tag not declared in `profiles.yaml` is warned about and ignored, so the categories in force are exactly the ones the operator wrote. Each satisfiable category emits its **own** entry; two entries for one model is therefore just two categories in sidecars, not a separate mechanism. Every model additionally gets a **fallback** entry with bare minimums and no category name in the id, so an untagged model still reaches clients.
+A sidecar tags itself with `usage: [coding, chat]`. **The category is the operator's declaration, not an inference** — nothing about the model or the GPU chooses it or overrides it, exactly as `hf_url` and `context_length` are declarations. A tag not declared in `profiles.yaml` is warned about and ignored, so the categories in force are exactly the ones the operator wrote. That warning **names its sidecar** — and so does every log line about one sidecar: a diagnostic leads with the sidecar's name, so an operator can triage it by name without cross-referencing. Each satisfiable category emits its **own** entry; two entries for one model is therefore just two categories in sidecars, not a separate mechanism. Every model additionally gets a **fallback** entry with bare minimums and no category name in the id, so an untagged model still reaches clients.
 
 Two things follow from this.
 
