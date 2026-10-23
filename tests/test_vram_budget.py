@@ -19,6 +19,7 @@ from _gguf import write_gguf
 from llama_packer import gpu_state, vram
 from llama_packer.consts import _MIN_CTX_SIZE
 from llama_packer.vram import (FitParams, parse_device_buffers,
+                               parse_fit_log, parse_host_buffers,
                                parse_spill_mib, solve_matrix_ctx)
 
 
@@ -52,6 +53,220 @@ def test_parse_device_buffers_empty_log():
     # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     assert parse_device_buffers("garbage") == {
         "weights": 0.0, "kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
+
+
+# ── final-pass buffer window + host bucket (cpu-residency-budget) ─────────
+
+#: Real Qwen3-Reranker-0.6B CPU-shaped serve log (2026-10-23 probe): the
+#: projection pass (`load_mode = none`) prints real compute sizes, so a
+#: whole-log sum would double count; each pass ends in a breakdown table.
+_CPU_SERVE_LOG = """\
+0.00.174.400 I load_tensors:          CPU model buffer size =     0.00 MiB
+0.00.176.135 I llama_context:        CPU  output buffer size =     0.58 MiB
+0.00.176.234 I llama_kv_cache:        CPU KV buffer size =     0.00 MiB
+0.00.182.992 I sched_reserve:        CPU compute buffer size =    36.10 MiB
+0.00.183.066 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+0.00.183.066 I common_memory_breakdown_print: |   - Host               |                  978 =   466 +     476 +      36                |
+0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =     0.00 MiB
+0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =   121.50 MiB
+0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =   344.78 MiB
+0.05.263.659 I llama_context:        CPU  output buffer size =     0.58 MiB
+0.05.263.779 I llama_kv_cache:        CPU KV buffer size =   476.00 MiB
+0.05.466.825 I sched_reserve:        CPU compute buffer size =    36.10 MiB
+"""
+
+
+def test_parse_host_buffers_reads_final_pass():
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': The parse reads the **final pass** — the buffer lines between the last two breakdown headers — instead of summing duplicated pass lines; and: reports host-side (non-device) sums.
+    """Host sums from the final pass only: pass-1's real compute (36.10)
+    must not double count, and the host weights equal the breakdown's
+    model column (two CPU_Mapped buffers sum, 121.50 + 344.78)."""
+    host = parse_host_buffers(_CPU_SERVE_LOG)
+    assert host["weights"] == pytest.approx(121.50 + 344.78)
+    assert host["kv"] == pytest.approx(476.00)
+    assert host["rs"] == 0.0
+    assert host["compute"] == pytest.approx(36.10)  # final pass, not 2x
+    assert host["output"] == pytest.approx(0.58)
+
+
+def test_parse_host_buffers_headerless_log_parses_whole():
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a log with no breakdown header parses whole (fixture/fit-params compatible).
+    text = """\
+0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =   344.78 MiB
+0.05.263.779 I llama_kv_cache:        CPU KV buffer size =   476.00 MiB
+"""
+    host = parse_host_buffers(text)
+    assert host["weights"] == pytest.approx(344.78)
+    assert host["kv"] == pytest.approx(476.00)
+
+
+def test_parse_device_buffers_whole_log_device_path():
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': the device path keeps its whole-log sums — the projection pass of a device run measures 0 — and never touches host sums.
+    """Device sums are unchanged by this refactor: host-side values of a
+    CPU-shaped run contribute nothing to them (excluded upstream by the
+    spill check)."""
+    device = parse_device_buffers(_CPU_SERVE_LOG)
+    assert device == {
+        "weights": 0.0, "kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
+
+
+def test_parse_spill_rejects_vulkanless_fullcpu_launch():
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a ``-ngl 999`` launch that lost Vulkan still measures nothing — the spill check rejects it exactly as before.
+    """A `-ngl 999` run that never got the GPU serves the full-CPU shape;
+    the device-shaped spill formula sees host-visible KV and refuses."""
+    assert parse_spill_mib(_CPU_SERVE_LOG) == pytest.approx(476.00)
+
+
+def test_run_measure_server_cpu_shape_returns_host_buffers(
+        make_model, tmp_path, guard_env):
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``device: cpu`` measures (and shape-stamps) with ``--n-gpu-layers 0`` instead of ``-ngl 999`` … and never runs the device-shaped spill rejection.
+    model = make_model("a", device="cpu")
+    stub = _stub_server(
+        tmp_path,
+        "printf '%s\\n' \"$@\" > \"$0.args\"\n"
+        + "".join(f"echo '{line}'\n" for line in _CPU_SERVE_LOG.splitlines())
+        + "echo listening on http://127.0.0.1:1\nexec sleep 30\n")
+    buffers = model.vram._run_measure_server(stub, "q8_0", 8192, 1, "")
+    assert buffers is not None
+    assert buffers["kv"] == pytest.approx(476.00)
+    assert buffers["weights"] == pytest.approx(466.28)
+    args = (tmp_path / "stub-measure-server.sh.args").read_text().splitlines()
+    assert args.count("--n-gpu-layers") == 1  # the shape adds nothing
+    assert args[args.index("--n-gpu-layers") + 1] == "0"
+    entry = json.loads((guard_env / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "ok"
+
+
+def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
+        make_model, tmp_path, guard_env):
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a ``-ngl 999`` launch that lost Vulkan still measures nothing.
+    model = make_model("a")
+    stub = _stub_server(
+        tmp_path,
+        "printf '%s\\n' \"$@\" > \"$0.args\"\n"
+        + "".join(f"echo '{line}'\n" for line in _CPU_SERVE_LOG.splitlines())
+        + "echo listening on http://127.0.0.1:1\nexec sleep 30\n")
+    assert model.vram._run_measure_server(stub, "q8_0", 8192, 1, "") is None
+    args = (tmp_path / "stub-measure-server.sh.args").read_text().splitlines()
+    assert args[args.index("-ngl") + 1] == "999"
+    entry = json.loads((guard_env / "measure-journal.jsonl")
+                       .read_text().splitlines()[-1])
+    assert entry["outcome"] == "spill"
+
+
+def test_parse_fit_log_host_row_fallback():
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``parse_fit_log`` falls back to the ``Host`` report row when no device row exists.
+    """Captured CPU-shaped fit-params run: the affine report row is named
+    ``Host`` — today the parse rejects the whole run."""
+    text = """\
+0.04.426.841 D load_tensors:          CPU model buffer size =     0.00 MiB
+0.04.428.293 D llama_kv_cache:        CPU KV buffer size =     0.00 MiB
+0.04.428.298 D llama_kv_cache: size =  476.00 MiB (  8192 cells,  28 layers,  1/1 seqs), K (q8_0):  238.00 MiB, V (q8_0):  238.00 MiB
+0.04.434.024 D sched_reserve:        CPU compute buffer size =   316.33 MiB
+0.00.422.303 I common_memory_breakdown_print: |   - Host               |                 1258 =   466 +     476 +     316                |
+Host 466 476 316
+"""
+    parsed = parse_fit_log(text)
+    assert parsed is not None
+    assert parsed["model"] == 466
+    assert parsed["context"] == 476
+    assert parsed["compute"] == 316
+    assert parsed["kv"] == pytest.approx(476.00)
+    assert parsed["rs"] == 0.0 and parsed["rs_cells"] == 0
+
+
+def test_parse_fit_log_prefers_device_row():
+    # Validates: docs/plans/estimation-functions-facts.md: the device report row; a ``Host`` row beside it never wins.
+    text = """\
+Vulkan0 18904 8704 1552
+Host 466 476 316
+"""
+    parsed = parse_fit_log(text)
+    assert parsed is not None
+    assert parsed["model"] == 18904
+    assert (parsed["context"], parsed["compute"]) == (8704, 1552)
+
+
+def test_measure_affine_trio_cpu_shape_persists_host_quad(
+        make_model, tmp_path):
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': the affine trio (``c`` from ``(C, C/2)``, ``D`` from the p pair) derives CPU quads without measuring anything anew.
+    """Stub fit-params replays the three captured CPU-shaped runs
+    (8192/1, 8192/2, 4096/1); c = (476−238)/4096, D = 0, weights 466.
+    The persisted block carries the CPU device in its shape stamp."""
+    stub = _stub_fit_run(tmp_path)
+    model = make_model("a", device="cpu", context_length=8192)
+    model.vram.remeasure = False
+    params = model.vram.fit_params_static(
+        stub, cache_type="q8_0", llama_args="--n-gpu-layers 0",
+        allow_cpu=True)
+    assert params is not None
+    assert params.model_mib == 466
+    assert params.kv_per_token_mib == pytest.approx(
+        (476.0 - 238.0) / (8192 - 4096))
+    assert params.slot_mib == 0.0
+    assert params.compute_mib == 316
+    assert params.source == "fit-estimate"
+    assert params.shape == "--n-gpu-layers 0"
+    # persisted under the same shape → a later call reuses it unchanged
+    again = model.vram.fit_params_static(stub, cache_type="q8_0",
+                                         llama_args="--n-gpu-layers 0",
+                                         allow_cpu=True)
+    assert again == params
+
+
+#: Captured CPU-shaped llama-fit-params runs (Qwen3-Reranker-0.6B-Q6_K,
+#: q8_0, `--n-gpu-layers 0`, 2026-10-23 probe): the affine trio replays.
+_P1_RUN = """\
+0.04.426.841 D load_tensors:          CPU model buffer size =     0.00 MiB
+0.04.428.293 D llama_kv_cache:        CPU KV buffer size =     0.00 MiB
+0.04.428.298 D llama_kv_cache: size =  476.00 MiB (  8192 cells,  28 layers,  1/1 seqs), K (q8_0):  238.00 MiB, V (q8_0):  238.00 MiB
+0.04.434.024 D sched_reserve:        CPU compute buffer size =   316.33 MiB
+0.00.422.303 I common_memory_breakdown_print: |   - Host               |                 1258 =   466 +     476 +     316                |
+Host 466 476 316
+"""
+
+_P2_RUN = """\
+0.00.165.274 D load_tensors:          CPU model buffer size =     0.00 MiB
+0.00.166.729 D llama_kv_cache:        CPU KV buffer size =     0.00 MiB
+0.00.171.332 D llama_kv_cache: size =  476.00 MiB (  8192 cells,  28 layers,  1/2 seqs), K (q8_0):  238.00 MiB, V (q8_0):  238.00 MiB
+0.00.171.728 D sched_reserve:        CPU compute buffer size =   312.33 MiB
+0.00.172.375 I common_memory_breakdown_print: |   - Host               |                 1254 =   466 +     476 +     312                |
+Host 466 476 312
+"""
+
+_R3_RUN = """\
+0.00.164.528 D load_tensors:          CPU model buffer size =     0.00 MiB
+0.00.165.665 D llama_kv_cache:        CPU KV buffer size =     0.00 MiB
+0.00.165.670 D llama_kv_cache: size =  238.00 MiB (  4096 cells,  28 layers,  1/1 seqs), K (q8_0):  119.00 MiB, V (q8_0):  119.00 MiB
+0.00.171.438 D sched_reserve:        CPU compute buffer size =   312.33 MiB
+0.00.171.438 I common_memory_breakdown_print: |   - Host               |                 1016 =   466 +     238 +     312                |
+Host 466 238 312
+"""
+
+
+def _stub_fit_run(tmp_path):
+    """Fake llama-fit-params: replays the captured CPU trio, selected by
+    the `-c`/`--parallel` value it was invoked with."""
+    for name, text in (("p1", _P1_RUN), ("p2", _P2_RUN), ("r3", _R3_RUN)):
+        (tmp_path / f"fit-{name}.out").write_text(text)
+    stub = tmp_path / "stub-fit-params.sh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'c=""; p=""; prev=""\n'
+        'for arg in "$@"; do\n'
+        '  [ "$prev" = "-c" ] && c="$arg"\n'
+        '  [ "$prev" = "--parallel" ] && p="$arg"\n'
+        '  prev="$arg"\n'
+        'done\n'
+        f'if [ "$c" = "4096" ]; then exec cat "{tmp_path}/fit-r3.out"; fi\n'
+        f'if [ "$p" = "2" ]; then exec cat "{tmp_path}/fit-p2.out"; fi\n'
+        f'exec cat "{tmp_path}/fit-p1.out"\n')
+    stub.chmod(0o755)
+    return str(stub)
+
+
+
 
 
 # ── spill validity check (2026-09-07 post-mortem) ─────────────────────────

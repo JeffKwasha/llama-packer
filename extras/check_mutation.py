@@ -61,6 +61,34 @@ MUTATIONS = {
         "llama_packer/__main__.py",
         "level = max(0, logging.WARNING - 10 * max(0, verbosity))",
         "level = logging.WARNING"),
+    # ── CPU-residency measurement ──
+    "test_parse_host_buffers_reads_final_pass": (
+        "llama_packer/vram.py",
+        "    if final_pass:\n        log_text = _final_pass_scope(log_text)\n"),
+    "test_parse_host_buffers_headerless_log_parses_whole": (
+        "llama_packer/vram.py",
+        "            host[comp] += mib"),
+    "test_run_measure_server_cpu_shape_returns_host_buffers": (
+        "llama_packer/vram.py",
+        '                cmd += ["--n-gpu-layers", "0"]'),
+    "test_measurement_shape_stamps_cpu_device": (
+        "llama_packer/writer.py",
+        '    if model.on_cpu:\n        base = f"{base} --n-gpu-layers 0".strip()\n'),
+    "test_run_measure_server_gpu_refuses_vulkanless_fullcpu": (
+        "llama_packer/vram.py",
+        '                else:\n                    outcome = "spill"'),
+    "test_parse_fit_log_host_row_fallback": (
+        "llama_packer/vram.py",
+        "    row = device_row or next(\n        (m for m in rows if _is_host_report_name(m.group(1))), None)",
+        "    row = device_row"),
+    "test_measure_affine_trio_cpu_shape_persists_host_quad": (
+        "llama_packer/vram.py",
+        '        kv_per_token = (r1["kv"] - r3["kv"]) / (design - r3_ctx)'),
+    "test_parse_device_buffers_whole_log_device_path": (
+        "llama_packer/vram.py",
+        ('    return not (dev.endswith("_Host") or dev.startswith("CPU")\n'
+         '                or "Mapped" in dev)'),
+        '    return True'),
 }
 
 

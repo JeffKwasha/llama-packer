@@ -100,6 +100,13 @@ _BUFFER_RE = re.compile(
     r"|llama_context):\s+(\S+)\s+(model|KV|RS|compute|output)"
     r"\s+buffer size\s*=\s*([\d.]+)\s*MiB")
 
+# llama.cpp closes each init pass with a memory-breakdown table; buffer
+# lines printed before it belong to the projection pass (`load_mode =
+# none`) it closes.  The CPU backend materializes every pass buffer at
+# real sizes, so a whole-log sum would count projection bytes twice
+# (docs/plans/cpu-residency-budget.md, §"Measurement extension").
+_BREAKDOWN_RE = re.compile(r"\| memory breakdown \[MiB\] \|")
+
 
 def _is_device_buffer(dev: str) -> bool:
     """True when *dev* names device-resident memory (not host-visible)."""
@@ -119,8 +126,23 @@ def parse_device_buffers(log_text: str) -> dict[str, float]:
     GTT/system RAM, not VRAM — see :func:`parse_spill_mib` for when that
     exclusion makes a measurement invalid.
     """
-    device, _, _ = _buffer_walk(log_text)
+    device = _buffer_walk(log_text)[0]
     return device
+
+
+def parse_host_buffers(log_text: str) -> dict[str, float]:
+    """Sum host-visible buffer lines of a final serve pass.
+
+    Phase-1 of the host budget (docs/plans/cpu-residency-budget.md):
+    for a ``device: cpu`` serving these lines *are* the allocation
+    truth — weights (the mmap'd GGUF as loaded, splitting over several
+    ``CPU_Mapped`` buffers), the KV/recurrent pools, and compute.  The
+    parse reads after the first breakdown table (the projection pass's
+    marker), so pass-repeated lines are not summed twice; a log without
+    one, or where nothing terminates the projection, parses whole.
+    Device sums come from :func:`parse_device_buffers` on the same log.
+    """
+    return _buffer_walk(log_text, final_pass=True)[1]
 
 
 def parse_spill_mib(log_text: str) -> float:
@@ -131,9 +153,12 @@ def parse_spill_mib(log_text: str) -> float:
     the 2026-09-07 Dirk GTT spill) plus CPU-mapped weights beyond the
     structural placement llama.cpp always uses on Vulkan (~1 GiB
     observed in healthy runs).  Host compute/output staging is a normal
-    Vulkan cost and is not counted.
+    Vulkan cost and is not counted.  A ``-ngl 999`` launch that lost
+    its device serves the whole-CPU shape, which this rejects as host
+    KV spill — the measurement reports nothing instead of believing a
+    swapped device.
     """
-    _, host_kv_rs, cpu_weights = _buffer_walk(log_text)
+    _, _, host_kv_rs, cpu_weights = _buffer_walk(log_text)
     return (host_kv_rs
             + max(0.0, cpu_weights - _WEIGHT_CPU_MAP_TOLERANCE_MIB))
 
@@ -142,17 +167,46 @@ _COMP_BY_TOKEN = {"model": "weights", "KV": "kv", "RS": "rs",
                   "compute": "compute", "output": "output"}
 
 
-def _buffer_walk(log_text: str) -> tuple[dict[str, float], float, float]:
-    """One pass over the buffer lines → (device sums, host KV/RS, CPU weights).
+def _final_pass_scope(log_text: str) -> str:
+    """Log text after the first breakdown table, or the whole log.
+
+    The CPU backend repeats every real buffer size across its two init
+    passes (the `load_mode = none` projection allocates for real), so
+    the host parse takes the lines *after* the projection's closing
+    table.  When a table appears with no buffer line behind it — e.g. a
+    post-ready summary refresh no pass closed — the whole log parses,
+    matching the device path.
+    """
+    m = _BREAKDOWN_RE.search(log_text)
+    if m is None:
+        return log_text
+    after = log_text[m.end():]
+    return after if _BUFFER_RE.search(after) else log_text
+
+
+def _buffer_walk(
+    log_text: str,
+    final_pass: bool = False,
+) -> tuple[dict[str, float], dict[str, float], float, float]:
+    """One pass over the buffer lines → (device, host, host KV/RS, CPU weights).
 
     Device sums: ``weights`` as the max per device across load passes,
-    every other component summed across contexts.  Host KV/RS lines are
-    the capacity-spill signature; CPU-mapped weight lines are tracked
-    separately (structural placement up to a tolerance, offload failure
-    beyond it).
+    every other component summed across contexts.  Host sums: the same
+    components byte-summed (weights can split over several host
+    buffers, so there is no per-device max).  Within :func:
+    `_final_pass_scope` when *final_pass* — the projection double print
+    the CPU backend repeats is excluded there, never on the device path
+    (whose projection lines measure 0 on a real device).  Host KV/RS
+    lines double as the capacity-spill signature; CPU-mapped weight
+    lines are tracked separately (structural placement up to a
+    tolerance, offload failure beyond it).
     """
+    if final_pass:
+        log_text = _final_pass_scope(log_text)
     weights: dict[str, float] = {}
     totals = {"kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
+    host: dict[str, float] = dict.fromkeys(
+        ("weights", "kv", "rs", "compute", "output"), 0.0)
     host_kv_rs = 0.0
     cpu_weights = 0.0
     for m in _BUFFER_RE.finditer(log_text):
@@ -163,11 +217,14 @@ def _buffer_walk(log_text: str) -> tuple[dict[str, float], float, float]:
                 weights[dev] = max(weights.get(dev, 0.0), mib)
             else:
                 totals[comp] += mib
-        elif comp in ("kv", "rs"):
-            host_kv_rs += mib
-        elif comp == "weights" and dev.startswith("CPU"):
-            cpu_weights += mib
-    return {"weights": sum(weights.values()), **totals}, host_kv_rs, cpu_weights
+        else:
+            host[comp] += mib
+            if comp in ("kv", "rs"):
+                host_kv_rs += mib
+            if comp == "weights" and dev.startswith("CPU"):
+                cpu_weights += mib
+    return ({"weights": sum(weights.values()), **totals},
+            host, host_kv_rs, cpu_weights)
 
 
 def _free_port() -> int:
@@ -190,32 +247,42 @@ def parse_fit_log(log_text: str) -> dict[str, float] | None:
     """Parse a llama-fit-params ``--fit-print on --fit off -lv 5`` run.
 
     Returns ``{model, context, compute, kv, rs, rs_cells}`` (MiB; the
-    device report row only — the ``Host`` row is skipped), or None when
-    the report row is missing.  ``kv`` sums *every* KV pool the context
-    creates — for SWA architectures that is the C-scaling full-attention
-    pool plus the fixed-size per-slot sliding ring — and ``rs`` sums the
-    recurrent-state caches (``rs_cells`` their cells), so the
-    ``(C, C/2)`` pool difference isolates the per-token term exactly.
+    device report row when one exists — a CPU-shaped run reports only a
+    ``Host`` row, whose ``model``/``compute`` columns are the host quads
+    the device ones are otherwise: docs/plans/cpu-residency-budget.md,
+    requirement 5), or None when no report row exists.  ``kv`` sums
+    *every* KV pool the context creates — for SWA architectures that is
+    the C-scaling full-attention pool plus the fixed-size per-slot
+    sliding ring — and ``rs`` sums the recurrent-state caches
+    (``rs_cells`` their cells), so the ``(C, C/2)`` pool difference
+    isolates the per-token term exactly.
     """
-    for m in _FIT_REPORT_RE.finditer(log_text):
-        dev = m.group(1)
-        if dev == "Host" or dev.endswith("_Host"):
-            continue
-        kv = sum(float(x.group(1)) for x in _FIT_KV_RE.finditer(log_text))
-        rs = 0.0
-        rs_cells = 0
-        for x in _FIT_RS_RE.finditer(log_text):
-            rs += float(x.group(1))
-            rs_cells += int(x.group(2))
-        return {
-            "model": int(m.group(2)),
-            "context": int(m.group(3)),
-            "compute": int(m.group(4)),
-            "kv": kv,
-            "rs": rs,
-            "rs_cells": rs_cells,
-        }
-    return None
+    rows = list(_FIT_REPORT_RE.finditer(log_text))
+    device_row = next(
+        (m for m in rows if not _is_host_report_name(m.group(1))), None)
+    row = device_row or next(
+        (m for m in rows if _is_host_report_name(m.group(1))), None)
+    if row is None:
+        return None
+    kv = sum(float(x.group(1)) for x in _FIT_KV_RE.finditer(log_text))
+    rs = 0.0
+    rs_cells = 0
+    for x in _FIT_RS_RE.finditer(log_text):
+        rs += float(x.group(1))
+        rs_cells += int(x.group(2))
+    return {
+        "model": int(row.group(2)),
+        "context": int(row.group(3)),
+        "compute": int(row.group(4)),
+        "kv": kv,
+        "rs": rs,
+        "rs_cells": rs_cells,
+    }
+
+
+def _is_host_report_name(dev: str) -> bool:
+    """True when a fit-params report row names host memory."""
+    return dev == "Host" or dev.endswith("_Host")
 
 
 # The llama-server readiness marker: every buffer line precedes it.
@@ -280,6 +347,11 @@ def _wait_ready(
 # the estimate and the serve can never drift apart on batch flags.
 # vllm/safetensors estimates are flag-independent.
 _SHAPE_SOURCES = frozenset({"llama-server", "fit-estimate", "fit-params"})
+
+#: Serve-device pin inside a measurement shape: ``measurement_args`` stamps
+#: it for CPU-resident models, so a device flip (sidecar edit) invalidates
+#: the persisted block by shape instead of reusing the other budget's quads.
+_NGL_SHAPE_RE = re.compile(r"--n-gpu-layers|-ngl\b")
 
 
 @dataclass
@@ -630,10 +702,13 @@ class VramBudget:
         """One serve-shaped llama-server run → device buffer MiB, or None.
 
         Flags mirror what the emitted command will run with (cache types,
-        all layers on GPU, MTP draft, the profiles global args — flash
-        attention and the role batch sizes — plus the embed/rerank batch
-        override), because compute and recurrent-state allocations depend
-        on them.
+        all layers on the device pin the serve uses, MTP draft, the
+        profiles global args — flash attention and the role batch sizes —
+        plus the embed/rerank batch override), because compute and
+        recurrent-state allocations depend on them.  A ``device: cpu``
+        model measures its host shape: ``--n-gpu-layers 0`` and the
+        host-side buffers as the returned truth — the device-spill check
+        below would reject every such run as host-KV spill.
 
         Guardrails (2026-09-07 contamination post-mortem): the pre-flight
         refuses to measure beside a resident llama process; the child
@@ -644,7 +719,8 @@ class VramBudget:
         journaled.
         """
         shape = (llama_args or "").strip()
-        cache_key = ("serve", cache_type, ctx, parallel, shape)
+        on_cpu = bool(self.model.on_cpu)
+        cache_key = ("serve", on_cpu, cache_type, ctx, parallel, shape)
         if cache_key in self._serve_cache:
             return self._serve_cache[cache_key]
 
@@ -663,9 +739,17 @@ class VramBudget:
             str(server_bin), "-m", str(self.model.gguf_path),
             "-c", str(ctx), "--parallel", str(parallel),
             "--cache-type-k", cache_type, "--cache-type-v", cache_type,
-            "-ngl", "999",
             "--port", str(_free_port()), "-lv", "5",
         ]
+        # Device pin: all layers onto the GPU for the VRAM shape; the
+        # CPU shape pins 0 spelled as the serve emission
+        # (llama_server.py).  A shape that already carries the pin is
+        # not duplicated.
+        if on_cpu:
+            if not _NGL_SHAPE_RE.search(shape):
+                cmd += ["--n-gpu-layers", "0"]
+        elif not _NGL_SHAPE_RE.search(shape):
+            cmd += ["-ngl", "999"]
         cmd += self._mtp_measure_flags()
         cmd += shape.split()
         # Line-buffered stdout even redirected to a file: the stall
@@ -704,13 +788,22 @@ class VramBudget:
                     else:
                         proc.wait()
         if outcome == "ready":
-            spill = parse_spill_mib(text)
-            if spill <= _KV_SPILL_TOLERANCE_MIB:
-                buffers = parse_device_buffers(text)
+            if on_cpu:
+                # Host truth: every buffer lands on the CPU backend, so the
+                # device-shaped spill check (host KV = capacity defect)
+                # would reject the run by construction.
+                spill = 0.0
+                buffers = parse_host_buffers(text)
                 self._serve_cache[cache_key] = buffers
                 outcome = "ok"
             else:
-                outcome = "spill"
+                spill = parse_spill_mib(text)
+                if spill <= _KV_SPILL_TOLERANCE_MIB:
+                    buffers = parse_device_buffers(text)
+                    self._serve_cache[cache_key] = buffers
+                    outcome = "ok"
+                else:
+                    outcome = "spill"
         gpu_state.journal({
             "mode": "serve", "model": self.model.stem, "ctx": ctx,
             "parallel": parallel,

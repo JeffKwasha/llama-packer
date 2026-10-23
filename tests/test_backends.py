@@ -640,6 +640,23 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
         "--flash-attn on -ub 512"
 
 
+def test_measurement_shape_stamps_cpu_device(make_model):
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``device: cpu`` measures (and shape-stamps) with ``--n-gpu-layers 0`` instead of ``-ngl 999``, stamp included by ``measurement_args``.
+    """A CPU-resident model's measurement shape carries the device pin:
+    fit-params reports host buffers under it, and a later device flip
+    (sidecar edit) invalidates the persisted block by shape."""
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import measurement_args
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"}})
+    m = make_model("e", role="rerank", device="cpu")
+    assert measurement_args(profiles, m, "--flash-attn on") == \
+        "--flash-attn on --n-gpu-layers 0 -ub 512"
+    # GPU shapes are untouched — no fleet-wide re-measure
+    m2 = make_model("e2", role="rerank")
+    assert measurement_args(profiles, m2, "--flash-attn on") == \
+        "--flash-attn on -ub 512"
+
+
 def test_batch_ubatch_malformed_falls_through_to_builtin(make_model, caplog):
     # A garbage value is warned about and falls through to the next tier —
     # which for an unset fleet is None (emit nothing), not a magic number.

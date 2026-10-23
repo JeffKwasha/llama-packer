@@ -1470,20 +1470,27 @@ def measurement_args(
     profile: dict | None = None,
 ) -> str:
     """The exact flag string VRAM constants are measured (and shape-stamped)
-    under: global args + the model's effective ``-ub``.  ``batch`` is
-    excluded — measured to have no VRAM effect, so throughput tuning must
-    not invalidate estimates.
+    under: global args + the CPU device pin when the model is
+    CPU-resident (`--n-gpu-layers 0`, the measurement of the host-side
+    quads — docs/plans/cpu-residency-budget.md) + the model's effective
+    ``-ub``.  ``batch`` is excluded — measured to have no VRAM effect, so
+    throughput tuning must not invalidate estimates.
 
     The *effective* ubatch is stamped, not just an explicitly configured one:
     an unset key still serves at llama.cpp's builtin, so the compute buffer
     the constants were measured for is the one the server will actually
     allocate.  Omitting it would change every ``derived: shape`` key and
-    force a fleet-wide re-measurement for a flag that has not moved.
+    force a fleet-wide re-measurement for a flag that has not moved.  The
+    same holds for the device pin: a sidecar ``device: cpu`` edit must
+    re-measure (the block describes the other budget's byte terms), so the
+    pin rides the shape stamp.
     """
     _, ubatch = resolve_batch_ubatch(profiles, model, profile)
     if ubatch is None:
         ubatch = _LLAMA_CPP_DEFAULT_UBATCH
     base = (global_args or "").strip()
+    if model.on_cpu:
+        base = f"{base} --n-gpu-layers 0".strip()
     return f"{base} -ub {ubatch}".strip()
 
 
