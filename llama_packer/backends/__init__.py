@@ -83,8 +83,9 @@ class BoundBackend(BaseBackend):
     def unsupported_reason(self, model: "Model") -> str | None:
         return self.engine.unsupported_reason(model)
 
-    def warn_unhandled(self, declared: set[str]) -> None:
-        return self.engine.warn_unhandled(declared)
+    def warn_unhandled(self, declared: set[str],
+                       stem: str | None = None) -> None:
+        return self.engine.warn_unhandled(declared, stem)
 
     def default_batch_ubatch(self, role: str) -> tuple[int, int]:
         return self.engine.default_batch_ubatch(role)

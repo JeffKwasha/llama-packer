@@ -719,12 +719,13 @@ def load_dir_config(d: Path) -> dict | None:
     return cfg
 
 
-def _eval_expr(expr: str, base_val: float) -> float:
+def _eval_expr(expr: str, base_val: float, origin: str) -> float:
     """Safely evaluate expressions like 'base * 0.6'."""
     try:
         return eval(expr, {"__builtins__": {}}, {"base": base_val})
     except Exception:
-        logger.warning("failed to eval %r with base=%s, using base", expr, base_val)
+        logger.warning("%s: failed to eval %r with base=%s, using base",
+                       origin or "merge", expr, base_val)
         return base_val
 
 
@@ -779,7 +780,7 @@ def merge_layer(below: dict | None, above: dict | None, *,
             if (isinstance(v, str) and v.startswith("base *")
                     and k in SAMPLING_KEYS):
                 if isinstance(cur, (int, float)) and not isinstance(cur, bool):
-                    result[k] = _eval_expr(v, float(cur))
+                    result[k] = _eval_expr(v, float(cur), origin)
                 else:
                     logger.warning(
                         "%s: %r has no numeric value below to resolve "

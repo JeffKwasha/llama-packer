@@ -123,6 +123,21 @@ def test_profiles_groups_fallback_when_nothing_matches(profiles, make_model):
     assert group == [("default", {"cache_type": "q8_0", "parallel": 1})]
 
 
+def test_allow_profiles_bad_regex_names_the_sidecar(profiles, make_model,
+                                                   caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic about one sidecar leads with the sidecar's name.
+    """An invalid `allow_profiles` regex concerns one sidecar's declaration,
+    so the warning leads with that sidecar's name."""
+    import logging
+    m = make_model("m", allow_profiles="(((")
+    with caplog.at_level(logging.WARNING):
+        profiles.groups_for(m, vram_total=48000)
+    warned = [r.message for r in caplog.records
+              if "allow_profiles" in r.message]
+    assert warned, "expected the invalid regex to warn"
+    assert all(r.startswith("m:") for r in warned), warned
+
+
 def test_profiles_groups_by_cache_type(make_model):
     # Validates: SPEC.md, 'profiles.yaml': differing cache_type values split a model into separate profile groups
     m = make_model("m")

@@ -234,7 +234,8 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
             continue
 
         declared = {k for k in SETTING_KEYS if k in fm}
-        backend.warn_unhandled(declared - FRAMEWORK_CONSUMED - METADATA_ONLY)
+        backend.warn_unhandled(declared - FRAMEWORK_CONSUMED - METADATA_ONLY,
+                               stem=model.stem)
         supported.append(model)
     return supported
 
@@ -924,7 +925,8 @@ class UsageCatalogue:
 
 
 def resolve_usage(tags: object, catalogue: UsageCatalogue,
-                  logger_: logging.Logger | None = None) -> tuple[UsageDemand, ...]:
+                  logger_: logging.Logger | None = None,
+                  stem: str | None = None) -> tuple[UsageDemand, ...]:
     """Resolve a sidecar's ``usage:`` tags against the blessed catalogue.
 
     An unblessed tag is warned about and ignored, so the effective demands
@@ -933,28 +935,31 @@ def resolve_usage(tags: object, catalogue: UsageCatalogue,
 
     Accepts a bare string (one tag) or a list.  A sidecar with no tags gets
     no demands, which leaves it governed by the global ``min_context``
-    floor as before.
+    floor as before.  ``stem`` names the sidecar in warnings — a diagnostic
+    about one sidecar leads with its name.
     """
     log = logger_ or logger
+    who = f"{stem}: usage:" if stem else "usage:"
     if tags is None:
         return ()
     if isinstance(tags, str):
         tags = [tags]
     if not isinstance(tags, (list, tuple)):
-        log.warning("usage: %r is not a list of category names; ignoring",
-                    tags)
+        log.warning("%s %r is not a list of category names; ignoring",
+                    who, tags)
         return ()
     out: list[UsageDemand] = []
     for tag in tags:
         if not isinstance(tag, str):
-            log.warning("usage: %r is not a category name; ignoring", tag)
+            log.warning("%s %r is not a category name; ignoring", who, tag)
             continue
         name = tag.strip()
         demand = catalogue.get(name)
         if demand is None:
             blessed = ", ".join(catalogue.order) or "(none declared)"
-            log.warning("usage: tag %r is not declared in profiles.yaml "
-                        "`usage:`; ignoring it (blessed: %s)", name, blessed)
+            log.warning("%s tag %r is not declared in profiles.yaml "
+                        "`usage:`; ignoring it (blessed: %s)",
+                        who, name, blessed)
             continue
         if demand not in out:
             out.append(demand)
@@ -1872,7 +1877,8 @@ class Planner:
         """
         if not self.usage:
             return ()
-        demands = resolve_usage(model.usage_tags, self.usage, logger)
+        demands = resolve_usage(model.usage_tags, self.usage, logger,
+                                stem=model.stem)
         # A declared resolution budget means vision must actually be served at
         # that size, so it stops being shed-able for this model whatever the
         # category's sacrifice order says. ``keep`` rather than ``require``:

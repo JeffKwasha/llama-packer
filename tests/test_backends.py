@@ -356,6 +356,17 @@ def test_warn_unhandled(caplog):
     assert any("loras" in r.message for r in caplog.records)
 
 
+def test_warn_unhandled_names_the_sidecar(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic about one sidecar leads with the sidecar's name.
+    import logging
+    b = get_backend("vllm")
+    with caplog.at_level(logging.WARNING):
+        b.warn_unhandled({"loras"}, stem="s1")
+    warned = [r.message for r in caplog.records if "loras" in r.message]
+    assert warned, "expected the unhandled loras setting to warn"
+    assert all(m.startswith("s1:") for m in warned), warned
+
+
 def test_setting_keys_partition():
     # framework-consumed and metadata-only keys are disjoint from each other
     # and from what a backend would render.

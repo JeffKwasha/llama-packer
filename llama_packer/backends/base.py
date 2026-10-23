@@ -103,11 +103,14 @@ class BaseBackend(ABC):
                     f"(supports: {', '.join(sorted(self.formats))})")
         return None
 
-    def warn_unhandled(self, declared: set[str]) -> None:
+    def warn_unhandled(self, declared: set[str],
+                       stem: str | None = None) -> None:
         """Warn about declared settings this backend does not render."""
+        # A diagnostic about one sidecar names it first.
+        who = f"{stem}: " if stem else ""
         for key in sorted(declared - self.handles):
-            logger.warning("backend %s cannot handle setting %r (ignored)",
-                           self.name, key)
+            logger.warning("%sbackend %s cannot handle setting %r (ignored)",
+                           who, self.name, key)
 
     def supports(self, avail: dict, transport: Transport) -> bool:
         """Whether this engine can launch under *transport* with *avail*."""

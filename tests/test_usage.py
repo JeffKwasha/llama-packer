@@ -735,3 +735,23 @@ def test_usage_tag_not_declared_warns_and_is_ignored(caplog):
     assert [d.name for d in got] == ["coding"]
     assert any("invented" in r.message for r in caplog.records), [
         r.message for r in caplog.records]
+
+
+def test_usage_warnings_lead_with_the_sidecar_name(caplog):
+    """Every `usage:` warning is about one sidecar, so it names it first.
+
+    Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic leads
+    with the sidecar's name, so an operator can triage it by name.
+    """
+    import logging
+    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    with caplog.at_level(logging.WARNING):
+        # all three failure shapes: not a list, not a category, not declared
+        assert resolve_usage(42, cat, stem="s1") == ()
+        assert [d.name for d in resolve_usage(["chat", 7], cat, stem="s1")] \
+            == ["chat"]
+        assert [d.name for d in resolve_usage(["chat", "zork"], cat, stem="s1")] \
+            == ["chat"]
+    warned = [r.message for r in caplog.records]
+    assert warned, "expected the three failures to warn"
+    assert all(m.startswith("s1:") for m in warned), warned
