@@ -120,3 +120,15 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 58 | A pack run logs at WARNING unless asked: `-v` lifts it to INFO, and only `--dry-run` lifts the floor on its own | `test_pack_run_is_quiet_by_default`, `test_verbose_flag_lifts_the_level`, `test_dry_run_preview_is_visible_without_a_flag`, `test_verbosity_ladder_and_floor` |
+
+## CPU-residency measurement (docs/plans/cpu-residency-budget.md)
+
+| # | Requirement | Test |
+|---|---|---|
+| 59 | The host parse reads the buffer lines after the projection pass's closing table — the CPU backend's pass-repeated real sizes are never summed twice | `test_parse_host_buffers_reads_final_pass` |
+| 60 | The host parse reports host-side component sums beside the device sums; without a projection table the log parses whole | `test_parse_host_buffers_headerless_log_parses_whole` |
+| 61 | A `device: cpu` measurement carries the `--n-gpu-layers 0` pin in both the server command and the measurement shape, never duplicated | `test_run_measure_server_cpu_shape_returns_host_buffers`, `test_measurement_shape_stamps_cpu_device` |
+| 62 | A CPU-shaped measurement never runs the device-spill rejection; a `-ngl 999` launch that lost its device still measures nothing (spill refuses the host-KV shape) | `test_run_measure_server_cpu_shape_returns_host_buffers`, `test_run_measure_server_gpu_refuses_vulkanless_fullcpu` |
+| 63 | `parse_fit_log` falls back to the `Host` report row when no device row exists, so CPU quads derive without new tooling; a device row always wins | `test_parse_fit_log_host_row_fallback`, `test_parse_fit_log_prefers_device_row` |
+| 64 | The CPU-shaped affine trio derives the exact quad and persists it under the device-stamped shape | `test_measure_affine_trio_cpu_shape_persists_host_quad` |
+| 65 | The device parse stays whole-log: a device run's projection buffers measure 0, host sums never leak into it | `test_parse_device_buffers_whole_log_device_path` |

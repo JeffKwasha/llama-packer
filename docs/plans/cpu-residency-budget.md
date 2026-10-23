@@ -86,28 +86,72 @@ doctrine.
 
 ## Measurement extension (the DRY seam)
 
-`_run_measure_server` (`vram.py:663`) hardcodes `-ngl 999`; `_buffer_walk`
-(`vram.py:193`) skips the Host row. Changes:
+Three rules this seam lands: the serve-device pin (`-ngl`) is a shape
+decision, not a constant; host-side buffer lines parse beside the device
+sums; a `Host`-named affine report row is legal input. Observed shapes
+(Qwen3-Reranker-0.6B Q6_K, `-c 8192`, q8_0):
 
-1. Parameterize the `-ngl` flag by serving device: a `device: cpu` model
-   measures with `-ngl 0` **in a new shape-keyed run** (shape stamp carries
-   it, per `vram.py:277-336` — flags that shape compute/RS belong in the
-   shape key, and `-ngl 0` is one).
-2. `_buffer_walk` returns **host rows** (host KV/RS/weights/compute) beside
-   device sums — the same parse, one more output group. This is the §3
-   "measured host RAM" landing spot; branch 2 (split rungs) reads the same
-   host rows for its spill/host-half quads and reuses the split-aware
-   relaxation this must carry for `device: cpu` (a full-offload run's host
-   rows are *the* truth, not a spill defect — rejection is currently keyed
-   on device spills only and must stay exactly that way for `-ngl 999`;
-   host rows are simply reported).
-3. `FitParams` gains host-side keys (own `derived:` entries, shape-stamped,
-   same persisted cache as device quads). Nothing second-guesses the
-   measurement: tag/report rules per `memory-allocation-tags.md` v1
-   contract apply verbatim.
+- A CPU-shaped `llama-server` run prints every buffer line under the
+  ``CPU``/``CPU_Mapped`` device names (real weights split across two
+  buffers: 121.50 + 344.78 = 466.28 MiB matching the breakdown table's
+  model column; KV buffer 476 MiB; compute 36.10 MiB) — and reports a
+  per-pass ``memory breakdown`` table whose ``Host`` row is the pass
+  total. Both a dry projection pass (`load_mode = none`, sizes 0 except
+  compute) and the real load precede the ready marker.
+- A CPU-shaped `llama-fit-params` run prints the same ``CPU`` buffer
+  lines (0-weight projection), the breakdown table, and the affine
+  `Host`-named report row (`Host 466 476 316`) — which
+  `parse_fit_log` used to reject, so every CPU-measured value was
+  `None`. The KV-pool `size =` lines carry the pool bytes either way, so
+  the affine trio math (c from (C, C/2), D from p) is unchanged.
 
-`llama-fit-params` acceptance of extra flags (`llama_args` passthrough,
-`vram.py:565`) is already sufficient for both shapes — no new tool.
+- A Vulkan-less environment (missing device ACL) silently serves the
+  full-CPU shape even under `-ngl 999`; the existing spill check
+  rejects it as host-KV capacity spill — the pre-existing guardrail
+  does the device-refusal job and stays keyed on device shapes.
+
+One persisted block serves both budgets: a model carries a single
+`derived:` block describing its *serving placement's* byte terms, and
+the `--n-gpu-layers 0` pin rides the `shape` stamp, so a sidecar
+`device:` flip invalidates the block by shape (a device flip re-measures
+for the other budget) instead of needing a parallel host block family.
+Nothing second-guesses the measurement: tag/report rules per
+`memory-allocation-tags.md` v1 contract apply verbatim.
+
+`llama-fit-params` acceptance of extra flags (`llama_args` passthrough
+in `fit_params`) is already sufficient for both shapes — no new tool;
+`measurement_args` stamps the device pin.
+
+
+### Requirements (citable by tests)
+
+1. §"Measurement extension", *pass window*: a serve log holds the
+   projection pass (`load_mode = none`) and the real load before the
+   ready marker, and the projection closes with a `| memory breakdown
+   [MiB] |` table. The **host** parse reads the buffer lines after that
+   table — the final pass — instead of summing the CPU backend's
+   pass-repeated real sizes; when a table has no buffer line behind it
+   (post-ready summary refresh), or no table exists, the log parses
+   whole (fixture/fit-params compatible). The **device** parse keeps its
+   whole-log sums: on a real device the projection buffers measure 0.
+2. §"Measurement extension", *host bucket*: `parse_host_buffers`
+   reports the host-side (non-device) sums — weights (sum over host
+   weight lines, zeros excluded by arithmetic), `kv`/`rs` (pool lines,
+   summed across contexts), `compute`, `output` — from the same final
+   pass as the device sums, without touching the device rules.
+3. §"Measurement extension", *device flag*: `device: cpu` measures
+   (and shape-stamps) with `--n-gpu-layers 0` instead of `-ngl 999`,
+   stamp included by `measurement_args`; a shape that already carries
+   the flag is not duplicated on the measurement command.
+4. §"Measurement extension", *CPU spill relaxation*: a `device: cpu`
+   measurement never runs the device-shaped spill rejection (host
+   KV/RS and CPU-mapped weights are its truth); a `-ngl 999` launch
+   that lost Vulkan still measures nothing — the spill check rejects
+   it exactly as before.
+5. §"Measurement extension", *fit-params Host row*: `parse_fit_log`
+   falls back to the `Host` report row when no device row exists, so
+   the affine trio (`c` from `(C, C/2)`, `D` from the p pair) derives
+   CPU quads without measuring anything anew.
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 
