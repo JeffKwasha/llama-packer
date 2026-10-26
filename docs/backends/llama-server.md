@@ -30,6 +30,12 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
   [--reasoning-format <f>] [--reasoning-preserve]   # chat only
 ```
 
+CPU-resident entries (`--n-gpu-layers 0`) are budgeted off **host RAM** at
+pack time, not freed of budgeting: the pool is `MemAvailable − sysctl
+pressure zone`, capped by the llama-swap service cgroup headroom, and the
+same `over_budget` refusal applies — an entry whose measured quad will not
+fit is omitted from the config. See `docs/plans/cpu-residency-budget.md`.
+
 `--kv-unified-per-slot X` sizes the shared KV pool to `parallel × X`, which is
 byte-identical to a `-c parallel*X` pool (validated against `llama-fit-params`).
 

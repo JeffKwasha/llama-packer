@@ -379,10 +379,41 @@ the rest of this section work:
 The cap is not a concession to revisit when VRAM is tight. If VRAM binds,
 context in main chat is worth more than context in RAG.
 
+A sidecar declaring `device: cpu` pins that resident (or any model) to
+**host RAM instead**: it charges the host pool, never VRAM — one of the
+two budgets, never both.
+
 Residents are selected by role, or by `--embed` / `--rerank` CLI selectors.
 **They always serve single-slot**: resident parallelism must never buy
 context away from the chat it serves. A declared `parallel:` on an
 embeddings/rerank model is ignored with a note.
+
+### Host pool (`device: cpu`)
+
+A `device: cpu` sidecar places the serving entirely in host RAM: it
+competes for no VRAM — charged by neither the resident tier nor a chat
+set, it cannot be evicted on VRAM grounds, and once warm it stays.
+Its price is a host-RAM budget with the same decision quality
+(`docs/plans/cpu-residency-budget.md`):
+
+- **detection** finds the pool at pack time — `MemAvailable` minus a sysctl
+  pressure zone (per-zone high-watermark sum; declared fallback 25% of
+  total), capped by the llama-swap service cgroup headroom
+  (`memory.high`/`memory.max` − `memory.current`). Every term is
+  overridable from `profiles.yaml hardware:`; each chosen value is logged
+  with the arm that picked it.
+- **the charge** is the serving's own measured quad at its design context
+  — the same `derived:` block family the VRAM budget uses, measured
+  under a `--n-gpu-layers 0` shape stamp. A declared `parallel:` on a CPU
+  chat model is honoured and multiplies the pool terms; residents stay
+  single-slot.
+- **the check is go/no-go**: a quad that will not fit the pool remaining
+  after committed residents logs the shortfall and emits no id — no
+  solve-down, no automatic offload. `device: cpu` is the only gate.
+
+`metadata.packing` names the placement (`device: cpu|gpu`) and the decided
+byte facts (`ram_mib`/`vram_mib`, `kv_per_token`) so clients can filter
+without parsing ids.
 
 ### Remainder
 

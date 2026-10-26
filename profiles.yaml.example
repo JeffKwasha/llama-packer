@@ -252,6 +252,12 @@ profiles:
 #   #                          # platter branches.  Family representatives and
 #   #                          # measurement prefer models resolved here;
 #   #                          # unset = no tier preference.
+#   # host RAM budget for `device: cpu` models (docs/plans/cpu-residency-budget.md):
+#   host_pool: auto            # auto (min formula) | <abs> | <frac>%
+#   # system_ram: 64G          # total override; default /proc/meminfo MemTotal
+#   # host_pressure: sysctl    # arm: sysctl (zone high-wms floored by
+#   #                          # vm.min_free_kbytes) | 25% | <abs>
+#   # cgroup_dir: /sys/fs/cgroup/system.slice/llama-swap.service
 
 # ── Override rules (optional) ────────────────────────────
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.
