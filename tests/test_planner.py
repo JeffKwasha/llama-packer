@@ -1679,6 +1679,30 @@ def test_no_host_pool_never_gates(profiles, caplog):
     assert "cpu" in plan
 
 
+def test_host_resident_sizing_lifts_cpu_gate(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #74 -- the host ledger
+    # sizes CPU-resident residents through allow_cpu=True (fit_params_static
+    # otherwise returns None for a device: cpu model and the charge reads 0).
+    m = make("e", role="embeddings", device="cpu", context_length=8192)
+    seen = {}
+
+    def fake_static(fit_bin, cache_type="q8_0", llama_args="",
+                    allow_cpu=False):
+        seen["allow_cpu"] = allow_cpu
+        if allow_cpu:
+            return SimpleNamespace(model_mib=100, kv_per_token_mib=0.1,
+                                   slot_mib=0.0, compute_mib=50,
+                                   source="fit-params")
+        return None
+
+    m.vram.fit_params_static = fake_static
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=4096)
+    mb = planner._host_resident_mb(m, 4096)
+    assert seen["allow_cpu"] is True
+    assert mb == 100 + 50 + int(0.1 * 4096)
+
+
 # ── metadata.packing ──────────────────────────────────────────────────────
 
 

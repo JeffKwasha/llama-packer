@@ -135,6 +135,12 @@ MUTATIONS = {
         "llama_packer/writer.py",
         'packing: dict = {"device": "cpu" if model.on_cpu else "gpu"}',
         "packing: dict = {}"),
+    "test_host_resident_sizing_lifts_cpu_gate": (
+        "llama_packer/writer.py",
+        ("                measurement_args(self.profiles, model, self.llama_args),\n"
+         "                allow_cpu=True)"),
+        ("                measurement_args(self.profiles, model, self.llama_args),\n"
+         "                allow_cpu=False)")),
 }
 
 

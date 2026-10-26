@@ -2253,7 +2253,8 @@ class Planner:
         try:
             quad = _static_params(
                 model, self.fit_bin, self.profiles.default_cache_type,
-                measurement_args(self.profiles, model, self.llama_args))
+                measurement_args(self.profiles, model, self.llama_args),
+                allow_cpu=True)
             if quad is None:
                 quad = self.synthetic_quads.get(model.stem)
             if quad is None:
@@ -2611,11 +2612,14 @@ class Planner:
 
 def _static_params(model: Model, fit_bin: str, cache_type: str,
                    llama_args: str = "",
+                   allow_cpu: bool = False,
                    ) -> tuple[int, float, float, int] | None:
     """(model_mib, kv_per_token_mib, slot_mib, compute_mib) quad, or None
-    when unmeasurable."""
+    when unmeasurable.  ``allow_cpu`` lifts the CPU-resident gate — the
+    host ledger sizes `device: cpu` quads through the same gate."""
     fp = model.vram.fit_params_static(fit_bin, cache_type=cache_type,
-                                      llama_args=llama_args)
+                                      llama_args=llama_args,
+                                      allow_cpu=allow_cpu)
     if fp is None:
         return None
     return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)

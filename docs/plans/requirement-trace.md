@@ -150,7 +150,7 @@ and every one of them carries a `Validates:` citation.
 | 71 | Pressure zone: sysctl `(zone high sum, min_free_kbytes floor)` primary; missing/zeroed zoneinfo falls back to 25% of total, called out in the log | `test_pressure_zone_from_zoneinfo`, `test_pressure_zone_fallback_is_logged`, `test_pressure_zone_override_asserted` |
 | 72 | `host_pool = min(sys_free, cgroup_free)` with every override arm (`system_ram`, `host_pool` abs/frac) honored | `test_host_pool_mixed_terms`, `test_host_pool_overrides_arm` |
 | 73 | Service cgroup caps the pool; no llama-swap cgroup skips the term with a warning | `test_host_pool_mixed_terms`, `test_cgroup_missing_service_skips_term` |
-| 74 | A `device: cpu` resident is charged to the host ledger; its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram` |
+| 74 | A `device: cpu` resident is charged to the host ledger; its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram`, `test_host_resident_sizing_lifts_cpu_gate` |
 | 75 | Host charge is the serving quad at the served context — declared parallel multiplies D and the KV pool and can flip the refusal | `test_cpu_variant_refused_on_small_pool`, `test_cpu_parallel_charge_flips_refusal` |
 | 76 | No pool knowledge, no gate — a planner without a host pool never refuses on host grounds | `test_no_host_pool_never_gates` |
 | 77 | Every entry carries `metadata.packing`; `device: cpu` entries name device/ctx/parallel/ram and carry no `vram_mib` | `test_metadata_packing_cpu_entry`, `test_metadata_packing_gpu_entry` |
