@@ -411,6 +411,14 @@ Its price is a host-RAM budget with the same decision quality
   after committed residents logs the shortfall and emits no id — no
   solve-down, no automatic offload. `device: cpu` is the only gate.
 
+**Moving a whole usecase off VRAM** takes one declaration —
+`profiles.yaml device_roles: [embeddings, rerank]` (or a
+`{role: cpu}` mapping) places every model of those roles on the host,
+exactly as if each sidecar carried `device: cpu`. A CPU helper entry
+also joins every routing set and serves with `ttl: 0`: a request names
+it, it loads once, and no later swap evicts it — evicting it would
+reclaim no device memory. Set subsets mean nothing is preloaded.
+
 `metadata.packing` names the placement (`device: cpu|gpu`) and the decided
 byte facts (`ram_mib`/`vram_mib`, `kv_per_token`) so clients can filter
 without parsing ids.

@@ -593,6 +593,13 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
+    # CPU entries never idle-expire (design decision 12): a host-resident
+    # helper is cheap to keep and expensive to reload (process start +
+    # page-cache warmup), so ttl 0 keeps it up between requests. Device
+    # entries keep the inherited/global ttl.
+    if model.on_cpu:
+        entry["ttl"] = 0
+
     # Proxied backends (sd-server, whisper-server, audio-cpp) are proxied HTTP
     # services, not llama-swap managed inference — expose the standard proxy
     # fields so llama-swap can health-check and route.  Each backend names its

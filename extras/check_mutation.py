@@ -141,6 +141,50 @@ MUTATIONS = {
          "                allow_cpu=True)"),
         ("                measurement_args(self.profiles, model, self.llama_args),\n"
          "                allow_cpu=False)")),
+    "test_select_model_prefers_cpu_candidate": (
+        "llama_packer/__main__.py",
+        'cpu = [m for m in cands if getattr(m, "on_cpu", False)]',
+        "cpu = []"),
+    "test_select_model_smallest_among_cpu_candidates": (
+        "llama_packer/__main__.py",
+        "return min(cpu or cands, key=lambda m: m.vram_mb)",
+        "return min(cpu or cands, key=lambda m: -m.vram_mb)"),
+    "test_select_model_no_cpu_keeps_size_rule": (
+        "llama_packer/__main__.py",
+        "return min(cpu or cands, key=lambda m: m.vram_mb)",
+        "return (cpu or cands)[0]"),
+    "test_select_model_selector_overrides_cpu_preference": (
+        "llama_packer/__main__.py",
+        "        return hits[0]",
+        "        return min(cpu or cands, key=lambda m: m.vram_mb)"),
+    "test_selection_reason_names_the_arm": (
+        "llama_packer/__main__.py",
+        '        return "device: cpu — explicit placement"',
+        '        return "explicit placement"'),
+    "test_device_roles_place_every_role_model": (
+        "llama_packer/__main__.py",
+        '            m.frontmatter["device"] = "cpu"',
+        '            m.frontmatter["device"] = "gpu"'),
+    "test_device_roles_absent_and_unmatched": (
+        "llama_packer/__main__.py",
+        '            logger.warning("device_roles: role %r matched no model", role)',
+        '            pass'),
+    "test_device_roles_rejects_unknown_role": (
+        "llama_packer/__main__.py",
+        '        if role not in _DEVICE_ROLES:',
+        '        if False:'),
+    "test_cpu_helpers_pinned_into_every_set": (
+        "llama_packer/__main__.py",
+        '                expr = f"{expr.strip()} & {name}"',
+        '                expr = expr.strip()'),
+    "test_cpu_entry_ttl_zero": (
+        "llama_packer/writer.py",
+        "    if model.on_cpu:\n        entry[\"ttl\"] = 0",
+        "    if model.on_cpu:\n        pass"),
+    "test_gpu_entry_has_no_ttl": (
+        "llama_packer/writer.py",
+        "    if model.on_cpu:\n        entry[\"ttl\"] = 0",
+        '    if model.on_cpu: \n        entry["ttl"] = 0\n    entry["ttl"] = 0'),
 }
 
 

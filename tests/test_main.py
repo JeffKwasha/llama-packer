@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,9 @@ import pytest
 
 from llama_packer.__main__ import (resolve_host_binary,
                                  _apply_env_subst,
-                                 _health_check_timeout)
+                                 _health_check_timeout,
+                                 _select_model,
+                                 _selection_reason)
 from llama_packer.utils import make_subst
 
 
@@ -438,3 +441,113 @@ def test_every_backend_uses_the_same_chain():
     body = src.split('"""', 2)[-1]
     for tier in ("run_dir", "shutil.which", "env_var"):
         assert tier in body
+
+
+# ── resident selection (`device: cpu` wins the role) ─────────────────────
+
+
+def _role_model(stem, mb, role="embeddings", **fm):
+    m = SimpleNamespace(stem=stem, role=role, vram_mb=mb,
+                        template_id=stem,
+                        frontmatter={"name": stem, **fm})
+    m.on_cpu = str(m.frontmatter.get("device", "")).strip().lower() == "cpu"
+    return m
+
+
+def test_select_model_prefers_cpu_candidate():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- a device: cpu
+    # candidate wins the resident role over a smaller device model.
+    gpu_small = _role_model("voyage", 355)
+    cpu_big = _role_model("jina", 472, device="cpu")
+    assert _select_model([gpu_small, cpu_big], "embeddings", None, None) is cpu_big
+
+
+def test_select_model_smallest_among_cpu_candidates():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- among CPU
+    # candidates the smallest footprint still wins.
+    cpu_big = _role_model("qwen3-embed", 640, device="cpu")
+    cpu_small = _role_model("jina", 472, device="cpu")
+    assert _select_model([cpu_big, cpu_small], "embeddings", None,
+                         None) is cpu_small
+
+
+def test_select_model_no_cpu_keeps_size_rule():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no CPU
+    # candidate the selection is unchanged (smallest footprint).
+    big = _role_model("big", 900)
+    small = _role_model("small", 355)
+    assert _select_model([big, small], "embeddings", None, None) is small
+
+
+def test_select_model_selector_overrides_cpu_preference():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- an explicit
+    # selector overrides the CPU preference.
+    cpu = _role_model("jina", 472, device="cpu")
+    gpu = _role_model("voyage", 355)
+    assert _select_model([cpu, gpu], "embeddings", "voyage", None) is gpu
+
+
+def test_selection_reason_names_the_arm():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the resident pick
+    # logs why it won (explicit CPU placement vs smallest footprint).
+    cpu = _role_model("jina", 472, device="cpu")
+    gpu = _role_model("voyage", 355)
+    assert _selection_reason(cpu) == "device: cpu — explicit placement"
+    assert _selection_reason(gpu) == "smallest footprint 355 MiB"
+
+
+# ── role-wide placement + CPU-helper pinning ─────────────────────────────
+
+
+def test_device_roles_place_every_role_model(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- device_roles names
+    # roles whose every model is CPU-placed, logged with the count.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("embed-a", role="embeddings")
+    b = make_model("embed-b", role="embeddings")
+    chat = make_model("chat", role="chat")
+    with caplog.at_level(logging.INFO):
+        apply_device_roles([a, b, chat], ["embeddings"], logging.getLogger("t"))
+    assert a.on_cpu and b.on_cpu
+    assert not chat.on_cpu
+    assert any("device_roles: embeddings" in r.message for r in caplog.records)
+
+
+def test_device_roles_absent_and_unmatched(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- absent key changes
+    # nothing; a role matching no model warns.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("chat", role="chat")
+    apply_device_roles([a], None, logging.getLogger("t"))
+    assert not a.on_cpu
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], {"s2t": "cpu"}, logging.getLogger("t"))
+    assert any("matched no model" in r.message for r in caplog.records)
+
+
+def test_device_roles_rejects_unknown_role(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- unknown role names
+    # warn and are ignored (placement stays an explicit, known-role act).
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("chat", role="chat")
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], {"everything": "cpu"}, logging.getLogger("t"))
+    assert not a.on_cpu
+    assert any("not a placeable role" in r.message for r in caplog.records)
+
+
+def test_cpu_helpers_pinned_into_every_set():
+    # Validates: docs/plans/cpu-residency-budget.md #20 -- CPU helper terms
+    # join every set unless already a leaf.
+    from llama_packer.__main__ import _expand_matrix_sets
+    out = _expand_matrix_sets(
+        {"rag": "__CHAT_VARS__ & emb & rnk",
+         "talk": "__CHAT_VARS__ & tts"},
+        "(c1 | c2)", ["tts"], None, pinned=["emb", "rnk", "qwen3-embedding-0.6b"])
+    leaves = lambda e: re.findall(r"(?<![\w.-])(?:emb|rnk)(?![\w.-])", e)
+    assert leaves(out["rag"]) == ["emb", "rnk"]
+    assert out["rag"].endswith("& qwen3-embedding-0.6b")
+    assert out["talk"].endswith("& emb & rnk & qwen3-embedding-0.6b")

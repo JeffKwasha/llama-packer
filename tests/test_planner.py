@@ -1741,3 +1741,25 @@ def test_metadata_packing_gpu_entry(profiles):
     assert p["ctx_size"] == v.ctx_size
     assert p["parallel"] == v.parallel
     assert p["kv_per_token"] == 59769
+
+
+def test_cpu_entry_ttl_zero(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #20 -- a device: cpu entry
+    # carries ttl 0 (no idle expiry); device entries carry no ttl key.
+    m = make("ttlcpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                       host_pool_mb=8192).plan()["ttlcpu"]
+    entry = only_entry(emit_config([m], {"ttlcpu": variants}, profiles, TVARS))
+    assert entry["ttl"] == 0
+
+
+def test_gpu_entry_has_no_ttl(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #20 -- device entries keep
+    # the inherited/global TTL (no per-model ttl key emitted).
+    m = make("ttlgpu", role="chat")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024).plan()["ttlgpu"]
+    entry = only_entry(emit_config([m], {"ttlgpu": variants}, profiles, TVARS))
+    assert "ttl" not in entry

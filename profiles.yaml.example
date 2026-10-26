@@ -258,6 +258,11 @@ profiles:
 #   # host_pressure: sysctl    # arm: sysctl (zone high-wms floored by
 #   #                          # vm.min_free_kbytes) | 25% | <abs>
 #   # cgroup_dir: /sys/fs/cgroup/system.slice/llama-swap.service
+#   # Role-wide host placement: every model of a named role runs from RAM —
+#   # identical to tagging each sidecar `device: cpu`: no VRAM charge, host
+#   # budget, never evicted by a swap, ttl 0.  Unset = per-sidecar tags only.
+#   # device_roles: [embeddings, rerank]
+#   # device_roles: {embeddings: cpu, s2t: cpu}
 
 # ── Override rules (optional) ────────────────────────────
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.

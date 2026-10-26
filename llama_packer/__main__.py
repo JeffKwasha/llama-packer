@@ -254,9 +254,12 @@ def _apply_env_subst(config: EmittedConfig, sub, raw_paths: list[str]) -> Emitte
 def _select_model(models: list, type_name: str, selector: str | None, logger) -> "Model | None":
     """Pick a model of `type_name` (role).
 
-    With no selector, returns the smallest by VRAM footprint. With a selector
-    substring, returns the single model whose id/name/stem contains it; errors
-    if the match is not exactly one.
+    With no selector, a `device: cpu` candidate wins — the tag is the
+    operator's explicit "this one stays warm in host RAM" choice, and it
+    must not lose to the size-only default (smallest footprint). Among CPU
+    candidates the smallest footprint still wins. A selector substring
+    overrides the preference: returns the single model whose id/name/stem
+    contains it; errors if the match is not exactly one.
     """
     cands = [m for m in models if m.role == type_name]
     if not cands:
@@ -273,7 +276,55 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
                   selector, len(hits), type_name,
                   [h.stem for h in hits])
         return hits[0]
-    return min(cands, key=lambda m: m.vram_mb)
+    cpu = [m for m in cands if getattr(m, "on_cpu", False)]
+    return min(cpu or cands, key=lambda m: m.vram_mb)
+
+
+def _selection_reason(model) -> str:
+    """Why the resident pick went to *model* — logged beside its name."""
+    if getattr(model, "on_cpu", False):
+        return "device: cpu — explicit placement"
+    return f"smallest footprint {model.vram_mb} MiB"
+
+
+_DEVICE_ROLES = frozenset({"embeddings", "rerank", "s2t", "t2s"})
+
+
+def apply_device_roles(models: list, roles_cfg, logger) -> None:
+    """Place every model of the declared roles on the host (decision 11).
+
+    ``profiles.yaml device_roles:`` names serving roles (a list, or a
+    mapping role → ``cpu``); each becomes ``device: cpu`` for every model
+    of that role, indistinguishable from the sidecar tag.  Nothing here
+    infers placement: an absent key changes nothing, and each role applied
+    is logged with the number of models it matched.
+    """
+    if not roles_cfg:
+        return
+    if isinstance(roles_cfg, dict):
+        declared = {str(k) for k, v in roles_cfg.items()
+                    if str(v).strip().lower() == "cpu"}
+    elif isinstance(roles_cfg, str):
+        declared = {roles_cfg}
+    else:
+        declared = {str(r) for r in roles_cfg}
+    for role in sorted(declared):
+        if role not in _DEVICE_ROLES:
+            logger.warning("device_roles: %r is not a placeable role %s; "
+                           "ignored", role, sorted(_DEVICE_ROLES))
+            continue
+        hits = [m for m in models if m.role == role]
+        if not hits:
+            logger.warning("device_roles: role %r matched no model", role)
+            continue
+        placed = 0
+        for m in hits:
+            if m.on_cpu:
+                continue
+            m.frontmatter["device"] = "cpu"
+            placed += 1
+        logger.info("device_roles: %s → cpu (%d model(s)%s)", role, len(hits),
+                    f", {placed} newly placed" if placed else ", all already")
 
 
 def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
@@ -342,8 +393,10 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
 
     fixed = [(n, m) for n, m in categories.items()
              if m is not embed_model and m is not rerank_model]
-    logger.info("matrix embed: %s", embed_model.stem)
-    logger.info("matrix rerank: %s", rerank_model.stem)
+    logger.info("matrix embed: %s (%s)", embed_model.stem,
+                _selection_reason(embed_model))
+    logger.info("matrix rerank: %s (%s)", rerank_model.stem,
+                _selection_reason(rerank_model))
     if fixed:
         logger.info("matrix categories: %s",
                     ", ".join(f"{n}={m.stem}" for n, m in fixed))
@@ -470,6 +523,7 @@ def _health_check_timeout(models, args) -> int:
 def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
                         coload_vars: list[str], logger,
                         chat_expr_by_set: dict[str, str] | None = None,
+                        pinned: list[str] | None = None,
                         ) -> dict:
     """Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs.
 
@@ -481,6 +535,11 @@ def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
     *chat_expr_by_set* overrides the chat OR-list per set, so a model that
     cannot hold its context alongside a set's residents is left out of that
     set alone instead of every set.
+
+    *pinned* lists var names or entry ids that join every set unless
+    already a leaf — the CPU-helper rule (design decision 12): evicting
+    them buys no device memory, and sets permit subsets, so membership
+    never preloads one.
     """
     coload_expr = ("(" + " | ".join(coload_vars) + ")") if coload_vars else None
     expanded: dict[str, str] = {}
@@ -497,6 +556,9 @@ def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
                 logger.warning(
                     "matrix: set %r references __COLOAD_VARS__ but no "
                     "co-loads were included; term dropped", sname)
+        for name in (pinned or []):
+            if not re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", expr):
+                expr = f"{expr.strip()} & {name}"
         expanded[sname] = expr.strip()
     return expanded
 
@@ -755,6 +817,9 @@ def main(argv: list[str] | None = None) -> None:
         fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
 
+    # Role-wide host placement, declared in profiles.yaml (design decision 11).
+    apply_device_roles(models, profiles_cfg.get("device_roles"), logger)
+
     if args.remeasure:
         for m in models:
             m.vram.remeasure = True
@@ -1008,6 +1073,22 @@ def main(argv: list[str] | None = None) -> None:
         else:
             # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
             chat_expr = "(" + " | ".join(chat_var_names) + ")"
+            # CPU helpers join every set (design decision 12): a swap cannot
+            # reclaim device memory by evicting them, so the only sane rule
+            # is that it never does. Sets allow subsets, so this preloads
+            # nothing; it keeps an already-loaded helper alive.
+            eid_var = {eid: v for v, eid in vars_.items()}
+            cpu_pins: list[str] = []
+            for m in models:
+                if m.role not in NON_CHAT_ROLES or not m.on_cpu:
+                    continue
+                for eid in config.entry_ids_by_stem.get(m.stem, []):
+                    pin = eid_var.get(eid, eid)
+                    if pin not in cpu_pins:
+                        cpu_pins.append(pin)
+            if cpu_pins:
+                logger.info("matrix: CPU helpers pinned into every set: %s",
+                            ", ".join(cpu_pins))
             sets_cfg = matrix_cfg.get("sets") or {}
             # Per-set chat lists: a model that cannot meet its usage demands
             # beside a set's residents is dropped from that set only.  An
@@ -1048,7 +1129,8 @@ def main(argv: list[str] | None = None) -> None:
                                        logger,
                                        chat_expr_by_set={
                                            s: "(" + " | ".join(v) + ")"
-                                           for s, v in per_set.items() if v})
+                                           for s, v in per_set.items() if v},
+                                       pinned=cpu_pins)
             if coload_vars:
                 joined = " ".join(str(s) for s in sets_cfg.values())
                 if "__COLOAD_VARS__" not in joined:

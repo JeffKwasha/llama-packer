@@ -57,6 +57,31 @@ path).
    the bulk of `vram.py` is device-specific; the shared atoms are `FitParams`
    and the `-lv 5` log parse. The measurement extension (below) is the only
    DRY surface the two budgets touch.
+10. **`device: cpu` is the resident selection.** A role whose candidates
+    include a `device: cpu` model takes that model as the resident winner
+    (one per role, decision 2) — the tag is the operator's explicit
+    "this is the one that stays warm in host RAM" choice, and it must not
+    lose to the size-only default (smallest file). Among CPU candidates
+    the smallest footprint wins; with no CPU candidate the existing rule
+    is unchanged. An explicit selector (`matrix:` `selector:` / CLI
+    `--embed`/`--rerank`) still overrides both. Duplicate *servings* of a
+    role stay operator catalog/set policy — the resident tier holds one,
+    and the host ledger asserts it (requirement 14).
+11. **Role-wide placement is declared, not inferred.** `profiles.yaml`
+    `device_roles:` may name serving roles (`embeddings`, `rerank`,
+    `s2t`, `t2s`) whose every model is CPU-placed exactly as if each
+    sidecar carried `device: cpu`: same `-ngl 0`, same host charge, same
+    VRAM exclusion, same resident eligibility. This is an operator
+    declaration under decision 1 — nothing discovers "too big" and moves
+    it, the list is explicit, and every application is logged with the
+    role and the number of models it matched.
+12. **CPU helpers are never evicted.** A `device: cpu` non-chat entry is
+    pinned into every routing set expression (by its category var when
+    it has one, else its entry id) and carries `ttl: 0`: a request names
+    the model, loads it once, and no later swap evicts it. Sets permit
+    subsets, so pinning never preloads one. Evicting a CPU entry buys no
+    device memory, so the matrix's cost model has nothing to trade —
+    this is the placement rule, not a new heuristic.
 
 ## Host pool equation
 
@@ -203,16 +228,39 @@ fallback is a bug.
 16. *no pool knowledge, no gate*: with detection unavailable (no
     profiles override, unreadable /proc), the ledger logs that fact once
     and does not gate — it never invents a budget it cannot read.
+17. *CPU wins the role*: for a resident role (embeddings, rerank, and the
+    declared fixed categories), a `device: cpu` candidate is selected
+    over device candidates regardless of footprint (decision 10); among
+    CPU candidates the smallest footprint still wins, and no CPU
+    candidate leaves the selection exactly as it was. A selector
+    (`selector:`/`--embed`/`--rerank`) overrides the preference.
 
 **metadata.packing** (client-visible facts; emission site shared with
 branch 2).
 
-17. *every entry carries `metadata.packing`* — decided facts only:
+18. *every entry carries `metadata.packing`* — decided facts only:
     `device` (`cpu`/`gpu`), `ctx_size`, `parallel`; `vram_mib` when the
     serving is device-resident and estimated, `ram_mib` for the
     host-side bytes when decided, and `kv_per_token` (per-token KV
     bytes at the served cache_type) when the backend measures an affine
     quad. `device: cpu` entries carry no `vram_mib`.
+
+**Role-wide placement and eviction** (decisions 11–12).
+
+19. *role declaration*: `profiles.yaml device_roles:` (a list of role
+    names, or a mapping role → `cpu`) places every model of each named
+    role on the host — identical in every respect to the sidecar tag
+    (requirement 3's shape stamp, the host charge, no VRAM charge,
+    resident eligibility). Each role applied is logged with the number
+    of models it matched; a role that matches nothing warns; leaving the
+    key out changes nothing.
+20. *CPU helpers are pinned into every set*: every `device: cpu`
+    non-chat entry joins every routing set expression — by its category
+    var when it has one, else by its entry id — unless already a leaf.
+    Set subsets keep this from preloading, so the effect is exactly
+    "never evicted by a swap". The entry also carries `ttl: 0`, so idle
+    expiry does not unload it. Device entries keep today's behaviour
+    (no pin, no `ttl` key).
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 
