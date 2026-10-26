@@ -105,6 +105,14 @@ MUTATIONS = {
         "llama_packer/utils.py",
         'logger.warning("%s: failed to eval %r with base=%s, using base",',
         'logger.warning("failed to eval %r with base=%s, using base",'),
+    "test_host_pool_clamps_to_zero": (
+        "llama_packer/hardware.py",
+        "pool_mb=max(0, pool_mb)",
+        "pool_mb=pool_mb"),
+    "test_pressure_zone_fallback_is_logged": (
+        "llama_packer/hardware.py",
+        "           pressure_mb = int((total_mb or 0) * frac)",
+        "           pressure_mb = total_mb or 0"),
 }
 
 

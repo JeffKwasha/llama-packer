@@ -19,7 +19,133 @@ from llama_packer.consts import _RESERVE_SYSTEM
 from llama_packer.hardware import (
     _UNIFIED_SYSTEM_RESERVE_DEFAULT,
     GpuProfile,
+    HostProfile,
 )
+
+
+# ── Host RAM pool (`device: cpu` budget) ──────────────────────────────────
+
+_MEMINFO = ("MemTotal:       65536000 kB\n"   # 64000 MiB
+            "MemFree:       10485760 kB\n"
+            "MemAvailable:  41943040 kB\n")  # 40960 MiB
+_ZONEINFO = ("  DMA:\n"
+             "      high  100\n"
+             "  Normal:\n"
+             "      high  200\n")             # 300 kB total, below the floor
+
+
+def _proc_fixture(monkeypatch, tmp_path, *, zoneinfo=_ZONEINFO,
+                  meminfo=_MEMINFO, min_free="1024", cgroup_span_pid=77):
+    """Point the host-detection readers at fixture files."""
+    meminfo_path = tmp_path / "meminfo"
+    meminfo_path.write_text(meminfo)
+    monkeypatch.setattr(hardware, "_PROC_MEMINFO", meminfo_path)
+    zi = tmp_path / "zoneinfo"
+    zi.write_text(zoneinfo if zoneinfo is not None else "")
+    monkeypatch.setattr(hardware, "_PROC_ZONEINFO", zi)
+    vm = tmp_path / "min_free_kbytes"
+    vm.write_text(min_free)
+    monkeypatch.setattr(hardware, "_VM_MIN_FREE", vm)
+    monkeypatch.setattr(hardware, "_find_llama_swap_pid", lambda: None)
+
+
+def test_pressure_zone_from_zoneinfo(monkeypatch, tmp_path, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #7 -- sysctl arm: per-zone high sum, min_free_kbytes floor.
+    """The zone `high` sum feeds the sysctl arm, raised to the
+    min_free_kbytes floor when the watermark sum is lower."""
+    # 300 kB of high-watermarks < the 1024 kB floor → the floor wins.
+    _proc_fixture(monkeypatch, tmp_path)
+    hp = HostProfile.detect(stable=False)
+    assert hp.provenance["pressure"] == "sysctl"
+    assert hp.pressure_zone_mb == 1                 # 1024 kB Floored
+    assert hp.sys_free_mb == 40960 - 1
+    assert hp.pool_mb == 40960 - 1
+
+    # Zone sum above the floor: the watermark sum is the arm.
+    _proc_fixture(monkeypatch, tmp_path, zoneinfo="  Normal:\n    high 4000000\n",
+                  min_free="1024")
+    hp = HostProfile.detect(stable=False)
+    assert hp.pressure_zone_mb == 4000000 // 1024
+
+
+def test_pressure_zone_fallback_is_logged(monkeypatch, tmp_path, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #7 -- missing/zeroed zoneinfo falls back to 25% of total, logged.
+    """unreadable zoneinfo is the declared fallback trigger: 25% of total,
+    and the log names the arm — a silent fallback is a bug."""
+    _proc_fixture(monkeypatch, tmp_path, zoneinfo="no zones here\n")
+    with caplog.at_level("INFO"):
+        hp = HostProfile.detect(stable=False)
+    assert hp.provenance["pressure"] == "fallback-25%"
+    assert hp.pressure_zone_mb == 64000 // 4
+    assert any("fallback-25" in r.message for r in caplog.records)
+
+
+def test_pressure_zone_override_asserted(monkeypatch, tmp_path):
+    # Validates: docs/plans/cpu-residency-budget.md #7 -- hardware.host_pressure: sysctl | 25% | <abs>.
+    _proc_fixture(monkeypatch, tmp_path)
+    hp = HostProfile.detect(yaml_hw={"host_pressure": "4G"})
+    assert hp.pressure_zone_mb == 4096
+    assert hp.provenance["pressure"] == "declared"
+
+    hp = HostProfile.detect(yaml_hw={"host_pressure": "25%"})
+    assert hp.pressure_zone_mb == 64000 // 4
+    assert hp.provenance["pressure"] == "fallback-25%"
+
+
+def test_host_pool_mixed_terms(monkeypatch, tmp_path):
+    # Validates: docs/plans/cpu-residency-budget.md #10 -- host_pool = min(sys_free, cgroup_free).
+    """Both terms bind: the pool is the smaller of sys_free and the
+    service cgroup headroom."""
+    _proc_fixture(monkeypatch, tmp_path)
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.high").write_text(f"{32 * 1024**3}")
+    (cgroup / "memory.max").write_text(f"{40 * 1024**3}")
+    (cgroup / "memory.current").write_text(f"{4 * 1024**3}")
+    monkeypatch.setattr(hardware, "_find_llama_swap_pid", lambda: 77)
+    monkeypatch.setattr(hardware, "_service_cgroup_path", lambda pid: cgroup)
+    hp = HostProfile.detect(stable=False)
+    # cgroup free: min(32G−4G, 40G−4G) = 28G < sys_free 40959 → binding term
+    assert hp.cgroup_free_mb == 28 * 1024
+    assert hp.pool_mb == 28 * 1024
+    assert hp.provenance["cgroup"] == "detected"
+
+
+def test_host_pool_overrides_arm(monkeypatch, tmp_path):
+    # Validates: docs/plans/cpu-residency-budget.md #10 -- hardware.host_pool: auto | <abs> | <frac>%.
+    _proc_fixture(monkeypatch, tmp_path)
+    hp = HostProfile.detect(yaml_hw={"host_pool": "16G"})
+    assert hp.pool_mb == 16 * 1024
+    assert hp.provenance["pool"] == "declared"
+    hp = HostProfile.detect(yaml_hw={"host_pool": "50%"})
+    assert hp.pool_mb == 32000           # frac of the detected total
+    hp = HostProfile.detect(yaml_hw={})
+    assert hp.provenance["pool"] == "sys_free"
+
+
+def test_cgroup_missing_service_skips_term(monkeypatch, tmp_path, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #9 -- no service cgroup skips the term with a warning.
+    _proc_fixture(monkeypatch, tmp_path)
+    with caplog.at_level("WARNING"):
+        hp = HostProfile.detect(stable=False)
+    assert hp.cgroup_free_mb is None
+    assert hp.pool_mb == hp.sys_free_mb
+    assert hp.provenance["cgroup"] == "skipped-cgroup"
+    assert any("skipped-cgroup" in r.message for r in caplog.records)
+
+
+def test_host_pool_clamps_to_zero(monkeypatch, tmp_path):
+    # Validates: docs/plans/cpu-residency-budget.md #10 -- an infeasible read clamps the pool to 0, never invents.
+    """sys_free may go negative (requirement 8); the POOL is where the
+    floor lives — a squeezed box plans no CPU models rather than a
+    negative budget."""
+    _proc_fixture(monkeypatch, tmp_path, meminfo="MemTotal: 65536000 kB\n"
+                                                "MemAvailable: 100 kB\n")
+    monkeypatch.setattr(hardware, "_find_llama_swap_pid", lambda: None)
+    hp = HostProfile.detect(yaml_hw={"host_pressure": "4G"}, stable=False)
+    assert hp.sys_free_mb == 100 // 1024 - 4096        # negative is fine
+    assert hp.pool_mb == 0
+    assert hp.provenance["pool"] == "sys_free"
 
 
 class Completed:

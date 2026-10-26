@@ -153,6 +153,67 @@ in `fit_params`) is already sufficient for both shapes — no new tool;
    the affine trio (`c` from `(C, C/2)`, `D` from the p pair) derives
    CPU quads without measuring anything anew.
 
+### Host-budget requirements (citable by tests)
+
+**Detection** (`hardware.py`, `HostProfile`). Every term logs its path —
+`declared` / `sysctl` / `fallback-25%` / `skipped-cgroup`. A silent
+fallback is a bug.
+
+6. *total*: `MemTotal` from `/proc/meminfo` (pack-time reference for
+   percent overrides); `hardware.system_ram` declares it instead.
+7. *pressure zone*: primary is the sysctl arm — per-zone `high`
+   high-watermark sum from `/proc/zoneinfo`, raised to the
+   `vm.min_free_kbytes` floor when the read is lower; when zoneinfo is
+   missing, zeroed, or unparseable the *declared fallback assumption* is
+   25% of total, and that is what is logged. `hardware.host_pressure:
+   sysctl | 25% | <abs>` chooses the arm.
+8. *sys_free*: `MemAvailable − pressure_zone`. A negative result is not
+   a bug report — it feeds the pool floor clause (10).
+9. *service cgroup*: resolved from the llama-swap process's
+   `/proc/<pid>/cgroup` (v2 `0::<path>`, `/sys/fs/cgroup` root) —
+   `sg_free = min(present caps − memory.current)` over
+   `memory.high`/`memory.max` (`max`/absent caps skip their term). No
+   such process, or an unreadable cgroup, skips the term with a
+   `skipped-cgroup` warning (then `sg_free` does not bind).
+   `hardware.cgroup_dir` declares the path directly.
+10. *pool*: `host_pool = min(sys_free, sg_free)` (skipped-cgroup → just
+    `sys_free`), clamped at 0. `hardware.host_pool: auto | <abs> |
+    <frac>%` overrides the whole result (`auto` = the formula, `<frac>%`
+    of total). An infeasible read (term missing *and* no override) is
+    not invented: the pool clamps to 0 rather than assuming.
+
+**Budget** (`HostLedger`, sibling of `PoolLedger`).
+
+11. *charge*: a `device: cpu` model is charged its serving quad at the
+    served context — weights + compute + KV(c·C_design·p) + p·D, `C_design`
+    the design/sidecar context (decision 3: no solve); the quad is the
+    same measured block family VRAM uses (the shape-stamped extension).
+12. *refusal*: the check is go/no-go against the pool remaining after
+    committed residents — over budget logs the shortfall and emits no
+    id (no solve-down, ~ the VRAM `over_budget` path, per-category like
+    every other refusal).
+13. *residents charge host*: a `device: cpu` embed/rerank resident is
+    charged to the host ledger at its solved context; its VRAM-ledger
+    charge stays 0 (decision 5 — no double counting).
+14. *one co-resident per role*: the host ledger asserts two committed
+    quads for one role as a planner bug — the resident selection already
+    picks one winner per role (decision 2).
+15. *declared parallel is charged*: `parallel: N` on a CPU chat model
+    multiplies D and the KV pool in the charge and can flip the refusal.
+16. *no pool knowledge, no gate*: with detection unavailable (no
+    profiles override, unreadable /proc), the ledger logs that fact once
+    and does not gate — it never invents a budget it cannot read.
+
+**metadata.packing** (client-visible facts; emission site shared with
+branch 2).
+
+17. *every entry carries `metadata.packing`* — decided facts only:
+    `device` (`cpu`/`gpu`), `ctx_size`, `parallel`; `vram_mib` when the
+    serving is device-resident and estimated, `ram_mib` for the
+    host-side bytes when decided, and `kv_per_token` (per-token KV
+    bytes at the served cache_type) when the backend measures an affine
+    quad. `device: cpu` entries carry no `vram_mib`.
+
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 
 One structured dict emitted by `_build_entry` (`writer.py:440-545`) for every

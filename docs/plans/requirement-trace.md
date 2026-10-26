@@ -141,3 +141,12 @@ and every one of them carries a `Validates:` citation.
 | 67 | An unhandled-setting warning leads with the sidecar's name | `test_warn_unhandled_names_the_sidecar` |
 | 68 | An invalid `allow_profiles` regex warning leads with the sidecar's name | `test_allow_profiles_bad_regex_names_the_sidecar` |
 | 69 | A failed `base *` expression warning names the layer it came from | `test_merge_bad_base_expression_names_the_origin` |
+
+## Host budget (docs/plans/cpu-residency-budget.md §Host-budget requirements)
+
+| # | Requirement | Test |
+|---|---|---|
+| 70 | Host pool floor: an infeasible read clamps the pool to 0 and an over-pool `device: cpu` model emits no id | `test_host_pool_clamps_to_zero` |
+| 71 | Pressure zone: sysctl `(zone high sum, min_free_kbytes floor)` primary; missing/zeroed zoneinfo falls back to 25% of total, called out in the log | `test_pressure_zone_from_zoneinfo`, `test_pressure_zone_fallback_is_logged`, `test_pressure_zone_override_asserted` |
+| 72 | `host_pool = min(sys_free, cgroup_free)` with every override arm (`system_ram`, `host_pool` abs/frac) honored | `test_host_pool_mixed_terms`, `test_host_pool_overrides_arm` |
+| 73 | Service cgroup caps the pool; no llama-swap cgroup skips the term with a warning | `test_host_pool_mixed_terms`, `test_cgroup_missing_service_skips_term` |
