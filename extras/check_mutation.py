@@ -113,6 +113,24 @@ MUTATIONS = {
         "llama_packer/hardware.py",
         "           pressure_mb = int((total_mb or 0) * frac)",
         "           pressure_mb = total_mb or 0"),
+    "test_cpu_variant_refused_on_small_pool": (
+        "llama_packer/writer.py",
+        ("                    host_free = self.host_ledger.available() \\\n"
+         "                        if serve_view.on_cpu else None"),
+        "                    host_free = None"),
+    "test_cpu_parallel_charge_flips_refusal": (
+        "llama_packer/writer.py",
+        ("                    host_free = self.host_ledger.available() \\\n"
+         "                        if serve_view.on_cpu else None"),
+        "                    host_free = None"),
+    "test_cpu_resident_charges_host_not_vram": (
+        "llama_packer/writer.py",
+        "mb = self._host_resident_mb(model, ctx)",
+        "mb = self._resident_overhead(model, ctx)"),
+    "test_no_host_pool_never_gates": (
+        "llama_packer/writer.py",
+        "self.host_ledger = HostLedger(host_pool_mb)",
+        "self.host_ledger = HostLedger(host_pool_mb or 0)"),
 }
 
 

@@ -20,7 +20,7 @@ import yaml
 
 from llama_packer import Model, __version__, find_bin_dir, utils
 from llama_packer import model as _modelmod
-from llama_packer.hardware import GpuProfile, detect_gpu_vendor
+from llama_packer.hardware import GpuProfile, HostProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
@@ -792,6 +792,9 @@ def main(argv: list[str] | None = None) -> None:
         baseline=args.baseline,
         unified_system_mb=args.unified_system_mb,
     )
+    # The host-RAM pool `device: cpu` models charge (same declared >
+    # detected precedence as the VRAM profile).
+    host = HostProfile.detect(yaml_hw=yaml_hw)
 
     # Compute optimal ${env.*} prefixes from the raw paths actually emitted,
     # then substitute them into the binary path and post-process the config.
@@ -933,6 +936,7 @@ def main(argv: list[str] | None = None) -> None:
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
             memory_margin=margin,
+            host_pool_mb=host.pool_mb,
             progress_cb=lambda stem: progress.advance(stem),
         )
     except ValueError as e:

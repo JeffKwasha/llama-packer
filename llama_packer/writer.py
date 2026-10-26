@@ -1388,6 +1388,45 @@ class PoolLedger:
         return total
 
 
+class HostLedger:
+    """Sibling of PoolLedger: host-RAM claims by ``device: cpu`` models.
+
+    Committed residents (embed/rerank winners, one per role) are charged
+    at build time; every other CPU-resident entry is judged go/no-go
+    against the pool remaining after them — never solved down, mirror of
+    the VRAM `over_budget` refusal
+    (docs/plans/cpu-residency-budget.md §Budget).  ``pool_mb=None``
+    (detection unavailable) means the ledger cannot gate: it logs that
+    once and reports an unbounded pool rather than inventing one.
+    """
+
+    def __init__(self, pool_mb: int | None):
+        self.pool_mb = pool_mb
+        self.residents: list[tuple[str, str, int]] = []  # (label, role, mb)
+        self._roles: set[str] = set()
+
+    def add_resident(self, label: str, role: str, mb: int) -> None:
+        # One co-resident per role (design decision 2): the resident
+        # selection already picks one winner — two quads for one role is
+        # a planner bug, not a pool this ledger would silently book.
+        if role in self._roles:
+            raise AssertionError(
+                f"host ledger: two committed residents for role {role!r} "
+                f"({label!r}, already have one)")
+        self._roles.add(role)
+        if mb > 0:
+            self.residents.append((label, role, int(mb)))
+
+    def resident_mb(self) -> int:
+        return sum(mb for _, _, mb in self.residents)
+
+    def available(self) -> int | None:
+        """Pool remaining after committed residents; None = cannot gate."""
+        if self.pool_mb is None:
+            return None
+        return self.pool_mb - self.resident_mb()
+
+
 @dataclass(frozen=True)
 class MatrixSolve:
     """Result of the shared matrix solve.
@@ -1527,6 +1566,7 @@ class Planner:
         min_context_explicit: bool = False,
         memory_margin: float = _MEMORY_MARGIN,
         llama_args: str = "",
+        host_pool_mb: int | None = None,
         progress_cb=None,
     ):
         self.models = models
@@ -1563,6 +1603,7 @@ class Planner:
         self.min_context_explicit = min_context_explicit
         self.memory_margin = memory_margin
         self.ledger = PoolLedger(vram_total, self.profiles.pools_cfg)
+        self.host_ledger = HostLedger(host_pool_mb)
         self.chat_ctx: int | None = None  # matrix-solved shared context, if any
         self.matrix_result: MatrixSolve | None = None
         # Optional per-model tick (stem) for the progress bar; None in tests.
@@ -2112,6 +2153,11 @@ class Planner:
         """
         ledger = PoolLedger(self.vram_total,
                             self.profiles.pools_cfg)
+        if self.host_ledger.pool_mb is None:
+            # Cannot gate what cannot be read — say so once, loudly.
+            logger.info("host ledger: no pool detected and none declared — "
+                        "device: cpu models are ungated "
+                        "(profiles.yaml hardware: host keys)")
         res = self.matrix_result
         if res is not None:
             for model, ctx, label in ((self.embed_model, res.embed_ctx,
@@ -2119,6 +2165,18 @@ class Planner:
                                       (self.rerank_model, res.rerank_ctx,
                                        "rerank")):
                 if model is None:
+                    continue
+                if model.on_cpu:
+                    # A CPU resident charges host RAM, not VRAM (decision 5).
+                    mb = self._host_resident_mb(model, ctx)
+                    # The co-residency role is the matrix slot, not the
+                    # frontmatter role: the resident selection picks one
+                    # winner per slot.
+                    self.host_ledger.add_resident(
+                        f"{label}:{model.stem}", label, mb)
+                    logger.info("host ledger: %s resident %s (%d MiB of "
+                                "%s pool, ctx %d)", label, model.stem, mb,
+                                self.host_ledger.pool_mb, ctx)
                     continue
                 mb = self._resident_overhead(model, ctx)
                 pool = ledger.pool_id_for(model)
@@ -2158,6 +2216,32 @@ class Planner:
                 kv_factor * ctx * parallel + slot_mib * parallel)
         except Exception as e:  # keep planning alive; matrix already solved
             logger.warning("ledger: cannot size resident %s (%s)",
+                           model.stem, e)
+            return 0
+
+    def _host_resident_mb(self, model, ctx: int) -> int:
+        """Host-RAM (MiB) of a CPU-resident resident at its served ctx.
+
+        Same measured-quad family as the device path (requirement 11),
+        single-slot (residents never take declared parallel), 0 on shader
+        — a resident that cannot be measured is a rider charged nothing
+        (the matrix solve's no-expansion rule).
+        """
+        if getattr(self.host_ledger, "pool_mb", None) is None \
+                or self.host_ledger.pool_mb <= 0:
+            return 0
+        try:
+            quad = _static_params(
+                model, self.fit_bin, self.profiles.default_cache_type,
+                measurement_args(self.profiles, model, self.llama_args))
+            if quad is None:
+                quad = self.synthetic_quads.get(model.stem)
+            if quad is None:
+                return 0
+            mib, kv_factor, slot_mib, compute = quad
+            return mib + compute + int(kv_factor * ctx + slot_mib)
+        except Exception as e:  # keep planning alive; matrix already solved
+            logger.warning("host ledger: cannot size resident %s (%s)",
                            model.stem, e)
             return 0
 
@@ -2463,6 +2547,20 @@ class Planner:
                             include_mmproj=not shed_vision,
                             ctx_size=serve_ctx, parallel=serve_par,
                             profile=group[0][1])
+                    host_free = self.host_ledger.available() \
+                        if serve_view.on_cpu else None
+                    if (host_free is not None and mem[1] is not None
+                            and mem[1] > host_free):
+                        # Go/no-go on the host pool: the CPU-resident quad
+                        # does not fit after committed residents. No id may
+                        # claim it and there is no solve-down (requirement 12) —
+                        # the operator picks a smaller sidecar or a bigger box.
+                        logger.info(
+                            "%s: %s over_budget_reason: host pool — %d MiB "
+                            "needed, %d MiB free after residents; entry "
+                            "omitted", serve_view.stem,
+                            demand.name or "fallback", int(mem[1]), host_free)
+                        continue
                     variants.append(Variant(
                         parallel=(0 if uncapped else serve_par),
                         cache_type=cache_type, spare_mb=spare_mb,
@@ -3102,6 +3200,7 @@ def build_config(
     min_context: int = _MIN_AGENTIC_CTX,
     min_context_explicit: bool = False,
     memory_margin: float = _MEMORY_MARGIN,
+    host_pool_mb: int | None = None,
     progress_cb=None,
 ) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
@@ -3150,6 +3249,7 @@ def build_config(
         min_context=min_context, min_context_explicit=min_context_explicit,
         memory_margin=memory_margin,
         llama_args=template_vars.get("llama_args", ""),
+        host_pool_mb=host_pool_mb,
         progress_cb=progress_cb,
     )
     plan = planner.plan()

@@ -1597,3 +1597,83 @@ def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
     demands = Planner([m], _mp_profiles(), fit_bin="unused",
                       vram_total=64 * 1024).demands_for(m)
     assert demands and all("vision" not in d.keep for d in demands)
+
+
+# ── host budget (`device: cpu`) ───────────────────────────────────────────
+
+
+def test_cpu_resident_charges_host_not_vram(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #74 -- a CPU resident charges
+    # the host ledger (VRAM charge stays 0), and two committed quads for one
+    # role are a planner bug.
+    from llama_packer import writer
+    from llama_packer.writer import HostLedger
+
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings", device="cpu", context_length=32768)
+    _fake_vram(chat, (1000, 0.5, 100))
+    _fake_vram(embed, (466, 0.057, 346))
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = Planner([chat, embed], profiles, fit_bin="unused",
+                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
+                      embed_model=embed, rerank_model=embed,
+                      host_pool_mb=4096)
+    planner.plan()
+    # Charge is the measured CPU quad at the resolved resident context.
+    # Both slots embed+rerank are filled by the same model: two server
+    # processes, two host charges ("one per role", not one per model).
+    ctx = planner.matrix_result.embed_ctx
+    per_slot = 466 + 346 + int(0.057 * ctx)   # residents serve single-slot
+    assert planner.host_ledger.resident_mb() == 2 * per_slot
+    assert planner.host_ledger.available() == 4096 - 2 * per_slot
+    # The VRAM ledger carries nothing for it (decision 5: no double count).
+    assert planner.ledger.extra_reserve_mb("default") == 0
+
+    # One co-resident per role: committing two quads for one role is a
+    # planner bug, not a pool the packer would overrun.
+    ledger = HostLedger(4096)
+    ledger.add_resident("embed:e", "embeddings", 100)
+    with pytest.raises(AssertionError):
+        ledger.add_resident("embed:e2", "embeddings", 100)
+
+
+def test_cpu_variant_refused_on_small_pool(profiles, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #12 -- a CPU entry whose
+    # quad exceeds the host pool emits no id and logs the shortfall.
+    import logging
+    m = make("cpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=1000)
+    with caplog.at_level(logging.INFO):
+        plan = planner.plan()
+    assert "cpu" not in plan
+    assert any("host pool" in r.message for r in caplog.records)
+
+
+def test_cpu_parallel_charge_flips_refusal(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #15 -- declared parallel
+    # multiplies D and the KV pool and can flip the refusal.
+    m = make("cpu", role="chat", device="cpu", parallel=2)
+    _fake_vram(m, (466, 0.057, 346))
+    # parallel 2 charges two KV pools and two D terms: p=2 charge ≈ 4572 MiB
+    refused = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=1800).plan()
+    assert "cpu" not in refused
+    emitted = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=8192).plan()
+    assert [v.parallel for v in emitted["cpu"]] == [2]
+
+
+def test_no_host_pool_never_gates(profiles, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #16 -- without a detected
+    # pool the planner never refuses on host grounds.
+    import logging
+    m = make("cpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=None)
+    with caplog.at_level(logging.INFO):
+        plan = planner.plan()
+    assert "cpu" in plan
