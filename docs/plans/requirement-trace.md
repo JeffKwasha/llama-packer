@@ -153,3 +153,4 @@ and every one of them carries a `Validates:` citation.
 | 74 | A `device: cpu` resident is charged to the host ledger; its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram` |
 | 75 | Host charge is the serving quad at the served context — declared parallel multiplies D and the KV pool and can flip the refusal | `test_cpu_variant_refused_on_small_pool`, `test_cpu_parallel_charge_flips_refusal` |
 | 76 | No pool knowledge, no gate — a planner without a host pool never refuses on host grounds | `test_no_host_pool_never_gates` |
+| 77 | Every entry carries `metadata.packing`; `device: cpu` entries name device/ctx/parallel/ram and carry no `vram_mib` | `test_metadata_packing_cpu_entry`, `test_metadata_packing_gpu_entry` |

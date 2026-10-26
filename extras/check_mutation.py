@@ -131,6 +131,10 @@ MUTATIONS = {
         "llama_packer/writer.py",
         "self.host_ledger = HostLedger(host_pool_mb)",
         "self.host_ledger = HostLedger(host_pool_mb or 0)"),
+    "test_metadata_packing_cpu_entry": (
+        "llama_packer/writer.py",
+        'packing: dict = {"device": "cpu" if model.on_cpu else "gpu"}',
+        "packing: dict = {}"),
 }
 
 

@@ -1677,3 +1677,43 @@ def test_no_host_pool_never_gates(profiles, caplog):
     with caplog.at_level(logging.INFO):
         plan = planner.plan()
     assert "cpu" in plan
+
+
+# ── metadata.packing ──────────────────────────────────────────────────────
+
+
+def test_metadata_packing_cpu_entry(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #77 -- CPU entries name device/ctx/parallel/ram and carry no vram_mib.
+    m = make("cpk", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024,
+                       host_pool_mb=8192).plan()["cpk"]
+    v = variants[0]
+    assert v.mem_vram_mib is None and v.mem_ram_mib > 0
+    config = emit_config([m], {"cpk": variants}, profiles, TVARS)
+    p = only_entry(config)["metadata"]["packing"]
+    assert p["device"] == "cpu"
+    assert p["ctx_size"] == v.ctx_size == 32768
+    assert p["parallel"] == v.parallel
+    assert p["ram_mib"] == int(round(v.mem_ram_mib))
+    assert p["kv_per_token"] == 59769      # 0.057 MiB expressed in bytes
+    assert "vram_mib" not in p
+
+
+def test_metadata_packing_gpu_entry(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #77 -- every entry carries packing; gpu entries carry vram_mib when decided.
+    m = make("gpk", role="chat")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024).plan()["gpk"]
+    v = variants[0]
+    assert v.mem_vram_mib is not None
+    config = emit_config([m], {"gpk": variants}, profiles, TVARS)
+    p = only_entry(config)["metadata"]["packing"]
+    assert p["device"] == "gpu"
+    assert p["vram_mib"] == int(round(v.mem_vram_mib))
+    assert p["ram_mib"] == int(round(v.mem_ram_mib))
+    assert p["ctx_size"] == v.ctx_size
+    assert p["parallel"] == v.parallel
+    assert p["kv_per_token"] == 59769

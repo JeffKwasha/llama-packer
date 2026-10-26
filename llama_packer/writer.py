@@ -311,6 +311,7 @@ def _build_entry(
     ubatch: int | None = None,
     mem_vram_mib: float | None = None,
     mem_ram_mib: float | None = None,
+    kv_per_token_mib: float | None = None,
     vram_note: str | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
@@ -538,6 +539,22 @@ def _build_entry(
         metadata["max_output_tokens"] = min(ceiling or ctx_size, ctx_size)
     if context_length != ctx_size:
         metadata["context_max"] = context_length
+    # Client-visible packing facts (docs/plans/cpu-residency-budget.md
+    # §metadata.packing): only what was decided at pack time. memory.packing
+    # dicts go inside metadata so clients can filter by placement.
+    packing: dict = {"device": "cpu" if model.on_cpu else "gpu"}
+    if model.on_cpu:
+        if mem_ram_mib is not None:
+            packing["ram_mib"] = int(round(mem_ram_mib))
+    elif mem_vram_mib is not None:
+        packing["vram_mib"] = int(round(mem_vram_mib))
+        if mem_ram_mib is not None:
+            packing["ram_mib"] = int(round(mem_ram_mib))
+    packing["ctx_size"] = ctx_size
+    packing["parallel"] = parallel
+    if kv_per_token_mib is not None:
+        packing["kv_per_token"] = int(round(kv_per_token_mib * 1024 * 1024))
+    metadata["packing"] = packing
     # The blessed usage categories this serving actually satisfies — the same
     # set the id's category segment names.  Client-facing so a metadata-aware
     # client can filter without parsing the id.
@@ -1485,6 +1502,9 @@ class Variant:
     #: (no estimate) — then no tag is emitted.
     mem_vram_mib: float | None = None
     mem_ram_mib: float | None = None
+    #: The affine per-token KV constant (MiB/token) of this serving, or
+    #: None for fixed-overhead backends — metadata.packing.kv_per_token.
+    kv_per_token_mib: float | None = None
     #: Non-None when the VRAM budget could not afford the design context
     #: (``--spare``/``--baseline`` active): appended to the description so
     #: the entry visibly carries its over-budget status.
@@ -2254,17 +2274,19 @@ class Planner:
         ctx_size: int,
         parallel: int,
         profile: dict | None,
-    ) -> tuple[float | None, float | None]:
+    ) -> tuple[float | None, float | None, float | None]:
         """Decided TOTAL memory (MiB) attributable to one serving variant.
 
-        ``(vram_mib, ram_mib)`` evaluated from the combined affine quad at
-        the variant's served ``(ctx_size, parallel)`` — weights + folded
-        companions + context — exactly what the emitted description tag
-        reports verbatim (no capping, no re-solving).  CPU-resident
-        servings return ``(None, ram_mib)`` (host-RAM constants via
-        ``allow_cpu`` — never used for VRAM sizing).  ``(None, None)``
-        when undecidable (no estimate source worked).  ``parallel <= 0``
-        (uncapped vLLM) is priced single-seq, matching its ctx solve.
+        ``(vram_mib, ram_mib, kv_per_token_mib)`` evaluated from the combined
+        affine quad at the variant's served ``(ctx_size, parallel)`` —
+        weights + folded companions + context — exactly what the emitted
+        description tag reports verbatim (no capping, no re-solving).
+        ``kv_per_token_mib`` is the affine ``c`` — None for fixed-overhead
+        backends.  CPU-resident servings return ``(None, ram_mib, …)``
+        (host-RAM constants via ``allow_cpu`` — never used for VRAM sizing).
+        ``(None, None, None)`` when undecidable (no estimate source worked).
+        ``parallel <= 0`` (uncapped vLLM) is priced single-seq, matching its
+        ctx solve.
         """
         quad = view.vram.effective_static(
             self.fit_bin, cache_type=cache_type,
@@ -2274,20 +2296,21 @@ class Planner:
             allow_cpu=True,
         )
         if quad is None:
-            return (None, None)
+            return (None, None, None)
         model_mib, kv_factor, slot_mib, compute_mib = quad
         p = parallel if parallel > 0 else 1
         total = (model_mib + compute_mib
                  + kv_factor * ctx_size * p + slot_mib * p)
         if view.on_cpu:
-            return (None, float(total))
+            return (None, float(total), float(kv_factor))
         files_mb = view.size_mb
         if include_mmproj and view.mmproj is not None \
                 and view.mmproj.gguf_path is not None:
             files_mb += view.mmproj.size_mb
         if view.mtp is not None and view.mtp.gguf_path is not None:
             files_mb += view.mtp.size_mb
-        return (float(total), max(0.0, float(files_mb - model_mib)))
+        return (float(total), max(0.0, float(files_mb - model_mib)),
+                float(kv_factor))
 
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
@@ -2540,7 +2563,7 @@ class Planner:
                     demoted = self._tools_demoted(serve_view, serve_ctx)
                     usage = () if demand is FALLBACK else (demand,)
                     if est_error is not None:
-                        mem = (None, None)
+                        mem = (None, None, None)
                     else:
                         mem = self._variant_memory(
                             serve_view, cache_type=cache_type,
@@ -2572,6 +2595,7 @@ class Planner:
                         category=demand,
                         estimate_error=est_error,
                         mem_vram_mib=mem[0], mem_ram_mib=mem[1],
+                        kv_per_token_mib=mem[2],
                         vram_note=(vram_note if serve_ctx < context_length
                                    else None)))
             if variants:
@@ -3053,6 +3077,7 @@ def emit_config(models: list[Model], plan: dict,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
+                kv_per_token_mib=v.kv_per_token_mib,
                 vram_note=v.vram_note,
             )
             if entry_id in entries:
