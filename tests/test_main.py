@@ -463,8 +463,9 @@ def test_select_model_prefers_cpu_candidate():
 
 
 def test_select_model_smallest_among_cpu_candidates():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- among CPU
-    # candidates the smallest footprint still wins.
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no measured
+    # cost available, the smallest footprint is the fallback among CPU
+    # candidates.
     cpu_big = _role_model("qwen3-embed", 640, device="cpu")
     cpu_small = _role_model("jina", 472, device="cpu")
     assert _select_model([cpu_big, cpu_small], "embeddings", None,
@@ -551,3 +552,81 @@ def test_cpu_helpers_pinned_into_every_set():
     assert leaves(out["rag"]) == ["emb", "rnk"]
     assert out["rag"].endswith("& qwen3-embedding-0.6b")
     assert out["talk"].endswith("& emb & rnk & qwen3-embedding-0.6b")
+
+
+def test_select_model_picks_measured_cheapest_over_file_size():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the resident is the
+    # cheapest *measured serving at its ctx*, not the smallest file: a big
+    # file with cheap KV beats a small file with expensive KV.
+    cheap = _role_model("cheap-big", 900, device="cpu")
+    small = _role_model("small-costly", 300, device="cpu")
+    costs = {cheap.stem: 800, small.stem: 1100}
+    # Cheapest last, so "first priced candidate" is not accidentally right.
+    picked = _select_model([small, cheap], "embeddings", None, None,
+                           cost=lambda m: costs[m.stem])
+    assert picked is cheap
+
+
+def test_select_model_falls_back_to_size_when_unmeasurable():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no measurable
+    # candidate the size rule is the fallback, never an invented cost.
+    a = _role_model("a", 900, device="cpu")
+    b = _role_model("b", 300, device="cpu")
+    assert _select_model([a, b], "embeddings", None, None,
+                         cost=lambda m: None) is b
+
+
+def test_select_model_cpu_preference_beats_cheaper_device():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the CPU candidate
+    # wins the role before cost is compared (placement is the operator's).
+    gpu = _role_model("gpu-cheap", 100)
+    cpu = _role_model("cpu-costly", 900, device="cpu")
+    costs = {gpu.stem: 400, cpu.stem: 2000}
+    assert _select_model([gpu, cpu], "embeddings", None, None,
+                         cost=lambda m: costs[m.stem]) is cpu
+
+
+def test_select_model_selector_prices_only_the_pick():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- a selector names the
+    # resident and prices it; it never re-ranks the other candidates.
+    a = _role_model("jina", 472, device="cpu")
+    b = _role_model("voyage", 355, device="cpu")
+    import logging
+    seen = []
+    picked = _select_model([a, b], "embeddings", "jina",
+                           logging.getLogger("t"),
+                           cost=lambda m: seen.append(m.stem) or 1050)
+    assert picked is a
+    assert seen == ["jina"]
+
+
+def test_selection_reason_measured_and_selector_arms():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the log names the
+    # arm that won: measured cost, selector, or the size fallback.
+    m = _role_model("jina", 472, device="cpu")
+    assert _selection_reason(m, 1050) == "cheapest measured resident, 1050 MiB"
+    assert _selection_reason(m, 1050, by_selector=True) == \
+        "selector, 1050 MiB resident"
+    assert _selection_reason(m) == "device: cpu — explicit placement"
+
+
+def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the category
+    # selector is the RAG pair too: one answer per role, never a solve on one
+    # model while the `emb` var points at another.
+    import logging
+    from llama_packer import __main__ as m
+
+    voyage = make_model("voyage", role="embeddings")
+    jina = make_model("jina", role="embeddings", device="cpu")
+    rnk = make_model("rnk", role="rerank")
+    monkeypatch.setattr(m, "resident_cost_mb", lambda model, **kw: 900)
+    args = SimpleNamespace(embed=None, rerank=None)
+    # The selector pins the *device* model: the pair pick alone would take
+    # the CPU candidate, so only the pair adoption can make this pass.
+    cfg = {"matrix": {"categories": {
+        "emb": {"role": "embeddings", "selector": "voyage"}}}}
+    _, emb, _, cats, fixed = m._detect_matrix(
+        cfg, [voyage, jina, rnk], args, logging.getLogger("t"))
+    assert emb is voyage and cats["emb"] is voyage
+    assert all(name != "emb" for name, _ in fixed)

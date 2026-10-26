@@ -2212,6 +2212,20 @@ class Planner:
                             label, model.stem, footprint_bucket(model), pool,
                             " — no reserve (unestimated)"
                             if model.stem in self.synthetic_quads else "")
+            # Declared fixed categories (stt/tts/rnk2/…) are residents too:
+            # a CPU one charges the host pool, one per category, at the
+            # same served context the planner prices them at.  Without
+            # this, a role-wide device_roles switch moves a 3 GiB rerank
+            # variant off VRAM and nothing accounts for it in RAM.
+            for name, model in (self.fixed_categories or []):
+                if model is None or not model.on_cpu:
+                    continue
+                ctx = self._rag_ctx(model)
+                mb = self._host_resident_mb(model, ctx)
+                self.host_ledger.add_resident(f"{name}:{model.stem}", name, mb)
+                logger.info("host ledger: %s resident %s (%d MiB of %s pool, "
+                            "ctx %d)", name, model.stem, mb,
+                            self.host_ledger.pool_mb, ctx)
             by_stem = {m.stem: m for m in self.models}
             for stem, mb in res.coloads:
                 m = by_stem.get(stem)
@@ -2228,19 +2242,20 @@ class Planner:
         if model is None or model.on_cpu:
             return 0
         try:
-            quad = _static_params(
-                model, self.fit_bin, self.profiles.default_cache_type,
-                measurement_args(self.profiles, model, self.llama_args))
-            if quad is None:
+            parallel = model.parallel_for(self.profiles.default_parallel)
+            mb = resident_cost_mb(
+                model, fit_bin=self.fit_bin,
+                cache_type=self.profiles.default_cache_type,
+                profiles=self.profiles, llama_args=self.llama_args,
+                ctx=ctx, parallel=parallel, allow_cpu=True)
+            if mb is None:
                 # Unestimable resident: charged 0 — the no-expansion rider
                 # policy (see _solve_matrix_context).
                 quad = self.synthetic_quads.get(model.stem)
-            if quad is None:
-                return 0
-            mib, kv_factor, slot_mib, compute = quad
-            parallel = model.parallel_for(self.profiles.default_parallel)
-            return mib + compute + int(
-                kv_factor * ctx * parallel + slot_mib * parallel)
+                if quad is None:
+                    return 0
+                mb = _quad_cost_mb(quad, ctx, parallel)
+            return mb
         except Exception as e:  # keep planning alive; matrix already solved
             logger.warning("ledger: cannot size resident %s (%s)",
                            model.stem, e)
@@ -2249,25 +2264,26 @@ class Planner:
     def _host_resident_mb(self, model, ctx: int) -> int:
         """Host-RAM (MiB) of a CPU-resident resident at its served ctx.
 
-        Same measured-quad family as the device path (requirement 11),
-        single-slot (residents never take declared parallel), 0 on shader
-        — a resident that cannot be measured is a rider charged nothing
-        (the matrix solve's no-expansion rule).
+        The same estimator the VRAM charge uses (requirement 11), single-
+        slot (residents never take declared parallel), 0 on shader — a
+        resident that cannot be measured is a rider charged nothing (the
+        matrix solve's no-expansion rule).
         """
         if getattr(self.host_ledger, "pool_mb", None) is None \
                 or self.host_ledger.pool_mb <= 0:
             return 0
         try:
-            quad = _static_params(
-                model, self.fit_bin, self.profiles.default_cache_type,
-                measurement_args(self.profiles, model, self.llama_args),
-                allow_cpu=True)
-            if quad is None:
+            mb = resident_cost_mb(
+                model, fit_bin=self.fit_bin,
+                cache_type=self.profiles.default_cache_type,
+                profiles=self.profiles, llama_args=self.llama_args,
+                ctx=ctx, allow_cpu=True)
+            if mb is None:
                 quad = self.synthetic_quads.get(model.stem)
-            if quad is None:
-                return 0
-            mib, kv_factor, slot_mib, compute = quad
-            return mib + compute + int(kv_factor * ctx + slot_mib)
+                if quad is None:
+                    return 0
+                mb = _quad_cost_mb(quad, ctx)
+            return mb
         except Exception as e:  # keep planning alive; matrix already solved
             logger.warning("host ledger: cannot size resident %s (%s)",
                            model.stem, e)
@@ -2630,6 +2646,33 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
     if fp is None:
         return None
     return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)
+
+
+def _quad_cost_mb(quad: tuple[int, float, float, int], ctx: int,
+                  parallel: int = 1) -> int:
+    """Affine serving cost (MiB) of one measured quad at (ctx, parallel)."""
+    mib, kv_factor, slot_mib, compute = quad
+    return int(mib + compute + kv_factor * ctx * parallel
+               + slot_mib * parallel)
+
+
+def resident_cost_mb(model: Model, *, fit_bin: str, cache_type: str,
+                     profiles, llama_args: str, ctx: int,
+                     parallel: int = 1, allow_cpu: bool = False) -> int | None:
+    """Measured serving cost (MiB) of one resident at its served context.
+
+    The one estimator behind resident *selection*, the VRAM resident
+    charge and the host resident charge: the same affine quad family
+    (shape-stamped, so a `device: cpu` model measures under `-ngl 0`),
+    priced at the same context.  None when nothing can size it — callers
+    treat that as "not a candidate for a cost comparison", never as 0.
+    """
+    quad = _static_params(model, fit_bin, cache_type,
+                          measurement_args(profiles, model, llama_args),
+                          allow_cpu=allow_cpu)
+    if quad is None:
+        return None
+    return _quad_cost_mb(quad, ctx, parallel)
 
 
 def _sets_reference_coloads(sets_cfg: dict | None) -> bool:

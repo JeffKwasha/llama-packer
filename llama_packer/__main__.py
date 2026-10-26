@@ -34,7 +34,8 @@ from llama_packer.consts import (
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
 from llama_packer.writer import (
-    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name)
+    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name,
+    MatrixKnobs, resident_cost_mb)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -251,14 +252,17 @@ def _apply_env_subst(config: EmittedConfig, sub, raw_paths: list[str]) -> Emitte
     return config
 
 
-def _select_model(models: list, type_name: str, selector: str | None, logger) -> "Model | None":
+def _select_model(models: list, type_name: str, selector: str | None, logger,
+                  *, cost=None) -> "Model | None":
     """Pick a model of `type_name` (role).
 
     With no selector, a `device: cpu` candidate wins — the tag is the
     operator's explicit "this one stays warm in host RAM" choice, and it
-    must not lose to the size-only default (smallest footprint). Among CPU
-    candidates the smallest footprint still wins. A selector substring
-    overrides the preference: returns the single model whose id/name/stem
+    must not lose to the size default. Among the eligible candidates the
+    pick is the **cheapest measured serving at the role's ctx** (`cost`),
+    because that is the number the resident costs the chat budget; file
+    size is only the fallback when nothing can be measured. A selector
+    substring overrides both: returns the single model whose id/name/stem
     contains it; errors if the match is not exactly one.
     """
     cands = [m for m in models if m.role == type_name]
@@ -275,13 +279,41 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
             fatal("selector %r matched %d %s models (need exactly 1): %s",
                   selector, len(hits), type_name,
                   [h.stem for h in hits])
+        # Price the quality choice: the operator should see what the
+        # pinned model costs the budget.
+        if cost is not None and logger is not None:
+            mb = cost(hits[0])
+            if mb is not None:
+                logger.info("%s: selector %r → %s (%d MiB resident)",
+                            type_name, selector, hits[0].stem, mb)
         return hits[0]
     cpu = [m for m in cands if getattr(m, "on_cpu", False)]
-    return min(cpu or cands, key=lambda m: m.vram_mb)
+    pool = cpu or cands
+    if cost is not None:
+        priced = []
+        for m in pool:
+            mb = cost(m)
+            if mb is not None:
+                priced.append((m, mb))
+        if priced:
+            if logger is not None:
+                logger.info(
+                    "%s: cheapest resident wins — %s",
+                    type_name,
+                    ", ".join(f"{m.stem}={mb} MiB"
+                              for m, mb in sorted(priced, key=lambda t: t[1])))
+            return min(priced, key=lambda t: t[1])[0]
+    return min(pool, key=lambda m: m.vram_mb)
 
 
-def _selection_reason(model) -> str:
+def _selection_reason(model, measured_mb: int | None = None,
+                      by_selector: bool = False) -> str:
     """Why the resident pick went to *model* — logged beside its name."""
+    if by_selector:
+        return ("selector" if measured_mb is None
+                else f"selector, {measured_mb} MiB resident")
+    if measured_mb is not None:
+        return f"cheapest measured resident, {measured_mb} MiB"
     if getattr(model, "on_cpu", False):
         return "device: cpu — explicit placement"
     return f"smallest footprint {model.vram_mb} MiB"
@@ -327,7 +359,8 @@ def apply_device_roles(models: list, roles_cfg, logger) -> None:
                     f", {placed} newly placed" if placed else ", all already")
 
 
-def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
+def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
+                   *, fit_bin: str = "", llama_args: str = "") -> tuple:
     """Resolve the swap-matrix configuration before build_config.
 
     Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
@@ -343,6 +376,33 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     missing co-loading setup looks exactly like a bug (it has, repeatedly).
     """
     matrix_cfg = profiles_cfg.get("matrix")
+    prof_cfg = Profiles(profiles_cfg)
+    knobs = MatrixKnobs.from_cfg(matrix_cfg)
+    measured: dict[str, int | None] = {}
+
+    def resident_cost(role: str):
+        """Cost callable: measured MiB at this role's served ctx.
+
+        The same estimator the planner charges residents with
+        (``resident_cost_mb``), so selection and budget cannot disagree.
+        """
+        def cost(m):
+            try:
+                design = m.design_context
+                cap = (knobs.rag_cap(role) if role in ("embeddings", "rerank")
+                       else design)
+                ctx = min(design, cap)
+                mb = resident_cost_mb(
+                    m, fit_bin=fit_bin,
+                    cache_type=prof_cfg.default_cache_type, profiles=prof_cfg,
+                    llama_args=llama_args, ctx=ctx, allow_cpu=True)
+            except Exception as e:
+                logger.warning("matrix: cannot size %s (%s)", m.stem, e)
+                mb = None
+            measured[m.stem] = mb
+            return mb
+        return cost
+
     if not matrix_cfg:
         emb = _select_model(models, "embeddings", args.embed, logger)
         rnk = _select_model(models, "rerank", args.rerank, logger)
@@ -352,8 +412,10 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
                 "RAG co-loading off (emb: %s, rnk: %s)",
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
         return None, None, None, {}, ()
-    embed_model = _select_model(models, "embeddings", args.embed, logger)
-    rerank_model = _select_model(models, "rerank", args.rerank, logger)
+    embed_model = _select_model(models, "embeddings", args.embed, logger,
+                                cost=resident_cost("embeddings"))
+    rerank_model = _select_model(models, "rerank", args.rerank, logger,
+                                 cost=resident_cost("rerank"))
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
         return None, None, None, {}, ()
@@ -373,7 +435,8 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
         if not role:
             logger.warning("matrix: category %r has no role; omitted", name)
             continue
-        model = _select_model(models, role, selector, logger)
+        model = _select_model(models, role, selector, logger,
+                              cost=resident_cost(role))
         if model is None:
             logger.warning("matrix: category %r: no %s model%s; omitted",
                            name, role,
@@ -383,6 +446,23 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     # Back-compat: the canonical RAG names always resolve.
     categories.setdefault("emb", embed_model)
     categories.setdefault("rnk", rerank_model)
+    # One answer per role: a category selector (the more specific
+    # declaration) defines the RAG pair too, instead of leaving the solve
+    # on a different model than the `emb`/`rnk` vars point at.
+    emb_by_selector = bool(args.embed)
+    rnk_by_selector = bool(args.rerank)
+    if categories.get("emb") is not embed_model:
+        logger.info("matrix embed: category selector overrides the pair "
+                    "pick (%s instead of %s)",
+                    categories["emb"].stem, embed_model.stem)
+        embed_model = categories["emb"]
+        emb_by_selector = True
+    if categories.get("rnk") is not rerank_model:
+        logger.info("matrix rerank: category selector overrides the pair "
+                    "pick (%s instead of %s)",
+                    categories["rnk"].stem, rerank_model.stem)
+        rerank_model = categories["rnk"]
+        rnk_by_selector = True
 
     known = set(categories)
     for key in (matrix_cfg.get("evict_costs") or {}):
@@ -394,9 +474,11 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     fixed = [(n, m) for n, m in categories.items()
              if m is not embed_model and m is not rerank_model]
     logger.info("matrix embed: %s (%s)", embed_model.stem,
-                _selection_reason(embed_model))
+                _selection_reason(embed_model, measured.get(embed_model.stem),
+                                  by_selector=emb_by_selector))
     logger.info("matrix rerank: %s (%s)", rerank_model.stem,
-                _selection_reason(rerank_model))
+                _selection_reason(rerank_model, measured.get(rerank_model.stem),
+                                  by_selector=rnk_by_selector))
     if fixed:
         logger.info("matrix categories: %s",
                     ", ".join(f"{n}={m.stem}" for n, m in fixed))
@@ -957,7 +1039,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # Detect matrix configuration before build_config
     (matrix_cfg, embed_model, rerank_model, matrix_categories,
-     matrix_fixed) = _detect_matrix(profiles_cfg, models, args, logger)
+     matrix_fixed) = _detect_matrix(
+        profiles_cfg, models, args, logger,
+        fit_bin=llama_bin, llama_args=template_vars["llama_args"])
 
     # ── Degenerate-budget refusal ──
     # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):

@@ -137,26 +137,24 @@ MUTATIONS = {
         "packing: dict = {}"),
     "test_host_resident_sizing_lifts_cpu_gate": (
         "llama_packer/writer.py",
-        ("                measurement_args(self.profiles, model, self.llama_args),\n"
-         "                allow_cpu=True)"),
-        ("                measurement_args(self.profiles, model, self.llama_args),\n"
-         "                allow_cpu=False)")),
+        "                          allow_cpu=allow_cpu)",
+        "                          allow_cpu=False)"),
     "test_select_model_prefers_cpu_candidate": (
         "llama_packer/__main__.py",
         'cpu = [m for m in cands if getattr(m, "on_cpu", False)]',
         "cpu = []"),
     "test_select_model_smallest_among_cpu_candidates": (
         "llama_packer/__main__.py",
-        "return min(cpu or cands, key=lambda m: m.vram_mb)",
-        "return min(cpu or cands, key=lambda m: -m.vram_mb)"),
+        "    return min(pool, key=lambda m: m.vram_mb)",
+        "    return min(pool, key=lambda m: -m.vram_mb)"),
     "test_select_model_no_cpu_keeps_size_rule": (
         "llama_packer/__main__.py",
-        "return min(cpu or cands, key=lambda m: m.vram_mb)",
-        "return (cpu or cands)[0]"),
+        "    return min(pool, key=lambda m: m.vram_mb)",
+        "    return pool[0]"),
     "test_select_model_selector_overrides_cpu_preference": (
         "llama_packer/__main__.py",
         "        return hits[0]",
-        "        return min(cpu or cands, key=lambda m: m.vram_mb)"),
+        "        return min(pool, key=lambda m: m.vram_mb)"),
     "test_selection_reason_names_the_arm": (
         "llama_packer/__main__.py",
         '        return "device: cpu — explicit placement"',
@@ -185,6 +183,34 @@ MUTATIONS = {
         "llama_packer/writer.py",
         "    if model.on_cpu:\n        entry[\"ttl\"] = 0",
         '    if model.on_cpu: \n        entry["ttl"] = 0\n    entry["ttl"] = 0'),
+    "test_select_model_picks_measured_cheapest_over_file_size": (
+        "llama_packer/__main__.py",
+        "            return min(priced, key=lambda t: t[1])[0]",
+        "            return priced[0][0]"),
+    "test_select_model_falls_back_to_size_when_unmeasurable": (
+        "llama_packer/__main__.py",
+        "    return min(pool, key=lambda m: m.vram_mb)",
+        "    return pool[0]"),
+    "test_select_model_cpu_preference_beats_cheaper_device": (
+        "llama_packer/__main__.py",
+        "    pool = cpu or cands",
+        "    pool = cands"),
+    "test_select_model_selector_prices_only_the_pick": (
+        "llama_packer/__main__.py",
+        "        if cost is not None and logger is not None:",
+        "        if False:"),
+    "test_detect_matrix_category_selector_defines_the_pair": (
+        "llama_packer/__main__.py",
+        '        embed_model = categories["emb"]',
+        "        embed_model = embed_model"),
+    "test_cpu_fixed_category_resident_charged_host": (
+        "llama_packer/writer.py",
+        "                if model is None or not model.on_cpu:\n"
+        "                    continue\n"
+        "                ctx = self._rag_ctx(model)",
+        "                if True:\n"
+        "                    continue\n"
+        "                ctx = self._rag_ctx(model)"),
 }
 
 

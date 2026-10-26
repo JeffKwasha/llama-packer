@@ -1763,3 +1763,28 @@ def test_gpu_entry_has_no_ttl(profiles):
                        vram_total=64 * 1024).plan()["ttlgpu"]
     entry = only_entry(emit_config([m], {"ttlgpu": variants}, profiles, TVARS))
     assert "ttl" not in entry
+
+
+def test_cpu_fixed_category_resident_charged_host(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #74 -- a declared fixed
+    # category (rnk2/stt/…) on device: cpu is a resident too and charges the
+    # host pool, one per category.
+    from llama_packer import writer
+
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings", device="cpu", context_length=32768)
+    rnk = make("r", role="rerank", device="cpu", context_length=32768)
+    extra = make("z", role="rerank", device="cpu", context_length=32768)
+    _fake_vram(chat, (1000, 0.5, 100))
+    for m in (embed, rnk, extra):
+        _fake_vram(m, (100, 0.01, 50))
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = Planner([chat, embed, rnk, extra], profiles, fit_bin="unused",
+                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
+                      embed_model=embed, rerank_model=rnk,
+                      fixed_categories=[("rnk2", extra)],
+                      host_pool_mb=10000)
+    planner.plan()
+    roles = [role for _, role, _ in planner.host_ledger.residents]
+    assert sorted(roles) == ["embed", "rerank", "rnk2"]

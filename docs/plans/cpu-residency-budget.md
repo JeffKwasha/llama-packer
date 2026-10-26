@@ -61,12 +61,16 @@ path).
     include a `device: cpu` model takes that model as the resident winner
     (one per role, decision 2) — the tag is the operator's explicit
     "this is the one that stays warm in host RAM" choice, and it must not
-    lose to the size-only default (smallest file). Among CPU candidates
-    the smallest footprint wins; with no CPU candidate the existing rule
-    is unchanged. An explicit selector (`matrix:` `selector:` / CLI
-    `--embed`/`--rerank`) still overrides both. Duplicate *servings* of a
-    role stay operator catalog/set policy — the resident tier holds one,
-    and the host ledger asserts it (requirement 14).
+    lose to a cheaper device model. Among the eligible candidates the
+    winner is the **cheapest measured serving at the role's ctx**
+    (`resident_cost_mb` — the same estimator the budget charges with);
+    file size is only the fallback when nothing can be sized. A selector
+    (`matrix:` `selector:` / CLI `--embed`/`--rerank`) expresses the one
+    thing no measurement can know — value — overrides the cost pick, and
+    is priced in the log so its cost against the cheapest is visible.
+    Duplicate *servings* of a role stay operator catalog/set policy — the
+    resident tier holds one, and the host ledger asserts it
+    (requirement 14).
 11. **Role-wide placement is declared, not inferred.** `profiles.yaml`
     `device_roles:` may name serving roles (`embeddings`, `rerank`,
     `s2t`, `t2s`) whose every model is CPU-placed exactly as if each
@@ -228,12 +232,16 @@ fallback is a bug.
 16. *no pool knowledge, no gate*: with detection unavailable (no
     profiles override, unreadable /proc), the ledger logs that fact once
     and does not gate — it never invents a budget it cannot read.
-17. *CPU wins the role*: for a resident role (embeddings, rerank, and the
-    declared fixed categories), a `device: cpu` candidate is selected
-    over device candidates regardless of footprint (decision 10); among
-    CPU candidates the smallest footprint still wins, and no CPU
-    candidate leaves the selection exactly as it was. A selector
-    (`selector:`/`--embed`/`--rerank`) overrides the preference.
+17. *CPU wins the role, cost picks inside it*: for a resident role
+    (embeddings, rerank, and the declared fixed categories), a
+    `device: cpu` candidate is selected over device candidates regardless
+    of footprint (decision 10). Among the eligible candidates the winner
+    is the cheapest **measured serving at the role's ctx**
+    (`resident_cost_mb`, the same estimator the budget charges with);
+    only when nothing can be sized does the smallest-file rule apply, and
+    no CPU candidate leaves the selection exactly as it was. A selector
+    (`selector:`/`--embed`/`--rerank`) overrides the cost pick and is
+    priced in the log.
 
 **metadata.packing** (client-visible facts; emission site shared with
 branch 2).
@@ -261,6 +269,11 @@ branch 2).
     "never evicted by a swap". The entry also carries `ttl: 0`, so idle
     expiry does not unload it. Device entries keep today's behaviour
     (no pin, no `ttl` key).
+21. *one answer per role*: a category selector (`matrix.categories.emb`
+    / `.rnk`) defines the RAG pair too — the solve, the charge, the
+    `emb`/`rnk` vars and the resident entry all name the same model.
+    Two independent selections (CLI/role pick vs category spec) must
+    never disagree.
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 
