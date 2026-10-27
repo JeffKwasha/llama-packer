@@ -173,8 +173,8 @@ MUTATIONS = {
         '        if False:'),
     "test_cpu_helpers_pinned_into_every_set": (
         "llama_packer/__main__.py",
-        '                expr = f"{expr.strip()} & {name}"',
-        '                expr = expr.strip()'),
+        '            expr = f"{expr.strip()} & {name}"',
+        '            expr = expr.strip()'),
     "test_cpu_entry_ttl_zero": (
         "llama_packer/writer.py",
         "    if model.on_cpu:\n        entry[\"ttl\"] = 0",
@@ -211,6 +211,65 @@ MUTATIONS = {
         "                if True:\n"
         "                    continue\n"
         "                ctx = self._rag_ctx(model)"),
+    "test_host_measurement_does_not_leak_into_vram_pricing": (
+        "llama_packer/vram.py",
+        '        if getattr(self.model, "on_cpu", False) and not allow_cpu:',
+        "        if False:"),
+    # ── set composition: pricing, worst set, per-role pin ──
+    "test_set_overhead_prices_nested_branches": (
+        "llama_packer/writer.py",
+        '    alternatives = _split_top(expr, "|")\n'
+        "    if len(alternatives) > 1:",
+        '    alternatives = [expr]\n'
+        "    if len(alternatives) > 1:"),
+    "test_solve_matrix_prices_a_nested_and_branch": (
+        "llama_packer/writer.py",
+        '    alternatives = _split_top(expr, "|")\n'
+        "    if len(alternatives) > 1:",
+        '    alternatives = [expr]\n'
+        "    if len(alternatives) > 1:"),
+    "test_set_overhead_expands_named_sets": (
+        "llama_packer/writer.py",
+        "        if sets_cfg and name in sets_cfg and name not in _seen:\n"
+        "            return set_overhead_mb(",
+        "        if False:\n"
+        "            return set_overhead_mb("),
+    "test_expr_leaves_walks_nested_branches": (
+        "llama_packer/writer.py",
+        "        for part in parts:\n            out |= _expr_leaves(part, sets_cfg, _seen)",
+        "        return set(parts)"),
+    "test_solve_matrix_reserves_worst_set_not_category_union": (
+        "llama_packer/writer.py",
+        "        return max(_set_costs(embed_ctx_, rerank_ctx_, extra_mb).values(),\n"
+        "                   default=0)",
+        "        return sum(_set_costs(embed_ctx_, rerank_ctx_, extra_mb).values())"),
+    "test_solve_matrix_unreferenced_category_reserves_nothing": (
+        "llama_packer/writer.py",
+        "        return {name: set_overhead_mb(expr, var_mb, frozenset(), frozenset(),\n"
+        "                                      sets_cfg=raw_sets, coload_mb=coload_mb)\n"
+        "                for name, expr in chat_sets.items()}",
+        "        return {name: set_overhead_mb(expr, var_mb, frozenset(), frozenset(),\n"
+        "                                      sets_cfg=raw_sets, coload_mb=coload_mb)\n"
+        "                       + sum(v for n, v in fixed_mb.items()\n"
+        "                             if n not in _expr_leaves(expr, raw_sets))\n"
+        "                for name, expr in chat_sets.items()}"),
+    "test_cpu_pin_is_one_canonical_category_per_role": (
+        "llama_packer/__main__.py",
+        '        if role not in canonical or name in ("emb", "rnk"):',
+        "        if True:"),
+    "test_cpu_pin_skips_a_set_that_chose_the_role": (
+        "llama_packer/__main__.py",
+        "            if role and any(role_of.get(leaf) == role for leaf in leaves):\n"
+        "                continue",
+        "            if False:\n                continue"),
+    "test_selection_reason_names_the_cost_terms": (
+        "llama_packer/__main__.py",
+        '    suffix = f" = {detail}" if detail else ""',
+        '    suffix = ""'),
+    "test_resident_cost_detail_names_the_terms": (
+        "llama_packer/writer.py",
+        "    kv_mb = int(kv_factor * ctx + slot_mib)",
+        "    kv_mb = 0"),
 }
 
 

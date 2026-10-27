@@ -474,6 +474,16 @@ verdicts, because they are independently sized servings. A `.aux` entry
 that cannot hold its 80k minimum beside the 5.7 GB reranker is dropped from
 `ragz` while the `.coding` entry stays in it.
 
+`sets:` is also the **budget contract**. A set is a role composition
+(`rag: __CHAT_VARS__ & emb & rnk` is embed *and* rerank; `talk:
+__CHAT_VARS__ & stt & tts` is 2-way speech), and the chat solve reserves the
+worst branch of the most expensive chat-capable set it can be requested
+under: `&` sums, `|` maxes, `+set` expands, nesting prices recursively. It is
+not the sum of every declared category, and a category in no chat set
+reserves nothing (llama-swap can only hold it alone). A second category of
+the same role is an alternative, never an addition — one model per role per
+set. See `docs/plans/cpu-residency-budget.md` decisions 13–15.
+
 `min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and `estimate_headroom`
 belonged to the allocation passes and **nothing consults them any more** —
 they are dead configuration that still parses, and still warns on a bad

@@ -979,18 +979,20 @@ class VramBudget:
         for the emitted memory tag — never for VRAM sizing); without it
         CPU-resident models return None as before.
         """
-        shape = (llama_args or "").strip()
-        if (cache_type, shape) in self._static_cache:
-            return self._static_cache[(cache_type, shape)]
-
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Fixed-overhead backends are sized from file size + a fixed
             # buffer (effective_static); CPU-resident models are not
             # VRAM-bound.  Neither has meaningful FitParams.
             return None
         if getattr(self.model, "on_cpu", False) and not allow_cpu:
-            # CPU-resident models are not VRAM-bound (see allow_cpu).
+            # CPU-resident models are not VRAM-bound (see allow_cpu).  This
+            # guard must precede the cache read: a host-RAM measurement
+            # (allow_cpu=True, the host ledger) caches the same quad, and
+            # returning it here would charge a CPU resident VRAM again.
             return None
+        shape = (llama_args or "").strip()
+        if (cache_type, shape) in self._static_cache:
+            return self._static_cache[(cache_type, shape)]
 
         # 1. Saved values from frontmatter (legacy fit-params blocks and
         #    wrong-shape blocks are rejected by FitParams.from_dict and

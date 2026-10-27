@@ -150,11 +150,22 @@ and every one of them carries a `Validates:` citation.
 | 71 | Pressure zone: sysctl `(zone high sum, min_free_kbytes floor)` primary; missing/zeroed zoneinfo falls back to 25% of total, called out in the log | `test_pressure_zone_from_zoneinfo`, `test_pressure_zone_fallback_is_logged`, `test_pressure_zone_override_asserted` |
 | 72 | `host_pool = min(sys_free, cgroup_free)` with every override arm (`system_ram`, `host_pool` abs/frac) honored | `test_host_pool_mixed_terms`, `test_host_pool_overrides_arm` |
 | 73 | Service cgroup caps the pool; no llama-swap cgroup skips the term with a warning | `test_host_pool_mixed_terms`, `test_cgroup_missing_service_skips_term` |
-| 74 | A `device: cpu` resident is charged to the host ledger (RAG pair and declared fixed categories); its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram`, `test_host_resident_sizing_lifts_cpu_gate`, `test_cpu_fixed_category_resident_charged_host` |
+| 74 | A `device: cpu` resident is charged to the host ledger (RAG pair and declared fixed categories); its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram`, `test_host_resident_sizing_lifts_cpu_gate`, `test_cpu_fixed_category_resident_charged_host`, `test_host_measurement_does_not_leak_into_vram_pricing` |
 | 75 | Host charge is the serving quad at the served context — declared parallel multiplies D and the KV pool and can flip the refusal | `test_cpu_variant_refused_on_small_pool`, `test_cpu_parallel_charge_flips_refusal` |
 | 76 | No pool knowledge, no gate — a planner without a host pool never refuses on host grounds | `test_no_host_pool_never_gates` |
 | 77 | Every entry carries `metadata.packing`; `device: cpu` entries name device/ctx/parallel/ram and carry no `vram_mib` | `test_metadata_packing_cpu_entry`, `test_metadata_packing_gpu_entry` |
 | 78 | `device: cpu` wins the resident role; inside that set the cheapest **measured serving at the role's ctx** wins (file size only when unmeasurable); a selector overrides and is priced; every arm is logged | `test_select_model_prefers_cpu_candidate`, `test_select_model_smallest_among_cpu_candidates`, `test_select_model_no_cpu_keeps_size_rule`, `test_select_model_selector_overrides_cpu_preference`, `test_selection_reason_names_the_arm`, `test_selection_reason_measured_and_selector_arms`, `test_select_model_picks_measured_cheapest_over_file_size`, `test_select_model_falls_back_to_size_when_unmeasurable`, `test_select_model_cpu_preference_beats_cheaper_device`, `test_select_model_selector_prices_only_the_pick` |
 | 79 | `profiles.yaml device_roles:` places every model of a named role on the host (logged with its count); absent key is a no-op; unmatched or unknown roles warn | `test_device_roles_place_every_role_model`, `test_device_roles_absent_and_unmatched`, `test_device_roles_rejects_unknown_role` |
-| 80 | CPU helper entries join every routing set (never evicted, never preloaded) and carry `ttl: 0`; device entries keep no per-model TTL | `test_cpu_helpers_pinned_into_every_set`, `test_cpu_entry_ttl_zero`, `test_gpu_entry_has_no_ttl` |
+| 80 | CPU helper entries join every chat set **one per role** (never evicted, never preloaded, same-role alternatives never forced in) and carry `ttl: 0`; device entries keep no per-model TTL | `test_cpu_helpers_pinned_into_every_set`, `test_cpu_entry_ttl_zero`, `test_gpu_entry_has_no_ttl` |
 | 81 | A category selector defines the RAG pair too — solve, charge, `emb`/`rnk` vars and resident entry name one model | `test_detect_matrix_category_selector_defines_the_pair` |
+
+## Set composition (docs/plans/cpu-residency-budget.md §Set composition)
+
+| # | Requirement | Test |
+|---|---|---|
+| 82 | A set expression prices as a boolean tree — `&` sums, `|` maxes, `+set` expands, nesting recurses, a `+set` cycle terminates | `test_set_overhead_prices_nested_branches`, `test_set_overhead_expands_named_sets`, `test_expr_leaves_walks_nested_branches`, `test_solve_matrix_prices_a_nested_and_branch` |
+| 83 | The chat solve reserves the worst branch of the most expensive chat set, never the union of declared categories | `test_solve_matrix_reserves_worst_set_not_category_union` |
+| 84 | A category no set names reserves nothing and is logged as unreferenced | `test_solve_matrix_unreferenced_category_reserves_nothing` |
+| 85 | Exactly one canonical CPU category per role is pinned; device categories are never pinned; same-role alternatives are not | `test_cpu_pin_is_one_canonical_category_per_role` |
+| 86 | A set that already names a category of the pinned role keeps its own choice | `test_cpu_pin_skips_a_set_that_chose_the_role` |
+| 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |

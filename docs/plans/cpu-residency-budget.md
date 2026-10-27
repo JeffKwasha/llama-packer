@@ -80,12 +80,128 @@ path).
     it, the list is explicit, and every application is logged with the
     role and the number of models it matched.
 12. **CPU helpers are never evicted.** A `device: cpu` non-chat entry is
-    pinned into every routing set expression (by its category var when
+    pinned into every *chat* set expression (by its category var when
     it has one, else its entry id) and carries `ttl: 0`: a request names
     the model, loads it once, and no later swap evicts it. Sets permit
     subsets, so pinning never preloads one. Evicting a CPU entry buys no
     device memory, so the matrix's cost model has nothing to trade —
-    this is the placement rule, not a new heuristic.
+    this is the placement rule, not a new heuristic. **One pin per role**
+    (decision 14): the pin is the role's canonical category (`emb`,
+    `rnk`, …), and it is skipped for a set that already names a different
+    category of the same role — pinning every CPU model made same-role
+    alternatives co-resident (two embedders, two rerankers), which is
+    exactly the duplicate serving decision 2 forbids.
+13. **The set expression is the budget contract.** The routing `sets` are
+    not decoration forwarded to llama-swap: they are the operator's
+    statement of which models may be resident together, and the solver
+    must price them as such. `&` sums (co-resident), `|` takes the max
+    (one alternative), `+set` expands the referenced set. A chat model is
+    charged the **worst branch of the most expensive chat-capable set it
+    belongs to** — never the union of every declared category. A
+    category that appears in no set reserves nothing, because llama-swap
+    can never hold it beside chat ("a model in no set can only run
+    alone"). Reasoning: the old rule summed every declared category, so
+    declaring a 3 GB bucket made every chat solve pay 3 GB even when the
+    set holding it was an alternative to a cheaper one.
+14. **A set is a role composition, not a category list.** One set names a
+    use case: RAG is `emb & rnk` (one embedding model *and* one rerank
+    model — two roles), 2-way speech is `stt & tts` (one each). Within a
+    set a role appears once: two embedders or two rerankers are never
+    co-resident, and a second category of the same role is an
+    *alternative* (`rnk | rnk2`), not an addition. Roles compose, models
+    of one role do not. This is what makes buckets expressible without
+    inventing a task vocabulary: `chat & (three | (two & one))` is a
+    valid composition of three operator buckets, priced 3 (the `three`
+    branch) rather than 6 (their sum).
+15. **One canonical category per role is the CPU resident.** Placement is
+    per model (`device: cpu`), residency is per role. When several
+    categories of one role are CPU-placed, the canonical name (`emb`,
+    `rnk`; else the first declared) is the pinned resident; the others
+    are catalog entries that load on request and are not forced into
+    every set. Same-role alternatives are never co-resident (decision 2),
+    so pinning all of them contradicts the budget the sets describe.
+
+## Set composition (the budget contract)
+
+Three different things share the word "category" in the config; keep them
+apart:
+
+| term | what it is | where it lives | example |
+|---|---|---|---|
+| **role** | what a model *does*; one resident per role | sidecar `role:` / directory (`dirs:`) | `embeddings`, `rerank`, `s2t`, `t2s` |
+| **category** | an operator-named routing var for a served model | `matrix.categories` (or a bucket name) | `emb`, `rnk`, `one`, `two`, `three` |
+| **set** | a use case: a composition of roles/categories that must be live together | `matrix.sets` | `rag: __CHAT_VARS__ & emb & rnk` |
+
+A **set is a role composition**. RAG is not "the embedding category" — it is
+`emb & rnk`, one model in each of two roles. 2-way speech is `stt & tts`.
+A chat set is a composition with chat: `__CHAT_VARS__ & stt & tts`.
+
+Consequences, in the order the solver applies them:
+
+1. **`&` sums, `|` maxes, `+set` expands.** The expression is a boolean
+   tree and is priced recursively, so nested branches price correctly:
+   `(c1) & (three | (two & one))` = `max(3000, 2000 + 1000)` = 3000, and
+   `(c1) & (one | (two & three))` = `max(1000, 2000 + 3000)` = 5000. The
+   old depth-0 split priced the second as 1000 — a `(two & three)` group
+   became an unknown var worth 0.
+2. **The worst chat set wins.** A chat entry can be requested under any set
+   that contains it, and llama-swap activates the cheapest set, so the
+   entry must survive the heaviest one: `reserve = max over chat-capable
+   sets of (that set's branch cost)`. It is not the sum over declared
+   categories, and it is not a per-category admission loop.
+3. **A category in no set reserves nothing.** It can only run alone, so
+   charging it against every chat solve buys nothing and silently shrinks
+   context. The planner logs it as unreferenced instead of reserving.
+4. **One model per role per set.** A set that names two categories of the
+   same role is a *composition error*, not a fatter use case: the second
+   one is an alternative. The planner never adds a same-role model to a
+   set that already names one (the CPU pin rule, decision 15), and portion
+   2 adds the emitted warning/validation for operator sets that do it.
+5. **Buckets are just categories with operator names.** `one`, `two`,
+   `three` are declared like `emb`/`rnk`; `combo: chat & (three | (two &
+   one))` needs no task vocabulary. The packer does not need to know what
+   a bucket is *for* — only its cost and whether a set references it.
+6. **Each resident is priced at its own served context** — `embed_context`
+   / `rerank_context` for the RAG roles, design context for the rest —
+   through the same `resident_ctx` / `resident_cost_mb` seam as selection
+   and the host ledger. One context policy, one estimator, three
+   consumers.
+7. **The log names the terms.** A resident costs
+   `weights + compute + kv@ctx`, and the selection line prints all three,
+   so two residents that both cost 1050 MiB can be seen to be the same
+   shape (two Qwen3-0.6B Q6_K models) rather than a repeated number
+   hiding a bug.
+
+CPU residency composes with this without a special case: a CPU category is
+charged 0 VRAM but its full quad to the host ledger (requirements 11–14),
+and it composes into sets exactly like a device category. That is why the
+bucket example works on this branch's fleet — all three buckets are CPU
+residents, and the GPU side is free either way.
+
+### Portions
+
+**Portion 1 — set pricing and pinning (this branch).** Bugfixes only, no new
+config surface.
+
+- recursive set pricing (`&` sum, `|` max, `+set` expand) for both the
+  budget and the host-ledger cost view;
+- the solve reserves the worst chat set instead of the category union;
+- an unreferenced category reserves nothing and says so;
+- the CPU pin is one canonical category per role, and a set that already
+  names that role keeps its own choice;
+- the resident log prints the cost terms.
+
+**Portion 2 — composition validation and per-category context.** A set
+naming two categories of one role warns (or refuses) by name; per-category
+`ctx:` so a bucket can declare its served context instead of inheriting the
+role's; the host ledger's set awareness (a set that cannot fit its CPU
+residents is refused as a unit); `matrix.categories` schema documented.
+
+**Portion 3 — refactor / capacity exploration.** Generalize
+`solve_matrix_ctx` from `(chat, embed, rerank)` to a category-parameter map
+so the solver no longer knows the RAG roles by name; evaluate llama-swap's
+native `capacity` routing as the runtime half of the same contract. Out of
+scope until portions 1–2 are green and the live config is repacked.
 
 ## Host pool equation
 
@@ -274,6 +390,30 @@ branch 2).
     `emb`/`rnk` vars and the resident entry all name the same model.
     Two independent selections (CLI/role pick vs category spec) must
     never disagree.
+
+**Set composition** (decisions 13–15; portion 1).
+
+22. *recursive pricing*: a set expression prices as a boolean tree —
+    `&` sums, `|` maxes, `+set` expands the referenced expression — so
+    `(one | (two & three))` is `two + three` when that is larger, and a
+    nested group is never mistaken for an unknown var worth 0. A `+set`
+    cycle terminates instead of recursing.
+23. *worst branch of the worst chat set*: the chat solve reserves the
+    most expensive chat-capable set's branch cost. Declared categories
+    that only appear as alternatives add nothing, and a category in no
+    chat set adds nothing.
+24. *unreferenced reserves nothing*: a category no set names is logged
+    as unreferenced and charged 0 — it can only run alone.
+25. *the CPU pin is per role*: exactly one canonical category per role is
+    pinned into the chat sets (`emb`, `rnk`, else the first declared),
+    and only when that category is CPU-placed. Pinning never adds a
+    second model of a role.
+26. *a set keeps its own role choice*: a set that already names a
+    category of the pinned role (e.g. `ragz: … & rnk2`) is emitted
+    unchanged — the canonical `rnk` is not appended to it.
+27. *a priced resident names its terms*: the resident selection log
+    shows weights, compute and KV at the served context for a measured
+    pick, not only the total.
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 

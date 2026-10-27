@@ -497,6 +497,18 @@ def test_selection_reason_names_the_arm():
     assert _selection_reason(gpu) == "smallest footprint 355 MiB"
 
 
+def test_selection_reason_names_the_cost_terms():
+    # Validates: docs/plans/cpu-residency-budget.md #27 -- a priced pick names
+    # weights/compute/KV, so two residents that both cost 1050 MiB can be seen
+    # to be the same shape rather than a repeated number hiding a bug.
+    m = _role_model("jina", 1050, device="cpu")
+    detail = "466 weights + 346 compute + 238 kv @4096"
+    assert _selection_reason(m, 1050, detail=detail) == \
+        f"cheapest measured resident, 1050 MiB = {detail}"
+    assert _selection_reason(m, 1050, by_selector=True, detail=detail) == \
+        f"selector, 1050 MiB resident = {detail}"
+
+
 # ── role-wide placement + CPU-helper pinning ─────────────────────────────
 
 
@@ -541,17 +553,45 @@ def test_device_roles_rejects_unknown_role(make_model, caplog):
 
 
 def test_cpu_helpers_pinned_into_every_set():
-    # Validates: docs/plans/cpu-residency-budget.md #20 -- CPU helper terms
-    # join every set unless already a leaf.
+    # Validates: docs/plans/cpu-residency-budget.md #25 -- the canonical CPU
+    # category of each role joins the chat sets that do not name that role,
+    # so a transcription does not evict RAG.
     from llama_packer.__main__ import _expand_matrix_sets
     out = _expand_matrix_sets(
         {"rag": "__CHAT_VARS__ & emb & rnk",
          "talk": "__CHAT_VARS__ & tts"},
-        "(c1 | c2)", ["tts"], None, pinned=["emb", "rnk", "qwen3-embedding-0.6b"])
-    leaves = lambda e: re.findall(r"(?<![\w.-])(?:emb|rnk)(?![\w.-])", e)
-    assert leaves(out["rag"]) == ["emb", "rnk"]
-    assert out["rag"].endswith("& qwen3-embedding-0.6b")
-    assert out["talk"].endswith("& emb & rnk & qwen3-embedding-0.6b")
+        "(c1 | c2)", ["tts"], None, pinned=["emb", "rnk"],
+        role_of={"emb": "embeddings", "rnk": "rerank", "tts": "t2s"})
+    assert out["rag"] == "(c1 | c2) & emb & rnk"
+    assert out["talk"] == "(c1 | c2) & tts & emb & rnk"
+
+
+def test_cpu_pin_skips_a_set_that_chose_the_role():
+    # Validates: docs/plans/cpu-residency-budget.md #26 -- a set that already
+    # names a category of the pinned role keeps its own choice: appending the
+    # canonical `rnk` beside `rnk2` would make two rerankers resident.
+    from llama_packer.__main__ import _expand_matrix_sets
+    out = _expand_matrix_sets(
+        {"ragz": "__CHAT_VARS__ & emb & rnk2",
+         "voice": "__CHAT_VARS__ & stt"},
+        "(c1 | c2)", [], None, pinned=["emb", "rnk"],
+        role_of={"emb": "embeddings", "rnk": "rerank", "rnk2": "rerank",
+                 "stt": "s2t"})
+    assert out["ragz"] == "(c1 | c2) & emb & rnk2"
+    assert out["voice"] == "(c1 | c2) & stt & emb & rnk"
+
+
+def test_cpu_pin_is_one_canonical_category_per_role():
+    # Validates: docs/plans/cpu-residency-budget.md #25 -- placement is per
+    # model, residency is per role: one CPU category per role is pinned, and
+    # a device category is never pinned.
+    from llama_packer.__main__ import canonical_cpu_pins
+    cats = {"jina": _role_model("jina", 1050, device="cpu"),
+            "emb": _role_model("voyage", 797, device="cpu"),
+            "rnk": _role_model("rnk", 1050, role="rerank", device="cpu"),
+            "rnk2": _role_model("zerank", 3042, role="rerank", device="cpu"),
+            "tts": _role_model("kokoro", 1204, role="t2s")}
+    assert canonical_cpu_pins(cats) == ["emb", "rnk"]
 
 
 def test_select_model_picks_measured_cheapest_over_file_size():
@@ -620,7 +660,8 @@ def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatc
     voyage = make_model("voyage", role="embeddings")
     jina = make_model("jina", role="embeddings", device="cpu")
     rnk = make_model("rnk", role="rerank")
-    monkeypatch.setattr(m, "resident_cost_mb", lambda model, **kw: 900)
+    monkeypatch.setattr(m, "resident_cost_detail",
+                        lambda model, **kw: (900, "900 test"))
     args = SimpleNamespace(embed=None, rerank=None)
     # The selector pins the *device* model: the pair pick alone would take
     # the CPU candidate, so only the pair adoption can make this pass.

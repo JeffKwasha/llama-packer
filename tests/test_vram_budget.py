@@ -215,6 +215,22 @@ def test_measure_affine_trio_cpu_shape_persists_host_quad(
     assert again == params
 
 
+def test_host_measurement_does_not_leak_into_vram_pricing(make_model,
+                                                         tmp_path):
+    # Validates: docs/plans/cpu-residency-budget.md #11/#27 -- a host-RAM
+    # measurement (allow_cpu=True, the host ledger) caches the same quad; a
+    # VRAM-priced call must still see None, or the CPU resident is charged to
+    # the chat solve after all.
+    stub = _stub_fit_run(tmp_path)
+    model = make_model("a", device="cpu", context_length=8192)
+    model.vram.remeasure = False
+    assert model.vram.fit_params_static(
+        stub, cache_type="q8_0", llama_args="--n-gpu-layers 0",
+        allow_cpu=True) is not None
+    assert model.vram.fit_params_static(
+        stub, cache_type="q8_0", llama_args="--n-gpu-layers 0") is None
+
+
 #: Captured CPU-shaped llama-fit-params runs (Qwen3-Reranker-0.6B-Q6_K,
 #: q8_0, `--n-gpu-layers 0`, 2026-10-23 probe): the affine trio replays.
 _P1_RUN = """\

@@ -575,7 +575,7 @@ def _fake_vram(m, params):
 # The co-load pass is gated on some set referencing __COLOAD_VARS__ — the
 # only way a co-load's var reaches a set.  Tests of the pass itself opt in
 # with this; the gate has its own test below.
-COLOAD_SETS = {"talk": "__CHAT_VARS__ & tts & __COLOAD_VARS__"}
+COLOAD_SETS = {"talk": "__CHAT_VARS__ & emb & rnk & tts & __COLOAD_VARS__"}
 
 
 def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
@@ -620,6 +620,91 @@ def test_sets_reference_coloads():
     assert _sets_reference_coloads({"rag": "__CHAT_VARS__ & emb & rnk"}) is False
     assert _sets_reference_coloads({}) is False
     assert _sets_reference_coloads(None) is False
+
+
+def _bucket(stem, mb, role="s2t"):
+    """A fixed-overhead category with an authoritative pinned size."""
+    m = make(stem, role=role, backend="whisper-server", vram_mb=mb,
+             context_length=8192)
+    m.vram.effective_static = lambda *a, **k: (mb, 0.0, 0.0, 0)
+    m.vram.fit_params_static = lambda *a, **k: None
+    return m
+
+
+def _solve_sets(profiles, cats, sets, vram_total=32 * 1024):
+    chat = make("chat", role="chat", context_length=262144)
+    embed = make("e", role="embeddings", context_length=8192)
+    rerank = make("r", role="rerank", context_length=8192)
+    _fake_vram(chat, (8000, 0.4, 500))
+    for m in (embed, rerank):
+        _fake_vram(m, (500, 0.1, 100))
+    return _solve_matrix_context(
+        [chat, embed, rerank], embed, rerank, fit_bin="unused",
+        vram_total=vram_total, spare=None, profiles=profiles,
+        knobs=MatrixKnobs(min_chat_ctx=8192), fixed_categories=cats,
+        coload_sets=sets)
+
+
+def test_solve_matrix_reserves_worst_set_not_category_union(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #23 -- the chat solve is
+    # charged the worst branch of the most expensive chat set, not the sum of
+    # every declared category.  (three | (two & one)) costs max(4000, 3000).
+    cats = [("one", _bucket("one", 1000)),
+            ("two", _bucket("two", 2000)),
+            ("three", _bucket("three", 4000))]
+    composed = _solve_sets(profiles, cats, {
+        "rag": "__CHAT_VARS__ & emb & rnk",
+        "combo": "__CHAT_VARS__ & (three | (two & one))"})
+    only_three = _solve_sets(profiles, cats, {
+        "combo": "__CHAT_VARS__ & three"})
+    union = _solve_sets(profiles, cats, {
+        "all": "__CHAT_VARS__ & emb & rnk & one & two & three"})
+    assert composed is not None and only_three is not None and union is not None
+    assert composed.chat_ctx == only_three.chat_ctx
+    assert composed.chat_ctx > union.chat_ctx
+
+
+def test_solve_matrix_prices_a_nested_and_branch(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #22 -- (one | (two & three))
+    # costs two + three when that branch is larger, so a nested group is never
+    # priced as an unknown var worth 0.
+    cats = [("one", _bucket("one", 1000)),
+            ("two", _bucket("two", 2000)),
+            ("three", _bucket("three", 4000))]
+    nested = _solve_sets(profiles, cats,
+                         {"s": "__CHAT_VARS__ & (one | (two & three))"})
+    flat = _solve_sets(profiles, cats,
+                       {"s": "__CHAT_VARS__ & (two & three)"})
+    assert nested is not None and flat is not None
+    assert nested.chat_ctx == flat.chat_ctx
+
+
+def test_solve_matrix_unreferenced_category_reserves_nothing(profiles, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #24 -- a category no set
+    # names can only run alone, so it must not shrink the chat solve.
+    cats = [("three", _bucket("three", 4000))]
+    sets = {"rag": "__CHAT_VARS__ & emb & rnk"}
+    with caplog.at_level("INFO"):
+        referenced = _solve_sets(profiles, [], sets)
+        unreferenced = _solve_sets(profiles, cats, sets)
+    assert referenced is not None and unreferenced is not None
+    assert unreferenced.chat_ctx == referenced.chat_ctx
+    assert any("in no set" in r.message for r in caplog.records)
+
+
+def test_resident_cost_detail_names_the_terms(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #27 -- the cost the log
+    # prints is the same quad the budget charges, broken into its terms.
+    from llama_packer.writer import resident_cost_detail
+    m = make("jina", role="embeddings", context_length=4096)
+    m.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
+        model_mib=466, kv_per_token_mib=238 / 4096, slot_mib=0.0,
+        compute_mib=346, source="fit-params")
+    total, detail = resident_cost_detail(
+        m, fit_bin="unused", cache_type="q8_0", profiles=profiles,
+        llama_args="", ctx=4096)
+    assert total == 1050
+    assert detail == "466 weights + 346 compute + 238 kv @4096"
 
 
 def test_solve_matrix_includes_smallest_coload_skips_big(profiles):

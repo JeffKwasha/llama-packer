@@ -318,11 +318,40 @@ profiles:
 #                               # slots), so no single value suits every
 #                               # model. See SPEC.md
 #
-# Retired with the two-mechanism design, and documented as dead rather than
-# removed: `categories:`, `sets:`, `evict_costs:`, `min_chat_ctx`,
-# `coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`. They still parse,
-# nothing consults them for allocation, and they stop parsing when the group
-# loop is rewritten onto the model above.
+# A routing set is a use case — a composition of roles that must be live
+# together. `rag` is embed AND rerank (two roles); `talk` is stt AND tts.
+# One set names one model per role; a second category of the same role is an
+# alternative (`rnk | rnk2`), never an addition. Operators may also declare
+# their own buckets (one/two/three) and compose them without naming a task:
+#   combo: "__CHAT_VARS__ & (three | (two & one))"
+# The sets are also the VRAM budget contract: the chat solve reserves the
+# worst branch of the most expensive chat set (`&` sums, `|` maxes, `+set`
+# expands a named set), not the sum of every declared category. A category
+# no chat set references reserves nothing (it can only run alone). See
+# docs/plans/cpu-residency-budget.md decisions 13-15.
+#
+# matrix:
+#   embed_context: 4096
+#   rerank_context: 4096
+#   categories:                 # var -> served model; `emb`/`rnk` are the
+#     emb: { role: embeddings } # canonical names of the RAG roles
+#     rnk: { role: rerank }
+#     rnk2: { role: rerank, selector: zerank }   # alternative, not additive
+#   sets:
+#     rag:   "__CHAT_VARS__ & emb & rnk"
+#     ragz:  "__CHAT_VARS__ & emb & rnk2"
+#     talk:  "__CHAT_VARS__ & stt & tts"
+#
+# `min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and `estimate_headroom`
+# belong to the retired allocation passes: nothing consults them for
+# allocation any more. They still parse and still warn on a bad value;
+# removing the parsing is a separate cleanup.
+#
+# `device_roles:` places every model of the named serving roles on the host
+# (same effect as tagging each sidecar `device: cpu`): same -ngl 0, same
+# host-pool charge, no VRAM charge. One CPU category per role is pinned into
+# the chat sets so a swap never evicts it.
+#   device_roles: [embeddings, rerank]
 #
 # ── VRAM pools (optional) ───────────────────────────────────
 # One shared ledger per pool: per-pool spare override, unmodelled residents,

@@ -142,3 +142,12 @@ Each member resolves its own context and decides its own mmproj, against
 the same number. There is no shared `chat_ctx` and no per-set re-solve —
 those were two mechanisms answering one question, and every bug where one
 pass read a value the other decided came from that.
+
+**Roles compose; models of one role do not.** The resident tier is one
+resident *per role* (one embedder, one reranker, one STT, one TTS), but a use
+case composes several roles: RAG needs an embedder **and** a reranker, 2-way
+speech needs STT **and** TTS. In the routing config that composition is the
+set expression (`rag: __CHAT_VARS__ & emb & rnk`, `talk: __CHAT_VARS__ & stt &
+tts`), and it is also the VRAM budget contract (`&` sums, `|` maxes,
+`cpu-residency-budget.md` decisions 13–14). A second model of a role is an
+alternative, not a second resident.
