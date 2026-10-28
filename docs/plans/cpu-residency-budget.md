@@ -123,13 +123,12 @@ path).
 
 ## Set composition (the budget contract)
 
-Three different things share the word "category" in the config; keep them
-apart:
+Three different things get confused in the config; keep them apart:
 
 | term | what it is | where it lives | example |
 |---|---|---|---|
 | **role** | what a model *does*; one resident per role | sidecar `role:` / directory (`dirs:`) | `embeddings`, `rerank`, `s2t`, `t2s` |
-| **category** | an operator-named routing var for a served model | `matrix.categories` (or a bucket name) | `emb`, `rnk`, `one`, `two`, `three` |
+| **matrix category** | an operator-named routing var for a served model | `matrix.categories` (or a bucket name) | `emb`, `rnk`, `one`, `two`, `three` |
 | **set** | a use case: a composition of roles/categories that must be live together | `matrix.sets` | `rag: __CHAT_VARS__ & emb & rnk` |
 
 A **set is a role composition**. RAG is not "the embedding category" — it is
@@ -164,7 +163,7 @@ definition is the same for every role; only the values differ.
 | `chat` | llama-server, vLLM | affine quad | solved per usage category | no | no (per-model `device: cpu` only) |
 | `embeddings` | llama-server, vLLM | affine quad | `embed_context` (4096) | yes | yes |
 | `rerank` | llama-server, vLLM | affine quad | `rerank_context` (4096) | yes | yes |
-| `image` | sd-server | file size + buffer | design | no | no |
+| `image` | sd-server | file size + buffer | design | no (not a resident role) | no |
 | `s2t` | audio-cpp, whisper-server | file size + buffer | design | when declared | yes |
 | `t2s` | audio-cpp | file size + buffer | design | when declared | yes |
 
