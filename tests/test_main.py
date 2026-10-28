@@ -552,6 +552,32 @@ def test_device_roles_rejects_unknown_role(make_model, caplog):
     assert any("not a placeable role" in r.message for r in caplog.records)
 
 
+def test_device_roles_rejects_a_non_cpu_value(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- the mapping is
+    # role -> device: a value that is not `cpu` places nothing and says so.
+    # A silent no-op is how `role: cpu` thinking survives a repack.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("embed-a", role="embeddings")
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], {"embeddings": "gpu"}, logging.getLogger("t"))
+    assert not a.on_cpu
+    assert any("is not a device" in r.message for r in caplog.records)
+
+
+def test_device_roles_rejects_a_scalar(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- device_roles is a
+    # list of roles or a role->device mapping; a bare scalar is a typo, not a
+    # shorthand, and must warn instead of crashing on iteration.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("embed-a", role="embeddings")
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], 3, logging.getLogger("t"))
+    assert not a.on_cpu
+    assert any("expected a list" in r.message for r in caplog.records)
+
+
 def test_cpu_helpers_pinned_into_every_set():
     # Validates: docs/plans/cpu-residency-budget.md #25 -- the canonical CPU
     # category of each role joins the chat sets that do not name that role,

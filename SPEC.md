@@ -412,9 +412,10 @@ Its price is a host-RAM budget with the same decision quality
   solve-down, no automatic offload. `device: cpu` is the only gate.
 
 **Moving a whole usecase off VRAM** takes one declaration —
-`profiles.yaml device_roles: [embeddings, rerank]` (or a
-`{role: cpu}` mapping) places every model of those roles on the host,
-exactly as if each sidecar carried `device: cpu`. A CPU helper entry
+`profiles.yaml device_roles: [embeddings, rerank]` (or the mapping
+`{embeddings: cpu, rerank: cpu}`) places every model of those roles on the
+host, exactly as if each sidecar carried `device: cpu`. The key is a role
+and the value is a device; there is no `role: cpu` field. A CPU helper entry
 also joins every routing set and serves with `ttl: 0`: a request names
 it, it loads once, and no later swap evicts it — evicting it would
 reclaim no device memory. Set subsets mean nothing is preloaded.
@@ -432,21 +433,21 @@ resident_vram  = Σ VRAM(resident, at its own fixed context)
 chat_budget    = available - resident_vram
 ```
 
-`chat_budget` is **a number**, not a solved context. Each chat model then
-resolves its own serving against it, through its category:
+The matrix solve turns `chat_budget` into **one shared per-slot
+`chat_ctx`** — the target every co-resident chat model is sized against.
+Each chat model then resolves its own serving against that target, through
+its category:
 
 ```
 for each chat model:
     for each declared category, and the fallback:
-        solve (shed, ctx, parallel) from chat_budget
+        solve (shed, ctx, parallel) from chat_ctx
 ```
 
-Two chat models therefore land on **different** contexts — a `.coding` entry
-takes what its category asks for, a small `.aux` entry takes what is left.
-That is the intended outcome, not something to reconcile. There is no shared
-`chat_ctx` and no per-set re-solve; those were two mechanisms answering one
-question, and every defect where one pass read a value the other decided
-came from that.
+Two chat models can therefore serve different contexts — a 27B stops at its
+design window, a 4B takes the full target — but they are priced against the
+same number. The worst set branch is charged once, before `chat_ctx` is
+solved; there is no per-set re-solve.
 
 A model smaller than its own category's `min_context` at every rung emits
 **nothing** for that category. The fallback entry is the floor on that: every
@@ -484,10 +485,13 @@ reserves nothing (llama-swap can only hold it alone). A second category of
 the same role is an alternative, never an addition — one model per role per
 set. See `docs/plans/cpu-residency-budget.md` decisions 13–15.
 
-`min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and `estimate_headroom`
-belonged to the allocation passes and **nothing consults them any more** —
-they are dead configuration that still parses, and still warns on a bad
-value. Removing the parsing is a separate cleanup.
+`tools_min_ctx`, `min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and
+`estimate_headroom` shape the shared solve, in that order: the RAG pair is
+squeezed only when chat falls below `tools_min_ctx`, no further than
+`coload_min_ctx`, and only if the gain reaches `ctx_gain_min`; a co-load is
+admitted only while chat stays at `min_chat_ctx` (or `tools_min_ctx` when
+the chat model still has tools); an estimated, not measured, overhead is
+padded by `estimate_headroom`. Defaults: 128k, 64k, 20k, 4k, 1.25.
 
 ### What `parallel_power` actually controls
 
@@ -1344,18 +1348,21 @@ sources overwrite earlier values). The same order applies to every backend:
 2. global `<section>.args` — so e.g. `-b 512` tunes chat models only
 3. per-role flags (embed/rerank mode flags) **+ the resolved named batch
    keys** — `batch:`/`ubatch:` (sidecar > profile > `llama_server:` fleet
-   section > role defaults) render explicitly on every llama-server command
-   and win over conflicting `args` values; `cli_args` `-b`/`-ub` is warned
-   about (shadowed, and invisible to the VRAM measurement)
+   section > backend role defaults) render explicitly on every
+   llama-server command and win over conflicting `args` values; `cli_args`
+   `-b`/`-ub` is warned about (shadowed, and invisible to the VRAM
+   measurement)
 4. per-model sidecar `cli_args:`
 
 **A batch key that is unset anywhere in the cascade renders no flag at all**,
 so llama.cpp's own builtin applies (`-b` 2048, `-ub` 512) — the defaults are
-not copied into the command, which would pin them against upstream. The only
-value declared by default is the embed/rerank `batch` of 4096, a genuine
-throughput tuning with no VRAM effect; a malformed value is warned about and
-falls through to the next tier. `ubatch` is the one half that reaches the VRAM
-measurement shape, and it is stamped with its **effective** value: an unset
+not copied into the command, which would pin them against upstream. No
+llama-server role declares a default: the old embed/rerank `batch` of 4096
+was never in effect (llama-server forces `n_batch = n_ubatch` when
+embeddings are enabled), so it was removed instead of copied. A malformed
+value is warned about and falls through to the next tier. `ubatch` is the
+one half that reaches the VRAM measurement shape, and it is stamped with its
+**effective** value: an unset
 key still serves at the builtin, so `measurement_args()` substitutes it and
 `derived: shape` keys stay stable across an upstream default change.
 

@@ -703,9 +703,9 @@ class VramBudget:
 
         Flags mirror what the emitted command will run with (cache types,
         all layers on the device pin the serve uses, MTP draft, the
-        profiles global args — flash attention and the role batch sizes —
-        plus the embed/rerank batch override), because compute and
-        recurrent-state allocations depend on them.  A ``device: cpu``
+        profiles global args — flash attention and the resolved batch keys —
+        plus the role flags), because compute and recurrent-state
+        allocations depend on them.  A ``device: cpu``
         model measures its host shape: ``--n-gpu-layers 0`` and the
         host-side buffers as the returned truth — the device-spill check
         below would reject every such run as host-KV spill.

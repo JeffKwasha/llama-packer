@@ -122,8 +122,8 @@ class BaseBackend(ABC):
         """``(batch, ubatch)`` defaults for *role* when nothing is
         configured.  ``None`` means **"emit nothing"** — the engine's own
         builtin applies — which is why the default here is ``(None, None)``
-        rather than a hardcoded copy of it.  llama-server overrides per role
-        (embed/rerank keep their tuned batch depth)."""
+        rather than a hardcoded copy of it.  A backend overrides per role
+        only when upstream really has a different depth."""
         return (None, None)
 
     @abstractmethod

@@ -334,23 +334,35 @@ def apply_device_roles(models: list, roles_cfg, logger) -> None:
     """Place every model of the declared roles on the host (decision 11).
 
     ``profiles.yaml device_roles:`` names serving roles (a list, or a
-    mapping role → ``cpu``); each becomes ``device: cpu`` for every model
-    of that role, indistinguishable from the sidecar tag.  Nothing here
-    infers placement: an absent key changes nothing, and each role applied
-    is logged with the number of models it matched.
+    mapping role → device — ``{embeddings: cpu}``); each becomes
+    ``device: cpu`` for every model of that role, indistinguishable from the
+    sidecar tag.  Nothing here infers placement: an absent key changes
+    nothing, and each role applied is logged with the number of models it
+    matched.
     """
     if not roles_cfg:
         return
     if isinstance(roles_cfg, dict):
-        declared = {str(k) for k, v in roles_cfg.items()
-                    if str(v).strip().lower() == "cpu"}
-    elif isinstance(roles_cfg, str):
-        declared = {roles_cfg}
-    else:
+        declared: set[str] = set()
+        for k, v in roles_cfg.items():
+            if str(v).strip().lower() == "cpu":
+                declared.add(str(k))
+            else:
+                logger.warning(
+                    "device_roles: %r: %r is not a device; only 'cpu' can "
+                    "be declared here (the key is a role, the value is a "
+                    "device) — ignored", k, v)
+    elif isinstance(roles_cfg, (list, tuple)):
         declared = {str(r) for r in roles_cfg}
+    else:
+        logger.warning(
+            "device_roles: expected a list of roles or a role→device "
+            "mapping, got %r; ignored", roles_cfg)
+        return
     for role in sorted(declared):
         if role not in _DEVICE_ROLES:
             logger.warning("device_roles: %r is not a placeable role %s; "
+                           "the key is a role and the value is a device — "
                            "ignored", role, sorted(_DEVICE_ROLES))
             continue
         hits = [m for m in models if m.role == role]

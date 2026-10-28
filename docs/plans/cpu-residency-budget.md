@@ -136,6 +136,43 @@ A **set is a role composition**. RAG is not "the embedding category" — it is
 `emb & rnk`, one model in each of two roles. 2-way speech is `stt & tts`.
 A chat set is a composition with chat: `__CHAT_VARS__ & stt & tts`.
 
+### What a role definition holds
+
+A role is not just a name: it is the bundle of facts below. They already
+exist in the code, but scattered across constants, backends and the matrix
+config — which is how "role" starts to drift into meaning "placement". The
+definition is the same for every role; only the values differ.
+
+- **id** — the accepted spelling. There are six, and they are the only
+  strings `dirs:`, `role:`, `device_roles:` and `matrix.categories[].role`
+  accept.
+- **served by** — the engines that can serve it (`backend.roles`).
+- **sized by** — the estimator: the measured affine quad when the engine
+  exposes KV, or file size + buffer for the fixed-overhead engines.
+- **context policy** — solved per usage category (chat), a fixed small
+  `embed_context`/`rerank_context` (RAG), or design context.
+- **residency** — a pinned resident or an on-demand serving.
+- **placeability** — may `device_roles:` move it, and is `device: cpu`
+  honoured?
+- **cardinality** — one resident per role, one model per role per set; a
+  second category of a role is an alternative.
+- **parallel** — honoured and charged, or ignored (residents are
+  single-slot).
+
+| role | served by | sized by | context | resident | in `device_roles` |
+|---|---|---|---|---|---|
+| `chat` | llama-server, vLLM | affine quad | solved per usage category | no | no (per-model `device: cpu` only) |
+| `embeddings` | llama-server, vLLM | affine quad | `embed_context` (4096) | yes | yes |
+| `rerank` | llama-server, vLLM | affine quad | `rerank_context` (4096) | yes | yes |
+| `image` | sd-server | file size + buffer | design | no | no |
+| `s2t` | audio-cpp, whisper-server | file size + buffer | design | when declared | yes |
+| `t2s` | audio-cpp | file size + buffer | design | when declared | yes |
+
+Two fields a role definition does **not** have: a device, and a
+`role: cpu` form. A role says *what* a model does; `device:` says *where*
+that particular model runs; `device_roles: {embeddings: cpu}` is only
+shorthand for "set `device: cpu` on every model of this role".
+
 Consequences, in the order the solver applies them:
 
 1. **`&` sums, `|` maxes, `+set` expands.** The expression is a boolean
@@ -372,12 +409,15 @@ branch 2).
 **Role-wide placement and eviction** (decisions 11–12).
 
 19. *role declaration*: `profiles.yaml device_roles:` (a list of role
-    names, or a mapping role → `cpu`) places every model of each named
-    role on the host — identical in every respect to the sidecar tag
-    (requirement 3's shape stamp, the host charge, no VRAM charge,
-    resident eligibility). Each role applied is logged with the number
-    of models it matched; a role that matches nothing warns; leaving the
-    key out changes nothing.
+    names, or a mapping **role → device** — `{embeddings: cpu}`) places
+    every model of each named role on the host — identical in every
+    respect to the sidecar tag (requirement 3's shape stamp, the host
+    charge, no VRAM charge, resident eligibility). Each role applied is
+    logged with the number of models it matched; a role that matches
+    nothing warns; leaving the key out changes nothing. A mapping value
+    other than `cpu` places nothing and warns: the key is a role and the
+    value is a device — there is no `role: cpu` form. Any other shape (a
+    bare scalar) warns and places nothing.
 20. *CPU helpers are pinned into every set*: every `device: cpu`
     non-chat entry joins every routing set expression — by its category
     var when it has one, else by its entry id — unless already a leaf.

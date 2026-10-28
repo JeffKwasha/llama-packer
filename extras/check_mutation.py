@@ -171,6 +171,14 @@ MUTATIONS = {
         "llama_packer/__main__.py",
         '        if role not in _DEVICE_ROLES:',
         '        if False:'),
+    "test_device_roles_rejects_a_non_cpu_value": (
+        "llama_packer/__main__.py",
+        '            if str(v).strip().lower() == "cpu":',
+        "            if True:"),
+    "test_device_roles_rejects_a_scalar": (
+        "llama_packer/__main__.py",
+        "    elif isinstance(roles_cfg, (list, tuple)):",
+        "    elif True:"),
     "test_cpu_helpers_pinned_into_every_set": (
         "llama_packer/__main__.py",
         '            expr = f"{expr.strip()} & {name}"',

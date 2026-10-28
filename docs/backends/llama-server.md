@@ -41,9 +41,12 @@ byte-identical to a `-c parallel*X` pool (validated against `llama-fit-params`).
 
 ## Roles and flags
 
-- `embeddings` → `--embedding --embd-normalize 2`; batch defaults `4096/512`.
-- `rerank` → `--rerank --pooling rank`; batch defaults `4096/512`.
-- `chat` → batch defaults `2048/512`.
+- `embeddings` → `--embedding --embd-normalize 2`.
+- `rerank` → `--rerank --pooling rank`.
+- No role declares a batch default: an unset `batch:`/`ubatch:` renders no
+  flag, so llama.cpp's builtin (`-b` 2048, `-ub` 512) applies. The old
+  embed/rerank `4096` was never in effect — llama-server forces
+  `n_batch = n_ubatch` when embeddings are enabled.
 - Reasoning flags and image-token flags are chat/vision-only and skipped
   elsewhere (with warnings when a declaration cannot apply).
 
