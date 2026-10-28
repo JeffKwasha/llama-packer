@@ -135,42 +135,15 @@ A **set is a role composition**. RAG is not "the embedding category" — it is
 `emb & rnk`, one model in each of two roles. 2-way speech is `stt & tts`.
 A chat set is a composition with chat: `__CHAT_VARS__ & stt & tts`.
 
-### What a role definition holds
+A role is one name for one kind of work. The six ids, the fields a role
+does hold, and the model/engine separation are defined once in
+[`docs/architecture.md`](../architecture.md#roles-models-and-engines). Two
+consequences matter for the budget:
 
-A role is not just a name: it is the bundle of facts below. They already
-exist in the code, but scattered across constants, backends and the matrix
-config — which is how "role" starts to drift into meaning "placement". The
-definition is the same for every role; only the values differ.
-
-- **id** — the accepted spelling. There are six, and they are the only
-  strings `dirs:`, `role:`, `device_roles:` and `matrix.categories[].role`
-  accept.
-- **served by** — the engines that can serve it (`backend.roles`).
-- **sized by** — the estimator: the measured affine quad when the engine
-  exposes KV, or file size + buffer for the fixed-overhead engines.
-- **context policy** — solved per usage category (chat), a fixed small
-  `embed_context`/`rerank_context` (RAG), or design context.
-- **residency** — a pinned resident or an on-demand serving.
-- **placeability** — may `device_roles:` move it, and is `device: cpu`
-  honoured?
-- **cardinality** — one resident per role, one model per role per set; a
-  second category of a role is an alternative.
-- **parallel** — honoured and charged, or ignored (residents are
-  single-slot).
-
-| role | served by | sized by | context | resident | in `device_roles` |
-|---|---|---|---|---|---|
-| `chat` | llama-server, vLLM | affine quad | solved per usage category | no | no (per-model `device: cpu` only) |
-| `embeddings` | llama-server, vLLM | affine quad | `embed_context` (4096) | yes | yes |
-| `rerank` | llama-server, vLLM | affine quad | `rerank_context` (4096) | yes | yes |
-| `image` | sd-server | file size + buffer | design | no (not a resident role) | no |
-| `s2t` | audio-cpp, whisper-server | file size + buffer | design | when declared | yes |
-| `t2s` | audio-cpp | file size + buffer | design | when declared | yes |
-
-Two fields a role definition does **not** have: a device, and a
-`role: cpu` form. A role says *what* a model does; `device:` says *where*
-that particular model runs; `device_roles: {embeddings: cpu}` is only
-shorthand for "set `device: cpu` on every model of this role".
+- a role may be served by several models (a cheap one that takes parallel
+  slots, an expensive one that cannot); a set holds at most one of them;
+- placement (`device:`), sizing and parallel are model/serving facts, so a
+  role never implies an engine or a device.
 
 Consequences, in the order the solver applies them:
 
@@ -453,6 +426,15 @@ branch 2).
 27. *a priced resident names its terms*: the resident selection log
     shows weights, compute and KV at the served context for a measured
     pick, not only the total.
+28. *an unsupported value warns*: a known key whose value the tool cannot
+    honour says so at discovery instead of falling through. `role:` must
+    be one of the six canonical ids (a near miss names the likely role),
+    and `device:` is `cpu` or a non-negative GPU index — `device: gpu`
+    used to place the model on the default device as if the key were
+    absent.
+29. *an unknown profiles key warns*: a top-level key nothing reads (a typo
+    such as `device_role`) warns with a near-miss hint instead of being
+    silently ignored.
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 

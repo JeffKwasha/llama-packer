@@ -261,6 +261,18 @@ MUTATIONS = {
         "                       + sum(v for n, v in fixed_mb.items()\n"
         "                             if n not in _expr_leaves(expr, raw_sets))\n"
         "                for name, expr in chat_sets.items()}"),
+    "test_unknown_role_value_warns_with_a_hint": (
+        "llama_packer/discover.py",
+        '    if role and role not in utils.SERVED_ROLES:',
+        "    if False:"),
+    "test_unknown_device_value_warns": (
+        "llama_packer/discover.py",
+        "    if problem:",
+        "    if False:"),
+    "test_unknown_profiles_key_warns_with_a_hint": (
+        "llama_packer/profiles.py",
+        "        if key in PROFILES_KEYS:",
+        "        if True:"),
     "test_cpu_pin_is_one_canonical_category_per_role": (
         "llama_packer/__main__.py",
         '        if role not in canonical or name in ("emb", "rnk"):',

@@ -38,6 +38,72 @@ main()                                        (__main__.py — thin orchestratio
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
+## Roles, models and engines
+
+Three nouns, three owners. Keeping them apart is what stops "role" from
+becoming a synonym for "engine" or "placement":
+
+| noun | answers | owner |
+|---|---|---|
+| **role** | *what work* the serving does | the role registry (`utils.SERVED_ROLES` today) |
+| **model** | *which weights* do the work, and whether they can | the sidecar (`role:`, `device:`, `parallel:`, `context_length`, …) |
+| **engine** | *how* those weights are executed | `backends/<engine>.py` (`roles`, `formats`, `host_requires`) |
+
+The relationships are many-to-many at both ends: one engine serves several
+roles, and one role is served by several models (a cheap model that can take
+parallel slots and an expensive one that cannot are both valid `rerank`
+models). A model may in principle perform several roles; today the sidecar
+field is a single `role:`, so the planner treats it as one.
+
+### A role definition
+
+A role has one name and only these fields:
+
+- **name** — one canonical id: `chat`, `embeddings`, `rerank`, `image`,
+  `s2t`, `t2s`. Directory names (`embed/`, `rerank/`, …) map *to* a role
+  (`dirs:`); they are not second spellings of it.
+- **work** — the service contract (vectors, scores, transcript, audio,
+  completions, image). This is what decides "is this a chat role" and
+  therefore which planner passes apply.
+- **claim** — how a model declares the role: sidecar `role:` or the
+  directory mapping.
+- **cardinality** — several models may serve one role; a routing set holds
+  at most one of them. A second model of a role is an alternative, never a
+  co-resident.
+- **residency policy** — pinned by default (embeddings, rerank), optional
+  (s2t, t2s), or on demand (chat, image).
+- **context policy** — the default served context for a resident role
+  (`embed_context`/`rerank_context`), overridable per category.
+
+| role | work | residency policy | default context |
+|---|---|---|---|
+| `chat` | completions | on demand | solved per usage category |
+| `embeddings` | vectors | pinned | `embed_context` (4096) |
+| `rerank` | relevance scores | pinned | `rerank_context` (4096) |
+| `image` | image generation | on demand | design context |
+| `s2t` | transcript | optional | design context |
+| `t2s` | audio | optional | design context |
+
+**Not in a role definition**, because each belongs to the model or the
+engine: the engine that serves it, the estimator that sizes it (affine quad
+vs file size + fixed buffer), its file format, its placement (`device:`),
+and whether it can take parallel slots. audio.cpp serves some `s2t` models
+and whisper-server serves others; adding an STT engine changes no role.
+
+### Where the registry lives
+
+Today the same idea is spread over `SERVED_ROLES`, `NON_CHAT_ROLES`,
+`_DEVICE_ROLES` (`__main__.py`), `MatrixKnobs.rag_cap` and each backend's
+`roles`. The target is one `Role` record per id, with the fields above, and
+the derived sets (`chat roles`, `device_roles`-eligible, RAG context knob)
+computed from it — one table, so a new role cannot be added to one list and
+forgotten in another.
+
+Validation follows the same split: an unsupported *value* of a known sidecar
+key warns at discovery (`role:` against the registry with a near-miss hint,
+`device:` against `cpu`/non-negative index), and engine/role compatibility
+is checked once in `_filter_supported` before any budgeting.
+
 ## Invariants (and their single homes)
 
 | Invariant | Home |

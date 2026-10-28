@@ -21,7 +21,7 @@ import yaml
 from llama_packer import Model, __version__, find_bin_dir, utils
 from llama_packer import model as _modelmod
 from llama_packer.hardware import GpuProfile, HostProfile, detect_gpu_vendor
-from llama_packer.profiles import Profiles
+from llama_packer.profiles import Profiles, validate_profiles_keys
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
 from llama_packer.utils import (
@@ -802,6 +802,7 @@ def main(argv: list[str] | None = None) -> None:
     with open(profiles_path) as f:
         profiles_cfg = yaml.safe_load(f) or {}
 
+    validate_profiles_keys(profiles_cfg)
     if not Profiles(profiles_cfg).profile_list:
         fatal("no profiles defined in profiles.yaml")
 
