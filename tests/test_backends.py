@@ -52,7 +52,7 @@ def test_llama_server_roles_and_formats():
     # Validates: SPEC.md, 'Backend Selection': the engine's formats and the roles it serves.
     b = LlamaServerBackend()
     assert b.formats == {".gguf"}
-    assert b.roles == {"chat", "embeddings", "rerank"}
+    assert b.operations == {"generate", "embed", "rerank"}
 
 
 def test_supports_role_and_format(make_model):
@@ -484,7 +484,7 @@ def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
 def test_vllm_podman_pair_cmd(make_model):
     # Validates: docs/transports/podman.md, 'Transport: podman': the podman pair is the same engine with podman's device flags and lifecycle
     b = get_backend("vllm-podman")
-    assert b.roles == {"chat", "embeddings", "rerank"}
+    assert b.operations == {"generate", "embed", "rerank"}
     assert b.stop_cmd == "podman stop ${MODEL_ID}"
     assert b.unload_timeout == 30
     m = make_model("p", hf_repo="org/model")
@@ -1160,7 +1160,7 @@ def test_whisper_server_registered():
     # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("whisper-server")
     assert b.formats == {".bin"}
-    assert b.roles == {"s2t"}
+    assert b.operations == {"transcribe"}
     assert b.proxied is True
 
 
@@ -1216,7 +1216,7 @@ def test_audio_cpp_registered():
     # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("audio-cpp")
     assert b.formats == {".gguf", ".safetensors", "hf_repo"}
-    assert b.roles == {"t2s", "s2t"}
+    assert b.operations == {"transcribe", "synthesize"}
     assert b.proxied is True
     assert b.check_endpoint == "/health"
     assert b.stop_cmd is None  # host launch: no container lifecycle

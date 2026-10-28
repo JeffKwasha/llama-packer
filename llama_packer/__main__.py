@@ -28,6 +28,7 @@ from llama_packer.utils import (
     compute_env_prefixes, make_subst, make_fast_storage_predicate,
     _detect_drive_speed, validate_dir_roles, NON_CHAT_ROLES,
 )
+from llama_packer import roles
 from llama_packer.consts import (
     _MIN_AGENTIC_CTX, _MEMORY_MARGIN, _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
@@ -327,9 +328,6 @@ def _selection_reason(model, measured_mb: int | None = None,
     return f"smallest footprint {model.vram_mb} MiB"
 
 
-_DEVICE_ROLES = frozenset({"embeddings", "rerank", "s2t", "t2s"})
-
-
 def apply_device_roles(models: list, roles_cfg, logger) -> None:
     """Place every model of the declared roles on the host (decision 11).
 
@@ -360,10 +358,10 @@ def apply_device_roles(models: list, roles_cfg, logger) -> None:
             "mapping, got %r; ignored", roles_cfg)
         return
     for role in sorted(declared):
-        if role not in _DEVICE_ROLES:
+        if role not in roles.DEVICE_ROLES:
             logger.warning("device_roles: %r is not a placeable role %s; "
                            "the key is a role and the value is a device — "
-                           "ignored", role, sorted(_DEVICE_ROLES))
+                           "ignored", role, sorted(roles.DEVICE_ROLES))
             continue
         hits = [m for m in models if m.role == role]
         if not hits:

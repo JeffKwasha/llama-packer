@@ -171,3 +171,9 @@ and every one of them carries a `Validates:` citation.
 | 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
 | 88 | A known key with an unsupported value warns at discovery: `role:` must be a canonical id (typo hint), `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
+
+## Roles (docs/architecture.md §Roles, models and engines)
+
+| # | Requirement | Test |
+|---|---|---|
+| 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every role's operation is implemented by an engine (no orphan operation) | `test_role_registry_derives_its_sets`, `test_every_role_operation_is_implemented` |

@@ -781,12 +781,12 @@ published to llama-swap's `${PORT}` host macro. Everything else works
 identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
 matrix routing.
 
-All three roles are supported, mapped onto vLLM's pooling interface:
+All three operations are supported, mapped onto vLLM's pooling interface:
 
-| Role | Task flag | Endpoints |
-|------|-----------|-----------|
-| `chat` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
-| `embeddings` | `--task embed` | `/v1/embeddings` |
+| Operation | Task flag | Endpoints |
+|-----------|-----------|-----------|
+| `generate` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
+| `embed` | `--task embed` | `/v1/embeddings` |
 | `rerank` | `--task score` | `/v1/rerank`, `/v1/score` |
 
 Sidecars themselves carry no backend key — backend selection, chat templates and
@@ -1274,19 +1274,19 @@ server-side flag for it; clients pass it per-request (e.g. Qwen's
 `enable_thinking`).
 
 **Backend support matrix.** A backend that cannot serve a model — wrong file
-format (e.g. a `.gguf` under vLLM) or unsupported role (e.g. embeddings/rerank
-under vLLM in this version) — logs an error and the model's entries are skipped
+format (e.g. a `.gguf` under vLLM) or an operation its role needs (e.g.
+embeddings under sd-server) — logs an error and the model's entries are skipped
 entirely. A backend that recognizes a setting it cannot render (e.g. `loras`
 under vLLM) logs a warning and ignores that one setting; settings that simply do
 not apply (e.g. `cache_type` under vLLM) are silently dropped.
 
-| Backend | Model formats | Roles |
-|---------|--------------|-------|
-| `llama-server` | `.gguf` | chat, embeddings, rerank |
-| `vllm` / `vllm-podman` / `vllm-docker` | safetensors, `hf_repo` | chat, embeddings, rerank |
-| `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | image |
-| `whisper-server` | `.bin` (s2t dir only) | s2t |
-| `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | t2s, s2t |
+| Backend | Model formats | Operations |
+|---------|--------------|------------|
+| `llama-server` | `.gguf` | generate, embed, rerank |
+| `vllm` / `vllm-podman` / `vllm-docker` | safetensors, `hf_repo` | generate, embed, rerank |
+| `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | generate_image |
+| `whisper-server` | `.bin` (s2t dir only) | transcribe |
+| `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | transcribe, synthesize |
 
 ## Backend Selection
 
@@ -1308,7 +1308,8 @@ backends:
 
 Inference walks this list (availability still filters: a pair without its
 binary/image configured, or without its container runtime on `PATH`, is
-skipped) and picks the first backend whose formats and roles cover the model.
+skipped) and picks the first backend whose formats cover the model and whose
+operations cover its role.
 An explicit sidecar/override `backend:` pin to a disabled name is an error that
 skips that model — pinning bypasses *inference*, never policy. Registration
 order: `llama-server`, `vllm`, `vllm-podman`, `vllm-docker`, `sd-server`,

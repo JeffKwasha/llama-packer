@@ -73,7 +73,7 @@ class BoundBackend(BaseBackend):
         engine.transport = transport
         self.name = transport.bind_name(engine.name)
         self.formats = engine.formats
-        self.roles = engine.roles
+        self.operations = engine.operations
         self.handles = engine.handles
         self.proxied = engine.proxied
         self.check_endpoint = engine.check_endpoint
@@ -174,7 +174,7 @@ def infer_backend(model: "Model", avail: dict | None = None,
             # Role must be supported — otherwise a .gguf diffusion model under
             # role=image would incorrectly infer llama-server and then be skipped
             # as unsupported.  Infer the only backend that can actually serve it.
-            if model.role not in backend.roles:
+            if not backend.supports_role(model.role):
                 continue
             return backend.name
     return None

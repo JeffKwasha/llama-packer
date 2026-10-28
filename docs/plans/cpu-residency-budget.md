@@ -435,6 +435,10 @@ branch 2).
 29. *an unknown profiles key warns*: a top-level key nothing reads (a typo
     such as `device_role`) warns with a near-miss hint instead of being
     silently ignored.
+30. *one role table*: `roles.py` is the registry — served, non-chat,
+    `device_roles` and context-knob facts are derived from it, engines
+    declare operations (never roles), every role's operation is implemented
+    by an engine, and no engine advertises an operation no role requires.
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 

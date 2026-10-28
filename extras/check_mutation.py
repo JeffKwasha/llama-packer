@@ -169,7 +169,7 @@ MUTATIONS = {
         '            pass'),
     "test_device_roles_rejects_unknown_role": (
         "llama_packer/__main__.py",
-        '        if role not in _DEVICE_ROLES:',
+        '        if role not in roles.DEVICE_ROLES:',
         '        if False:'),
     "test_device_roles_rejects_a_non_cpu_value": (
         "llama_packer/__main__.py",
@@ -269,6 +269,14 @@ MUTATIONS = {
         "llama_packer/discover.py",
         "    if problem:",
         "    if False:"),
+    "test_role_registry_derives_its_sets": (
+        "llama_packer/roles.py",
+        "if r.device_role)",
+        "if True)"),
+    "test_every_role_operation_is_implemented": (
+        "llama_packer/roles.py",
+        'Role("s2t", "transcribe", False, "optional", None, True),',
+        'Role("s2t", "transcribe_x", False, "optional", None, True),'),
     "test_unknown_profiles_key_warns_with_a_hint": (
         "llama_packer/profiles.py",
         "        if key in PROFILES_KEYS:",

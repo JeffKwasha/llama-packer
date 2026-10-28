@@ -37,6 +37,7 @@ from llama_packer.consts import (
     _RESERVE_VIDEO,
     ESTIMATE_ERROR_REASON,
 )
+from llama_packer import roles
 from llama_packer.profiles import Profiles, parse_spare_mb
 from llama_packer.backends import (
     SETTING_KEYS,
@@ -716,17 +717,16 @@ class MatrixKnobs:
         return cls(**knobs)
 
     def rag_cap(self, role: str) -> int:
-        """Configured context cap for a RAG role (embeddings | rerank).
+        """Configured context cap for a role with a resident context policy.
 
         The served RAG context is ``min(rag_cap(role), design_context)``
-        everywhere; unknown roles fall back to ``coload_min_ctx`` (legacy
-        behavior).
+        everywhere; a role without a knob (and an unknown role) falls back
+        to ``coload_min_ctx``.
         """
-        if role == "embeddings":
-            return self.embed_context
-        if role == "rerank":
-            return self.rerank_context
-        return self.coload_min_ctx
+        knobs = roles.get(role)
+        if knobs is None or knobs.ctx_knob is None:
+            return self.coload_min_ctx
+        return getattr(self, knobs.ctx_knob)
 
 
 @dataclass(frozen=True)

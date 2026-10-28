@@ -86,7 +86,7 @@ class AudioCppBackend(BaseBackend):
 
     name = "audio-cpp"
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
-    roles = frozenset({"t2s", "s2t"})
+    operations = frozenset({"transcribe", "synthesize"})
     handles = frozenset({"audio_cpp"})
     # Host first; a container transport is a later deployment (the engine
     # would reuse transport.py unchanged).

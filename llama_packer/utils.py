@@ -24,6 +24,7 @@ from pathlib import Path
 import yaml
 
 from llama_packer import ggufmeta
+from llama_packer import roles
 from llama_packer.consts import (
     _SAFETENSORS_DTYPE_BYTES,
     _KV_CACHE_BYTES,
@@ -468,13 +469,10 @@ def _is_ignored(rel_parts: tuple[str, ...], rel_path: str,
             return True
     return False
 
-# Roles a served directory may map to
-# ``img: image``.
-SERVED_ROLES = ("chat", "embeddings", "rerank", "image", "s2t", "t2s")
-
-# Roles excluded from chat-specific passes: mmproj keep/drop, the shared
-# chat+emb+rnk matrix solve, and matrix var collection.
-NON_CHAT_ROLES = ("embeddings", "rerank", "image", "s2t", "t2s")
+# Roles and their derived sets live in `roles.py`; these names are the
+# module-level aliases older imports use, never a second definition.
+SERVED_ROLES = roles.SERVED_ROLES
+NON_CHAT_ROLES = roles.NON_CHAT_ROLES
 
 
 def validate_dir_roles(dir_roles: dict) -> str | None:

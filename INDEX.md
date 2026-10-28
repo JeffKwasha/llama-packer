@@ -46,7 +46,7 @@ Engines and transports are independent axes: each engine declares the transports
 - [FAQ.md](FAQ.md) — why HF-hub models don't show up and how to serve them (sidecar `model:`+`hf_repo:` vs symlinks)
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
-- [docs/backends/](docs/backends/) — one doc per engine (llama-server, vllm, sd-server, whisper-server, audio-cpp): roles/formats, command shape, config keys, VRAM
+- [docs/backends/](docs/backends/) — one doc per engine (llama-server, vllm, sd-server, whisper-server, audio-cpp): operations/formats, command shape, config keys, VRAM
 - [docs/transports/](docs/transports/) — host / docker / podman: launch wrapping, path translation, mounts, lifecycle
 - [SPEC.md](SPEC.md) — behavioral contract: discovery, fit-params estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch keys; deleting `derived:` costs seconds, never a probe
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes

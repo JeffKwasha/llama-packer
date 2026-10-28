@@ -12,7 +12,9 @@ form the support matrix consulted by ``build_config``:
               itself is *not* a file – it is the *place* where a file lives,
               resolved by ``Model._resolve_gguf_path`` to a concrete snapshot
               file, ``gguf_path``)
-    roles     model roles it can serve: chat / embeddings / rerank
+    operations  serving operations it implements: generate / embed / rerank /
+              generate_image / transcribe / synthesize.  A role names the
+              operation it needs; engines never declare roles.
     handles   SETTING_KEYS it renders into the command; anything a user
               declares that a backend does not handle is warned about instead
               of silently dropped
@@ -24,6 +26,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
+from llama_packer import roles
 from llama_packer.backends.transport import HostTransport, Transport
 
 if TYPE_CHECKING:
@@ -59,7 +62,7 @@ class BaseBackend(ABC):
 
     name: str
     formats: frozenset[str]
-    roles: frozenset[str]
+    operations: frozenset[str]
     handles: frozenset[str]
     #: Transports this engine can run under (see ``transport.py``).  The
     #: registry materialises one bound backend per supported pair.
@@ -85,11 +88,17 @@ class BaseBackend(ABC):
     stop_cmd: str | None = None
     unload_timeout: int | None = None
 
+    def supports_role(self, name: str) -> bool:
+        """Whether this engine implements the operation *name* requires."""
+        role = roles.get(name)
+        return role is not None and role.operation in self.operations
+
     def unsupported_reason(self, model: "Model") -> str | None:
         """Return why this backend cannot serve *model*, or None if it can."""
-        if model.role not in self.roles:
+        if not self.supports_role(model.role):
+            supported = roles.roles_for_operations(self.operations)
             return (f"role {model.role!r} not supported "
-                    f"(supports: {', '.join(sorted(self.roles))})")
+                    f"(supports: {', '.join(sorted(supported))})")
         if "hf_repo" in self.formats and model.hf_repo:
             return None
         suffix = model.gguf_path.suffix.lower() if model.gguf_path else None
