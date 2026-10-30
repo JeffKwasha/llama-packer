@@ -202,14 +202,14 @@ live repack validated (54 models). Bugfixes only, no new config surface.
 - the resident log prints the cost terms.
 
 **Portion 2 — composition validation and per-category context.** A set
-naming two categories of one role warns (or refuses) by name; substitution
-of a *cross-role* element inside a role (e.g. `emb | rnk` as one element)
-warns rather than refuses — the role hosts elements, it does not require
-them, so the packer's job is to price the composition and flag the likely
-mistake, not to forbid it (`tasks-and-endpoints.md` D7); per-category
+naming two categories of one role warns (or refuses) by name —
+alternation across *different* roles inside a set stays a legitimate
+bucket composition and never warns (requirement 31); per-category
 `ctx:` so a bucket can declare its served context instead of inheriting
-the role's; the host ledger's set awareness (a set that cannot fit its CPU
-residents is refused as a unit); `matrix.categories` schema documented.
+the role's, honoured at one seam by every consumer (requirement 32); the
+host ledger's set awareness — a chat-capable composition's CPU residents
+are judged as a unit and refused together when the unit cannot fit
+(requirement 33); `matrix.categories` schema documented.
 
 **Portion 3 — refactor / capacity exploration.** Deferred to
 `tasks-and-endpoints.md` (branch C, D12): the solver's unification
@@ -446,6 +446,35 @@ branch 2).
     `device_roles` and context-knob facts are derived from it, engines
     declare operations (never roles), every role's operation is implemented
     by an engine, and no engine advertises an operation no role requires.
+
+**Portion 2 (citable by tests).**
+
+31. *same-role co-residence warns*: a routing set naming two categories of
+    one role (e.g. `rnk` and `rnk2` in one expression) warns by name —
+    the set, the role and the two categories. It does not refuse: the
+    emitted set is what the operator wrote. Alternation across *different*
+    roles inside a set is a legitimate composition (`three | (two & one)`
+    operator buckets, `opportunistic-coload.md` §Buckets) and never warns —
+    a rule flags the likely mistake, not a documented one.
+32. *per-category `ctx:`*: `matrix.categories.<name>.ctx:` declares the
+    served context for that category's model instead of inheriting the
+    role's. It is a **cap applied at one seam** (`resident_ctx`) so
+    selection, matrix pricing, the host ledger, per-set pricing and the
+    emitted `ctx_size` all honour it identically; it never acts as a
+    floor, so a squeezed or design-limited serving still cannot exceed
+    the declared value; a malformed value warns and the category keeps
+    its default.
+33. *the host ledger judges CPU compositions as units*: a chat-capable
+    set's CPU residents (the committed pair plus the fixed CPU categories
+    it names) are checked as one unit against the pool remaining after
+    the pair, the same way the VRAM budget charges the worst chat set.
+    When a composition cannot fit, its not-yet-committed fixed CPU
+    categories are refused together — no ids, the var pruned from the
+    emitted sets, logged with the unit and the shortfall — and a category
+    that another, fitting composition admits survives. The committed
+    embed/rerank winners are never refused by this pass (decision 13's
+    host ledger exists to carry them); refusals never invent a budget
+    the ledger cannot read (requirement 16 — no pool, no gate).
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 

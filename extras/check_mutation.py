@@ -93,6 +93,34 @@ MUTATIONS = {
         "llama_packer/writer.py",
         '    who = f"{stem}: usage:" if stem else "usage:"',
         '    who = "usage:"'),
+    "test_warn_same_role_names_the_pair": (
+        "llama_packer/__main__.py",
+        "                if len(names) < 2:",
+        "                if False:"),
+    "test_resident_options_branch_alternatives_not_co_resident": (
+        "llama_packer/writer.py",
+        '                elif op == "&":',
+        "                elif False:"),
+    "test_prune_leaves_removes_refused_members": (
+        "llama_packer/writer.py",
+        'kept.append(pruned if other not in pruned',
+        "                                    kept.append(pruned if other in pruned"),
+    "test_drop_refused_categories_prunes_sets_and_pins": (
+        "llama_packer/__main__.py",
+        "    return kept, [p for p in cpu_pins if p not in refused]",
+        "    return kept, list(cpu_pins)"),
+    "test_category_ctx_caps_at_one_seam": (
+        "llama_packer/writer.py",
+        "    ctx = (model.design_context if model.role not in (",
+        "    ctx = (model.design_context if True not in ("),
+    "test_host_unit_refusals_drop_the_unit": (
+        "llama_packer/writer.py",
+        "            if available < total:",
+        "            if False:"),
+    "test_host_unit_refusals_survive_one_fitting_set": (
+        "llama_packer/writer.py",
+        "                if all(s in fails for s in named):",
+        "                if True:"),
     "test_warn_unhandled_names_the_sidecar": (
         "llama_packer/backends/base.py",
         '        who = f"{stem}: " if stem else ""',
@@ -215,10 +243,10 @@ MUTATIONS = {
         "llama_packer/writer.py",
         "                if model is None or not model.on_cpu:\n"
         "                    continue\n"
-        "                ctx = self._rag_ctx(model)",
+        "                if name in self.host_unit_refused_vars:",
         "                if True:\n"
         "                    continue\n"
-        "                ctx = self._rag_ctx(model)"),
+        "                if name in self.host_unit_refused_vars:"),
     "test_host_measurement_does_not_leak_into_vram_pricing": (
         "llama_packer/vram.py",
         '        if getattr(self.model, "on_cpu", False) and not allow_cpu:',

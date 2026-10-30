@@ -37,7 +37,8 @@ from llama_packer.consts import (
 from llama_packer.writer import (
     build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name,
     MatrixKnobs, resident_cost_detail, resident_ctx,
-    _expr_leaves, _has_chat_slot)
+    _expr_leaves, _has_chat_slot, _prune_leaves,
+    _resident_options)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -381,7 +382,9 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
                    *, fit_bin: str = "", llama_args: str = "") -> tuple:
     """Resolve the swap-matrix configuration before build_config.
 
-    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
+    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed,
+    ctx_by_var)`` — the last naming each category's optional served-context
+    override (requirement 32, ``matrix.categories.<name>.ctx:``).
 
     ``categories`` maps each declared category name → its selected model
     (defaults: ``emb``/``rnk`` bound to the embeddings/rerank models).  The
@@ -431,25 +434,30 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
                 "matrix: disabled — profiles.yaml has no matrix: section; "
                 "RAG co-loading off (emb: %s, rnk: %s)",
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
-        return None, None, None, {}, ()
+        return None, None, None, {}, (), {}
     embed_model = _select_model(models, "embeddings", args.embed, logger,
                                 cost=resident_cost())
     rerank_model = _select_model(models, "rerank", args.rerank, logger,
                                  cost=resident_cost())
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
-        return None, None, None, {}, ()
+        return None, None, None, {}, (), {}
     if rerank_model is None:
         logger.warning("no rerank model found; skipping matrix")
-        return None, None, None, {}, ()
+        return None, None, None, {}, (), {}
 
     # Declared categories (defaults bind the RAG pair).  Category names are
     # the matrix var names; roles may repeat (e.g. tts/stt on t2s/s2t).
     cat_specs = matrix_cfg.get("categories") or {
         "emb": {"role": "embeddings"}, "rnk": {"role": "rerank"}}
     categories: dict[str, "Model"] = {}
+    ctx_by_var: dict[str, int] = {}
     for name, spec in cat_specs.items():
-        spec = spec if isinstance(spec, dict) else {}
+        # The spec schema is strict (D13, clean break): anything but these
+        # keys is an alien spelling and warns instead of being ignored.
+        for key in sorted(set(spec) - {"role", "selector", "ctx"}):
+            logger.warning("matrix: category %r: unhandled key %r "
+                           "(known: role, selector, ctx)", name, key)
         role = str(spec.get("role") or "")
         selector = spec.get("selector")
         if not role:
@@ -463,6 +471,16 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
                            f" matching {selector!r}" if selector else "")
             continue
         categories[str(name)] = model
+        ctx = spec.get("ctx")
+        if ctx is not None:
+            try:
+                iv = int(ctx)
+                assert iv > 0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("matrix: category %r: ctx=%r is not a "
+                               "positive integer; ignored", name, ctx)
+            else:
+                ctx_by_var[str(name)] = iv
     # Back-compat: the canonical RAG names always resolve.
     categories.setdefault("emb", embed_model)
     categories.setdefault("rnk", rerank_model)
@@ -504,11 +522,64 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
     if fixed:
         logger.info("matrix categories: %s",
                     ", ".join(f"{n}={m.stem}" for n, m in fixed))
-    return matrix_cfg, embed_model, rerank_model, categories, fixed
+    return (matrix_cfg, embed_model, rerank_model, categories, fixed,
+            ctx_by_var)
 
 
 # Var-name prefix per co-load role, used in set expressions
 # (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
+
+
+def _drop_refused_categories(sets: dict[str, str], cpu_pins: list[str],
+                            refused: tuple[str, ...], logger):
+    """Reshape the emitted config for host-unit refusals (requirement 33).
+
+    A refused category has no id, so its var must vanish both from the
+    ``vars`` map (which the emitter already omit — the stem drew no
+    variants) and from every set expression, or llama-swap rejects the
+    whole config.  Returns (pruned sets, surviving pins).
+    """
+    kept: dict[str, str] = {}
+    for sname, expr in sets.items():
+        clean = _prune_leaves(expr, frozenset(refused), sets)
+        if clean:
+            kept[sname] = clean
+        else:
+            logger.info("matrix: set %r emptied by refused categories; "
+                        "omitted", sname)
+    return kept, [p for p in cpu_pins if p not in refused]
+
+
+def _warn_same_role(sets: dict[str, str], sets_cfg: dict[str, str],
+                    role_of: dict[str, str], logger) -> None:
+    """Warn when a set may hold two categories of one role at once.
+
+    Requirement 31: one live model per role per set — `rnk` beside `rnk2`
+    is two rerankers resident. Membership is judged per *and-branch*:
+    alternation across roles is a legitimate composition (operator
+    buckets), so only an option that actually holds both warns, naming
+    the set, the role and the two categories.
+    """
+    seen: set[tuple[str, str]] = set()
+    for sname, expr in sets.items():
+        for option in _resident_options(expr, sets_cfg):
+            by_role: dict[str, list[str]] = {}
+            for leaf in option:
+                role = role_of.get(leaf)
+                if role:
+                    by_role.setdefault(role, []).append(leaf)
+            for role, names in sorted(by_role.items()):
+                if len(names) < 2:
+                    continue
+                key = (sname, role)
+                if key in seen:
+                    continue
+                seen.add(key)
+                logger.warning(
+                    "matrix: set %r may hold two categories of role %r "
+                    "(%s) — one live model per role; the extra is an "
+                    "alternative, never a co-resident", sname, role,
+                    ", ".join(sorted(names)))
 
 
 def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
@@ -1097,7 +1168,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Detect matrix configuration before build_config
     (matrix_cfg, embed_model, rerank_model, matrix_categories,
-     matrix_fixed) = _detect_matrix(
+     matrix_fixed, matrix_ctx) = _detect_matrix(
         profiles_cfg, models, args, logger,
         fit_bin=llama_bin, llama_args=template_vars["llama_args"])
 
@@ -1139,6 +1210,7 @@ def main(argv: list[str] | None = None) -> None:
             spare=args.spare, max_context=max_ctx,
             matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
             fixed_categories=matrix_fixed,
+            category_ctx=matrix_ctx,
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
@@ -1270,6 +1342,13 @@ def main(argv: list[str] | None = None) -> None:
                                            s: "(" + " | ".join(v) + ")"
                                            for s, v in per_set.items() if v},
                                        pinned=cpu_pins, role_of=role_of)
+            refused = tuple(sorted(config.host_unit_refused))
+            if refused:
+                logger.info("host ledger: refused %s — no ids; set leaves "
+                            "pruned", ", ".join(refused))
+                sets, cpu_pins = _drop_refused_categories(
+                    sets, cpu_pins, refused, logger)
+            _warn_same_role(sets, sets, role_of, logger)
             if coload_vars:
                 joined = " ".join(str(s) for s in sets_cfg.values())
                 if "__COLOAD_VARS__" not in joined:

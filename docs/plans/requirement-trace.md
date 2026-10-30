@@ -177,3 +177,11 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every role's operation is implemented by an engine (no orphan operation) | `test_role_registry_derives_its_sets`, `test_every_role_operation_is_implemented` |
+
+## Portion 2 (docs/plans/cpu-residency-budget.md §Portion 2)
+
+| # | Requirement | Test |
+|---|---|---|
+| 91 | Same-role co-residence warns per and-branch, naming the set, role and both categories; alternation across roles (operator buckets) never reports co-residency | `test_warn_same_role_names_the_pair`, `test_resident_options_branch_alternatives_not_co_resident` |
+| 92 | A per-category `ctx:` caps the served context at one seam (`resident_ctx`) and is never a floor | `test_category_ctx_caps_at_one_seam` |
+| 93 | A chat-capable composition's CPU residents are judged as one unit: not fitting refuses the unit together (no ids, vars pruned from sets and pins), a category any fitting composition admits survives, and the committed pair is never refused | `test_host_unit_refusals_drop_the_unit`, `test_host_unit_refusals_survive_one_fitting_set`, `test_prune_leaves_removes_refused_members`, `test_drop_refused_categories_prunes_sets_and_pins` |

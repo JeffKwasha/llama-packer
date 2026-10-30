@@ -214,7 +214,7 @@ def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
               _stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed = _detect_matrix({}, models, args,
+        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({}, models, args,
                                                     logging.getLogger("test"))
     assert cfg is None and emb is None and rnk is None
     assert "matrix: disabled" in caplog.text
@@ -231,7 +231,7 @@ def test_detect_matrix_silent_without_rag_models(caplog):
     models = [_stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, _, _, cats, fixed = _detect_matrix({}, models, args,
+        cfg, _, _, cats, fixed, _ctx = _detect_matrix({}, models, args,
                                                 logging.getLogger("test"))
     assert cfg is None
     assert "matrix: disabled" not in caplog.text
@@ -249,7 +249,7 @@ def test_detect_matrix_selects_when_section_present(caplog):
     args = SimpleNamespace(embed=None, rerank=None)
     matrix_cfg = {"sets": {"rag": "__CHAT_VARS__ & emb & rnk"}}
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed = _detect_matrix({"matrix": matrix_cfg},
+        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({"matrix": matrix_cfg},
                                                     models, args,
                                                     logging.getLogger("test"))
     assert cfg is matrix_cfg
@@ -279,7 +279,7 @@ def test_detect_matrix_custom_categories(caplog):
         "sets": {"voice": "__CHAT_VARS__ & (tts | stt)"},
     }
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed = _detect_matrix(
+        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix(
             {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
     assert cfg is matrix_cfg
     assert set(cats) == {"emb", "rnk", "tts", "stt"}
@@ -578,6 +578,46 @@ def test_device_roles_rejects_a_scalar(make_model, caplog):
     assert any("expected a list" in r.message for r in caplog.records)
 
 
+def test_warn_same_role_names_the_pair(caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #31 -- same-role
+    # co-residence warns per and-branch, naming both categories;
+    # alternation (operator buckets) never reports a co-residency.
+    import logging
+    from llama_packer.__main__ import _warn_same_role
+    sets = {"bad": "__CHAT_VARS__ & rnk & rnk2",
+            "bucket": "__CHAT_VARS__ & (three | (two & one))",
+            "alts": "__CHAT_VARS__ & emb & (rnk | rnk2)"}
+    role_of = {"emb": "embeddings", "rnk": "rerank", "rnk2": "rerank",
+               "three": "rerank", "two": "embeddings", "one": "rerank"}
+    _warn_same_role(sets, sets, role_of, logging.getLogger("t"))
+    text = caplog.text
+    assert "'bad'" in text and "'rerank'" in text
+    assert "(rnk, rnk2)" in text
+    for sname in ("bucket", "alts"):
+        assert sname not in text, text
+
+
+def test_drop_refused_categories_prunes_sets_and_pins(caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a refused
+    # category's var vanishes from vars (no id), the sets and the pins;
+    # a set emptied entirely is omitted.
+    import logging
+    from llama_packer.__main__ import _drop_refused_categories
+    sets = {"voice": "__CHAT_VARS__ & tts & music",
+            "solo": "__CHAT_VARS__ & tts"}
+    kept, pins = _drop_refused_categories(sets, ["tts", "music"],
+                                          ("music",), logging.getLogger("t"))
+    assert kept["voice"] == "__CHAT_VARS__ & tts"
+    assert pins == ["tts"]
+    sets["cpu_part"] = "music"
+    gone, gone_pins = _drop_refused_categories(sets, ["tts", "music"],
+                                               ("music", "tts"),
+                                               logging.getLogger("t"))
+    assert gone["voice"] == "__CHAT_VARS__"
+    assert "cpu_part" not in gone
+    assert gone_pins == []
+
+
 def test_cpu_helpers_pinned_into_every_set():
     # Validates: docs/plans/cpu-residency-budget.md #25 -- the canonical CPU
     # category of each role joins the chat sets that do not name that role,
@@ -693,7 +733,7 @@ def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatc
     # the CPU candidate, so only the pair adoption can make this pass.
     cfg = {"matrix": {"categories": {
         "emb": {"role": "embeddings", "selector": "voyage"}}}}
-    _, emb, _, cats, fixed = m._detect_matrix(
+    _, emb, _, cats, fixed, _ctx = m._detect_matrix(
         cfg, [voyage, jina, rnk], args, logging.getLogger("t"))
     assert emb is voyage and cats["emb"] is voyage
     assert all(name != "emb" for name, _ in fixed)

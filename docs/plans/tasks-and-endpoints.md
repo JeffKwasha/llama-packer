@@ -207,6 +207,10 @@ consequences, recorded so the portions execute them:
 - `matrix.categories` specs validate strictly: `role`, `selector`, `ctx`
   are the known keys; anything else warns as an alien key (same class as
   requirement 28/29), never silently ignored.
+  **Clarified:** migration doesn't mean tolerated dual syntax — when a
+  portion changes the spelling, the fleet's sidecars/profiles are
+  migrated as part of that portion; the rule is that the *code* never
+  keeps a second, old syntax.
 - **O4 resolves: `engines:` is required.** There is no inference fallback
   to keep, because nothing old is grandfathered — D4's "explicit
   compatibility declaration" is the only syntax. `backend:` as a
@@ -329,9 +333,11 @@ here rather than refactored twice on the way to D12.
   sacrifice order) catalog/role-owned; sampling half stays operator config
   (`profiles:`), the task id naming which profile applies — task ids and
   profile names must then coincide by convention. Confirm.
-- **O4 — resolved by D13.** `engines:` is required; there is no
-  inference fallback and no tolerated `backend:` spelling once P2 lands.
-  Migration is the sidecar author's edit.
+- **O4 — resolved by D13.** `engines:` is required and is the only
+  compatibility spelling. Clarified: **the fleet's sidecars/profiles get
+  migrated as part of the portion** — the requirement is that the *code*
+  never keeps a second, old syntax, not that old files stay unmigrated.
+  After the portion lands, an un-migrated `backend:` warns as alien.
 - **O5 — per-role engine lists.** Today: one `engines:` list per model.
   If a model hosts different tasks on different engines, that needs
   `role → engines`. Lean: forbid and document until a real case appears.

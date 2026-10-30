@@ -614,6 +614,115 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
     assert with_ref.coloads == (("s2t", 640),)
 
 
+def test_prune_leaves_removes_refused_members():
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a refused CPU
+    # category disappears from the emitted sets without leaving a dangling
+    # var; sizes keep their members and empty groups collapse.
+    from llama_packer.writer import _prune_leaves as prune_leaves
+    drops = frozenset({"b"})
+    assert prune_leaves("(CHAT) & (b & c)", drops) == "CHAT & c"
+    assert prune_leaves("(a | b | c) & d", drops) == "(a | c) & d"
+    assert prune_leaves("(CHAT) & (b)", drops) == "CHAT"
+    assert prune_leaves("(CHAT) & (b & c)",
+                        frozenset({"b", "c"})) == "CHAT"
+    assert prune_leaves("a | b", drops) == "a"
+    assert prune_leaves("rnk2 & x", drops) == "rnk2 & x"
+    assert prune_leaves("b", drops) == ""
+    assert prune_leaves("(CHAT) & +combo", drops,
+                        {"combo": "b | d"}) == "CHAT & d"
+
+
+def test_category_ctx_caps_at_one_seam(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #32 -- a per-category
+    # ctx is a cap honoured by the served context and never a floor.
+    from llama_packer.writer import resident_ctx
+    m = make("stt2", role="s2t", context_length=32768, device="cpu")
+    assert resident_ctx(m, MatrixKnobs(), 2048) == 2048
+    assert resident_ctx(m, MatrixKnobs(), 65536) == 32768
+    emb = make("emb2", role="embeddings", context_length=65536)
+    assert resident_ctx(emb, MatrixKnobs(), None) == 4096
+    assert resident_ctx(emb, MatrixKnobs(embed_context=8192), None) == 8192
+    assert resident_ctx(emb, MatrixKnobs(embed_context=8192), 1024) == 1024
+    assert resident_ctx(emb, MatrixKnobs(), 999999) == 4096
+
+
+def test_host_unit_refusals_drop_the_unit(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a CPU
+    # composition that cannot fit is refused as a unit: each category in
+    # the unit gets no id, nothing commits, and the emitted set loses
+    # both leaves.
+    from llama_packer import writer
+    chat = make("chat", role="chat")
+    emb = make("e", role="embeddings", context_length=32768)
+    rnk = make("r", role="rerank", context_length=32768)
+    tts = make("t", role="t2s", context_length=32768, device="cpu")
+    music = make("muz", role="t2s", context_length=32768, device="cpu")
+    _fake_vram(chat, (1000, 0.5, 100))
+    for m in (emb, rnk):
+        _fake_vram(m, (100, 0.01, 0))
+    _fake_vram(tts, (4000, 0.01, 0))
+    _fake_vram(music, (3000, 0.01, 0))
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = writer.Planner(
+        [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
+        vram_total=64 * 1024, matrix_cfg={
+            "sets": {"voice": "__CHAT_VARS__ & tts & music"}},
+        embed_model=emb, rerank_model=rnk,
+        fixed_categories=[("tts", tts), ("music", music)],
+        host_pool_mb=5000)
+    plan = planner.plan()
+    assert planner.host_unit_refused_vars == frozenset({"tts", "music"})
+    assert not planner.host_ledger.residents
+    assert "t" not in plan and "muz" not in plan
+    assert dict(plan)[writer.HOST_REFUSED_KEY] == ["music", "tts"]
+
+
+def test_host_unit_refusals_survive_one_fitting_set(profiles, monkeypatch,
+                                                   caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a category that
+    # any fitting composition admits survives (it is an alternative of the
+    # failing one, not co-resident); the failing composition warns.
+    import logging
+    from llama_packer import writer
+    chat = make("chat", role="chat")
+    emb = make("e", role="embeddings", context_length=32768)
+    rnk = make("r", role="rerank", context_length=32768)
+    tts = make("t", role="t2s", context_length=32768, device="cpu")
+    music = make("muz", role="t2s", context_length=32768, device="cpu")
+    _fake_vram(chat, (1000, 0.5, 100))
+    for m in (emb, rnk):
+        _fake_vram(m, (100, 0.01, 0))
+    _fake_vram(tts, (4000, 0.01, 0))
+    _fake_vram(music, (3000, 0.01, 0))
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = writer.Planner(
+        [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
+        vram_total=64 * 1024, matrix_cfg={
+            "sets": {"both": "__CHAT_VARS__ & tts & music",
+                     "solo": "__CHAT_VARS__ & tts"},
+        },
+        embed_model=emb, rerank_model=rnk,
+        fixed_categories=[("tts", tts), ("music", music)],
+        host_pool_mb=5000)
+    plan = planner.plan()
+    assert planner.host_unit_refused_vars == frozenset({"music"})
+    assert "t" in plan and "muz" not in plan
+    with caplog.at_level(logging.WARNING):
+        planner._host_unit_refusals()
+    assert "cannot fit as a unit" in caplog.text
+
+
+def test_resident_options_branch_alternatives_not_co_resident():
+    # Validates: docs/plans/cpu-residency-budget.md #31 -- membership is
+    # judged per and-branch: an alternation never reports same-role
+    # co-residency, only a genuine conjunction does.
+    from llama_packer.writer import _resident_options
+    assert sorted(map(sorted, _resident_options(
+        "three | (two & one)"))) == [["one", "two"], ["three"]]
+    assert sorted(map(sorted, _resident_options(
+        "a & (b | c)"))) == [["a", "b"], ["a", "c"]]
+
+
 def test_sets_reference_coloads():
     # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the co-load pass only fires when a routing set can actually co-locate
     assert _sets_reference_coloads(COLOAD_SETS) is True
