@@ -783,16 +783,18 @@ published to llama-swap's `${PORT}` host macro. Everything else works
 identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
 matrix routing.
 
-All three operations are supported, mapped onto vLLM's pooling interface:
+All three endpoints are supported, mapped onto vLLM's pooling interface:
 
-| Operation | Task flag | Endpoints |
-|-----------|-----------|-----------|
-| `generate` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
-| `embed` | `--task embed` | `/v1/embeddings` |
+| task | vLLM flag | endpoint |
+|------|-----------|----------|
+| `chat` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
+| `embeddings` | `--task embed` | `/v1/embeddings` |
 | `rerank` | `--task score` | `/v1/rerank`, `/v1/score` |
 
-Sidecars themselves carry no backend key — backend selection, chat templates and
-LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`.
+A sidecar declares the engines that can load it with `engines:` (P2; until
+that lands the same field is spelled `backend:`). Without a declaration,
+selection is inferred from file format, gated by the profiles allow list; chat
+templates and LoRA adapters come from pattern-scoped override rules.
 
 ```yaml
 # profiles.yaml
