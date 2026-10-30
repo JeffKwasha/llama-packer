@@ -133,6 +133,12 @@ and every one of them carries a `Validates:` citation.
 | 64 | The CPU-shaped affine trio derives the exact quad and persists it under the device-stamped shape | `test_measure_affine_trio_cpu_shape_persists_host_quad` |
 | 65 | The device parse stays whole-log: a device run's projection buffers measure 0, host sums never leak into it | `test_parse_device_buffers_whole_log_device_path` |
 
+## Measurement failure evidence
+
+| # | Requirement | Test |
+|---|---|---|
+| 94 | A failed `llama-fit-params` run records the evidence a later diagnosis needs — argv, model facts, exit code and the full log — in a durable artifact, indexed by one journal row; the warning names the artifact and the cause instead of only the exit code | `test_fit_crash_records_argv_and_stderr`, `test_fit_crash_recorded_once_per_invocation`, `test_fit_timeout_records_argv`, `test_fit_unparseable_records_output` |
+
 ## A diagnostic names its subject
 
 | # | Requirement | Test |

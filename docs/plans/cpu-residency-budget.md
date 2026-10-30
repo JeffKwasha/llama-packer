@@ -567,6 +567,16 @@ description grammar; mem-tag `+`/`SSD`/RAM rules unchanged.
   hides whatever new quads the first measurement would have produced.
   Diagnose on the measurement path (fit-params invocation/flag shape,
   `llama_packer/vram.py`), not the planner.
+  **Evidence, 2026-10-30:** the crash no longer reproduces on `llama-b11988`
+  for the named models on any trio shape (`-c` design, `p=2`, `-c` design/2,
+  `--n-gpu-layers 0`, `-ub 512`) — all exit 0. So the cause is
+  binary-version- or argv-shape-specific, and the failing run is the only
+  evidence worth having: `VramBudget._record_fit_failure` now writes
+  `~/.cache/llama-packer/fit-params-failures/<ts>-<pid>-<model>-<outcome>.log`
+  (argv, model facts, binary identity, full stdout/stderr, exit/signal) and
+  indexes it with one `mode: fit` journal row; the warning names the
+  artifact and the cause. The next real crash is diagnosable from that file
+  alone.
 - **PR #4 body**: its vocabulary section still describes the
   operations-on-engines model; re-edit when `tasks-and-endpoints.md`
   lands (that branch owns the rework).
