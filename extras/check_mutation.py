@@ -301,10 +301,10 @@ MUTATIONS = {
         "llama_packer/roles.py",
         "if r.device_role)",
         "if True)"),
-    "test_every_role_operation_is_implemented": (
-        "llama_packer/roles.py",
-        'Role("s2t", "transcribe", False, "optional", None, True),',
-        'Role("s2t", "transcribe_x", False, "optional", None, True),'),
+    "test_every_task_maps_to_a_served_endpoint": (
+        "llama_packer/endpoints.py",
+        '    "s2t": TRANSCRIPTIONS,',
+        '    "s2t": "openai.nonexistent",'),
     "test_unknown_profiles_key_warns_with_a_hint": (
         "llama_packer/profiles.py",
         "        if key in PROFILES_KEYS:",

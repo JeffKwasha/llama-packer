@@ -1,6 +1,6 @@
 # Plan: tasks and endpoints — the serving-contract redesign
 
-Status: **design accepted in principle** (2026-10-29); **P0 landed**
+Status: **design accepted in principle** (2026-10-29); **P0–P1 landed**
 2026-10-30. Branch `feat/tasks-and-endpoints`, stacked on PR #4
 (`feat/cpu-residency-budget`).
 Supersedes `docs/plans/audio-roles.md`'s role proposal (cited, absorbed) and
@@ -288,9 +288,12 @@ refactor.
   `audio-roles.md` cross-referenced and its role table marked absorbed;
   `cpu-residency-budget.md` pruned to shipped status with its followers and
   open defects moved to `roadmap.md`.
-- **P1 undo operations**: remove `Role.operation`/`OPERATIONS`, backend
-  `operations`, `supports_role`; keep the scheduling registry; rework
-  affected tests; SPEC/architecture rewording.
+- **P1 undo operations** *(landed 2026-10-30)*: `Role.operation`/`OPERATIONS`,
+  backend `operations` and `supports_role` are gone; the scheduling registry
+  stays. Compatibility moved one hop to **endpoints**: `endpoints.py` holds
+  the closed id set and the task→endpoint map, engines declare `endpoints`,
+  and `endpoints.serves()` is the check. P3 therefore owns the registry's
+  validation API and doc/code agreement test, not the per-engine lists.
 - **P2 `engines:`**: sidecar key (engine names — required, D13's clean
   break; a single-engine claim is `engines: [x]`), resolution (order,
   allow list, availability), refusal by name when none applies; a

@@ -17,6 +17,7 @@ from llama_packer.backends import (
     BaseBackend,
     get_backend,
 )
+from llama_packer import endpoints
 from llama_packer.backends.llama_server import LlamaServerBackend
 from llama_packer.profiles import Profiles
 from llama_packer.writer import MatrixKnobs
@@ -52,10 +53,11 @@ def test_llama_server_roles_and_formats():
     # Validates: SPEC.md, 'Backend Selection': the engine's formats and the roles it serves.
     b = LlamaServerBackend()
     assert b.formats == {".gguf"}
-    assert b.operations == {"generate", "embed", "rerank"}
+    assert b.endpoints == {endpoints.CHAT, endpoints.EMBEDDINGS,
+                           endpoints.RERANK}
 
 
-def test_supports_role_and_format(make_model):
+def test_llama_server_serves_its_endpoints(make_model):
     # Validates: SPEC.md, 'Backend Selection': Return why this backend cannot serve *model*, or None if it can.
     b = LlamaServerBackend()
     assert b.unsupported_reason(make_model("m")) is None
@@ -437,6 +439,14 @@ def test_infer_backend_gguf_prefers_llama_server(make_model):
     assert infer_backend(make_model("g"), {"llama_bin": "/opt/llama-server"}) == "llama-server"
 
 
+def test_infer_backend_gguf_image_goes_to_sd_server(make_model):
+    # Validates: docs/plans/requirement-trace.md #90 -- an engine is chosen by the endpoint its task needs, not by format alone.
+    from llama_packer.backends import infer_backend
+    m = make_model("img", role="image")
+    assert infer_backend(m, {"llama_bin": "/opt/llama-server",
+                             "sd_bin": "/opt/sd-server"}) == "sd-server"
+
+
 def test_infer_backend_safetensors_prefers_host_then_container(make_model):
     # Validates: SPEC.md, 'Backend Selection': Infer a backend name from the model's file format and configuration. Backends register the formats they can load (``formats``); the registry.
     from llama_packer.backends import infer_backend
@@ -484,7 +494,8 @@ def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
 def test_vllm_podman_pair_cmd(make_model):
     # Validates: docs/transports/podman.md, 'Transport: podman': the podman pair is the same engine with podman's device flags and lifecycle
     b = get_backend("vllm-podman")
-    assert b.operations == {"generate", "embed", "rerank"}
+    assert b.endpoints == {endpoints.CHAT, endpoints.EMBEDDINGS,
+                           endpoints.RERANK}
     assert b.stop_cmd == "podman stop ${MODEL_ID}"
     assert b.unload_timeout == 30
     m = make_model("p", hf_repo="org/model")
@@ -1160,7 +1171,7 @@ def test_whisper_server_registered():
     # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("whisper-server")
     assert b.formats == {".bin"}
-    assert b.operations == {"transcribe"}
+    assert b.endpoints == {endpoints.TRANSCRIPTIONS}
     assert b.proxied is True
 
 
@@ -1216,7 +1227,7 @@ def test_audio_cpp_registered():
     # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("audio-cpp")
     assert b.formats == {".gguf", ".safetensors", "hf_repo"}
-    assert b.operations == {"transcribe", "synthesize"}
+    assert b.endpoints == {endpoints.TRANSCRIPTIONS, endpoints.SPEECH}
     assert b.proxied is True
     assert b.check_endpoint == "/health"
     assert b.stop_cmd is None  # host launch: no container lifecycle
