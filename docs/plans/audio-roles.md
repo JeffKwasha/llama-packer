@@ -8,6 +8,15 @@ silently lost when they come up.
 Related: [`audio-cpp.md`](audio-cpp.md) (the engine that ships t2s/s2t),
 [`matrix-categories.md`](matrix-categories.md) (the co-load model).
 
+> **Absorbed (2026-10-30).** The table below is superseded by the
+> task/endpoint vocabulary in
+> [`tasks-and-endpoints.md`](tasks-and-endpoints.md): audio.cpp's `task`
+> values become **task ids**, and the column headed "role" is what that
+> vocabulary calls a task. `vc` remains a genuinely new task (audio→audio);
+> `vad`/`align`/`diar` are tasks on the `openai.audio.transcriptions`
+> endpoint, and `music`/`sfx`/… on `openai.audio.speech`. Nothing here is
+> scheduled — see [`roadmap.md`](roadmap.md).
+
 ## Families → roles
 
 audio.cpp's `task` values already map onto llama-packer roles; the shipped set

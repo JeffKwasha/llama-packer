@@ -357,7 +357,7 @@ class GpuProfile:
 
 # ── Host RAM detection (the `device: cpu` budget) ─────────────────────────
 #
-# docs/plans/cpu-residency-budget.md §Host-budget requirements 6–10.  Every
+# SPEC.md §Host pool.  Every
 # term logs its path (declared / sysctl / fallback-25% / skipped-cgroup) —
 # a silent fallback is a bug.  Declared overrides in `profiles.yaml
 # hardware:` always win over detection; detection is discovery with

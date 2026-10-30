@@ -46,12 +46,13 @@ Engines and transports are independent axes: each engine declares the transports
 - [FAQ.md](FAQ.md) — why HF-hub models don't show up and how to serve them (sidecar `model:`+`hf_repo:` vs symlinks)
 - [SPEC.md](SPEC.md) — model metadata schema, sampling modes/aliases, vLLM backend, health-check/env/matrix
 - [docs/architecture.md](docs/architecture.md) — component ownership, plan→emit pipeline, invariants, testing seams
-- [docs/backends/](docs/backends/) — one doc per engine (llama-server, vllm, sd-server, whisper-server, audio-cpp): operations/formats, command shape, config keys, VRAM
+- [docs/backends/](docs/backends/) — one doc per engine (llama-server, vllm, sd-server, whisper-server, audio-cpp): formats/endpoints, command shape, config keys, VRAM
 - [docs/transports/](docs/transports/) — host / docker / podman: launch wrapping, path translation, mounts, lifecycle
 - [SPEC.md](SPEC.md) — behavioral contract: discovery, fit-params estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch keys; deleting `derived:` costs seconds, never a probe
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
 - [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
 - [docs/plans/](docs/plans/) — design proposals ([category-semantics](docs/plans/category-semantics.md): how a declared `usage:` category becomes emitted entries — one per satisfiable category, degradation along the category's own `sacrifice:` order, and the null-category fallback) (vllm-gb10, matrix-categories, opportunistic-coload, auto-parallel, audio-roles: 2×128k slots beat 1×256k; per-GPU budgets for multi-GPU pins) — and the in-design serving-contract redesign ([tasks-and-endpoints](docs/plans/tasks-and-endpoints.md): engines serve models, models declare `engines:`+`tasks:`, roles host endpoint-grouped elements with persistence tiers and TTL orthogonal to precedence, one solver for everything)
+- [docs/plans/roadmap.md](docs/plans/roadmap.md) — followers designed but unscheduled, and open defects, so a shipped plan can be pruned without losing them
 - [docs/glossary.md](docs/glossary.md) — **one name per concept**: sidecar, spare, derived:, rung, demand, blessed, coload, entry id, and the rest, each tied to the identifier that implements it
 - [docs/reference.md](docs/reference.md) — external links
 - [docs/install.md](docs/install.md) — deploying under systemd from a run directory: service account, group-writable config, GPU-node discovery ([extras/install.py](extras/install.py))

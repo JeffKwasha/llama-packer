@@ -30,86 +30,103 @@ main()                                        (__main__.py — thin orchestratio
 | `Planner` | `writer.py` | Every *context decision*: per-category rung search, shared matrix solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx, optional `vram_note` (over-budget squeeze tag for the description) |
 | `emit_config` | `writer.py` | Pure rendering: plans → entry dicts. Zero VRAM contact, zero I/O |
-| `_filter_supported` | `writer.py` | **The** validation boundary: backend format/role compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
-| Backends (engines) | `backends/`, `backends/base.py` | The serving engines (llama.cpp, vLLM, sd.cpp, whisper.cpp, audio.cpp): operations/formats, argv construction (`build_cmd`), and the resource requirements needed to launch them (`host_requires`/`container_requires`). Each renders a resolved `Model` into a `cmd` |
+| `_filter_supported` | `writer.py` | **The** validation boundary: backend format/task compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
+| Backends (engines) | `backends/`, `backends/base.py` | The serving engines (llama.cpp, vLLM, sd.cpp, whisper.cpp, audio.cpp): formats and the endpoints they serve, argv construction (`build_cmd`), and the resource requirements needed to launch them (`host_requires`/`container_requires`). Each renders a resolved `Model` into a `cmd` |
 | Transports | `backends/transport.py` | How an engine's process is launched: `host`, or a container runtime (`docker`, `podman`). Owns host→container path translation, mounts, container env, GPU device flags and lifecycle (`stop_cmd`/`unload_timeout`). One `ContainerTransport(runtime)` serves both docker and podman |
 | Registry binding | `backends/__init__.py` | Materialises one `BoundBackend` per valid (engine, transport) pair; engines declare which transports they support. Names: bare engine for host, `<engine>-<transport>` otherwise. Inference order: engines in declaration order, transports host > podman > docker; a container pair is only inferred when its runtime is on `PATH`. Selection: sidecar/override `backend:` > format/role inference gated by configured resources |
 | `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `calc_ctx`, matrix solver primitives |
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
-## Roles, models and engines
+## Models, tasks, engines and endpoints
 
-Three nouns, three owners. Keeping them apart is what stops "role" from
+Four nouns, four owners. Keeping them apart is what stops "role" from
 becoming a synonym for "engine" or "placement":
 
 | noun | answers | owner |
 |---|---|---|
-| **role** | *what work* the serving does | `roles.py` (one `Role` per id) |
-| **model** | *which weights* do the work, and whether they can | the sidecar (`role:`, `device:`, `parallel:`, `context_length`, …) |
-| **engine** | *how* those weights are executed | `backends/<engine>.py` (`operations`, `formats`, `host_requires`) |
+| **model** | *which weights*, what work they can do, and which engines can load them | the sidecar (`engines:`, `tasks:`, `device:`, `parallel:`, `context_length`, …) |
+| **task** | *what work* is being done | `tasks.py` — the closed catalog (P4) |
+| **endpoint** | *where* that work is served | `endpoints.py` — the one registry (P3) |
+| **engine** | *how* the weights are executed | `backends/<engine>.py` (`formats`, `endpoints`, `host_requires`) |
 
-The engine never names a role. It implements **operations** (`generate`,
-`embed`, `rerank`, `generate_image`, `transcribe`, `synthesize`), and a role
-names the operation it needs. That is the whole compatibility rule:
+The engine never names a task or a role. It declares the **formats** it can
+load and the **endpoints** it serves. A model declares the engines that can
+load it and the tasks it performs; every task maps to exactly one endpoint.
+That is the whole compatibility rule:
 
 ```
-model --performs--> role --requires--> operation --implemented by--> engine
+model --declares--> engines                      (can load)
+model --declares--> tasks --served at--> endpoints <--served by--> engine
 ```
 
-So one engine serves many models, one role can be served by several engines,
-and a model may in principle perform several roles (today the sidecar field
-is a single `role:`, so the planner treats it as one). A role may also be
-served by several models — a cheap one that takes parallel slots and an
-expensive one that cannot are both valid `rerank` models.
+So one engine serves many models, one task can be served by several engines,
+and a model may perform several tasks. Two models performing the same task
+are alternatives, never co-resident.
 
-### A role definition
+### A task is a catalog entry
 
-A role has one name and only these fields:
+A task is a closed id and carries everything the packer needs to schedule
+it: the endpoint it is served at, the scheduling role it implies, its load
+semantics (request-time parameter vs one task per process), and the negative
+examples that keep near neighbours apart. Adding a task is a contract change
+— endpoint + role + policy — never an agent's passing invention; an unknown
+id warns and is ignored, and "we don't know" is an empty `tasks:`, not an
+invented name.
 
-- **name** — one canonical id: `chat`, `embeddings`, `rerank`, `image`,
-  `s2t`, `t2s`. Directory names (`embed/`, `rerank/`, …) map *to* a role
-  (`dirs:`); they are not second spellings of it.
-- **work** — the service contract (vectors, scores, transcript, audio,
-  completions, image) and the **operation** an engine must implement for it.
-  This is what decides "is this a chat role" and therefore which planner
-  passes apply.
-- **claim** — how a model declares the role: sidecar `role:` or the
-  directory mapping.
-- **cardinality** — several models may serve one role; a routing set holds
-  at most one of them. A second model of a role is an alternative, never a
-  co-resident.
-- **residency policy** — pinned by default (embeddings, rerank), optional
-  (s2t, t2s), or on demand (chat, image).
-- **context policy** — the default served context for a resident role
-  (`embed_context`/`rerank_context`), overridable per category.
+The six ids that exist today (`chat`, `embeddings`, `rerank`, `image`,
+`s2t`, `t2s`) become catalog entries in P4; until then they live in
+`roles.py` and the sidecar claims them with `role:`.
 
-| role | work | operation | residency policy | default context |
-|---|---|---|---|---|
-| `chat` | completions | `generate` | on demand | solved per usage category |
-| `embeddings` | vectors | `embed` | pinned | `embed_context` (4096) |
-| `rerank` | relevance scores | `rerank` | pinned | `rerank_context` (4096) |
-| `image` | image generation | `generate_image` | on demand | design context |
-| `s2t` | transcript | `transcribe` | optional | design context |
-| `t2s` | audio | `synthesize` | optional | design context |
+### An endpoint is standardized
 
-**Not in a role definition**, because each belongs to the model or the
-engine: the engine that serves it, the estimator that sizes it (affine quad
-vs file size + fixed buffer), its file format, its placement (`device:`),
-and whether it can take parallel slots. audio.cpp serves some `s2t` models
-and whisper-server serves others; adding an STT engine changes no role.
+Endpoints are concrete serving surfaces, engine-owned and hardcoded in one
+place: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`,
+`openai.audio.transcriptions`, `openai.audio.speech`, plus `native.*` for
+engine-specific surfaces. Servers and clients choose endpoints; a model
+never does. A role's required endpoints are the union of its tasks'
+endpoints, and one live serving covers every task sharing an endpoint —
+those tasks are aliases of one serving, never one load each.
+
+### A role is a composition
+
+A role hosts elements; it does not require them — RAG with the rerank slot
+empty is thinner but valid. Roles live in `profiles.yaml` and list their
+tasks with a persistence class:
+
+```yaml
+roles:
+  chat:
+    tasks:
+      - chat:  pinned
+      - agent: on_demand
+  rag:
+    min_context: 4k
+    sacrifice: [concurrency, vision]
+    tasks:
+      - embed:  pinned
+      - rerank: pinned
+```
+
+`pinned` is resident; `on_demand` (the default) loads when requested and
+evicts its siblings. Role terms (`require:`/`keep:`/`sacrifice:`/`min_*:`)
+reach every element's serving and rank earlier in the sacrifice order than
+the task's own terms — the role degrades before its tasks do. The matrix
+`sets:` are generated from this table (P5), not hand-authored: dual
+authorship is the drift this design exists to remove.
 
 ### Where the registry lives
 
-`llama_packer/roles.py` is the one table: a `Role` per id, and the derived
-sets read off it — `SERVED_ROLES`, `NON_CHAT_ROLES`, `DEVICE_ROLES` (the
-`device_roles:` vocabulary), `OPERATIONS`, and the matrix context knob
-(`MatrixKnobs.rag_cap`). Adding a role means adding one row; a role without
-an engine operation fails `test_every_role_operation_is_implemented`.
+`roles.py` is the scheduling table: one row per id with the chat-pass flag,
+residency policy, context knob and `device_roles:` eligibility. P1 drops
+`Role.operation`/`OPERATIONS` — engines declare endpoints, not operations —
+and P4 moves the id list into the task catalog. Until then the table is the
+single home of the six ids, and every derived set (`SERVED_ROLES`,
+`NON_CHAT_ROLES`, `DEVICE_ROLES`) is read off it.
 
 Validation follows the same split: an unsupported *value* of a known sidecar
 key warns at discovery (`role:` against the registry with a near-miss hint,
-`device:` against `cpu`/non-negative index), and operation/role
+`device:` against `cpu`/non-negative index), and format/endpoint
 compatibility is checked once in `_filter_supported` before any budgeting.
 
 ## Invariants (and their single homes)
@@ -143,7 +160,7 @@ plain data — see `tests/test_planner.py`.
 ## Extension points
 
 - **Add an engine**: create `backends/<name>.py` with a `BaseBackend` subclass
-  and add it to `ENGINES` (`backends/__init__.py`). Declare `formats`, `operations`,
+  and add it to `ENGINES` (`backends/__init__.py`). Declare `formats`, `endpoints`,
   `transports` (which of `host`/`podman`/`docker` it runs under), and
   `host_requires`/`container_requires` (the `avail` keys needed to launch).
   Registration order is the inference preference order; the transport seam
@@ -158,7 +175,7 @@ plain data — see `tests/test_planner.py`.
 
 ## Where to read more
 
-- [backends/](backends/) — one doc per engine: operations/formats, command shape, config keys, VRAM
+- [backends/](backends/) — one doc per engine: formats/endpoints, command shape, config keys, VRAM
 - [transports/](transports/) — host / docker / podman: launch wrapping, path translation, lifecycle
 - [SPEC.md](../SPEC.md) — behavioral contract (discovery, fit-params
   estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch

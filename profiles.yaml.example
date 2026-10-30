@@ -1,3 +1,14 @@
+# ── Sidecar syntax (NEW — lands in P2/P4) ───────────────
+# Compatibility and capability are declared, never inferred. In a model
+# sidecar (the `<model>.md` beside the weights):
+#   engines: [llama-server]    # engine names that can load the weights;
+#                              # required — a single-engine claim is a list
+#   tasks: [embeddings]        # closed catalog ids; unset/empty = unverified
+#                              # (never an invented name)
+# `backend:` (compatibility) and `usage:` (workload tags) are the old
+# spellings: they warn as alien keys once their portion lands, and there is
+# no tolerated dual vocabulary.
+#
 # ── Global defaults ────────────────────────────────────
 defaults:
   cache_type: q8_0
@@ -301,6 +312,29 @@ profiles:
 #   - when: {name: 'tiny-.*'}
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
+# ── Roles (optional; NEW — lands in P5) ─────────────────
+# A role is a use case that *hosts* tasks; it does not require them — RAG
+# with the rerank slot empty is thinner but valid. `pinned` tasks are
+# resident, `on_demand` (the default) load when requested and evict their
+# siblings. Role terms reach every element's serving and degrade before the
+# task's own terms do. The matrix `sets:` below are generated from this
+# table, so hand-authored sets become alien when this lands.
+# roles:
+#   chat:
+#     tasks:
+#       - chat: pinned
+#       - agent: on_demand
+#   rag:
+#     min_context: 4k
+#     sacrifice: [concurrency, vision]
+#     tasks:
+#       - embed: pinned
+#       - rerank: pinned
+#   voice:
+#     tasks:
+#       - stt: pinned
+#       - tts: pinned
+#
 # ── Matrix: shared VRAM and routing sets (optional) ────
 # Residents are pinned and served at a fixed small context, so their
 # footprint is a number you can compute up front; whatever is left goes to
@@ -334,8 +368,7 @@ profiles:
 # The sets are also the VRAM budget contract: the chat solve reserves the
 # worst branch of the most expensive chat set (`&` sums, `|` maxes, `+set`
 # expands a named set), not the sum of every declared category. A category
-# no chat set references reserves nothing (it can only run alone). See
-# docs/plans/cpu-residency-budget.md decisions 13-15.
+# no chat set references reserves nothing (it can only run alone).
 #
 # matrix:
 #   embed_context: 4096

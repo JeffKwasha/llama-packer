@@ -1,10 +1,11 @@
 # Plan: CPU-residency budget — a host-RAM pool for `device: cpu` models
 
-Status: **in progress** (branch `feat/cpu-residency-budget`). Recorded
-2026-10-23. Related: `docs/plans/memory-allocation-tags.md` (§3 measured host
+Status: **shipped** — portions 1–2 in PR #4 (2026-10-30); portion 3 moved to
+[`tasks-and-endpoints.md`](tasks-and-endpoints.md). Recorded 2026-10-23.
+Related: `docs/plans/memory-allocation-tags.md` (§3 measured host
 RAM — this plan is its minimal form), `docs/plans/opportunistic-coload.md`
-(CPU-resident coload at 0 GPU cost, today's rule), `docs/plans/gpu-split-ladder.md`
-(follower branch — uses the measurement extension this plan builds),
+(CPU-resident coload at 0 GPU cost, today's rule),
+[`roadmap.md`](roadmap.md) (followers and open defects this plan produced),
 `SPEC.md` §VRAM Allocation, `llama_packer/{vram,hardware,writer,model}.py`.
 
 ## Problem
@@ -189,35 +190,13 @@ residents, and the GPU side is free either way.
 
 ### Portions
 
-**Portion 1 — set pricing and pinning (this branch).** Landed
-(`01d6a39`): 1121 tests, `check_trace` 87/87, `check_mutation` all hold,
-live repack validated (54 models). Bugfixes only, no new config surface.
-
-- recursive set pricing (`&` sum, `|` max, `+set` expand) for both the
-  budget and the host-ledger cost view;
-- the solve reserves the worst chat set instead of the category union;
-- an unreferenced category reserves nothing and says so;
-- the CPU pin is one canonical category per role, and a set that already
-  names that role keeps its own choice;
-- the resident log prints the cost terms.
-
-**Portion 2 — composition validation and per-category context.** A set
-naming two categories of one role warns (or refuses) by name —
-alternation across *different* roles inside a set stays a legitimate
-bucket composition and never warns (requirement 31); per-category
-`ctx:` so a bucket can declare its served context instead of inheriting
-the role's, honoured at one seam by every consumer (requirement 32); the
-host ledger's set awareness — a chat-capable composition's CPU residents
-are judged as a unit and refused together when the unit cannot fit
-(requirement 33); `matrix.categories` schema documented.
-
-**Portion 3 — refactor / capacity exploration.** Deferred to
-`tasks-and-endpoints.md` (branch C, D12): the solver's unification
-consumes the task/role/endpoint vocabulary that branch establishes, so
-generalizing `solve_matrix_ctx` here first would be rewritten on the way.
-llama-swap's native `capacity` routing stays under evaluation as the
-runtime half of the same contract. Out of scope until portions 1–2 are
-green and the live config is repacked.
+Portions 1–2 shipped in PR #4: recursive set pricing and the canonical CPU
+pin, then composition validation, per-category `ctx:` and host-ledger unit
+judgement. Their requirements are citable in
+[`requirement-trace.md`](requirement-trace.md); the rules they produced are
+in `SPEC.md` §VRAM Allocation. Portion 3 (solver generalisation) moved to
+[`tasks-and-endpoints.md`](tasks-and-endpoints.md) D12 — the solver consumes
+that branch's vocabulary, so generalising it here would be rewritten.
 
 ## Host pool equation
 
@@ -410,7 +389,7 @@ branch 2).
     Two independent selections (CLI/role pick vs category spec) must
     never disagree.
 
-**Set composition** (decisions 13–15; portion 1).
+**Set composition** (decisions 13–15).
 
 22. *recursive pricing*: a set expression prices as a boolean tree —
     `&` sums, `|` maxes, `+set` expands the referenced expression — so
@@ -548,25 +527,16 @@ description grammar; mem-tag `+`/`SSD`/RAM rules unchanged.
 
 ## Out of scope (followers / roadmap)
 
-- `gpu-split-ladder`: `moe-cpu` rungs, split spill-aware rejection, the
-  `+` mem-tag decision, `metadata.packing.split` (the emission site is
-  landable here, the split *value* is not).
-- `layers N` (`-ngl N`) rungs; resident-partial-offload
-  (`docs/plans/resident-partial-offload.md`); measured-host-RAM graduation
-  beyond the minimal keys here; alias rework (Option A — pending
-  llama-swap alias-routing probe); vLLM host offload; unified-memory pools
-  (GB10) — §5 rule stands no code change.
+Moved to [`roadmap.md`](roadmap.md): `gpu-split-ladder` (`moe-cpu` rungs,
+split spill-aware rejection, the `+` mem-tag decision,
+`metadata.packing.split`), `layers N` (`-ngl N`) rungs,
+resident-partial-offload, measured-host-RAM graduation beyond the minimal
+keys here, alias rework (Option A — pending the llama-swap alias-routing
+probe), vLLM host offload, and unified-memory pools (GB10).
 
 ## Deferred on this branch (recorded, not dropped)
 
-- **`fit-params crashed (exit 1)` warnings on first measurement** of the
-  embed/rerank models (`Qwen3-Embedding-0.6B-Q8_0`, `voyage-4-nano-q8_0`,
-  `jina-v5-small-retrieval`, `Qwen3-Reranker-0.6B-Q6_K`, …). Pre-existing
-  and environmental — the numbers actually used come from the saved
-  sidecar `derived:` blocks, so planning is not affected — but the crash
-  hides whatever new quads the first measurement would have produced.
-  Diagnose on the measurement path (fit-params invocation/flag shape,
-  `llama_packer/vram.py`), not the planner.
-- **PR #4 body**: its vocabulary section still describes the
-  operations-on-engines model; re-edit when `tasks-and-endpoints.md`
-  lands (that branch owns the rework).
+Moved to [`roadmap.md`](roadmap.md) §Open defects: the `fit-params crashed
+(exit 1)` first-measurement warnings (with the 2026-10-30 evidence), and the
+PR #4 body's stale vocabulary section, which `tasks-and-endpoints.md`
+supersedes.
