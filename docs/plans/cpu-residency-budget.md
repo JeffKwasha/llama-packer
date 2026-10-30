@@ -527,3 +527,17 @@ description grammar; mem-tag `+`/`SSD`/RAM rules unchanged.
   beyond the minimal keys here; alias rework (Option A — pending
   llama-swap alias-routing probe); vLLM host offload; unified-memory pools
   (GB10) — §5 rule stands no code change.
+
+## Deferred on this branch (recorded, not dropped)
+
+- **`fit-params crashed (exit 1)` warnings on first measurement** of the
+  embed/rerank models (`Qwen3-Embedding-0.6B-Q8_0`, `voyage-4-nano-q8_0`,
+  `jina-v5-small-retrieval`, `Qwen3-Reranker-0.6B-Q6_K`, …). Pre-existing
+  and environmental — the numbers actually used come from the saved
+  sidecar `derived:` blocks, so planning is not affected — but the crash
+  hides whatever new quads the first measurement would have produced.
+  Diagnose on the measurement path (fit-params invocation/flag shape,
+  `llama_packer/vram.py`), not the planner.
+- **PR #4 body**: its vocabulary section still describes the
+  operations-on-engines model; re-edit when `tasks-and-endpoints.md`
+  lands (that branch owns the rework).
