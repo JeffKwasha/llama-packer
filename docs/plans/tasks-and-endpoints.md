@@ -195,6 +195,35 @@ tightest lifetime wins wherever two scopes disagree (e.g. a pinned embed
 claimed by `rag` and `voice` with different role TTLs), with a warning
 naming the two scopes.
 
+## D13 — clean break on config syntax (operator policy)
+
+When a config syntax changes, the old spelling becomes alien: a key that
+does not parse under the current schema warns (or errors when it would
+silently contradict current semantics) exactly as a typo would — nothing
+is grandfathered, and there is no tolerated dual vocabulary. Migration is
+a sidecar/profiles *author's edit*, not packer tolerance. Immediate
+consequences, recorded so the portions execute them:
+
+- `matrix.categories` specs validate strictly: `role`, `selector`, `ctx`
+  are the known keys; anything else warns as an alien key (same class as
+  requirement 28/29), never silently ignored.
+- **O4 resolves: `engines:` is required.** There is no inference fallback
+  to keep, because nothing old is grandfathered — D4's "explicit
+  compatibility declaration" is the only syntax. `backend:` as a
+  compatibility declaration becomes alien when P2 lands: a single-engine
+  claim is written `engines: [x]`, and a sidecar still declaring
+  `backend:` warns.
+- `usage:` tags become alien when P4 lands (`tasks:` is the capability
+  claim; an un-migrated sidecar warns that its `usage:` tags are
+  unhandled).
+- Hand-authored `matrix.sets:` become alien once P5's `roles:` table
+  generates the routing sets — dual authorship is the drift this branch
+  exists to remove.
+
+Absence of a section is not old syntax: a fleet with no `matrix:` today
+keeps working (that is a configuration state, not a tolerated spelling);
+the strictness applies to keys that are *present*.
+
 ## D12 — the one allocation problem (branch C north star)
 
 Every element in every role is one item in one knapsack; degradation exists
@@ -255,10 +284,10 @@ refactor.
 - **P1 undo operations**: remove `Role.operation`/`OPERATIONS`, backend
   `operations`, `supports_role`; keep the scheduling registry; rework
   affected tests; SPEC/architecture rewording.
-- **P2 `engines:`**: sidecar key (engine names), resolution (order, allow
-  list, availability), refusal by name when none applies; migration via
-  overrides (`family:`/directory) for existing sidecars; `backend:` stays
-  as the single-engine shorthand.
+- **P2 `engines:`**: sidecar key (engine names — required, D13's clean
+  break; a single-engine claim is `engines: [x]`), resolution (order,
+  allow list, availability), refusal by name when none applies; a
+  sidecar still declaring `backend:` warns as an alien key.
 - **P3 endpoint registry**: the one file+class; per-engine endpoint
   lists; validation API; docs generated or checked against code (tests
   assert doc/code agreement).
@@ -300,9 +329,9 @@ here rather than refactored twice on the way to D12.
   sacrifice order) catalog/role-owned; sampling half stays operator config
   (`profiles:`), the task id naming which profile applies — task ids and
   profile names must then coincide by convention. Confirm.
-- **O4 — `engines:` required or optional with inference fallback** for
-  text/image during migration. Lean: optional, migrated via overrides;
-  engine-specific families must declare.
+- **O4 — resolved by D13.** `engines:` is required; there is no
+  inference fallback and no tolerated `backend:` spelling once P2 lands.
+  Migration is the sidecar author's edit.
 - **O5 — per-role engine lists.** Today: one `engines:` list per model.
   If a model hosts different tasks on different engines, that needs
   `role → engines`. Lean: forbid and document until a real case appears.
