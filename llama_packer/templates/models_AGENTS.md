@@ -270,7 +270,7 @@ Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
 | `loras: [...]` | LoRA adapter files (any file-ref form, like `chat_template:`); appended to override rules' lists |
 | `vllm_image: <img>` | Per-model vLLM container image override (vLLM backends only) |
 | `mmproj: {file: …}` | Companion block: `file:` locates the projector/draft file; other keys form a conditional overlay served only while the file is served (see Companions) |
-| `device: N` / `device: cpu` | Pin to GPU N or run on CPU |
+| `device: N` / `device: cpu` | Pin to GPU N, or run entirely from host RAM (`device: cpu`: charged to the host-RAM pool, refused when the measured quad will not fit — see the host-pool section of the design doc); a GPU `device: N` emits the vendor env pin |
 | `concurrency: N` | Per-model concurrency limit |
 | `allow_profiles: [...]` | Restrict which sampling profiles apply (list, regex, or false) |
 | `reasoning-format` / `reasoning-preserve` | Chat + reasoning only (see above) |

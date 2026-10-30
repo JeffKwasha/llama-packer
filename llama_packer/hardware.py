@@ -24,7 +24,6 @@ from llama_packer import utils
 from llama_packer.consts import _RESERVE_SYSTEM
 
 logger = logging.getLogger(__name__)
-
 # ── VRAM detection (moved from utils.py) ──────────────────────────────────
 
 
@@ -354,3 +353,315 @@ class GpuProfile:
                         system_mb, system_mb)
 
         return cls(vram_mb=vram_mb, family=family, baseline_mb=baseline_mb)
+
+
+# ── Host RAM detection (the `device: cpu` budget) ─────────────────────────
+#
+# docs/plans/cpu-residency-budget.md §Host-budget requirements 6–10.  Every
+# term logs its path (declared / sysctl / fallback-25% / skipped-cgroup) —
+# a silent fallback is a bug.  Declared overrides in `profiles.yaml
+# hardware:` always win over detection; detection is discovery with
+# fallback, never assumption.
+
+_PRESSURE_FALLBACK_FRACTION = 0.25
+
+_PROC_MEMINFO = Path("/proc/meminfo")
+_PROC_ZONEINFO = Path("/proc/zoneinfo")
+_VM_MIN_FREE = Path("/proc/sys/vm/min_free_kbytes")
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+
+def _parse_meminfo_kb(text: str) -> dict[str, int]:
+    """`MemAvailable:  4786243 kB` → ``{"MemAvailable": 4786243}``."""
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        m = re.match(r"(\w+):\s+(\d+) kB", line)
+        if m:
+            out[m.group(1)] = int(m.group(2))
+    return out
+
+
+def _zone_high_sum_kb(text: str) -> int | None:
+    """Sum of every zone's `high` watermark, kB.
+
+    Returns None when the text holds no plausibly-synced zone table —
+    absent, zeroed, or unparseable zoneinfo is the declared fallback
+    trigger (requirement 7), not a 0 that reads like success.
+    """
+    total = 0
+    for line in text.splitlines():
+        m = re.match(r"\s+high\s+(\d+)", line)
+        if m:
+            total += int(m.group(1))
+    return total if total > 0 else None
+
+
+def _cgroup_free_kb(caps: dict[str, str], current_kb: int) -> int | None:
+    """`min(present caps − current)` over memory.high/memory.max.
+
+    cgroup v2 cap files count bytes; they arrive converted to kB.
+    `max`/absent caps skip their term; no readable cap at all → None
+    (the cgroup does not bind).
+    """
+    frees = []
+    for key in ("high", "max"):
+        raw = caps.get(key)
+        if raw is None or raw == "max":
+            continue
+        try:
+            cap_kb = int(raw) // 1024
+        except ValueError:
+            continue
+        if cap_kb == 0:
+            continue
+        frees.append(max(0, cap_kb - current_kb))
+    return min(frees) if frees else None
+
+
+def _service_cgroup_path(pid: int) -> Path | None:
+    """The cgroup dir of *pid* (v2 `0::<path>`, v1 memory controller).
+
+    Returns None when no cgroup entry can be resolved — skipped-cgroup
+    is the caller's logged outcome.
+    """
+    try:
+        text = Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        _, controllers, name = fields
+        if controllers == "":           # cgroup v2 root entry
+            return _CGROUP_ROOT / name.lstrip("/")
+        if "memory" in controllers.split(","):
+            return _CGROUP_ROOT / name.lstrip("/")
+    return None
+
+
+@dataclass
+class HostProfile:
+    """The host-RAM budget pool for `device: cpu` models.
+
+    ``pool_mb`` is the chargeable surface: ``min(sys_free, cgroup_free)``
+    clamped at 0 by the pool floor clause.  ``cgroup_free_mb`` is None
+    when the service cgroup could not be located or binds nothing
+    (requirement 9 — skipped-cgroup); ``provenance`` names the arm each
+    term chose from.
+    """
+
+    pool_mb: int
+    total_mb: int
+    pressure_zone_mb: int
+    sys_free_mb: int
+    cgroup_free_mb: int | None = None
+    provenance: dict[str, str] | None = None
+
+    @classmethod
+    def detect(cls, yaml_hw: dict | None = None,
+               service_pid: int | None = None,
+               *, stable: bool = False) -> HostProfile:
+        """Detect the host pool, honored precedence: declared > detected.
+
+        ``stable`` forces the deterministic fixture arms only: no pid scan
+        and no live sysctl, so unit tests (and dry runs without a service)
+        exercise the declared/fallback paths instead of box state.
+        """
+        hw = yaml_hw or {}
+        prov: dict[str, str] = {}
+
+        total_mb: int | None
+        if hw.get("system_ram"):
+            total_mb = utils.parse_mem_mb(str(hw["system_ram"]), 0)
+            prov["total"] = "declared"
+            logger.info("host pool: total %d MiB (declared hardware.system_ram)",
+                        total_mb)
+        else:
+            try:
+                meminfo = _parse_meminfo_kb(_PROC_MEMINFO.read_text())
+                total_kb = meminfo.get("MemTotal")
+                total_mb = total_kb // 1024 if total_kb is not None else None
+            except OSError:
+                total_mb = None
+            if total_mb is None:
+                prov["total"] = "unreadable"
+                logger.warning("host pool: /proc/meminfo unreadable — "
+                               "totals unknown; declare hardware.system_ram")
+                total_mb = 0
+
+        # Pressure zone: sysctl arm first (requirement 7).
+        zone_kb: int | None = None
+        min_free_kb = 0
+        try:
+            min_free_kb = int(_VM_MIN_FREE.read_text().strip())
+        except (OSError, ValueError):
+            min_free_kb = 0
+        if not stable:
+            try:
+                zone_kb = _zone_high_sum_kb(_PROC_ZONEINFO.read_text())
+            except OSError:
+                zone_kb = None
+        if zone_kb is not None:
+            zone_kb = max(zone_kb, min_free_kb)
+            pressure_mb = max(0, zone_kb // 1024)
+            prov["pressure"] = "sysctl"
+            logger.info("host pool: pressure zone %d MiB (sysctl: zone "
+                        "high-watermarks, floor min_free_kbytes=%d kB)",
+                        pressure_mb, min_free_kb)
+        else:
+            frac = _PRESSURE_FALLBACK_FRACTION
+            pressure_mb = int((total_mb or 0) * frac)
+            prov["pressure"] = "fallback-25%"
+            logger.info("host pool: pressure zone %d MiB "
+                        "(fallback-25pct of total: zoneinfo unreadable)",
+                        pressure_mb)
+
+        # Declared pressure arm wins over both.
+        hp = hw.get("host_pressure")
+        if hp is not None:
+            s = str(hp).strip().lower()
+            if s == "sysctl" and zone_kb is not None and not stable:
+                pressure_mb = max(0, zone_kb // 1024)
+                prov["pressure"] = "sysctl"
+            elif s == "25%":
+                pressure_mb = int((total_mb or 0)
+                                  * _PRESSURE_FALLBACK_FRACTION)
+                prov["pressure"] = "fallback-25%"
+            else:
+                try:
+                    pressure_mb = int(utils.parse_mem_mb(str(hp), total_mb or 0))
+                    prov["pressure"] = "declared"
+                except (TypeError, ValueError, AssertionError):
+                    logger.warning("host pool: hardware.host_pressure %r "
+                                   "unreadable; keeping the detected arm",
+                                   hp)
+            logger.info("host pool: pressure zone %d MiB (arm %s)",
+                        pressure_mb, prov["pressure"])
+
+        mem_available_mb: int | None
+        if hw.get("system_ram"):
+            # A declared total replaces the runtime read wholesale — the
+            # operator owns the number, so no MemAvailable probe races it
+            # with unknown semantics.
+            sys_free_mb = max(0, (total_mb or 0) - pressure_mb)
+            prov["sys_free"] = "declared"
+        else:
+            try:
+                info = _parse_meminfo_kb(_PROC_MEMINFO.read_text())
+                avail = info.get("MemAvailable")
+                mem_available_mb = None if avail is None else avail // 1024
+            except OSError:
+                mem_available_mb = None
+            if mem_available_mb is None:
+                prov["sys_free"] = "unreadable"
+                sys_free_mb = 0
+            else:
+                sys_free_mb = mem_available_mb - pressure_mb
+                prov["sys_free"] = "detected"
+
+        # Service cgroup cap (requirement 9).
+        cgroup_free_mb: int | None = None
+        cgroup_dir = hw.get("cgroup_dir")
+        if cgroup_dir:
+            path = Path(str(cgroup_dir))
+            prov["cgroup"] = "declared"
+        elif not stable and service_pid is None:
+            service_pid = _find_llama_swap_pid()
+            path = _service_cgroup_path(service_pid) if service_pid else None
+            prov["cgroup"] = ("detected" if path is not None
+                              else "skipped-cgroup")
+        else:
+            path = None
+            prov["cgroup"] = "skipped-cgroup"
+        if path is not None:
+            try:
+                caps = {}
+                for key in ("high", "max", "current"):
+                    try:
+                        caps[key] = (path / f"memory.{key}").read_text().strip()
+                    except OSError:
+                        pass
+                if "current" in caps:
+                    cgroup_free_kb = _cgroup_free_kb(
+                        caps, int(caps["current"]) // 1024)
+                    cgroup_free_mb = (cgroup_free_kb // 1024
+                                      if cgroup_free_kb is not None else None)
+                if cgroup_free_mb is None:
+                    logger.warning("host pool: service cgroup at %s binds "
+                                   "nothing (skipped-cgroup)", path)
+                    prov["cgroup"] = "skipped-cgroup"
+                else:
+                    logger.info("host pool: cgroup headroom %d MiB (%s%s)",
+                                cgroup_free_mb,
+                                path,
+                                ", memory.high" if "high" in caps else "")
+            except (TypeError, ValueError) as e:
+                logger.warning("host pool: cgroup caps at %s unreadable "
+                               "(%s) — skipped-cgroup", path, e)
+                cgroup_free_mb = None
+                prov["cgroup"] = "skipped-cgroup"
+        elif not cgroup_dir:
+            logger.warning("host pool: no llama-swap cgroup found — "
+                           "skipped-cgroup (declare hardware.cgroup_dir)")
+
+        if hw.get("host_pool") is not None:
+            raw = str(hw["host_pool"]).strip()
+            if raw.lower() == "auto":
+                pool_mb = min(sys_free_mb, cgroup_free_mb) \
+                    if cgroup_free_mb is not None else sys_free_mb
+                prov["pool"] = "auto"
+            elif raw.endswith("%"):
+                try:
+                    frac = float(raw[:-1]) / 100.0
+                except ValueError:
+                    frac = None
+                if frac is None:
+                    logger.warning("host pool: hardware.host_pool %r "
+                                   "unreadable; keeping the formula", raw)
+                    pool_mb = min(sys_free_mb, cgroup_free_mb) \
+                        if cgroup_free_mb is not None else sys_free_mb
+                else:
+                    pool_mb = int((total_mb or 0) * frac)
+                    prov["pool"] = "declared"
+                    logger.info("host pool: %d MiB (declared hardware."
+                                "host_pool)", pool_mb)
+            else:
+                pool_mb = utils.parse_mem_mb(raw, total_mb or 0)
+                prov["pool"] = "declared"
+                logger.info("host pool: %d MiB (declared hardware.host_pool)",
+                            pool_mb)
+        else:
+            pool_mb = min(sys_free_mb, cgroup_free_mb) \
+                if cgroup_free_mb is not None else sys_free_mb
+            prov["pool"] = ("min(sys_free, cgroup_free)"
+                            if cgroup_free_mb is not None else "sys_free")
+            logger.info("host pool: %d MiB (%s: sys_free %d%s, pressure zone "
+                        "%d)", pool_mb, prov["pool"], sys_free_mb,
+                        f", cgroup_free {cgroup_free_mb}" if cgroup_free_mb is not None else "",
+                        pressure_mb)
+
+        return cls(pool_mb=max(0, pool_mb),
+                   total_mb=total_mb or 0,
+                   pressure_zone_mb=pressure_mb,
+                   sys_free_mb=sys_free_mb,
+                   cgroup_free_mb=cgroup_free_mb,
+                   provenance=prov)
+
+
+def _find_llama_swap_pid() -> int | None:
+    """A running llama-swap pid, or None.
+
+    Scans /proc comm files; the first match wins (llama-swap is a single
+    service per host in every deployment the packer serves).
+    """
+    try:
+        for cgroup_file in Path("/proc").glob("[0-9]*/comm"):
+            try:
+                if cgroup_file.read_text().strip() == "llama-swap":
+                    return int(cgroup_file.parent.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return None

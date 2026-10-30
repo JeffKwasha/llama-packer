@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class SdServerBackend(BaseBackend):
     name = "sd-server"
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
-    roles = frozenset({"image"})
+    operations = frozenset({"generate_image"})
     handles = frozenset({"cli_args"})
     proxied = True
     host_requires = frozenset({"sd_bin"})

@@ -212,12 +212,6 @@ _DEFAULT_DIR_ROLES = {
 }
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-# Non-chat roles
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-_NON_CHAT_ROLES = frozenset({"embeddings", "rerank", "image", "s2t", "t2s"})
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # Weight-file suffixes
 # The only files that can be models. Snapshot listings and companion
 # scans filter to these so config/asset subdirs (tokenizer/,

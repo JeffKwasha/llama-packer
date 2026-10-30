@@ -52,7 +52,7 @@ def test_llama_server_roles_and_formats():
     # Validates: SPEC.md, 'Backend Selection': the engine's formats and the roles it serves.
     b = LlamaServerBackend()
     assert b.formats == {".gguf"}
-    assert b.roles == {"chat", "embeddings", "rerank"}
+    assert b.operations == {"generate", "embed", "rerank"}
 
 
 def test_supports_role_and_format(make_model):
@@ -356,6 +356,17 @@ def test_warn_unhandled(caplog):
     assert any("loras" in r.message for r in caplog.records)
 
 
+def test_warn_unhandled_names_the_sidecar(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic about one sidecar leads with the sidecar's name.
+    import logging
+    b = get_backend("vllm")
+    with caplog.at_level(logging.WARNING):
+        b.warn_unhandled({"loras"}, stem="s1")
+    warned = [r.message for r in caplog.records if "loras" in r.message]
+    assert warned, "expected the unhandled loras setting to warn"
+    assert all(m.startswith("s1:") for m in warned), warned
+
+
 def test_setting_keys_partition():
     # framework-consumed and metadata-only keys are disjoint from each other
     # and from what a backend would render.
@@ -473,7 +484,7 @@ def test_docker_cmd_in_tree_template_maps_under_models(make_model, tmp_path):
 def test_vllm_podman_pair_cmd(make_model):
     # Validates: docs/transports/podman.md, 'Transport: podman': the podman pair is the same engine with podman's device flags and lifecycle
     b = get_backend("vllm-podman")
-    assert b.roles == {"chat", "embeddings", "rerank"}
+    assert b.operations == {"generate", "embed", "rerank"}
     assert b.stop_cmd == "podman stop ${MODEL_ID}"
     assert b.unload_timeout == 30
     m = make_model("p", hf_repo="org/model")
@@ -637,6 +648,23 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
                          "llama_server": {"args": "--flash-attn on"}})
     m = make_model("c", role="chat")
     assert measurement_args(profiles, m, "--flash-attn on") == \
+        "--flash-attn on -ub 512"
+
+
+def test_measurement_shape_stamps_cpu_device(make_model):
+    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``device: cpu`` measures (and shape-stamps) with ``--n-gpu-layers 0`` instead of ``-ngl 999``, stamp included by ``measurement_args``.
+    """A CPU-resident model's measurement shape carries the device pin:
+    fit-params reports host buffers under it, and a later device flip
+    (sidecar edit) invalidates the persisted block by shape."""
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import measurement_args
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"}})
+    m = make_model("e", role="rerank", device="cpu")
+    assert measurement_args(profiles, m, "--flash-attn on") == \
+        "--flash-attn on --n-gpu-layers 0 -ub 512"
+    # GPU shapes are untouched — no fleet-wide re-measure
+    m2 = make_model("e2", role="rerank")
+    assert measurement_args(profiles, m2, "--flash-attn on") == \
         "--flash-attn on -ub 512"
 
 
@@ -1132,7 +1160,7 @@ def test_whisper_server_registered():
     # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("whisper-server")
     assert b.formats == {".bin"}
-    assert b.roles == {"s2t"}
+    assert b.operations == {"transcribe"}
     assert b.proxied is True
 
 
@@ -1188,7 +1216,7 @@ def test_audio_cpp_registered():
     # Validates: SPEC.md, 'Backend Selection': Return the bound backend for *name* (raises KeyError if unknown).
     b = get_backend("audio-cpp")
     assert b.formats == {".gguf", ".safetensors", "hf_repo"}
-    assert b.roles == {"t2s", "s2t"}
+    assert b.operations == {"transcribe", "synthesize"}
     assert b.proxied is True
     assert b.check_endpoint == "/health"
     assert b.stop_cmd is None  # host launch: no container lifecycle

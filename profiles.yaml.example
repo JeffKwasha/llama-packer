@@ -16,8 +16,8 @@ defaults:
 # in force are exactly the ones written here.
 #
 # min_context / min_parallel are floors, not requests: one entry at
-# ctx >= 128k and parallel >= 2 satisfies all three categories below, so
-# nothing forces three entries per model.
+# ctx >= 128k and parallel >= 2 satisfies all four categories below, so
+# nothing forces four entries per model.
 #
 # require:   capabilities that survive every rung of the capability/context
 #            ladder. A model that cannot keep one is dropped from a set
@@ -30,9 +30,12 @@ defaults:
 #            draft, because an MTP draft roughly doubles generation speed.
 #            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
 #
-# Categories are applied per set: a model that meets `coding` beside emb+rnk
-# but not beside a 5.7 GB reranker joins `rag` and is dropped from `ragz`.
-# Only `role: chat` models are considered.
+# Categories are applied per set: a model that meets `coding` beside the
+# canonical RAG pair but not beside a heavier reranker joins `rag` and is
+# dropped from `ragz`. Only `role: chat` models are considered.
+#
+# shed: the default order for capabilities a category does not name.
+# shed: [vision, draft]
 usage:
   coding:
     min_context: 128k
@@ -67,8 +70,8 @@ models_dirs:
   # - /mnt/ai/models  # multiple roots allowed
 
 # Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank | image | s2t | t2s. CLI --extra-dirs
-# merges similarly.
+# values must be chat | embeddings | rerank | image | s2t | t2s. CLI
+# --extra-dirs adds directories to scan; they are chat unless named here.
 # Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
 # Speech-to-text (whisper.cpp) is opt-in: add `s2t: s2t` to serve .bin weights
 # via whisper-server (requires an authored same-stem sidecar per model).
@@ -84,9 +87,10 @@ models_dirs:
 
 # Backend enable/prefer list — ordered; a backend absent from the list is
 # disabled even when its resources are configured.  Omit the key to use all
-# registered backends in default order (llama-server, vllm-docker, vllm,
-# sd-server, whisper-server).  sd-server is opt-in for image generation and
-# whisper-server for speech-to-text; see the sd:/whisper: sections below.
+# registered backends in default order (llama-server, vllm, vllm-podman,
+# vllm-docker, sd-server, whisper-server, audio-cpp).  sd-server is opt-in
+# for image generation, whisper-server/audio-cpp for speech; see the sd:/
+# whisper:/audio_cpp: sections below.
 # backends:
 #   - llama-server
 #   - vllm-docker
@@ -131,9 +135,9 @@ profiles:
   #   freq_pen: 0.2
 
   # ── Grouping / placement params ──────────────────────
-  # Distinct (parallel, cache_type, spare) combos get their own VRAM solve
-  # and llama-swap entry; profile names within a group become setParamsByID
-  # keys. `spare` reserves VRAM headroom (e.g. "512m", "6G").
+  # Distinct (parallel, cache_type, spare, batch, ubatch) combos get their
+  # own VRAM solve and llama-swap entry; profile names within a group become
+  # setParamsByID keys. `spare` reserves VRAM headroom (e.g. "512m", "6G").
   # `parallel` is the slot count — and a pin: declaring it opts the model
   # out of auto-parallel.
   # server:
@@ -157,14 +161,15 @@ profiles:
 # shape — changing them re-measures every persisted `derived:` block.
 #
 # batch/ubatch are first-class planning keys with a resolution cascade:
-#   sidecar batch:/ubatch:  >  profile key  >  llama_server: here  >  role
-#   defaults (embed/rerank 4096 for batch; chat declares nothing)
+#   sidecar batch:/ubatch:  >  profile key  >  llama_server: here  >  backend
+#   role defaults
 # Leaving a key unset anywhere in that cascade means **no flag is rendered**
 # and llama.cpp's own builtin applies (-b 2048, -ub 512) — so an upstream
-# default change is picked up for free instead of being pinned here. Only
-# the embed/rerank batch depth is declared by default, because it is a real
-# tuning (throughput, no VRAM cost) rather than a copy of the builtin.
-# A malformed value is warned about and falls through to the next tier.
+# default change is picked up for free instead of being pinned here. No
+# llama-server role declares a batch default today: the old embed/rerank
+# 4096 was never in effect (llama-server forces n_batch = n_ubatch when
+# embeddings are enabled), so it was removed rather than copied. A malformed
+# value is warned about and falls through to the next tier.
 # `ubatch` shapes the compute buffer (~6 MiB per -ub token on Vulkan, no
 # throughput cost measured) and stamps the VRAM measurement shape; `batch`
 # has no VRAM effect and is deliberately not part of the shape.
@@ -174,7 +179,7 @@ profiles:
 #   # ubatch: 512       # -ub, per-pass tokens — shapes the compute buffer
 
 # ── vLLM backend (optional) ────────────────────────────
-# Defaults for `backend: vllm` / `vllm-docker` via overrides.
+# Defaults for `backend: vllm` / `vllm-podman` / `vllm-docker` via overrides.
 # CLI --vllm-image / --vllm-server win over this.
 # vllm:
 #   image: vllm/vllm-openai:latest
@@ -238,7 +243,8 @@ profiles:
 #   # model_spec_override: /mnt/pool/data/tools/audiocpp/model_specs
 
 # ── Hardware (optional) ─────────────────────────────────
-# Override auto-detected VRAM pool. CLI --vram / --unified-system-mb win.
+# Override the auto-detected VRAM pool and host-RAM budget. CLI --vram /
+# --baseline / --unified-system-mb win over the VRAM side.
 # hardware:
 #   vram: 48G
 #   # baseline_mb: 512m        # extra reserve on top of fixed 2 GiB (default 0)
@@ -252,6 +258,22 @@ profiles:
 #   #                          # platter branches.  Family representatives and
 #   #                          # measurement prefer models resolved here;
 #   #                          # unset = no tier preference.
+#   # host RAM budget for `device: cpu` models (docs/plans/cpu-residency-budget.md):
+#   host_pool: auto            # auto (min formula) | <abs> | <frac>%
+#   # system_ram: 64G          # total override; default /proc/meminfo MemTotal
+#   # host_pressure: sysctl    # arm: sysctl (zone high-wms floored by
+#   #                          # vm.min_free_kbytes) | 25% | <abs>
+#   # cgroup_dir: /sys/fs/cgroup/system.slice/llama-swap.service
+
+# ── Role-wide host placement (optional) ─────────────────
+# Every model of a named role runs from RAM — identical to tagging each
+# sidecar `device: cpu`: no VRAM charge, same host budget, -ngl 0, never
+# evicted by a swap, ttl 0. Only the four resident roles can be named here
+# (embeddings, rerank, s2t, t2s); a chat model is placed per sidecar.
+# The key is a role, the value is a device — there is no `role: cpu`.
+# Unset = per-sidecar tags only.
+# device_roles: [embeddings, rerank]
+# device_roles: {embeddings: cpu, s2t: cpu}
 
 # ── Override rules (optional) ────────────────────────────
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.
@@ -279,40 +301,69 @@ profiles:
 #   - when: {name: 'tiny-.*'}
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
-# ── VRAM allocation (optional) ──────────────────────────────
-# Two tiers. Residents are pinned and served at a fixed small context, so
-# their footprint is a number you can compute up front; whatever is left
-# goes to chat, and each chat model resolves its own serving against it
-# through its category (see `usage:` above and SPEC.md "VRAM Allocation").
+# ── Matrix: shared VRAM and routing sets (optional) ────
+# Residents are pinned and served at a fixed small context, so their
+# footprint is a number you can compute up front; whatever is left goes to
+# chat, and each chat model resolves its own serving against it through its
+# usage category (see `usage:` above and SPEC.md "VRAM Allocation").
 #
 # `embed_context` / `rerank_context` are that fixed context. They are small
 # on purpose: clients chunk to one stable RAG size, and a flexing context
 # would make the resident tier's VRAM move under the budget. If VRAM is the
 # binding constraint, context in main chat is worth more than context in RAG.
-# Select the resident models with --embed / --rerank (smallest of the role by
-# default); they always serve single-slot.
+# Select the residents with --embed / --rerank or a category `selector:`;
+# they always serve single-slot.
+#
+# The shared solve's floors and guards, in the order it applies them:
+#   tools_min_ctx     below this chat context, the RAG pair is squeezed to
+#                     buy context back (default 128k)
+#   coload_min_ctx    how far the RAG pair may be squeezed (default 20k)
+#   ctx_gain_min      the minimum chat gain that makes the squeeze worth it
+#                     (default 4k)
+#   min_chat_ctx      the floor kept for a co-load; below it nothing else is
+#                     admitted (default 64k; tools_min_ctx when tools still
+#                     have it)
+#   estimate_headroom pads an estimated, not measured, co-load overhead
+#                     (default 1.25; must be >= 1.0)
+#
+# A routing set is a use case — a composition of roles that must be live
+# together. `rag` is embed AND rerank (two roles); `talk` is stt AND tts.
+# One set names one model per role; a second category of the same role is an
+# alternative (`rnk | rnk2`), never an addition. Operators may declare their
+# own buckets (one/two/three) and compose them without naming a task.
+# The sets are also the VRAM budget contract: the chat solve reserves the
+# worst branch of the most expensive chat set (`&` sums, `|` maxes, `+set`
+# expands a named set), not the sum of every declared category. A category
+# no chat set references reserves nothing (it can only run alone). See
+# docs/plans/cpu-residency-budget.md decisions 13-15.
 #
 # matrix:
 #   embed_context: 4096
 #   rerank_context: 4096
+#   # tools_min_ctx: 131072
+#   # coload_min_ctx: 20480
+#   # ctx_gain_min: 4096
+#   # min_chat_ctx: 65536
+#   # estimate_headroom: 1.25
 #   auto_parallel: false        # on by default: value-function (ctx, slots)
 #                               # solve for unpinned chat; false disables it
-#                               # fleet-wide (a sidecar parallel: pin opts one
-#                               # model out)
-#   auto_parallel_max: 8        # hard cap on auto slots
+#                               # fleet-wide
+#   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
 #   parallel_power: 0.75        # slot exponent: how much context one extra
-#                               # slot may cost. Raise to protect context,
-#                               # lower to buy concurrency; the neutral point
-#                               # is 0.5*log2(context lost per doubling of
-#                               # slots), so no single value suits every
-#                               # model. See SPEC.md
-#
-# Retired with the two-mechanism design, and documented as dead rather than
-# removed: `categories:`, `sets:`, `evict_costs:`, `min_chat_ctx`,
-# `coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`. They still parse,
-# nothing consults them for allocation, and they stop parsing when the group
-# loop is rewritten onto the model above.
-#
+#                               # slot may cost. See SPEC.md
+#   categories:                 # var -> served model; `emb`/`rnk` are the
+#     emb: { role: embeddings } # canonical names of the RAG roles
+#     rnk: { role: rerank }
+#     rnk2: { role: rerank, selector: zerank }   # alternative, not additive
+#     stt: { role: s2t }
+#     tts: { role: t2s }
+#   sets:
+#     rag:   "__CHAT_VARS__ & emb & rnk"
+#     ragz:  "__CHAT_VARS__ & emb & rnk2"
+#     talk:  "__CHAT_VARS__ & stt & tts"           # 2-way speech
+#     combo: "__CHAT_VARS__ & (three | (two & one))"  # operator buckets
+#   # evict_costs: {one: 10, two: 10, three: 10}  # forwarded to llama-swap
+
 # ── VRAM pools (optional) ───────────────────────────────────
 # One shared ledger per pool: per-pool spare override, unmodelled residents,
 # and explicit claimant reservations. "auto" keeps the derived math.

@@ -3,7 +3,9 @@
 Status: **implemented** (approach (a): declared non-RAG categories are
 fixed-overhead residents). `matrix.categories` + `evict_costs` validation +
 category vars shipped 2026-09-12; the remaining "fully general N-category
-solved-context" idea is future work. Recorded 2026-08-24.
+solved-context" idea is future work. **Set composition and worst-branch
+pricing: portion 1 landed 2026-10-27** (see "Sets are role compositions").
+Recorded 2026-08-24.
 Related: `docs/plans/comfyui-sd.md`, `docs/plans/audio-roles.md`, `SPEC.md`
 Matrix Context Solving, `llama_packer/{__main__,writer,vram}.py`.
 
@@ -84,6 +86,55 @@ Exact YAML shape is TBD — the sketch above is illustrative. Key is that **var 
 5. **Sets DSL** — no change to llama-swap's `routing.router.settings.matrix.vars/sets` schema; we just emit the user-declared var names. Keep `__CHAT_VARS__` expansion for backward compat; optionally add `__VARS__[cat]` sugar.
 
 6. **Discovery / roles** — add `image` (and perhaps `audio`) to `SERVED_ROLES` / `dir_role_map` (`img → image`, `comfy → image`) and `backends` role sets (`llama_server` / `stable-diffusion.cpp` / `comfyui-boot` each declare which roles they serve). Until a sizing story exists for diffusion/comfy, those models are fixed-overhead (weight + declared `context_length` or `parameters` heuristic) similar to the `on_cpu` path today.
+
+## Sets are role compositions (2026-10-27)
+
+The shipped implementation treats a set as an opaque expression forwarded to
+llama-swap; the budget still summed every declared category. That is the wrong
+half of the contract. A set is the operator's statement of **which roles are
+live together**:
+
+```yaml
+matrix:
+  categories:
+    emb:  { role: embeddings }
+    rnk:  { role: rerank }
+    rnk2: { role: rerank }      # alternative, never additive
+    stt:  { role: s2t }
+    tts:  { role: t2s }
+    one:  { role: rerank,     selector: qwen3 }    # operator bucket
+    two:  { role: embeddings, selector: voyage }   # operator bucket
+    three: { role: rerank,    selector: zerank }   # operator bucket
+  sets:
+    rag:   "__CHAT_VARS__ & emb & rnk"        # RAG = embed AND rerank
+    ragz:  "__CHAT_VARS__ & emb & rnk2"       # same role, different model
+    voice: "__CHAT_VARS__ & stt"              # 2-way-speech, half
+    talk:  "__CHAT_VARS__ & stt & tts"        # 2-way-speech, whole
+    combo: "__CHAT_VARS__ & (three | (two & one))"  # buckets, no task name
+```
+
+Rules (see `cpu-residency-budget.md` decisions 13–15 for the reasoning):
+
+* `&` is co-residency (sum), `|` is one-of (max), `+set` expands a named set.
+  Nesting prices recursively; the old depth-0 split priced `(two & three)`
+  as an unknown var worth 0.
+* A chat model is charged the **worst branch of the most expensive
+  chat-capable set**, not the union of declared categories.
+* A category in no set reserves nothing and is logged as unreferenced.
+* One model per role per set. Two categories of one role are alternatives;
+  the CPU pin adds only the canonical category per role and skips a set that
+  already chose that role's model. A bucket pair may be ANDed only when the
+  buckets are different roles (`two` embeddings + `one` rerank); ANDing two
+  buckets of one role is a composition error (portion 2 validates it).
+* The packer needs no idea what a bucket is *for* — only its cost and whether
+  a set references it. That is what lets operators invent `one`/`two`/`three`
+  buckets without a task vocabulary.
+
+Portion 1 (this branch) lands the pricing, worst-set reserve, unreferenced
+rule, per-role pin and cost-term log. Portion 2 adds composition validation
+(a set naming two categories of one role warns by name) and per-category
+`ctx:`. Portion 3 generalizes the solver so it no longer knows `emb`/`rnk` by
+name.
 
 ## Open questions
 

@@ -20,21 +20,25 @@ import yaml
 
 from llama_packer import Model, __version__, find_bin_dir, utils
 from llama_packer import model as _modelmod
-from llama_packer.hardware import GpuProfile, detect_gpu_vendor
-from llama_packer.profiles import Profiles
+from llama_packer.hardware import GpuProfile, HostProfile, detect_gpu_vendor
+from llama_packer.profiles import Profiles, validate_profiles_keys
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
 from llama_packer.utils import (
     compute_env_prefixes, make_subst, make_fast_storage_predicate,
     _detect_drive_speed, validate_dir_roles, NON_CHAT_ROLES,
 )
+from llama_packer import roles
 from llama_packer.consts import (
     _MIN_AGENTIC_CTX, _MEMORY_MARGIN, _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
 from llama_packer.writer import (
-    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name)
+    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name,
+    MatrixKnobs, resident_cost_detail, resident_ctx,
+    _expr_leaves, _has_chat_slot, _prune_leaves,
+    _resident_options)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -251,12 +255,18 @@ def _apply_env_subst(config: EmittedConfig, sub, raw_paths: list[str]) -> Emitte
     return config
 
 
-def _select_model(models: list, type_name: str, selector: str | None, logger) -> "Model | None":
+def _select_model(models: list, type_name: str, selector: str | None, logger,
+                  *, cost=None) -> "Model | None":
     """Pick a model of `type_name` (role).
 
-    With no selector, returns the smallest by VRAM footprint. With a selector
-    substring, returns the single model whose id/name/stem contains it; errors
-    if the match is not exactly one.
+    With no selector, a `device: cpu` candidate wins — the tag is the
+    operator's explicit "this one stays warm in host RAM" choice, and it
+    must not lose to the size default. Among the eligible candidates the
+    pick is the **cheapest measured serving at the role's ctx** (`cost`),
+    because that is the number the resident costs the chat budget; file
+    size is only the fallback when nothing can be measured. A selector
+    substring overrides both: returns the single model whose id/name/stem
+    contains it; errors if the match is not exactly one.
     """
     cands = [m for m in models if m.role == type_name]
     if not cands:
@@ -272,14 +282,109 @@ def _select_model(models: list, type_name: str, selector: str | None, logger) ->
             fatal("selector %r matched %d %s models (need exactly 1): %s",
                   selector, len(hits), type_name,
                   [h.stem for h in hits])
+        # Price the quality choice: the operator should see what the
+        # pinned model costs the budget.
+        if cost is not None and logger is not None:
+            mb = cost(hits[0])
+            if mb is not None:
+                logger.info("%s: selector %r → %s (%d MiB resident)",
+                            type_name, selector, hits[0].stem, mb)
         return hits[0]
-    return min(cands, key=lambda m: m.vram_mb)
+    cpu = [m for m in cands if getattr(m, "on_cpu", False)]
+    pool = cpu or cands
+    if cost is not None:
+        priced = []
+        for m in pool:
+            mb = cost(m)
+            if mb is not None:
+                priced.append((m, mb))
+        if priced:
+            if logger is not None:
+                logger.info(
+                    "%s: cheapest resident wins — %s",
+                    type_name,
+                    ", ".join(f"{m.stem}={mb} MiB"
+                              for m, mb in sorted(priced, key=lambda t: t[1])))
+            return min(priced, key=lambda t: t[1])[0]
+    return min(pool, key=lambda m: m.vram_mb)
 
 
-def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
+def _selection_reason(model, measured_mb: int | None = None,
+                      by_selector: bool = False,
+                      detail: str | None = None) -> str:
+    """Why the resident pick went to *model* — logged beside its name.
+
+    *detail* spells out the measured terms, so two residents that happen
+    to cost the same can be seen to be the same shape (weights + compute +
+    KV) rather than a suspicious repeat.
+    """
+    suffix = f" = {detail}" if detail else ""
+    if by_selector:
+        return ("selector" if measured_mb is None
+                else f"selector, {measured_mb} MiB resident{suffix}")
+    if measured_mb is not None:
+        return f"cheapest measured resident, {measured_mb} MiB{suffix}"
+    if getattr(model, "on_cpu", False):
+        return "device: cpu — explicit placement"
+    return f"smallest footprint {model.vram_mb} MiB"
+
+
+def apply_device_roles(models: list, roles_cfg, logger) -> None:
+    """Place every model of the declared roles on the host (decision 11).
+
+    ``profiles.yaml device_roles:`` names serving roles (a list, or a
+    mapping role → device — ``{embeddings: cpu}``); each becomes
+    ``device: cpu`` for every model of that role, indistinguishable from the
+    sidecar tag.  Nothing here infers placement: an absent key changes
+    nothing, and each role applied is logged with the number of models it
+    matched.
+    """
+    if not roles_cfg:
+        return
+    if isinstance(roles_cfg, dict):
+        declared: set[str] = set()
+        for k, v in roles_cfg.items():
+            if str(v).strip().lower() == "cpu":
+                declared.add(str(k))
+            else:
+                logger.warning(
+                    "device_roles: %r: %r is not a device; only 'cpu' can "
+                    "be declared here (the key is a role, the value is a "
+                    "device) — ignored", k, v)
+    elif isinstance(roles_cfg, (list, tuple)):
+        declared = {str(r) for r in roles_cfg}
+    else:
+        logger.warning(
+            "device_roles: expected a list of roles or a role→device "
+            "mapping, got %r; ignored", roles_cfg)
+        return
+    for role in sorted(declared):
+        if role not in roles.DEVICE_ROLES:
+            logger.warning("device_roles: %r is not a placeable role %s; "
+                           "the key is a role and the value is a device — "
+                           "ignored", role, sorted(roles.DEVICE_ROLES))
+            continue
+        hits = [m for m in models if m.role == role]
+        if not hits:
+            logger.warning("device_roles: role %r matched no model", role)
+            continue
+        placed = 0
+        for m in hits:
+            if m.on_cpu:
+                continue
+            m.frontmatter["device"] = "cpu"
+            placed += 1
+        logger.info("device_roles: %s → cpu (%d model(s)%s)", role, len(hits),
+                    f", {placed} newly placed" if placed else ", all already")
+
+
+def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
+                   *, fit_bin: str = "", llama_args: str = "") -> tuple:
     """Resolve the swap-matrix configuration before build_config.
 
-    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
+    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed,
+    ctx_by_var)`` — the last naming each category's optional served-context
+    override (requirement 32, ``matrix.categories.<name>.ctx:``).
 
     ``categories`` maps each declared category name → its selected model
     (defaults: ``emb``/``rnk`` bound to the embeddings/rerank models).  The
@@ -292,6 +397,35 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
     missing co-loading setup looks exactly like a bug (it has, repeatedly).
     """
     matrix_cfg = profiles_cfg.get("matrix")
+    prof_cfg = Profiles(profiles_cfg)
+    knobs = MatrixKnobs.from_cfg(matrix_cfg)
+    measured: dict[str, int | None] = {}
+    breakdown: dict[str, str] = {}
+
+    def resident_cost():
+        """Cost callable: measured MiB at this model's served ctx.
+
+        The same estimator the planner charges residents with
+        (``resident_cost_mb``), so selection and budget cannot disagree.
+        """
+        def cost(m):
+            try:
+                ctx = resident_ctx(m, knobs)
+                detail = resident_cost_detail(
+                    m, fit_bin=fit_bin,
+                    cache_type=prof_cfg.default_cache_type, profiles=prof_cfg,
+                    llama_args=llama_args, ctx=ctx, allow_cpu=True)
+                if detail is None:
+                    mb = None
+                else:
+                    mb, breakdown[m.stem] = detail
+            except Exception as e:
+                logger.warning("matrix: cannot size %s (%s)", m.stem, e)
+                mb = None
+            measured[m.stem] = mb
+            return mb
+        return cost
+
     if not matrix_cfg:
         emb = _select_model(models, "embeddings", args.embed, logger)
         rnk = _select_model(models, "rerank", args.rerank, logger)
@@ -300,38 +434,73 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
                 "matrix: disabled — profiles.yaml has no matrix: section; "
                 "RAG co-loading off (emb: %s, rnk: %s)",
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
-        return None, None, None, {}, ()
-    embed_model = _select_model(models, "embeddings", args.embed, logger)
-    rerank_model = _select_model(models, "rerank", args.rerank, logger)
+        return None, None, None, {}, (), {}
+    embed_model = _select_model(models, "embeddings", args.embed, logger,
+                                cost=resident_cost())
+    rerank_model = _select_model(models, "rerank", args.rerank, logger,
+                                 cost=resident_cost())
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
-        return None, None, None, {}, ()
+        return None, None, None, {}, (), {}
     if rerank_model is None:
         logger.warning("no rerank model found; skipping matrix")
-        return None, None, None, {}, ()
+        return None, None, None, {}, (), {}
 
     # Declared categories (defaults bind the RAG pair).  Category names are
     # the matrix var names; roles may repeat (e.g. tts/stt on t2s/s2t).
     cat_specs = matrix_cfg.get("categories") or {
         "emb": {"role": "embeddings"}, "rnk": {"role": "rerank"}}
     categories: dict[str, "Model"] = {}
+    ctx_by_var: dict[str, int] = {}
     for name, spec in cat_specs.items():
-        spec = spec if isinstance(spec, dict) else {}
+        # The spec schema is strict (D13, clean break): anything but these
+        # keys is an alien spelling and warns instead of being ignored.
+        for key in sorted(set(spec) - {"role", "selector", "ctx"}):
+            logger.warning("matrix: category %r: unhandled key %r "
+                           "(known: role, selector, ctx)", name, key)
         role = str(spec.get("role") or "")
         selector = spec.get("selector")
         if not role:
             logger.warning("matrix: category %r has no role; omitted", name)
             continue
-        model = _select_model(models, role, selector, logger)
+        model = _select_model(models, role, selector, logger,
+                              cost=resident_cost())
         if model is None:
             logger.warning("matrix: category %r: no %s model%s; omitted",
                            name, role,
                            f" matching {selector!r}" if selector else "")
             continue
         categories[str(name)] = model
+        ctx = spec.get("ctx")
+        if ctx is not None:
+            try:
+                iv = int(ctx)
+                assert iv > 0
+            except (TypeError, ValueError, AssertionError):
+                logger.warning("matrix: category %r: ctx=%r is not a "
+                               "positive integer; ignored", name, ctx)
+            else:
+                ctx_by_var[str(name)] = iv
     # Back-compat: the canonical RAG names always resolve.
     categories.setdefault("emb", embed_model)
     categories.setdefault("rnk", rerank_model)
+    # One answer per role: a category selector (the more specific
+    # declaration) defines the RAG pair too, instead of leaving the solve
+    # on a different model than the `emb`/`rnk` vars point at.
+    emb_by_selector = bool(args.embed)
+    rnk_by_selector = bool(args.rerank)
+    if categories.get("emb") is not embed_model:
+        logger.info("matrix embed: category selector overrides the pair "
+                    "pick (%s instead of %s)",
+                    categories["emb"].stem, embed_model.stem)
+        embed_model = categories["emb"]
+        emb_by_selector = True
+    if categories.get("rnk") is not rerank_model:
+        logger.info("matrix rerank: category selector overrides the pair "
+                    "pick (%s instead of %s)",
+                    categories["rnk"].stem, rerank_model.stem)
+        rerank_model = categories["rnk"]
+        rnk_by_selector = True
 
     known = set(categories)
     for key in (matrix_cfg.get("evict_costs") or {}):
@@ -342,16 +511,75 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger) -> tuple:
 
     fixed = [(n, m) for n, m in categories.items()
              if m is not embed_model and m is not rerank_model]
-    logger.info("matrix embed: %s", embed_model.stem)
-    logger.info("matrix rerank: %s", rerank_model.stem)
+    logger.info("matrix embed: %s (%s)", embed_model.stem,
+                _selection_reason(embed_model, measured.get(embed_model.stem),
+                                  by_selector=emb_by_selector,
+                                  detail=breakdown.get(embed_model.stem)))
+    logger.info("matrix rerank: %s (%s)", rerank_model.stem,
+                _selection_reason(rerank_model, measured.get(rerank_model.stem),
+                                  by_selector=rnk_by_selector,
+                                  detail=breakdown.get(rerank_model.stem)))
     if fixed:
         logger.info("matrix categories: %s",
                     ", ".join(f"{n}={m.stem}" for n, m in fixed))
-    return matrix_cfg, embed_model, rerank_model, categories, fixed
+    return (matrix_cfg, embed_model, rerank_model, categories, fixed,
+            ctx_by_var)
 
 
 # Var-name prefix per co-load role, used in set expressions
 # (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
+
+
+def _drop_refused_categories(sets: dict[str, str], cpu_pins: list[str],
+                            refused: tuple[str, ...], logger):
+    """Reshape the emitted config for host-unit refusals (requirement 33).
+
+    A refused category has no id, so its var must vanish both from the
+    ``vars`` map (which the emitter already omit — the stem drew no
+    variants) and from every set expression, or llama-swap rejects the
+    whole config.  Returns (pruned sets, surviving pins).
+    """
+    kept: dict[str, str] = {}
+    for sname, expr in sets.items():
+        clean = _prune_leaves(expr, frozenset(refused), sets)
+        if clean:
+            kept[sname] = clean
+        else:
+            logger.info("matrix: set %r emptied by refused categories; "
+                        "omitted", sname)
+    return kept, [p for p in cpu_pins if p not in refused]
+
+
+def _warn_same_role(sets: dict[str, str], sets_cfg: dict[str, str],
+                    role_of: dict[str, str], logger) -> None:
+    """Warn when a set may hold two categories of one role at once.
+
+    Requirement 31: one live model per role per set — `rnk` beside `rnk2`
+    is two rerankers resident. Membership is judged per *and-branch*:
+    alternation across roles is a legitimate composition (operator
+    buckets), so only an option that actually holds both warns, naming
+    the set, the role and the two categories.
+    """
+    seen: set[tuple[str, str]] = set()
+    for sname, expr in sets.items():
+        for option in _resident_options(expr, sets_cfg):
+            by_role: dict[str, list[str]] = {}
+            for leaf in option:
+                role = role_of.get(leaf)
+                if role:
+                    by_role.setdefault(role, []).append(leaf)
+            for role, names in sorted(by_role.items()):
+                if len(names) < 2:
+                    continue
+                key = (sname, role)
+                if key in seen:
+                    continue
+                seen.add(key)
+                logger.warning(
+                    "matrix: set %r may hold two categories of role %r "
+                    "(%s) — one live model per role; the extra is an "
+                    "alternative, never a co-resident", sname, role,
+                    ", ".join(sorted(names)))
 
 
 def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
@@ -467,9 +695,31 @@ def _health_check_timeout(models, args) -> int:
     return hct
 
 
+def canonical_cpu_pins(categories: dict) -> list[str]:
+    """One CPU-placed category per role — the helper that stays warm.
+
+    Placement is per model, residency is per role: several CPU categories may
+    share a role, but only one of them can be the resident (decision 2), so
+    pinning all of them into every set would make the alternatives
+    co-resident.  ``emb``/``rnk`` are the canonical names; otherwise the
+    first declared category for the role wins.
+    """
+    canonical: dict[str, str] = {}
+    for name, m in categories.items():
+        role = getattr(m, "role", None)
+        if role is None:
+            continue
+        if role not in canonical or name in ("emb", "rnk"):
+            canonical[role] = name
+    return sorted(name for name in canonical.values()
+                  if categories[name] is not None and categories[name].on_cpu)
+
+
 def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
                         coload_vars: list[str], logger,
                         chat_expr_by_set: dict[str, str] | None = None,
+                        pinned: list[str] | None = None,
+                        role_of: dict[str, str] | None = None,
                         ) -> dict:
     """Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs.
 
@@ -481,7 +731,19 @@ def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
     *chat_expr_by_set* overrides the chat OR-list per set, so a model that
     cannot hold its context alongside a set's residents is left out of that
     set alone instead of every set.
+
+    *pinned* lists var names or entry ids that join every chat set unless
+    already a leaf — the CPU-helper rule (design decision 12): evicting
+    them buys no device memory, and sets permit subsets, so membership
+    never preloads one.
+
+    *role_of* maps every category var to its role.  With it, a pin is
+    skipped when the set already names a *different* category of the same
+    role: ``(rnk2 | emb)`` is an alternative, and forcing the canonical
+    ``rnk`` in would make both rerankers resident at once.
     """
+    if pinned and not role_of:
+        raise ValueError("pinned CPU helpers need role_of to stay one per role")
     coload_expr = ("(" + " | ".join(coload_vars) + ")") if coload_vars else None
     expanded: dict[str, str] = {}
     for sname, sexpr in sets_cfg.items():
@@ -497,6 +759,16 @@ def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
                 logger.warning(
                     "matrix: set %r references __COLOAD_VARS__ but no "
                     "co-loads were included; term dropped", sname)
+        for name in (pinned or []):
+            if not _has_chat_slot(expr, sets_cfg):
+                continue  # a non-chat set has no helper to keep warm
+            leaves = _expr_leaves(expr, sets_cfg)
+            if name in leaves:
+                continue
+            role = role_of.get(name)
+            if role and any(role_of.get(leaf) == role for leaf in leaves):
+                continue  # the set already chose this role's alternative
+            expr = f"{expr.strip()} & {name}"
         expanded[sname] = expr.strip()
     return expanded
 
@@ -599,6 +871,7 @@ def main(argv: list[str] | None = None) -> None:
     with open(profiles_path) as f:
         profiles_cfg = yaml.safe_load(f) or {}
 
+    validate_profiles_keys(profiles_cfg)
     if not Profiles(profiles_cfg).profile_list:
         fatal("no profiles defined in profiles.yaml")
 
@@ -755,6 +1028,9 @@ def main(argv: list[str] | None = None) -> None:
         fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
 
+    # Role-wide host placement, declared in profiles.yaml (design decision 11).
+    apply_device_roles(models, profiles_cfg.get("device_roles"), logger)
+
     if args.remeasure:
         for m in models:
             m.vram.remeasure = True
@@ -792,6 +1068,9 @@ def main(argv: list[str] | None = None) -> None:
         baseline=args.baseline,
         unified_system_mb=args.unified_system_mb,
     )
+    # The host-RAM pool `device: cpu` models charge (same declared >
+    # detected precedence as the VRAM profile).
+    host = HostProfile.detect(yaml_hw=yaml_hw)
 
     # Compute optimal ${env.*} prefixes from the raw paths actually emitted,
     # then substitute them into the binary path and post-process the config.
@@ -889,7 +1168,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # Detect matrix configuration before build_config
     (matrix_cfg, embed_model, rerank_model, matrix_categories,
-     matrix_fixed) = _detect_matrix(profiles_cfg, models, args, logger)
+     matrix_fixed, matrix_ctx) = _detect_matrix(
+        profiles_cfg, models, args, logger,
+        fit_bin=llama_bin, llama_args=template_vars["llama_args"])
 
     # ── Degenerate-budget refusal ──
     # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):
@@ -929,10 +1210,12 @@ def main(argv: list[str] | None = None) -> None:
             spare=args.spare, max_context=max_ctx,
             matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
             fixed_categories=matrix_fixed,
+            category_ctx=matrix_ctx,
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
             memory_margin=margin,
+            host_pool_mb=host.pool_mb,
             progress_cb=lambda stem: progress.advance(stem),
         )
     except ValueError as e:
@@ -1004,6 +1287,19 @@ def main(argv: list[str] | None = None) -> None:
         else:
             # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
             chat_expr = "(" + " | ".join(chat_var_names) + ")"
+            # CPU helpers join every chat set (design decision 12), but one
+            # per role: the canonical category (`emb`, `rnk`, …).  Pinning
+            # every CPU model made same-role alternatives co-resident
+            # (jina + voyage + qwen3-embedding, both rerankers) and added
+            # catalog noise to every set.  A set that already names another
+            # category of the same role keeps that choice — the alternative
+            # is not forced back in.
+            role_of = {name: m.role
+                       for name, m in (matrix_categories or {}).items()}
+            cpu_pins = canonical_cpu_pins(matrix_categories or {})
+            if cpu_pins:
+                logger.info("matrix: CPU helper pinned per role: %s",
+                            ", ".join(cpu_pins))
             sets_cfg = matrix_cfg.get("sets") or {}
             # Per-set chat lists: a model that cannot meet its usage demands
             # beside a set's residents is dropped from that set only.  An
@@ -1044,7 +1340,15 @@ def main(argv: list[str] | None = None) -> None:
                                        logger,
                                        chat_expr_by_set={
                                            s: "(" + " | ".join(v) + ")"
-                                           for s, v in per_set.items() if v})
+                                           for s, v in per_set.items() if v},
+                                       pinned=cpu_pins, role_of=role_of)
+            refused = tuple(sorted(config.host_unit_refused))
+            if refused:
+                logger.info("host ledger: refused %s — no ids; set leaves "
+                            "pruned", ", ".join(refused))
+                sets, cpu_pins = _drop_refused_categories(
+                    sets, cpu_pins, refused, logger)
+            _warn_same_role(sets, sets, role_of, logger)
             if coload_vars:
                 joined = " ".join(str(s) for s in sets_cfg.values())
                 if "__COLOAD_VARS__" not in joined:

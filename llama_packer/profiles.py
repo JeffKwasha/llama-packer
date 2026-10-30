@@ -19,6 +19,29 @@ from llama_packer.consts import DEFAULT_SACRIFICE_ORDER
 
 logger = logging.getLogger(__name__)
 
+#: Every top-level ``profiles.yaml`` key something reads.  Unknown keys warn
+#: (a typo such as ``device_role`` must not silently do nothing).
+PROFILES_KEYS: frozenset[str] = frozenset({
+    "defaults", "usage", "models_dirs", "dirs", "hf_home", "backends",
+    "profiles", "llama_server", "vllm", "sd", "whisper", "audio_cpp",
+    "hardware", "device_roles", "overrides", "matrix", "pools", "macros",
+    "shed",
+})
+
+
+def validate_profiles_keys(cfg: dict, log=logger) -> None:
+    """Warn on a top-level profiles key no component reads."""
+    if not isinstance(cfg, dict):
+        return
+    for key in cfg:
+        if key in PROFILES_KEYS:
+            continue
+        import difflib
+        close = difflib.get_close_matches(str(key), sorted(PROFILES_KEYS),
+                                          n=1, cutoff=0.7)
+        hint = f" (did you mean {close[0]!r}?)" if close else ""
+        log.warning("profiles.yaml: unknown key %r%s; ignored", key, hint)
+
 
 def parse_spare_mb(spare_str: str | None, vram_total: int) -> int:
     """Parse a spare string ("4G", "512m", bare MB); empty/None -> 0."""
@@ -126,7 +149,9 @@ class Profiles:
         """
         return [
             (pname, utils.resolve_params(pover, self.defaults))
-            for pname, pover in _filter_profiles(self.profile_list, model.allow_profiles)
+            for pname, pover in _filter_profiles(self.profile_list,
+                                                 model.allow_profiles,
+                                                 stem=model.stem)
         ]
 
     def groups_for(self, model, vram_total: int,
@@ -202,7 +227,8 @@ def _rag_parallel(model, declared: int) -> int:
     return 1
 
 
-def _filter_profiles(profile_list: dict, allow_profiles) -> list[tuple[str, dict]]:
+def _filter_profiles(profile_list: dict, allow_profiles,
+                     stem: str) -> list[tuple[str, dict]]:
     """Filter profiles according to allow_profiles frontmatter value."""
     if allow_profiles is False:
         return []
@@ -212,8 +238,8 @@ def _filter_profiles(profile_list: dict, allow_profiles) -> list[tuple[str, dict
         try:
             pattern = re.compile(allow_profiles)
         except re.error:
-            logger.warning("invalid allow_profiles regex %r, returning all profiles",
-                           allow_profiles)
+            logger.warning("%s: invalid allow_profiles regex %r, returning "
+                           "all profiles", stem, allow_profiles)
             return list(profile_list.items())
         return [(pname, pover) for pname, pover in profile_list.items()
                 if pattern.search(pname)]

@@ -167,7 +167,7 @@ class ScopeStack:
                        else "hf_repo" if model.hf_repo else "none")
                 reason = f"No backend supports {model_file} in {model.md_path} (role {model.role}, format {fmt!r})"
                 covered = [b for b in BACKENDS.values()
-                           if fmt in b.formats and model.role in b.roles]
+                           if fmt in b.formats and b.supports_role(model.role)]
                 if covered and not any(b.is_available(self.avail or {}) for b in covered):
                     logger.warning("%s — install the binary or pass "
                                    "--llama-server <path>", reason)

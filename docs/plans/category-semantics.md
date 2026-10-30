@@ -92,12 +92,13 @@ and that is exactly the case that should take more of them.
 
 ## MTP is required by coding, not merely preferred
 
-`coding` requires MTP when a draft companion exists and the solved context
-stays above the category's `min_context`. That is stricter than vision,
-which coding sheds freely. Modelled as `require: [draft]` on the category —
-data, not code — so it stays expressible.
+`coding` refuses to shed MTP when a draft companion exists and the solved
+context stays above the category's `min_context`, but a model that has no
+draft still qualifies. That is stricter than vision, which coding sheds
+freely. Modelled as `keep: [draft]` on the category — data, not code — so it
+stays expressible.
 
-## Allocation: residents then remainder
+## Allocation: residents, then one shared chat target
 
 Two tiers, and only two.
 
@@ -120,25 +121,33 @@ more in RAG context. When a resident has to grow — needing STT resident as
 well as RAG — it grows slightly within the tier rather than by introducing a
 second mechanism.
 
-**Everything else loads on demand.** Chat is not pinned. On this box that is
-the whole picture: one resident tier, one remainder, no further tiers to
-reason about. `matrix:` in its current form also carries `evict_costs:` and
-four-way set expressions (`ragz`, `voice`, `talk`) which exist to answer
-"which neighbours ride along with chat"; that question disappears when the
-resident tier is one list with fixed contexts.
+**Everything else loads on demand.** Chat is not pinned. The matrix solve
+charges the residents and the worst set branch, then solves **one shared
+per-slot chat context**; each chat model resolves its own serving against
+that target, capped by its design window and with its own parallel:
 
 ```
 resident_vram  = Σ VRAM(resident, at its own fixed context)
 chat_budget    = vram_total − reserve − spare − resident_vram
+chat_ctx       = solve_matrix_ctx(chat_budget, residents, worst set branch)
 ```
 
 Then, per chat model, per declared category *and* the fallback:
 
 ```
-solve (shed, ctx, parallel) from chat_budget
+solve (shed, ctx, parallel) from chat_ctx
 ```
 
-Each member resolves its own context and decides its own mmproj, against
-the same number. There is no shared `chat_ctx` and no per-set re-solve —
-those were two mechanisms answering one question, and every bug where one
-pass read a value the other decided came from that.
+Two chat models can therefore serve different contexts — a 27B stops at its
+design window, a 4B takes the full target — but they are priced against the
+same number. The solve runs once: there is no per-set re-solve, and no
+second pass reading a value the first one decided.
+
+**Roles compose; models of one role do not.** The resident tier is one
+resident *per role* (one embedder, one reranker, one STT, one TTS), but a use
+case composes several roles: RAG needs an embedder **and** a reranker, 2-way
+speech needs STT **and** TTS. In the routing config that composition is the
+set expression (`rag: __CHAT_VARS__ & emb & rnk`, `talk: __CHAT_VARS__ & stt &
+tts`), and it is also the VRAM budget contract (`&` sums, `|` maxes,
+`cpu-residency-budget.md` decisions 13–14). A second model of a role is an
+alternative, not a second resident.

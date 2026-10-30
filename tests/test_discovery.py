@@ -117,6 +117,40 @@ def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
     assert [m.role for m in models] == ["embeddings"]
 
 
+def test_unknown_role_value_warns_with_a_hint(tmp_path, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #28 -- role has one
+    # canonical spelling per role; a human alias warns instead of falling
+    # through to "no backend supports" much later.
+    import logging
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "m.gguf").write_bytes(b"x")
+    (root / "m.md").write_text("---\nrole: embedder\n---\n")
+    with caplog.at_level(logging.WARNING):
+        Model.from_dir([root], generate_stubs=False)
+    assert any("role 'embedder'" in r.message
+               and "did you mean 'embeddings'" in r.message
+               for r in caplog.records)
+
+
+def test_unknown_device_value_warns(tmp_path, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #28 -- device is `cpu`
+    # or a non-negative index; anything else used to place the model on the
+    # default GPU as if the key were absent.
+    import logging
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "a.gguf").write_bytes(b"x")
+    (root / "a.md").write_text("---\ndevice: gpu\n---\n")
+    (root / "b.gguf").write_bytes(b"x")
+    (root / "b.md").write_text("---\ndevice: -1\n---\n")
+    with caplog.at_level(logging.WARNING):
+        Model.from_dir([root], generate_stubs=False)
+    msgs = [r.message for r in caplog.records]
+    assert any("device 'gpu'" in m for m in msgs)
+    assert any("device -1" in m for m in msgs)
+
+
 def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
     # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Walk *models_dirs* depth-first and return deduplicated Models.
     import logging

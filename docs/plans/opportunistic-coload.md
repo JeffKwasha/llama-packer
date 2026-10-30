@@ -133,11 +133,20 @@ baseline). Order: baseline solve → optional squeeze → opportunistic adds.
 Unchanged in shape, now with co-loads accounted:
 
 ```
-available   = vram_total − reserve − spare − Σ(coload fixed overheads)
+available   = vram_total − reserve − spare − max over chat-capable sets
+                                                (that set's branch cost)
 chat_ctx    = max ctx where largest chat model fits
 per entry   = clamp(chat_ctx, model.design_context, --max-context),
               floor _MIN_CTX_SIZE
 ```
+
+With routing sets configured, the set expression *is* the non-chat budget
+(`&` sum, `|` max, `+set` expand — `cpu-residency-budget.md` decision 13), so
+the reserved term is the worst branch of the worst chat set rather than
+`Σ(coload fixed overheads)`. Declared categories and co-loads are already in
+that tree; the per-candidate admission loop below runs only when there are no
+sets (legacy), because admitting a category a second time would double-charge
+it and hide the alternatives.
 
 Worth documenting in SPEC.md because it is currently implicit: the shared
 solve targets the *largest* chat model and smaller models are clamped down

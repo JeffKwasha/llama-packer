@@ -120,3 +120,68 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 58 | A pack run logs at WARNING unless asked: `-v` lifts it to INFO, and only `--dry-run` lifts the floor on its own | `test_pack_run_is_quiet_by_default`, `test_verbose_flag_lifts_the_level`, `test_dry_run_preview_is_visible_without_a_flag`, `test_verbosity_ladder_and_floor` |
+
+## CPU-residency measurement (docs/plans/cpu-residency-budget.md)
+
+| # | Requirement | Test |
+|---|---|---|
+| 59 | The host parse reads the buffer lines after the projection pass's closing table — the CPU backend's pass-repeated real sizes are never summed twice | `test_parse_host_buffers_reads_final_pass` |
+| 60 | The host parse reports host-side component sums beside the device sums; without a projection table the log parses whole | `test_parse_host_buffers_headerless_log_parses_whole` |
+| 61 | A `device: cpu` measurement carries the `--n-gpu-layers 0` pin in both the server command and the measurement shape, never duplicated | `test_run_measure_server_cpu_shape_returns_host_buffers`, `test_measurement_shape_stamps_cpu_device` |
+| 62 | A CPU-shaped measurement never runs the device-spill rejection; a `-ngl 999` launch that lost its device still measures nothing (spill refuses the host-KV shape) | `test_run_measure_server_cpu_shape_returns_host_buffers`, `test_run_measure_server_gpu_refuses_vulkanless_fullcpu` |
+| 63 | `parse_fit_log` falls back to the `Host` report row when no device row exists, so CPU quads derive without new tooling; a device row always wins | `test_parse_fit_log_host_row_fallback`, `test_parse_fit_log_prefers_device_row` |
+| 64 | The CPU-shaped affine trio derives the exact quad and persists it under the device-stamped shape | `test_measure_affine_trio_cpu_shape_persists_host_quad` |
+| 65 | The device parse stays whole-log: a device run's projection buffers measure 0, host sums never leak into it | `test_parse_device_buffers_whole_log_device_path` |
+
+## A diagnostic names its subject
+
+| # | Requirement | Test |
+|---|---|---|
+| 66 | A `usage:` warning leads with the sidecar's name | `test_usage_warnings_lead_with_the_sidecar_name` |
+| 67 | An unhandled-setting warning leads with the sidecar's name | `test_warn_unhandled_names_the_sidecar` |
+| 68 | An invalid `allow_profiles` regex warning leads with the sidecar's name | `test_allow_profiles_bad_regex_names_the_sidecar` |
+| 69 | A failed `base *` expression warning names the layer it came from | `test_merge_bad_base_expression_names_the_origin` |
+
+## Host budget (docs/plans/cpu-residency-budget.md §Host-budget requirements)
+
+| # | Requirement | Test |
+|---|---|---|
+| 70 | Host pool floor: an infeasible read clamps the pool to 0 and an over-pool `device: cpu` model emits no id | `test_host_pool_clamps_to_zero`, `test_cpu_variant_refused_on_small_pool` |
+| 71 | Pressure zone: sysctl `(zone high sum, min_free_kbytes floor)` primary; missing/zeroed zoneinfo falls back to 25% of total, called out in the log | `test_pressure_zone_from_zoneinfo`, `test_pressure_zone_fallback_is_logged`, `test_pressure_zone_override_asserted` |
+| 72 | `host_pool = min(sys_free, cgroup_free)` with every override arm (`system_ram`, `host_pool` abs/frac) honored | `test_host_pool_mixed_terms`, `test_host_pool_overrides_arm` |
+| 73 | Service cgroup caps the pool; no llama-swap cgroup skips the term with a warning | `test_host_pool_mixed_terms`, `test_cgroup_missing_service_skips_term` |
+| 74 | A `device: cpu` resident is charged to the host ledger (RAG pair and declared fixed categories); its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram`, `test_host_resident_sizing_lifts_cpu_gate`, `test_cpu_fixed_category_resident_charged_host`, `test_host_measurement_does_not_leak_into_vram_pricing` |
+| 75 | Host charge is the serving quad at the served context — declared parallel multiplies D and the KV pool and can flip the refusal | `test_cpu_variant_refused_on_small_pool`, `test_cpu_parallel_charge_flips_refusal` |
+| 76 | No pool knowledge, no gate — a planner without a host pool never refuses on host grounds | `test_no_host_pool_never_gates` |
+| 77 | Every entry carries `metadata.packing`; `device: cpu` entries name device/ctx/parallel/ram and carry no `vram_mib` | `test_metadata_packing_cpu_entry`, `test_metadata_packing_gpu_entry` |
+| 78 | `device: cpu` wins the resident role; inside that set the cheapest **measured serving at the role's ctx** wins (file size only when unmeasurable); a selector overrides and is priced; every arm is logged | `test_select_model_prefers_cpu_candidate`, `test_select_model_smallest_among_cpu_candidates`, `test_select_model_no_cpu_keeps_size_rule`, `test_select_model_selector_overrides_cpu_preference`, `test_selection_reason_names_the_arm`, `test_selection_reason_measured_and_selector_arms`, `test_select_model_picks_measured_cheapest_over_file_size`, `test_select_model_falls_back_to_size_when_unmeasurable`, `test_select_model_cpu_preference_beats_cheaper_device`, `test_select_model_selector_prices_only_the_pick` |
+| 79 | `profiles.yaml device_roles:` places every model of a named role on the host (logged with its count); absent key is a no-op; unmatched or unknown roles warn; a mapping value other than `cpu` (the key is a role, the value a device) places nothing and warns | `test_device_roles_place_every_role_model`, `test_device_roles_absent_and_unmatched`, `test_device_roles_rejects_unknown_role`, `test_device_roles_rejects_a_non_cpu_value`, `test_device_roles_rejects_a_scalar` |
+| 80 | CPU helper entries join every chat set **one per role** (never evicted, never preloaded, same-role alternatives never forced in) and carry `ttl: 0`; device entries keep no per-model TTL | `test_cpu_helpers_pinned_into_every_set`, `test_cpu_entry_ttl_zero`, `test_gpu_entry_has_no_ttl` |
+| 81 | A category selector defines the RAG pair too — solve, charge, `emb`/`rnk` vars and resident entry name one model | `test_detect_matrix_category_selector_defines_the_pair` |
+
+## Set composition (docs/plans/cpu-residency-budget.md §Set composition)
+
+| # | Requirement | Test |
+|---|---|---|
+| 82 | A set expression prices as a boolean tree — `&` sums, `|` maxes, `+set` expands, nesting recurses, a `+set` cycle terminates | `test_set_overhead_prices_nested_branches`, `test_set_overhead_expands_named_sets`, `test_expr_leaves_walks_nested_branches`, `test_solve_matrix_prices_a_nested_and_branch` |
+| 83 | The chat solve reserves the worst branch of the most expensive chat set, never the union of declared categories | `test_solve_matrix_reserves_worst_set_not_category_union` |
+| 84 | A category no set names reserves nothing and is logged as unreferenced | `test_solve_matrix_unreferenced_category_reserves_nothing` |
+| 85 | Exactly one canonical CPU category per role is pinned; device categories are never pinned; same-role alternatives are not | `test_cpu_pin_is_one_canonical_category_per_role` |
+| 86 | A set that already names a category of the pinned role keeps its own choice | `test_cpu_pin_skips_a_set_that_chose_the_role` |
+| 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
+| 88 | A known key with an unsupported value warns at discovery: `role:` must be a canonical id (typo hint), `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
+| 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
+
+## Roles (docs/architecture.md §Roles, models and engines)
+
+| # | Requirement | Test |
+|---|---|---|
+| 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every role's operation is implemented by an engine (no orphan operation) | `test_role_registry_derives_its_sets`, `test_every_role_operation_is_implemented` |
+
+## Portion 2 (docs/plans/cpu-residency-budget.md §Portion 2)
+
+| # | Requirement | Test |
+|---|---|---|
+| 91 | Same-role co-residence warns per and-branch, naming the set, role and both categories; alternation across roles (operator buckets) never reports co-residency | `test_warn_same_role_names_the_pair`, `test_resident_options_branch_alternatives_not_co_resident` |
+| 92 | A per-category `ctx:` caps the served context at one seam (`resident_ctx`) and is never a floor | `test_category_ctx_caps_at_one_seam` |
+| 93 | A chat-capable composition's CPU residents are judged as one unit: not fitting refuses the unit together (no ids, vars pruned from sets and pins), a category any fitting composition admits survives, and the committed pair is never refused | `test_host_unit_refusals_drop_the_unit`, `test_host_unit_refusals_survive_one_fitting_set`, `test_prune_leaves_removes_refused_members`, `test_drop_refused_categories_prunes_sets_and_pins` |

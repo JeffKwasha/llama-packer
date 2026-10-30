@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class WhisperServerBackend(BaseBackend):
     name = "whisper-server"
     formats = frozenset({".bin"})
-    roles = frozenset({"s2t"})
+    operations = frozenset({"transcribe"})
     handles = frozenset({"cli_args"})  # --language, --threads, etc.
     proxied = True
     host_requires = frozenset({"whisper_bin"})

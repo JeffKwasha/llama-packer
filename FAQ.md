@@ -77,8 +77,9 @@ touching any files.
 ## How do I tune `-b` / `-ub`?
 
 They are first-class planning keys, resolved sidecar > profile >
-`llama_server:` fleet section > role defaults (chat 2048/512, embed/rerank
-4096/512 — the llama.cpp builtins):
+`llama_server:` fleet section > backend role defaults. No llama-server role
+declares a default, so an unset key renders no flag and llama.cpp's builtin
+applies (`-b` 2048, `-ub` 512):
 
 ```yaml
 llama_server:

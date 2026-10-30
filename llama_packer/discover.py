@@ -222,6 +222,45 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
         stack.pop()
 
 
+def _warn_unsupported_values(model: Model, label: str) -> None:
+    """Warn when a known key carries a value this tool cannot honour.
+
+    Unknown *keys* already warn (``Model.pass_through_metadata``).  An
+    unknown *value* used to fall through: ``role: embedder`` only surfaced
+    later as "no backend supports", and ``device: gpu`` silently placed the
+    model on the device exactly as if the key were absent.
+    """
+    role = str(model.frontmatter.get("role") or "")
+    if role and role not in utils.SERVED_ROLES:
+        import difflib
+        close = difflib.get_close_matches(role, utils.SERVED_ROLES,
+                                          n=1, cutoff=0.6)
+        hint = f" (did you mean {close[0]!r}?)" if close else ""
+        logger.warning("%s: role %r is not a served role%s; it must be one "
+                       "of %s", label, role, hint,
+                       ", ".join(utils.SERVED_ROLES))
+    dev = model.frontmatter.get("device")
+    if dev is None or model.on_cpu:
+        return
+    problem = _device_problem(dev)
+    if problem:
+        logger.warning("%s: device %r is %s; ignored (the model stays on "
+                       "the default device)", label, dev, problem)
+
+
+def _device_problem(dev) -> str | None:
+    """Why *dev* is not a usable `device:` value, or None when it is."""
+    if isinstance(dev, bool):
+        return "not a GPU index"
+    if isinstance(dev, int):
+        return None if dev >= 0 else "not a non-negative GPU index"
+    if isinstance(dev, str):
+        s = dev.strip()
+        if s.lstrip("+-").isdigit():
+            return None if int(s) >= 0 else "not a non-negative GPU index"
+    return "neither 'cpu' nor a GPU index"
+
+
 def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
            hf_home, out: list[Model], stub: bool = False) -> None:
     """The single model pipeline: merge → construct → rules → companions → finalize.
@@ -251,6 +290,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     model.resolve_companions()
     model.sync_measured_file(write=not stub)
     stack.finalize(model)
+    _warn_unsupported_values(model, path.name)
     # Guard: keep generative-media weights out of served text roles.  The
     # classification is header-only (GGUF metadata / safetensors names /
     # cached HF model card) and never blocks the run — one error log per

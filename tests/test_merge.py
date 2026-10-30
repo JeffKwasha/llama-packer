@@ -69,6 +69,22 @@ def test_merge_base_expression_missing_below_skipped(caplog):
                for r in caplog.records)
 
 
+def test_merge_bad_base_expression_names_the_origin(caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic leads with the name of the sidecar or layer it is about.
+    """A `base *` expression that cannot be evaluated warns naming the
+    layer the expression came from, not a bare fact."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="llama_packer.utils"):
+        assert utils.merge_layer(
+            {"temperature": 1.0},
+            {"temperature": "base * ("}, origin="sidecar") == \
+            {"temperature": 1.0}
+    warned = [r.message for r in caplog.records
+              if "failed to eval" in r.message]
+    assert warned, "expected the unparseable expression to warn"
+    assert all(r.startswith("sidecar:") for r in warned), warned
+
+
 def test_merge_does_not_alias_inputs():
     # Validates: SPEC.md, 'Layer merge rule': the merged result is a fresh structure; the layers are never aliased
     below = {"d": {"x": 1}, "l": ["a"]}

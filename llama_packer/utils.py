@@ -24,6 +24,7 @@ from pathlib import Path
 import yaml
 
 from llama_packer import ggufmeta
+from llama_packer import roles
 from llama_packer.consts import (
     _SAFETENSORS_DTYPE_BYTES,
     _KV_CACHE_BYTES,
@@ -87,7 +88,7 @@ def render_command(head: list[str], builtin_flags: list[str], global_args: str =
 
     1. ``builtin_flags`` — backend built-ins (``-c``, ``--parallel``, …)
     2. ``global_args``  — fleet-wide tuning flags (profiles.yaml ``<section>.args``)
-    3. ``role_flags``   — per-role flags (embed/rerank ``-b/-ub`` batch sizes)
+    3. ``role_flags``   — per-role server-mode flags, plus a resolved ``-b``/``-ub``
     4. ``cli_args``     — per-model sidecar ``cli_args:``
 
     The free-form sources are shlex-parsed here, so quoting errors surface at
@@ -468,13 +469,10 @@ def _is_ignored(rel_parts: tuple[str, ...], rel_path: str,
             return True
     return False
 
-# Roles a served directory may map to
-# ``img: image``.
-SERVED_ROLES = ("chat", "embeddings", "rerank", "image", "s2t", "t2s")
-
-# Roles excluded from chat-specific passes: mmproj keep/drop, the shared
-# chat+emb+rnk matrix solve, and matrix var collection.
-NON_CHAT_ROLES = ("embeddings", "rerank", "image", "s2t", "t2s")
+# Roles and their derived sets live in `roles.py`; these names are the
+# module-level aliases older imports use, never a second definition.
+SERVED_ROLES = roles.SERVED_ROLES
+NON_CHAT_ROLES = roles.NON_CHAT_ROLES
 
 
 def validate_dir_roles(dir_roles: dict) -> str | None:
@@ -719,12 +717,13 @@ def load_dir_config(d: Path) -> dict | None:
     return cfg
 
 
-def _eval_expr(expr: str, base_val: float) -> float:
+def _eval_expr(expr: str, base_val: float, origin: str) -> float:
     """Safely evaluate expressions like 'base * 0.6'."""
     try:
         return eval(expr, {"__builtins__": {}}, {"base": base_val})
     except Exception:
-        logger.warning("failed to eval %r with base=%s, using base", expr, base_val)
+        logger.warning("%s: failed to eval %r with base=%s, using base",
+                       origin or "merge", expr, base_val)
         return base_val
 
 
@@ -779,7 +778,7 @@ def merge_layer(below: dict | None, above: dict | None, *,
             if (isinstance(v, str) and v.startswith("base *")
                     and k in SAMPLING_KEYS):
                 if isinstance(cur, (int, float)) and not isinstance(cur, bool):
-                    result[k] = _eval_expr(v, float(cur))
+                    result[k] = _eval_expr(v, float(cur), origin)
                 else:
                     logger.warning(
                         "%s: %r has no numeric value below to resolve "

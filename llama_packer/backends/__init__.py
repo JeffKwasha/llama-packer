@@ -73,7 +73,7 @@ class BoundBackend(BaseBackend):
         engine.transport = transport
         self.name = transport.bind_name(engine.name)
         self.formats = engine.formats
-        self.roles = engine.roles
+        self.operations = engine.operations
         self.handles = engine.handles
         self.proxied = engine.proxied
         self.check_endpoint = engine.check_endpoint
@@ -83,8 +83,9 @@ class BoundBackend(BaseBackend):
     def unsupported_reason(self, model: "Model") -> str | None:
         return self.engine.unsupported_reason(model)
 
-    def warn_unhandled(self, declared: set[str]) -> None:
-        return self.engine.warn_unhandled(declared)
+    def warn_unhandled(self, declared: set[str],
+                       stem: str | None = None) -> None:
+        return self.engine.warn_unhandled(declared, stem)
 
     def default_batch_ubatch(self, role: str) -> tuple[int, int]:
         return self.engine.default_batch_ubatch(role)
@@ -173,7 +174,7 @@ def infer_backend(model: "Model", avail: dict | None = None,
             # Role must be supported — otherwise a .gguf diffusion model under
             # role=image would incorrectly infer llama-server and then be skipped
             # as unsupported.  Infer the only backend that can actually serve it.
-            if model.role not in backend.roles:
+            if not backend.supports_role(model.role):
                 continue
             return backend.name
     return None

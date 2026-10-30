@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,9 @@ import pytest
 
 from llama_packer.__main__ import (resolve_host_binary,
                                  _apply_env_subst,
-                                 _health_check_timeout)
+                                 _health_check_timeout,
+                                 _select_model,
+                                 _selection_reason)
 from llama_packer.utils import make_subst
 
 
@@ -211,7 +214,7 @@ def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
               _stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed = _detect_matrix({}, models, args,
+        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({}, models, args,
                                                     logging.getLogger("test"))
     assert cfg is None and emb is None and rnk is None
     assert "matrix: disabled" in caplog.text
@@ -228,7 +231,7 @@ def test_detect_matrix_silent_without_rag_models(caplog):
     models = [_stub_model("c1", "chat")]
     args = SimpleNamespace(embed=None, rerank=None)
     with caplog.at_level(logging.WARNING):
-        cfg, _, _, cats, fixed = _detect_matrix({}, models, args,
+        cfg, _, _, cats, fixed, _ctx = _detect_matrix({}, models, args,
                                                 logging.getLogger("test"))
     assert cfg is None
     assert "matrix: disabled" not in caplog.text
@@ -246,7 +249,7 @@ def test_detect_matrix_selects_when_section_present(caplog):
     args = SimpleNamespace(embed=None, rerank=None)
     matrix_cfg = {"sets": {"rag": "__CHAT_VARS__ & emb & rnk"}}
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed = _detect_matrix({"matrix": matrix_cfg},
+        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({"matrix": matrix_cfg},
                                                     models, args,
                                                     logging.getLogger("test"))
     assert cfg is matrix_cfg
@@ -276,7 +279,7 @@ def test_detect_matrix_custom_categories(caplog):
         "sets": {"voice": "__CHAT_VARS__ & (tts | stt)"},
     }
     with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed = _detect_matrix(
+        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix(
             {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
     assert cfg is matrix_cfg
     assert set(cats) == {"emb", "rnk", "tts", "stt"}
@@ -438,3 +441,299 @@ def test_every_backend_uses_the_same_chain():
     body = src.split('"""', 2)[-1]
     for tier in ("run_dir", "shutil.which", "env_var"):
         assert tier in body
+
+
+# ── resident selection (`device: cpu` wins the role) ─────────────────────
+
+
+def _role_model(stem, mb, role="embeddings", **fm):
+    m = SimpleNamespace(stem=stem, role=role, vram_mb=mb,
+                        template_id=stem,
+                        frontmatter={"name": stem, **fm})
+    m.on_cpu = str(m.frontmatter.get("device", "")).strip().lower() == "cpu"
+    return m
+
+
+def test_select_model_prefers_cpu_candidate():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- a device: cpu
+    # candidate wins the resident role over a smaller device model.
+    gpu_small = _role_model("voyage", 355)
+    cpu_big = _role_model("jina", 472, device="cpu")
+    assert _select_model([gpu_small, cpu_big], "embeddings", None, None) is cpu_big
+
+
+def test_select_model_smallest_among_cpu_candidates():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no measured
+    # cost available, the smallest footprint is the fallback among CPU
+    # candidates.
+    cpu_big = _role_model("qwen3-embed", 640, device="cpu")
+    cpu_small = _role_model("jina", 472, device="cpu")
+    assert _select_model([cpu_big, cpu_small], "embeddings", None,
+                         None) is cpu_small
+
+
+def test_select_model_no_cpu_keeps_size_rule():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no CPU
+    # candidate the selection is unchanged (smallest footprint).
+    big = _role_model("big", 900)
+    small = _role_model("small", 355)
+    assert _select_model([big, small], "embeddings", None, None) is small
+
+
+def test_select_model_selector_overrides_cpu_preference():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- an explicit
+    # selector overrides the CPU preference.
+    cpu = _role_model("jina", 472, device="cpu")
+    gpu = _role_model("voyage", 355)
+    assert _select_model([cpu, gpu], "embeddings", "voyage", None) is gpu
+
+
+def test_selection_reason_names_the_arm():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the resident pick
+    # logs why it won (explicit CPU placement vs smallest footprint).
+    cpu = _role_model("jina", 472, device="cpu")
+    gpu = _role_model("voyage", 355)
+    assert _selection_reason(cpu) == "device: cpu — explicit placement"
+    assert _selection_reason(gpu) == "smallest footprint 355 MiB"
+
+
+def test_selection_reason_names_the_cost_terms():
+    # Validates: docs/plans/cpu-residency-budget.md #27 -- a priced pick names
+    # weights/compute/KV, so two residents that both cost 1050 MiB can be seen
+    # to be the same shape rather than a repeated number hiding a bug.
+    m = _role_model("jina", 1050, device="cpu")
+    detail = "466 weights + 346 compute + 238 kv @4096"
+    assert _selection_reason(m, 1050, detail=detail) == \
+        f"cheapest measured resident, 1050 MiB = {detail}"
+    assert _selection_reason(m, 1050, by_selector=True, detail=detail) == \
+        f"selector, 1050 MiB resident = {detail}"
+
+
+# ── role-wide placement + CPU-helper pinning ─────────────────────────────
+
+
+def test_device_roles_place_every_role_model(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- device_roles names
+    # roles whose every model is CPU-placed, logged with the count.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("embed-a", role="embeddings")
+    b = make_model("embed-b", role="embeddings")
+    chat = make_model("chat", role="chat")
+    with caplog.at_level(logging.INFO):
+        apply_device_roles([a, b, chat], ["embeddings"], logging.getLogger("t"))
+    assert a.on_cpu and b.on_cpu
+    assert not chat.on_cpu
+    assert any("device_roles: embeddings" in r.message for r in caplog.records)
+
+
+def test_device_roles_absent_and_unmatched(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- absent key changes
+    # nothing; a role matching no model warns.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("chat", role="chat")
+    apply_device_roles([a], None, logging.getLogger("t"))
+    assert not a.on_cpu
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], {"s2t": "cpu"}, logging.getLogger("t"))
+    assert any("matched no model" in r.message for r in caplog.records)
+
+
+def test_device_roles_rejects_unknown_role(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- unknown role names
+    # warn and are ignored (placement stays an explicit, known-role act).
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("chat", role="chat")
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], {"everything": "cpu"}, logging.getLogger("t"))
+    assert not a.on_cpu
+    assert any("not a placeable role" in r.message for r in caplog.records)
+
+
+def test_device_roles_rejects_a_non_cpu_value(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- the mapping is
+    # role -> device: a value that is not `cpu` places nothing and says so.
+    # A silent no-op is how `role: cpu` thinking survives a repack.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("embed-a", role="embeddings")
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], {"embeddings": "gpu"}, logging.getLogger("t"))
+    assert not a.on_cpu
+    assert any("is not a device" in r.message for r in caplog.records)
+
+
+def test_device_roles_rejects_a_scalar(make_model, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #19 -- device_roles is a
+    # list of roles or a role->device mapping; a bare scalar is a typo, not a
+    # shorthand, and must warn instead of crashing on iteration.
+    import logging
+    from llama_packer.__main__ import apply_device_roles
+    a = make_model("embed-a", role="embeddings")
+    with caplog.at_level(logging.WARNING):
+        apply_device_roles([a], 3, logging.getLogger("t"))
+    assert not a.on_cpu
+    assert any("expected a list" in r.message for r in caplog.records)
+
+
+def test_warn_same_role_names_the_pair(caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #31 -- same-role
+    # co-residence warns per and-branch, naming both categories;
+    # alternation (operator buckets) never reports a co-residency.
+    import logging
+    from llama_packer.__main__ import _warn_same_role
+    sets = {"bad": "__CHAT_VARS__ & rnk & rnk2",
+            "bucket": "__CHAT_VARS__ & (three | (two & one))",
+            "alts": "__CHAT_VARS__ & emb & (rnk | rnk2)"}
+    role_of = {"emb": "embeddings", "rnk": "rerank", "rnk2": "rerank",
+               "three": "rerank", "two": "embeddings", "one": "rerank"}
+    _warn_same_role(sets, sets, role_of, logging.getLogger("t"))
+    text = caplog.text
+    assert "'bad'" in text and "'rerank'" in text
+    assert "(rnk, rnk2)" in text
+    for sname in ("bucket", "alts"):
+        assert sname not in text, text
+
+
+def test_drop_refused_categories_prunes_sets_and_pins(caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a refused
+    # category's var vanishes from vars (no id), the sets and the pins;
+    # a set emptied entirely is omitted.
+    import logging
+    from llama_packer.__main__ import _drop_refused_categories
+    sets = {"voice": "__CHAT_VARS__ & tts & music",
+            "solo": "__CHAT_VARS__ & tts"}
+    kept, pins = _drop_refused_categories(sets, ["tts", "music"],
+                                          ("music",), logging.getLogger("t"))
+    assert kept["voice"] == "__CHAT_VARS__ & tts"
+    assert pins == ["tts"]
+    sets["cpu_part"] = "music"
+    gone, gone_pins = _drop_refused_categories(sets, ["tts", "music"],
+                                               ("music", "tts"),
+                                               logging.getLogger("t"))
+    assert gone["voice"] == "__CHAT_VARS__"
+    assert "cpu_part" not in gone
+    assert gone_pins == []
+
+
+def test_cpu_helpers_pinned_into_every_set():
+    # Validates: docs/plans/cpu-residency-budget.md #25 -- the canonical CPU
+    # category of each role joins the chat sets that do not name that role,
+    # so a transcription does not evict RAG.
+    from llama_packer.__main__ import _expand_matrix_sets
+    out = _expand_matrix_sets(
+        {"rag": "__CHAT_VARS__ & emb & rnk",
+         "talk": "__CHAT_VARS__ & tts"},
+        "(c1 | c2)", ["tts"], None, pinned=["emb", "rnk"],
+        role_of={"emb": "embeddings", "rnk": "rerank", "tts": "t2s"})
+    assert out["rag"] == "(c1 | c2) & emb & rnk"
+    assert out["talk"] == "(c1 | c2) & tts & emb & rnk"
+
+
+def test_cpu_pin_skips_a_set_that_chose_the_role():
+    # Validates: docs/plans/cpu-residency-budget.md #26 -- a set that already
+    # names a category of the pinned role keeps its own choice: appending the
+    # canonical `rnk` beside `rnk2` would make two rerankers resident.
+    from llama_packer.__main__ import _expand_matrix_sets
+    out = _expand_matrix_sets(
+        {"ragz": "__CHAT_VARS__ & emb & rnk2",
+         "voice": "__CHAT_VARS__ & stt"},
+        "(c1 | c2)", [], None, pinned=["emb", "rnk"],
+        role_of={"emb": "embeddings", "rnk": "rerank", "rnk2": "rerank",
+                 "stt": "s2t"})
+    assert out["ragz"] == "(c1 | c2) & emb & rnk2"
+    assert out["voice"] == "(c1 | c2) & stt & emb & rnk"
+
+
+def test_cpu_pin_is_one_canonical_category_per_role():
+    # Validates: docs/plans/cpu-residency-budget.md #25 -- placement is per
+    # model, residency is per role: one CPU category per role is pinned, and
+    # a device category is never pinned.
+    from llama_packer.__main__ import canonical_cpu_pins
+    cats = {"jina": _role_model("jina", 1050, device="cpu"),
+            "emb": _role_model("voyage", 797, device="cpu"),
+            "rnk": _role_model("rnk", 1050, role="rerank", device="cpu"),
+            "rnk2": _role_model("zerank", 3042, role="rerank", device="cpu"),
+            "tts": _role_model("kokoro", 1204, role="t2s")}
+    assert canonical_cpu_pins(cats) == ["emb", "rnk"]
+
+
+def test_select_model_picks_measured_cheapest_over_file_size():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the resident is the
+    # cheapest *measured serving at its ctx*, not the smallest file: a big
+    # file with cheap KV beats a small file with expensive KV.
+    cheap = _role_model("cheap-big", 900, device="cpu")
+    small = _role_model("small-costly", 300, device="cpu")
+    costs = {cheap.stem: 800, small.stem: 1100}
+    # Cheapest last, so "first priced candidate" is not accidentally right.
+    picked = _select_model([small, cheap], "embeddings", None, None,
+                           cost=lambda m: costs[m.stem])
+    assert picked is cheap
+
+
+def test_select_model_falls_back_to_size_when_unmeasurable():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no measurable
+    # candidate the size rule is the fallback, never an invented cost.
+    a = _role_model("a", 900, device="cpu")
+    b = _role_model("b", 300, device="cpu")
+    assert _select_model([a, b], "embeddings", None, None,
+                         cost=lambda m: None) is b
+
+
+def test_select_model_cpu_preference_beats_cheaper_device():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the CPU candidate
+    # wins the role before cost is compared (placement is the operator's).
+    gpu = _role_model("gpu-cheap", 100)
+    cpu = _role_model("cpu-costly", 900, device="cpu")
+    costs = {gpu.stem: 400, cpu.stem: 2000}
+    assert _select_model([gpu, cpu], "embeddings", None, None,
+                         cost=lambda m: costs[m.stem]) is cpu
+
+
+def test_select_model_selector_prices_only_the_pick():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- a selector names the
+    # resident and prices it; it never re-ranks the other candidates.
+    a = _role_model("jina", 472, device="cpu")
+    b = _role_model("voyage", 355, device="cpu")
+    import logging
+    seen = []
+    picked = _select_model([a, b], "embeddings", "jina",
+                           logging.getLogger("t"),
+                           cost=lambda m: seen.append(m.stem) or 1050)
+    assert picked is a
+    assert seen == ["jina"]
+
+
+def test_selection_reason_measured_and_selector_arms():
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the log names the
+    # arm that won: measured cost, selector, or the size fallback.
+    m = _role_model("jina", 472, device="cpu")
+    assert _selection_reason(m, 1050) == "cheapest measured resident, 1050 MiB"
+    assert _selection_reason(m, 1050, by_selector=True) == \
+        "selector, 1050 MiB resident"
+    assert _selection_reason(m) == "device: cpu — explicit placement"
+
+
+def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #17 -- the category
+    # selector is the RAG pair too: one answer per role, never a solve on one
+    # model while the `emb` var points at another.
+    import logging
+    from llama_packer import __main__ as m
+
+    voyage = make_model("voyage", role="embeddings")
+    jina = make_model("jina", role="embeddings", device="cpu")
+    rnk = make_model("rnk", role="rerank")
+    monkeypatch.setattr(m, "resident_cost_detail",
+                        lambda model, **kw: (900, "900 test"))
+    args = SimpleNamespace(embed=None, rerank=None)
+    # The selector pins the *device* model: the pair pick alone would take
+    # the CPU candidate, so only the pair adoption can make this pass.
+    cfg = {"matrix": {"categories": {
+        "emb": {"role": "embeddings", "selector": "voyage"}}}}
+    _, emb, _, cats, fixed, _ctx = m._detect_matrix(
+        cfg, [voyage, jina, rnk], args, logging.getLogger("t"))
+    assert emb is voyage and cats["emb"] is voyage
+    assert all(name != "emb" for name, _ in fixed)

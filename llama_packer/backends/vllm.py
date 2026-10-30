@@ -216,7 +216,7 @@ class VllmBackend(BaseBackend):
 
     name = "vllm"
     formats = frozenset({".safetensors", "hf_repo"})
-    roles = frozenset({"chat", "embeddings", "rerank"})
+    operations = frozenset({"generate", "embed", "rerank"})
     handles = frozenset({
         "cli_args", "chat_template", "hf_repo",
         "vllm_quantization", "moe_backend", "mamba",

@@ -14,7 +14,11 @@ either way it should not be used in a commit message until it is.
 | **sidecar** | The `<model>.md` file next to a model file, holding its metadata as YAML frontmatter. The name comes from the printer's word for the separate insert the model is printed on. | any `*.md` beside a `.gguf` |
 | **orphan** | A model file with no sidecar. Still discovered and served with built-in defaults — the sidecar is an editing surface, not a requirement. | `discover.py` |
 | **stub** | An *empty* sidecar, written only with `--create-stubs`, as something to fill in. | `discover.py:_write_stub` |
-| **role** | What a model is for: chat, embed, rerank, tts, stt, img. Usually taken from the directory it sits in, not from the sidecar. | `_DEFAULT_DIR_ROLES` |
+| **role** | What a model *does*: one of six ids — `chat`, `embeddings`, `rerank`, `image`, `s2t`, `t2s`. Taken from the sidecar `role:` or the directory it sits in (`dirs:`), defaulting to `chat`. It is not a placement. | `utils.SERVED_ROLES` |
+| **role definition** | What a role *is*: one name, the work contract, how a model claims it, cardinality, and the default residency/context policy. Engine, sizing, placement and parallel are model/serving facts, not role facts. `docs/architecture.md` §"Roles, models and engines". | `utils.SERVED_ROLES` |
+| **device** | Where a serving runs: `cpu` or `gpu`. The sidecar key is `device:`, emitted as `metadata.packing.device`. The only placement word — there is no `role: cpu`. | `Model.on_cpu` |
+| **host-resident** | A `device: cpu` model: charged to the host pool, 0 VRAM, `ttl: 0`, pinned into the chat sets. Do not call it "a CPU role". | `HostLedger` |
+| **`device_roles`** | Profiles declaration that places every model of a role on the host. A list of role names, or a mapping **role → device**: `{embeddings: cpu}`. | `apply_device_roles` |
 | **profiles.yaml** | Fleet-wide sampling defaults, spare values, backend defaults, the blessed `usage:` categories, and the optional `matrix:` section. | `profiles.py` |
 | **override** | A rule that beats the profiles default, scoped to a glob or a directory. Per-directory `models.yaml` is the directory-scoped form. | `overrides.py` |
 | **derived:** | The frontmatter block holding measured, machine-specific values (fingerprints, `model_mib`, KV coefficients). Deleting it costs a re-measure, never a probe. | `model.py:persist_measured` |
@@ -35,6 +39,14 @@ either way it should not be used in a commit message until it is.
 | **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | writer, SPEC 305 |
 | **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same context, the least shed wins for the null category and the first qualifier stands. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
 
+## Host RAM
+
+| Term | Means | Code |
+|---|---|---|
+| **resident** | A model pinned for the service lifetime at a fixed small context, because losing it loses its KV cache. One per role. | SPEC §Residents |
+| **host pool** | The host RAM the ledger may spend: `min(sys_free, cgroup_free)`, each term logged with the arm (`declared`/`sysctl`/`fallback-25%`/`skipped-cgroup`) that chose it. | `hardware.py:HostProfile` |
+| **host ledger** | Sibling of `PoolLedger` that charges host-resident quads. Go/no-go, never a solve-down. | `HostLedger` |
+
 ## The capability ladder
 
 | Term | Means | Code |
@@ -49,15 +61,19 @@ either way it should not be used in a commit message until it is.
 | **mmproj** | The vision projector. Shedding it makes a model text-only and frees its VRAM. | llama-server |
 | **MTP** | Multi-token prediction draft model. Roughly doubles generation speed and is the costly thing to lose, so it sits late in the sacrifice order. | SPEC "MTP Speculative Decoding" |
 
-## Usage categories
+## Usage and routing categories
+
+Two different things are called a category. Say which one:
 
 | Term | Means | Code |
 |---|---|---|
 | **usage category** | A named workload class (`coding`, `chat`, `qa`) with a minimum context it needs to be useful. | profiles `usage:` |
 | **blessed** | Declared in profiles.yaml. An undeclared tag on a sidecar warns and is ignored — only declared categories exist. | `resolve_usage` |
-| **demand** | One category's requirement for one model, resolved from its tags. | `UsageDemand` |
-| **`min_context`** | The context a category requires. A model that cannot serve it at any rung is dropped from the set. | profiles `usage:` |
-| **set** | The models that must be co-resident to serve one category. Each set is priced with the overhead of the others. | `writer.py` |
+| **demand** | One usage category's requirement for one model, resolved from its tags. | `UsageDemand` |
+| **`min_context`** | The context a usage category requires. A model that cannot serve it at any rung emits nothing for that category. | profiles `usage:` |
+| **matrix category** | An operator-named routing var under `matrix.categories` that binds a model to a var a set can name (`emb`, `rnk`, or a bucket such as `one`). A routing name, not a workload claim. | `matrix.categories` |
+| **canonical category** | The category whose model is the role's pinned CPU resident: `emb`, `rnk`, else the first declared for that role. | `canonical_cpu_pins` |
+| **set** | A use case: a composition of roles/categories that must be live together — `rag: __CHAT_VARS__ & emb & rnk` is embed *and* rerank. `&` sums, `|` maxes, `+set` expands; the chat solve reserves the worst branch of the most expensive chat set. | `matrix.sets`, `set_overhead_mb` |
 
 ## Emission
 

@@ -123,6 +123,21 @@ def test_profiles_groups_fallback_when_nothing_matches(profiles, make_model):
     assert group == [("default", {"cache_type": "q8_0", "parallel": 1})]
 
 
+def test_allow_profiles_bad_regex_names_the_sidecar(profiles, make_model,
+                                                   caplog):
+    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic about one sidecar leads with the sidecar's name.
+    """An invalid `allow_profiles` regex concerns one sidecar's declaration,
+    so the warning leads with that sidecar's name."""
+    import logging
+    m = make_model("m", allow_profiles="(((")
+    with caplog.at_level(logging.WARNING):
+        profiles.groups_for(m, vram_total=48000)
+    warned = [r.message for r in caplog.records
+              if "allow_profiles" in r.message]
+    assert warned, "expected the invalid regex to warn"
+    assert all(r.startswith("m:") for r in warned), warned
+
+
 def test_profiles_groups_by_cache_type(make_model):
     # Validates: SPEC.md, 'profiles.yaml': differing cache_type values split a model into separate profile groups
     m = make_model("m")
@@ -560,7 +575,7 @@ def _fake_vram(m, params):
 # The co-load pass is gated on some set referencing __COLOAD_VARS__ — the
 # only way a co-load's var reaches a set.  Tests of the pass itself opt in
 # with this; the gate has its own test below.
-COLOAD_SETS = {"talk": "__CHAT_VARS__ & tts & __COLOAD_VARS__"}
+COLOAD_SETS = {"talk": "__CHAT_VARS__ & emb & rnk & tts & __COLOAD_VARS__"}
 
 
 def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
@@ -599,12 +614,206 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
     assert with_ref.coloads == (("s2t", 640),)
 
 
+def test_prune_leaves_removes_refused_members():
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a refused CPU
+    # category disappears from the emitted sets without leaving a dangling
+    # var; sizes keep their members and empty groups collapse.
+    from llama_packer.writer import _prune_leaves as prune_leaves
+    drops = frozenset({"b"})
+    assert prune_leaves("(CHAT) & (b & c)", drops) == "CHAT & c"
+    assert prune_leaves("(a | b | c) & d", drops) == "(a | c) & d"
+    assert prune_leaves("(CHAT) & (b)", drops) == "CHAT"
+    assert prune_leaves("(CHAT) & (b & c)",
+                        frozenset({"b", "c"})) == "CHAT"
+    assert prune_leaves("a | b", drops) == "a"
+    assert prune_leaves("rnk2 & x", drops) == "rnk2 & x"
+    assert prune_leaves("b", drops) == ""
+    assert prune_leaves("(CHAT) & +combo", drops,
+                        {"combo": "b | d"}) == "CHAT & d"
+
+
+def test_category_ctx_caps_at_one_seam(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #32 -- a per-category
+    # ctx is a cap honoured by the served context and never a floor.
+    from llama_packer.writer import resident_ctx
+    m = make("stt2", role="s2t", context_length=32768, device="cpu")
+    assert resident_ctx(m, MatrixKnobs(), 2048) == 2048
+    assert resident_ctx(m, MatrixKnobs(), 65536) == 32768
+    emb = make("emb2", role="embeddings", context_length=65536)
+    assert resident_ctx(emb, MatrixKnobs(), None) == 4096
+    assert resident_ctx(emb, MatrixKnobs(embed_context=8192), None) == 8192
+    assert resident_ctx(emb, MatrixKnobs(embed_context=8192), 1024) == 1024
+    assert resident_ctx(emb, MatrixKnobs(), 999999) == 4096
+
+
+def test_host_unit_refusals_drop_the_unit(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a CPU
+    # composition that cannot fit is refused as a unit: each category in
+    # the unit gets no id, nothing commits, and the emitted set loses
+    # both leaves.
+    from llama_packer import writer
+    chat = make("chat", role="chat")
+    emb = make("e", role="embeddings", context_length=32768)
+    rnk = make("r", role="rerank", context_length=32768)
+    tts = make("t", role="t2s", context_length=32768, device="cpu")
+    music = make("muz", role="t2s", context_length=32768, device="cpu")
+    _fake_vram(chat, (1000, 0.5, 100))
+    for m in (emb, rnk):
+        _fake_vram(m, (100, 0.01, 0))
+    _fake_vram(tts, (4000, 0.01, 0))
+    _fake_vram(music, (3000, 0.01, 0))
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = writer.Planner(
+        [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
+        vram_total=64 * 1024, matrix_cfg={
+            "sets": {"voice": "__CHAT_VARS__ & tts & music"}},
+        embed_model=emb, rerank_model=rnk,
+        fixed_categories=[("tts", tts), ("music", music)],
+        host_pool_mb=5000)
+    plan = planner.plan()
+    assert planner.host_unit_refused_vars == frozenset({"tts", "music"})
+    assert not planner.host_ledger.residents
+    assert "t" not in plan and "muz" not in plan
+    assert dict(plan)[writer.HOST_REFUSED_KEY] == ["music", "tts"]
+
+
+def test_host_unit_refusals_survive_one_fitting_set(profiles, monkeypatch,
+                                                   caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #33 -- a category that
+    # any fitting composition admits survives (it is an alternative of the
+    # failing one, not co-resident); the failing composition warns.
+    import logging
+    from llama_packer import writer
+    chat = make("chat", role="chat")
+    emb = make("e", role="embeddings", context_length=32768)
+    rnk = make("r", role="rerank", context_length=32768)
+    tts = make("t", role="t2s", context_length=32768, device="cpu")
+    music = make("muz", role="t2s", context_length=32768, device="cpu")
+    _fake_vram(chat, (1000, 0.5, 100))
+    for m in (emb, rnk):
+        _fake_vram(m, (100, 0.01, 0))
+    _fake_vram(tts, (4000, 0.01, 0))
+    _fake_vram(music, (3000, 0.01, 0))
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = writer.Planner(
+        [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
+        vram_total=64 * 1024, matrix_cfg={
+            "sets": {"both": "__CHAT_VARS__ & tts & music",
+                     "solo": "__CHAT_VARS__ & tts"},
+        },
+        embed_model=emb, rerank_model=rnk,
+        fixed_categories=[("tts", tts), ("music", music)],
+        host_pool_mb=5000)
+    plan = planner.plan()
+    assert planner.host_unit_refused_vars == frozenset({"music"})
+    assert "t" in plan and "muz" not in plan
+    with caplog.at_level(logging.WARNING):
+        planner._host_unit_refusals()
+    assert "cannot fit as a unit" in caplog.text
+
+
+def test_resident_options_branch_alternatives_not_co_resident():
+    # Validates: docs/plans/cpu-residency-budget.md #31 -- membership is
+    # judged per and-branch: an alternation never reports same-role
+    # co-residency, only a genuine conjunction does.
+    from llama_packer.writer import _resident_options
+    assert sorted(map(sorted, _resident_options(
+        "three | (two & one)"))) == [["one", "two"], ["three"]]
+    assert sorted(map(sorted, _resident_options(
+        "a & (b | c)"))) == [["a", "b"], ["a", "c"]]
+
+
 def test_sets_reference_coloads():
     # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the co-load pass only fires when a routing set can actually co-locate
     assert _sets_reference_coloads(COLOAD_SETS) is True
     assert _sets_reference_coloads({"rag": "__CHAT_VARS__ & emb & rnk"}) is False
     assert _sets_reference_coloads({}) is False
     assert _sets_reference_coloads(None) is False
+
+
+def _bucket(stem, mb, role="s2t"):
+    """A fixed-overhead category with an authoritative pinned size."""
+    m = make(stem, role=role, backend="whisper-server", vram_mb=mb,
+             context_length=8192)
+    m.vram.effective_static = lambda *a, **k: (mb, 0.0, 0.0, 0)
+    m.vram.fit_params_static = lambda *a, **k: None
+    return m
+
+
+def _solve_sets(profiles, cats, sets, vram_total=32 * 1024):
+    chat = make("chat", role="chat", context_length=262144)
+    embed = make("e", role="embeddings", context_length=8192)
+    rerank = make("r", role="rerank", context_length=8192)
+    _fake_vram(chat, (8000, 0.4, 500))
+    for m in (embed, rerank):
+        _fake_vram(m, (500, 0.1, 100))
+    return _solve_matrix_context(
+        [chat, embed, rerank], embed, rerank, fit_bin="unused",
+        vram_total=vram_total, spare=None, profiles=profiles,
+        knobs=MatrixKnobs(min_chat_ctx=8192), fixed_categories=cats,
+        coload_sets=sets)
+
+
+def test_solve_matrix_reserves_worst_set_not_category_union(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #23 -- the chat solve is
+    # charged the worst branch of the most expensive chat set, not the sum of
+    # every declared category.  (three | (two & one)) costs max(4000, 3000).
+    cats = [("one", _bucket("one", 1000)),
+            ("two", _bucket("two", 2000)),
+            ("three", _bucket("three", 4000))]
+    composed = _solve_sets(profiles, cats, {
+        "rag": "__CHAT_VARS__ & emb & rnk",
+        "combo": "__CHAT_VARS__ & (three | (two & one))"})
+    only_three = _solve_sets(profiles, cats, {
+        "combo": "__CHAT_VARS__ & three"})
+    union = _solve_sets(profiles, cats, {
+        "all": "__CHAT_VARS__ & emb & rnk & one & two & three"})
+    assert composed is not None and only_three is not None and union is not None
+    assert composed.chat_ctx == only_three.chat_ctx
+    assert composed.chat_ctx > union.chat_ctx
+
+
+def test_solve_matrix_prices_a_nested_and_branch(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #22 -- (one | (two & three))
+    # costs two + three when that branch is larger, so a nested group is never
+    # priced as an unknown var worth 0.
+    cats = [("one", _bucket("one", 1000)),
+            ("two", _bucket("two", 2000)),
+            ("three", _bucket("three", 4000))]
+    nested = _solve_sets(profiles, cats,
+                         {"s": "__CHAT_VARS__ & (one | (two & three))"})
+    flat = _solve_sets(profiles, cats,
+                       {"s": "__CHAT_VARS__ & (two & three)"})
+    assert nested is not None and flat is not None
+    assert nested.chat_ctx == flat.chat_ctx
+
+
+def test_solve_matrix_unreferenced_category_reserves_nothing(profiles, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #24 -- a category no set
+    # names can only run alone, so it must not shrink the chat solve.
+    cats = [("three", _bucket("three", 4000))]
+    sets = {"rag": "__CHAT_VARS__ & emb & rnk"}
+    with caplog.at_level("INFO"):
+        referenced = _solve_sets(profiles, [], sets)
+        unreferenced = _solve_sets(profiles, cats, sets)
+    assert referenced is not None and unreferenced is not None
+    assert unreferenced.chat_ctx == referenced.chat_ctx
+    assert any("in no set" in r.message for r in caplog.records)
+
+
+def test_resident_cost_detail_names_the_terms(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #27 -- the cost the log
+    # prints is the same quad the budget charges, broken into its terms.
+    from llama_packer.writer import resident_cost_detail
+    m = make("jina", role="embeddings", context_length=4096)
+    m.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
+        model_mib=466, kv_per_token_mib=238 / 4096, slot_mib=0.0,
+        compute_mib=346, source="fit-params")
+    total, detail = resident_cost_detail(
+        m, fit_bin="unused", cache_type="q8_0", profiles=profiles,
+        llama_args="", ctx=4096)
+    assert total == 1050
+    assert detail == "466 weights + 346 compute + 238 kv @4096"
 
 
 def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
@@ -1582,3 +1791,194 @@ def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
     demands = Planner([m], _mp_profiles(), fit_bin="unused",
                       vram_total=64 * 1024).demands_for(m)
     assert demands and all("vision" not in d.keep for d in demands)
+
+
+# ── host budget (`device: cpu`) ───────────────────────────────────────────
+
+
+def test_cpu_resident_charges_host_not_vram(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #74 -- a CPU resident charges
+    # the host ledger (VRAM charge stays 0), and two committed quads for one
+    # role are a planner bug.
+    from llama_packer import writer
+    from llama_packer.writer import HostLedger
+
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings", device="cpu", context_length=32768)
+    _fake_vram(chat, (1000, 0.5, 100))
+    _fake_vram(embed, (466, 0.057, 346))
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = Planner([chat, embed], profiles, fit_bin="unused",
+                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
+                      embed_model=embed, rerank_model=embed,
+                      host_pool_mb=4096)
+    planner.plan()
+    # Charge is the measured CPU quad at the resolved resident context.
+    # Both slots embed+rerank are filled by the same model: two server
+    # processes, two host charges ("one per role", not one per model).
+    ctx = planner.matrix_result.embed_ctx
+    per_slot = 466 + 346 + int(0.057 * ctx)   # residents serve single-slot
+    assert planner.host_ledger.resident_mb() == 2 * per_slot
+    assert planner.host_ledger.available() == 4096 - 2 * per_slot
+    # The VRAM ledger carries nothing for it (decision 5: no double count).
+    assert planner.ledger.extra_reserve_mb("default") == 0
+
+    # One co-resident per role: committing two quads for one role is a
+    # planner bug, not a pool the packer would overrun.
+    ledger = HostLedger(4096)
+    ledger.add_resident("embed:e", "embeddings", 100)
+    with pytest.raises(AssertionError):
+        ledger.add_resident("embed:e2", "embeddings", 100)
+
+
+def test_cpu_variant_refused_on_small_pool(profiles, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #12 -- a CPU entry whose
+    # quad exceeds the host pool emits no id and logs the shortfall.
+    import logging
+    m = make("cpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=1000)
+    with caplog.at_level(logging.INFO):
+        plan = planner.plan()
+    assert "cpu" not in plan
+    assert any("host pool" in r.message for r in caplog.records)
+
+
+def test_cpu_parallel_charge_flips_refusal(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #15 -- declared parallel
+    # multiplies D and the KV pool and can flip the refusal.
+    m = make("cpu", role="chat", device="cpu", parallel=2)
+    _fake_vram(m, (466, 0.057, 346))
+    # parallel 2 charges two KV pools and two D terms: p=2 charge ≈ 4572 MiB
+    refused = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=1800).plan()
+    assert "cpu" not in refused
+    emitted = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=8192).plan()
+    assert [v.parallel for v in emitted["cpu"]] == [2]
+
+
+def test_no_host_pool_never_gates(profiles, caplog):
+    # Validates: docs/plans/cpu-residency-budget.md #16 -- without a detected
+    # pool the planner never refuses on host grounds.
+    import logging
+    m = make("cpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=None)
+    with caplog.at_level(logging.INFO):
+        plan = planner.plan()
+    assert "cpu" in plan
+
+
+def test_host_resident_sizing_lifts_cpu_gate(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #74 -- the host ledger
+    # sizes CPU-resident residents through allow_cpu=True (fit_params_static
+    # otherwise returns None for a device: cpu model and the charge reads 0).
+    m = make("e", role="embeddings", device="cpu", context_length=8192)
+    seen = {}
+
+    def fake_static(fit_bin, cache_type="q8_0", llama_args="",
+                    allow_cpu=False):
+        seen["allow_cpu"] = allow_cpu
+        if allow_cpu:
+            return SimpleNamespace(model_mib=100, kv_per_token_mib=0.1,
+                                   slot_mib=0.0, compute_mib=50,
+                                   source="fit-params")
+        return None
+
+    m.vram.fit_params_static = fake_static
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=4096)
+    mb = planner._host_resident_mb(m, 4096)
+    assert seen["allow_cpu"] is True
+    assert mb == 100 + 50 + int(0.1 * 4096)
+
+
+# ── metadata.packing ──────────────────────────────────────────────────────
+
+
+def test_metadata_packing_cpu_entry(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #77 -- CPU entries name device/ctx/parallel/ram and carry no vram_mib.
+    m = make("cpk", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024,
+                       host_pool_mb=8192).plan()["cpk"]
+    v = variants[0]
+    assert v.mem_vram_mib is None and v.mem_ram_mib > 0
+    config = emit_config([m], {"cpk": variants}, profiles, TVARS)
+    p = only_entry(config)["metadata"]["packing"]
+    assert p["device"] == "cpu"
+    assert p["ctx_size"] == v.ctx_size == 32768
+    assert p["parallel"] == v.parallel
+    assert p["ram_mib"] == int(round(v.mem_ram_mib))
+    assert p["kv_per_token"] == 59769      # 0.057 MiB expressed in bytes
+    assert "vram_mib" not in p
+
+
+def test_metadata_packing_gpu_entry(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #77 -- every entry carries packing; gpu entries carry vram_mib when decided.
+    m = make("gpk", role="chat")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024).plan()["gpk"]
+    v = variants[0]
+    assert v.mem_vram_mib is not None
+    config = emit_config([m], {"gpk": variants}, profiles, TVARS)
+    p = only_entry(config)["metadata"]["packing"]
+    assert p["device"] == "gpu"
+    assert p["vram_mib"] == int(round(v.mem_vram_mib))
+    assert p["ram_mib"] == int(round(v.mem_ram_mib))
+    assert p["ctx_size"] == v.ctx_size
+    assert p["parallel"] == v.parallel
+    assert p["kv_per_token"] == 59769
+
+
+def test_cpu_entry_ttl_zero(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #20 -- a device: cpu entry
+    # carries ttl 0 (no idle expiry); device entries carry no ttl key.
+    m = make("ttlcpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                       host_pool_mb=8192).plan()["ttlcpu"]
+    entry = only_entry(emit_config([m], {"ttlcpu": variants}, profiles, TVARS))
+    assert entry["ttl"] == 0
+
+
+def test_gpu_entry_has_no_ttl(profiles):
+    # Validates: docs/plans/cpu-residency-budget.md #20 -- device entries keep
+    # the inherited/global TTL (no per-model ttl key emitted).
+    m = make("ttlgpu", role="chat")
+    _fake_vram(m, (466, 0.057, 346))
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024).plan()["ttlgpu"]
+    entry = only_entry(emit_config([m], {"ttlgpu": variants}, profiles, TVARS))
+    assert "ttl" not in entry
+
+
+def test_cpu_fixed_category_resident_charged_host(profiles, monkeypatch):
+    # Validates: docs/plans/cpu-residency-budget.md #74 -- a declared fixed
+    # category (rnk2/stt/…) on device: cpu is a resident too and charges the
+    # host pool, one per category.
+    from llama_packer import writer
+
+    chat = make("chat", role="chat")
+    embed = make("e", role="embeddings", device="cpu", context_length=32768)
+    rnk = make("r", role="rerank", device="cpu", context_length=32768)
+    extra = make("z", role="rerank", device="cpu", context_length=32768)
+    _fake_vram(chat, (1000, 0.5, 100))
+    for m in (embed, rnk, extra):
+        _fake_vram(m, (100, 0.01, 50))
+
+    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
+    planner = Planner([chat, embed, rnk, extra], profiles, fit_bin="unused",
+                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
+                      embed_model=embed, rerank_model=rnk,
+                      fixed_categories=[("rnk2", extra)],
+                      host_pool_mb=10000)
+    planner.plan()
+    roles = [role for _, role, _ in planner.host_ledger.residents]
+    assert sorted(roles) == ["embed", "rerank", "rnk2"]

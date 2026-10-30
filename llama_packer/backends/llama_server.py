@@ -26,7 +26,7 @@ _warned_cli_batch: set[str] = set()
 class LlamaServerBackend(BaseBackend):
     name = "llama-server"
     formats = frozenset({".gguf"})
-    roles = frozenset({"chat", "embeddings", "rerank"})
+    operations = frozenset({"generate", "embed", "rerank"})
     handles = frozenset({
         "cli_args", "chat_template", "loras",
         "reasoning-format", "reasoning-preserve",

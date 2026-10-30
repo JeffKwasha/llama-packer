@@ -171,7 +171,7 @@ def _demands(cat: UsageCatalogue, *names: str) -> tuple[UsageDemand, ...]:
 from llama_packer.writer import (  # noqa: E402
     MatrixKnobs,
     Planner,
-    set_coresident_vars,
+    _expr_leaves,
     set_overhead_mb,
     _split_top,
 )
@@ -229,18 +229,47 @@ def test_set_overhead_ignores_explicit_chat_vars():
     assert set_overhead_mb("c1 & emb & stt", _MB, _CH, _CO) == 749 + 1898
 
 
-def test_set_coresident_vars_names_the_residents():
-    # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the vars a set can co-reside with.
-    assert set_coresident_vars("__CHAT_VARS__ & emb & rnk", _CH, _CO) == \
-        frozenset({"emb", "rnk"})
-    assert set_coresident_vars("__CHAT_VARS__ & __COLOAD_VARS__", _CH, _CO) == _CO
-    assert set_coresident_vars("__CHAT_VARS__", _CH, _CO) == frozenset()
-
-
 def test_set_overhead_ignores_unknown_vars():
     # an unresolvable var charges nothing rather than exploding the solve
     # Validates: docs/plans/opportunistic-coload.md, 'Design': an unknown var is charged nothing.
     assert set_overhead_mb("__CHAT_VARS__ & mystery", _MB, _CH, _CO) == 0
+
+
+def test_set_overhead_prices_nested_branches():
+    # Validates: docs/plans/cpu-residency-budget.md #22 -- a set expression is
+    # a boolean tree: `&` sums, `|` maxes, and a nested group is never
+    # mistaken for an unknown var worth 0.
+    buckets = {"one": 1000, "two": 2000, "three": 4000}
+    ch = frozenset({"c1"})
+    # (two & three) is a branch, so this is max(1000, 6000) -- the old
+    # depth-0 split saw an unknown var and returned 1000.
+    assert set_overhead_mb("(c1) & (one | (two & three))", buckets,
+                           ch, frozenset()) == 6000
+    assert set_overhead_mb("(c1) & (three | (two & one))", buckets,
+                           ch, frozenset()) == 4000
+
+
+def test_set_overhead_expands_named_sets():
+    # Validates: docs/plans/cpu-residency-budget.md #22 -- `+set` expands the
+    # referenced expression, and a cycle terminates instead of recursing.
+    buckets = {"one": 1000, "two": 2000, "three": 4000}
+    cfgs = {"combo": "three | (two & one)"}
+    assert set_overhead_mb("(c1) & +combo", buckets, frozenset({"c1"}),
+                           frozenset(), sets_cfg=cfgs) == 4000
+    cyc = {"a": "+b", "b": "+a"}
+    assert set_overhead_mb("(c1) & +a", buckets, frozenset({"c1"}),
+                           frozenset(), sets_cfg=cyc) == 0
+
+
+def test_expr_leaves_walks_nested_branches():
+    # Validates: docs/plans/cpu-residency-budget.md #22 -- the walker names the
+    # real leaves of a nested branch, not a variable called "two & three", and
+    # expands `+set` references.
+    assert _expr_leaves("(c1) & (three | (two & one))") == \
+        {"c1", "one", "two", "three"}
+    assert _expr_leaves("(c1) & +combo",
+                        {"combo": "three | (two & one)"}) == \
+        {"c1", "one", "two", "three"}
 
 
 # ── the id label ────────────────────────────────────────────────────────────
@@ -735,3 +764,23 @@ def test_usage_tag_not_declared_warns_and_is_ignored(caplog):
     assert [d.name for d in got] == ["coding"]
     assert any("invented" in r.message for r in caplog.records), [
         r.message for r in caplog.records]
+
+
+def test_usage_warnings_lead_with_the_sidecar_name(caplog):
+    """Every `usage:` warning is about one sidecar, so it names it first.
+
+    Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic leads
+    with the sidecar's name, so an operator can triage it by name.
+    """
+    import logging
+    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    with caplog.at_level(logging.WARNING):
+        # all three failure shapes: not a list, not a category, not declared
+        assert resolve_usage(42, cat, stem="s1") == ()
+        assert [d.name for d in resolve_usage(["chat", 7], cat, stem="s1")] \
+            == ["chat"]
+        assert [d.name for d in resolve_usage(["chat", "zork"], cat, stem="s1")] \
+            == ["chat"]
+    warned = [r.message for r in caplog.records]
+    assert warned, "expected the three failures to warn"
+    assert all(m.startswith("s1:") for m in warned), warned
