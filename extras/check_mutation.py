@@ -326,6 +326,10 @@ MUTATIONS = {
         "llama_packer/writer.py",
         "    kv_mb = int(kv_factor * ctx + slot_mib)",
         "    kv_mb = 0"),
+    "test_fit_crash_records_argv_and_stderr": (
+        "llama_packer/vram.py",
+        '            artifact.write_text("\\n".join(header + body) + "\\n")',
+        "            pass"),
 }
 
 
