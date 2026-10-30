@@ -298,9 +298,9 @@ refactor.
   break; a single-engine claim is `engines: [x]`), resolution (order,
   allow list, availability), refusal by name when none applies; a
   sidecar still declaring `backend:` warns as an alien key.
-- **P3 endpoint registry**: the one file+class; per-engine endpoint
-  lists; validation API; docs generated or checked against code (tests
-  assert doc/code agreement).
+- **P3 endpoint registry**: validation API and the doc/code agreement test
+  (the file, the closed id set and the per-engine lists landed in P1);
+  endpoint ids checked against the docs.
 - **P4 task catalog**: ids, endpoints, scheduler role, load semantics,
   demand language, negative examples; generated section in
   `templates/models_AGENTS.md`; sidecar `tasks:` accepted with warn-and-
