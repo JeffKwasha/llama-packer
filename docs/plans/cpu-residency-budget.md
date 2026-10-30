@@ -189,8 +189,9 @@ residents, and the GPU side is free either way.
 
 ### Portions
 
-**Portion 1 — set pricing and pinning (this branch).** Bugfixes only, no new
-config surface.
+**Portion 1 — set pricing and pinning (this branch).** Landed
+(`01d6a39`): 1121 tests, `check_trace` 87/87, `check_mutation` all hold,
+live repack validated (54 models). Bugfixes only, no new config surface.
 
 - recursive set pricing (`&` sum, `|` max, `+set` expand) for both the
   budget and the host-ledger cost view;
@@ -201,16 +202,22 @@ config surface.
 - the resident log prints the cost terms.
 
 **Portion 2 — composition validation and per-category context.** A set
-naming two categories of one role warns (or refuses) by name; per-category
-`ctx:` so a bucket can declare its served context instead of inheriting the
-role's; the host ledger's set awareness (a set that cannot fit its CPU
+naming two categories of one role warns (or refuses) by name; substitution
+of a *cross-role* element inside a role (e.g. `emb | rnk` as one element)
+warns rather than refuses — the role hosts elements, it does not require
+them, so the packer's job is to price the composition and flag the likely
+mistake, not to forbid it (`tasks-and-endpoints.md` D7); per-category
+`ctx:` so a bucket can declare its served context instead of inheriting
+the role's; the host ledger's set awareness (a set that cannot fit its CPU
 residents is refused as a unit); `matrix.categories` schema documented.
 
-**Portion 3 — refactor / capacity exploration.** Generalize
-`solve_matrix_ctx` from `(chat, embed, rerank)` to a category-parameter map
-so the solver no longer knows the RAG roles by name; evaluate llama-swap's
-native `capacity` routing as the runtime half of the same contract. Out of
-scope until portions 1–2 are green and the live config is repacked.
+**Portion 3 — refactor / capacity exploration.** Deferred to
+`tasks-and-endpoints.md` (branch C, D12): the solver's unification
+consumes the task/role/endpoint vocabulary that branch establishes, so
+generalizing `solve_matrix_ctx` here first would be rewritten on the way.
+llama-swap's native `capacity` routing stays under evaluation as the
+runtime half of the same contract. Out of scope until portions 1–2 are
+green and the live config is repacked.
 
 ## Host pool equation
 
