@@ -633,6 +633,9 @@ class Model:
         self._finder = finder or default_finder()
         self._vram: VramBudget | None = None  # lazy VRAM budget calculator
         self._file: Model | None = None  # canonical file delegate (bound below)
+        #: True for a model served without an authored sidecar (discovery
+        #: materializes a stub).  Only these fall back to engine inference.
+        self.stub = False
 
         # Resolve the model file path. hf_repo is a *place* (hub repo)
         # where a file lives, not a file itself. Most sidecars resolve to a

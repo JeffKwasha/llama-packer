@@ -217,14 +217,14 @@ def resolve_engines(model: "Model", names: tuple[str, ...],
             if allowed is not None and backend.name not in allowed:
                 why = "disabled by profiles.yaml backends:"
                 continue
-            if not backend.is_available(avail):
-                why = "not available (binary/image or runtime missing)"
-                continue
             if fmt not in backend.formats:
                 why = f"cannot load {fmt}"
                 continue
             if not endpoints.serves(backend.endpoints, model.role):
                 why = f"does not serve role {model.role!r}"
+                continue
+            if not backend.is_available(avail):
+                why = "not available (binary/image or runtime missing)"
                 continue
             return backend.name, reasons
         reasons[name] = why

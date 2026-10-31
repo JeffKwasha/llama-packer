@@ -16,8 +16,7 @@ names), point at the file with `model:`.
 ### Directory layout
 
 A sidecar is YAML frontmatter (between `---` lines) in a `.md` file whose stem
-matches the model file next to it. The directory sets the task (today the
-sidecar spells it `role:`; `tasks:` lands with P4):
+matches the model file next to it. The directory sets the task:
 
 | Directory | Task | Notes |
 |-----------|------|-------|
@@ -119,9 +118,9 @@ engines: [vllm, llama-server]  # preference order: first that can serve wins
 Resolution takes the first declared engine that is enabled in
 `profiles.yaml backends:`, available (binary/image/runtime present), can load
 the file format, and serves the task's endpoint. When none can, the model is
-skipped and the log names each engine with its reason. `engines:` wins over the
-retiring `backend:` spelling; a model with neither still falls back to
-inference until every sidecar is migrated.
+skipped and the log names each engine with its reason. A sidecar must declare
+`engines:`; only an orphan model (no sidecar) is inferred from its file
+format.
 
 ## Sidecar format
 
@@ -218,8 +217,8 @@ is. If a capability needs the companion file, it goes in the `mmproj:` block
 `quantization`, `architecture`, …) warns: intrinsics belong in sidecars.
 
 Do not invent keys. `template:` is invalid (use fleet-level `chat_template:`).
-`engines:` is the compatibility claim (see Engines above); `backend:` is its
-retiring spelling — don't write it in a new sidecar. `mmproj:` is a mapping
+`engines:` is the compatibility claim (see Engines above); `backend:` is not a
+sidecar key. `mmproj:` is a mapping
 (see Companions), not a capability: declare
 `capabilities: [image]` (or `[image, video]`) inside the block so the purpose
 is served exactly where the file is served. `vision` is not a
@@ -259,10 +258,8 @@ Convention: brand + major version; minor only when it changed the architecture
 `role:` selects the task the model performs: `chat` (default), `embeddings`,
 `rerank`, `image`, `s2t`, `t2s`. It is inferred from the directory (table above)
 or from `type:` containing `embedding`/`rerank`/`image`; set `role:` to
-override. `tasks:` is the same claim in the new vocabulary and replaces `role:`
-with P4 — write `role:` today, and never both. `image`/`s2t`/`t2s` engines are
-opt-in via profiles.yaml (`dirs:` + `backends:`). See the `llama-packer`
-project's `SPEC.md` for the full map.
+override. `image`/`s2t`/`t2s` engines are opt-in via profiles.yaml (`dirs:` +
+`backends:`). See the `llama-packer` project's `SPEC.md` for the full map.
 
 ## HuggingFace resolution
 

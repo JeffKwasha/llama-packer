@@ -336,6 +336,10 @@ MUTATIONS = {
         '                why = f"cannot load {fmt}"\n'
         '                continue\n'
         '            if False:'),
+    "test_sidecar_without_engines_is_refused": (
+        "llama_packer/scope.py",
+        "        elif not model.stub:",
+        "        elif False:"),
     "test_fit_crash_records_argv_and_stderr": (
         "llama_packer/vram.py",
         '            artifact.write_text("\\n".join(header + body) + "\\n")',

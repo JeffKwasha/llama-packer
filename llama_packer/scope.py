@@ -149,10 +149,10 @@ class ScopeStack:
         errors: list[str] = []
         engines = model.engines
         backend_name = model.frontmatter.get("backend")
+        if backend_name is not None:
+            logger.warning("%s: backend: is not a sidecar key; declare "
+                           "engines: [<engine>]", model.stem)
         if engines:
-            if backend_name is not None:
-                logger.warning("%s: both engines: and backend: declared; "
-                               "engines: wins", model.stem)
             resolved, reasons = resolve_engines(model, engines, self.avail,
                                                 self.allowed)
             if resolved is not None:
@@ -165,13 +165,12 @@ class ScopeStack:
                 errors.append(
                     f"engines: none of {', '.join(engines)} can serve "
                     f"{model.stem} (role {model.role}) — {detail}")
-        elif backend_name is not None and str(backend_name) not in BACKENDS:
-            errors.append(f"unknown backend {backend_name!r}")
-        elif backend_name is not None and self.allowed is not None \
-                and str(backend_name) not in self.allowed:
-            errors.append(f"backend {backend_name!r} is disabled by "
-                          f"profiles.yaml backends: {self.allowed}")
-        elif backend_name is None:
+        elif not model.stub:
+            sidecar = model.md_path.name if model.md_path else model.stem
+            errors.append(
+                f"engines: required — {sidecar} must declare the engines "
+                "that can load it, e.g. engines: [llama-server]")
+        else:
             inferred = infer_backend(model, self.avail, allowed=self.allowed)
             if inferred is not None:
                 logger.debug("override: %s: inferred backend %r",

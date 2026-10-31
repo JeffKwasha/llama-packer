@@ -26,6 +26,9 @@ def make_model(tmp_path):
         fm: dict = {"name": stem, "context_length": 32768}
         fm.update(frontmatter)
         model = Model(md_path, fm)
+        # Synthetic fixture: no authored sidecar, so it keeps orphan
+        # semantics (engine inference) unless a test says otherwise.
+        model.stub = True
         model.resolve_companions()
         return model
 

@@ -70,15 +70,15 @@ def test_apply_overrides_sidecar_seed(make_model, tmp_path):
     assert m.frontmatter["cli_args"] == "--seed 1"
 
 
-def test_apply_overrides_unknown_backend_skips(make_model, tmp_path, caplog):
-    # Validates: SPEC.md, 'Override Rules': a rule that names an unknown backend is skipped, and says so.
+def test_apply_overrides_backend_is_alien(make_model, caplog):
+    # Validates: docs/plans/requirement-trace.md #96 -- `backend:` is not a sidecar key and never selects an engine.
     import logging
     profiles = {"overrides": [{"when": {"base_model": "qwen"}, "backend": "bogus"}]}
-    m = make_model("q", base_model="qwen3.8", name="qwen3-8")
-    with caplog.at_level(logging.ERROR):
-        _run([m], profiles)
-    assert getattr(m, "_override_error", None) is not None
-    assert any("unknown backend" in r.message for r in caplog.records)
+    m = make_model("qwen3-8", base_model="qwen3.8", name="qwen3-8")
+    with caplog.at_level(logging.WARNING):
+        _run([m], profiles, avail={"llama_bin": "/opt/llama-server"})
+    assert any("not a sidecar key" in r.message for r in caplog.records)
+    assert m.backend == "llama-server"
 
 
 def test_rule_matches_when_true_matches_all(make_model):
