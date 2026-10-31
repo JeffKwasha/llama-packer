@@ -204,6 +204,12 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 98 | The catalogue is the only task vocabulary: `tasks:` ids come from it, `role:`/`usage:` are alien keys, and an `audio_cpp.task` cannot contradict the model's task | `test_task_ids_resolve_to_declared_demands`, `test_resolve_tasks_ignores_unblessed_tag_with_warning`, `test_unknown_role_value_warns_with_a_hint`, `test_audio_cpp_task_must_match_the_model_task` |
 
+## Declared task vocabulary (SPEC.md §Tasks)
+
+| # | Requirement | Test |
+|---|---|---|
+| 99 | A task id is declared data: an arbitrary id declared in `profiles.yaml tasks:` serves, and the same id undeclared is not a task and produces no task entry | `test_a_declared_task_id_is_arbitrary`, `test_an_undeclared_task_id_fails` |
+
 ## Composition validation (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |

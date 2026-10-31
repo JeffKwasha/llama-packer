@@ -22,6 +22,7 @@ from llama_packer import Model, __version__, find_bin_dir, utils
 from llama_packer import model as _modelmod
 from llama_packer.hardware import GpuProfile, HostProfile, detect_gpu_vendor
 from llama_packer.profiles import Profiles, validate_profiles_keys
+from llama_packer.tasks import TaskCatalogue
 from llama_packer.scope import ScopeStack
 from llama_packer.discover import discover
 from llama_packer.utils import (
@@ -1017,6 +1018,7 @@ def main(argv: list[str] | None = None) -> None:
             "podman": bool(shutil.which("podman")),
         },
         allowed=[str(b) for b in backends_cfg] or None,
+        tasks=TaskCatalogue.from_cfg(profiles_cfg.get("tasks")),
     )
     stack.push({"overrides": profiles_cfg.get("overrides")},
                origin=str(profiles_path))

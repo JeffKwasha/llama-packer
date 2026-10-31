@@ -49,28 +49,49 @@ defaults:
 # shed: the default order for capabilities a task does not name.
 # shed: [vision, draft]
 tasks:
-  coding:
-    min_context: 128k
-    min_parallel: 1
-    sacrifice: [vision]
-    keep: [draft]
+  # Chat-endpoint tasks: one serving covers all of them; they evict each
+  # other by request. endpoint + role are required; the demand keys are the
+  # floors the planner must meet.
   chat:
+    endpoint: openai.chat.completions
+    role: chat
     min_context: 64k
     min_parallel: 2
     sacrifice: [draft, vision]
+  coding:
+    endpoint: openai.chat.completions
+    role: chat
+    min_context: 130k
+    min_parallel: 1
+    sacrifice: [vision]
+    keep: [draft]
   qa:
-    # QA means question answering. Whether a serving can also see is a
-    # capability the model has or lacks, orthogonal to the kind of work --
-    # so it is `capabilities: [image]` on the sidecar, not a `require` here.
+    endpoint: openai.chat.completions
+    role: chat
     min_context: 32k
     min_parallel: 2
   aux:
-    # One-off work: describe a picture, summarise a document. Not agentic, so
-    # it does not need an agentic window, and a slot is worth more than
-    # context -- the opposite trade from `coding`.
+    endpoint: openai.chat.completions
+    role: chat
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
+  # Capability tasks: endpoint and role only; they are sized by their role.
+  embeddings:
+    endpoint: openai.embeddings
+    role: embeddings
+  rerank:
+    endpoint: openai.rerank
+    role: rerank
+  image:
+    endpoint: openai.images.generations
+    role: image
+  s2t:
+    endpoint: openai.audio.transcriptions
+    role: s2t
+  t2s:
+    endpoint: openai.audio.speech
+    role: t2s
 
 # Model roots (CLI --models-dir overrides this). Role is selected by the
 # first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →

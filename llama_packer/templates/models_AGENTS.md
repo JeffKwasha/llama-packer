@@ -255,9 +255,9 @@ Convention: brand + major version; minor only when it changed the architecture
 
 ## Tasks and directories
 
-`tasks:` lists the work the model performs, from the closed catalog in
-`llama_packer/tasks.py`: `chat`, `coding`, `qa`, `aux` (chat endpoint),
-`embeddings`, `rerank`, `image`, `s2t`, `t2s`. A task is inferred from the
+`tasks:` lists the work the model performs, from the catalogue declared in
+`profiles.yaml tasks:` (typically `chat`, `coding`, `qa`, `aux` on the chat
+endpoint, plus `embeddings`, `rerank`, `image`, `s2t`, `t2s`). A task is inferred from the
 directory (table above) or from `type:` containing `embedding`/`rerank`/`image`
 when the sidecar declares none. `image`/`s2t`/`t2s` engines are opt-in via
 profiles.yaml (`dirs:` + `backends:`). See the `llama-packer` project's

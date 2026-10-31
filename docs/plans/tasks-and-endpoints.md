@@ -259,6 +259,28 @@ CPU residents stay go/no-go; the two-tier guarantee ("the resident tier's
 VRAM is a number computable up front") is preserved as tier-0 priority
 data.
 
+## Where these decisions live
+
+The plan is history: deleting it must lose no requirement. Every decision
+below is stated in the docs that outlive it; the pending ones are stated as
+design and tracked in [`roadmap.md`](roadmap.md).
+
+| decision | now stated in | state |
+|---|---|---|
+| D1 packer is a config generator | `SPEC.md` Overview ("generates `config.yaml` for llama-swap") | landed |
+| D2 engines serve models; models perform tasks | `docs/architecture.md` §Models, tasks, engines and endpoints; `docs/glossary.md` | landed |
+| D3 endpoints are standardized | `SPEC.md` §Backend support matrix; `docs/architecture.md`; `docs/glossary.md` | landed |
+| D4 compatibility is declared (`engines:`) | `SPEC.md` §Backend Selection; `templates/models_AGENTS.md` | landed |
+| D5 tasks come from the catalog | `SPEC.md` §Tasks; `docs/glossary.md` §Tasks and routing categories | landed |
+| D6 family is the interchangeability unit | `docs/glossary.md` | landed |
+| D7 a role hosts elements | `docs/architecture.md` §A role is a composition | design (P5) |
+| D8 roles declare their tasks | `docs/architecture.md` §A role is a composition | design (P5) |
+| D9 tasks are sacrifice-by-default | `docs/architecture.md` §A role is a composition | design (P5) |
+| D10 CPU placement flips the cost pool | `SPEC.md` §Host pool | landed |
+| D11 TTL is orthogonal to precedence | `docs/glossary.md` §Precedence and lifetime | design (P5) |
+| D12 the one allocation problem | [`roadmap.md`](roadmap.md) | design (branch C) |
+| D13 clean break on config syntax | `SPEC.md` §Backend Selection, §Tasks; `templates/models_AGENTS.md` | landed |
+
 ## What this undoes (from `6ca96fd`)
 
 - `llama_packer/roles.py`: drop `Role.operation`, `OPERATIONS`;
@@ -305,8 +327,9 @@ refactor.
   (the file, the closed id set and the per-engine lists landed in P1);
   endpoint ids checked against the docs.
 - **P4 task catalog** *(landed 2026-10-31; fleet migration runs separately)*:
-  `tasks.py` owns the closed ids, their endpoints, scheduling roles and
-  demand defaults; `profiles.yaml tasks:` overrides a demand. A sidecar
+  `profiles.yaml tasks:` declares the ids, their endpoints, scheduling roles
+  and demands; `tasks.py` validates each against the hardcoded endpoint and
+  role sets. A sidecar
   declares `tasks:`; `role:` and `usage:` are alien keys. An unknown id
   warns and is ignored, and an `audio_cpp.task` that contradicts the model's
   task warns. `templates/models_AGENTS.md` documents the catalog. The fleet

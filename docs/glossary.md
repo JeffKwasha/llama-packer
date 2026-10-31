@@ -80,7 +80,7 @@ the routing var a set names (`emb`, `rnk`):
 
 | Term | Means | Code |
 |---|---|---|
-| **task catalogue** | The closed set of task ids and their defaults: endpoint, scheduling role, intent, demand. An id outside it is not a task. | `tasks.py` |
+| **task catalogue** | The declared set of task ids: endpoint, scheduling role, intent, demand. An id outside it is not a task. | `profiles.yaml tasks:`, validated by `tasks.py` |
 | **demand** | One task's minimum serving (`min_context`, `min_parallel`, `require`, `keep`, `sacrifice`). | `tasks.Task` |
 | **`min_context`** | The context a task requires. A model that cannot serve it at any rung emits nothing for that task. | profiles `tasks:` |
 | **matrix category** | An operator-named routing var under `matrix.categories` that binds a model to a var a set can name (`emb`, `rnk`, or a bucket such as `one`). A routing name, not a workload claim. | `matrix.categories` |
