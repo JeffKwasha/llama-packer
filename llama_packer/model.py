@@ -582,7 +582,7 @@ class Model:
     # so a sidecar using one warns instead of silently doing nothing.
     FIELDS: ClassVar[frozenset[str]] = frozenset({
         "name", "model_id", "id", "context_length", "description", "cli_args", "model",
-        "backend", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
+        "backend", "engines", "hf_repo", "chat_template", "chat_template_kwargs", "loras",
         "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "speculative_config",
@@ -1348,6 +1348,24 @@ class Model:
         normal pipeline.
         """
         return str(self.frontmatter.get("backend") or DEFAULT_BACKEND)
+
+    @property
+    def engines(self) -> tuple[str, ...]:
+        """Engines the sidecar declares it can run on, in preference order.
+
+        The vocabulary is bare engine names (``vllm``, not ``vllm-podman``):
+        the transport is a deployment choice the registry resolves.  Empty
+        means "undeclared" — discovery then infers the engine as before.
+        """
+        raw = self.frontmatter.get("engines")
+        if raw is None or raw == "":
+            return ()
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        return tuple(str(x).strip() for x in raw
+                     if isinstance(x, str) and x.strip())
 
     @property
     def resolved_chat_template(self) -> Path | None:

@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 
 from llama_packer import endpoints, utils
-from llama_packer.backends import BACKENDS, infer_backend
+from llama_packer.backends import BACKENDS, infer_backend, resolve_engines
 from llama_packer.overrides import (
     compile_rule_list,
     resolve_setting_paths,
@@ -147,8 +147,25 @@ class ScopeStack:
         ``model._override_error`` (already logged) for the writer to skip.
         """
         errors: list[str] = []
+        engines = model.engines
         backend_name = model.frontmatter.get("backend")
-        if backend_name is not None and str(backend_name) not in BACKENDS:
+        if engines:
+            if backend_name is not None:
+                logger.warning("%s: both engines: and backend: declared; "
+                               "engines: wins", model.stem)
+            resolved, reasons = resolve_engines(model, engines, self.avail,
+                                                self.allowed)
+            if resolved is not None:
+                logger.debug("override: %s: engines: resolved to %r",
+                             model.stem, resolved)
+                model.frontmatter["backend"] = resolved
+            else:
+                detail = "; ".join(f"{name}: {why}"
+                                   for name, why in reasons.items())
+                errors.append(
+                    f"engines: none of {', '.join(engines)} can serve "
+                    f"{model.stem} (role {model.role}) — {detail}")
+        elif backend_name is not None and str(backend_name) not in BACKENDS:
             errors.append(f"unknown backend {backend_name!r}")
         elif backend_name is not None and self.allowed is not None \
                 and str(backend_name) not in self.allowed:

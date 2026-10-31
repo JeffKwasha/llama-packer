@@ -294,10 +294,13 @@ refactor.
   the closed id set and the task→endpoint map, engines declare `endpoints`,
   and `endpoints.serves()` is the check. P3 therefore owns the registry's
   validation API and doc/code agreement test, not the per-engine lists.
-- **P2 `engines:`**: sidecar key (engine names — required, D13's clean
-  break; a single-engine claim is `engines: [x]`), resolution (order,
-  allow list, availability), refusal by name when none applies; a
-  sidecar still declaring `backend:` warns as an alien key.
+- **P2 `engines:`** *(part 1 landed 2026-10-30; part 2 open)*: sidecar key
+  (engine names — required, D13's clean break; a single-engine claim is
+  `engines: [x]`), resolution (order, allow list, availability, format,
+  endpoint), refusal by name when none applies. **Part 1** accepts and
+  resolves the key, keeps inference as the fallback, and warns on an unknown
+  engine name with a near-miss hint. **Part 2** migrates the fleet's
+  sidecars, flips the key to required, and makes `backend:` an alien key.
 - **P3 endpoint registry**: validation API and the doc/code agreement test
   (the file, the closed id set and the per-engine lists landed in P1);
   endpoint ids checked against the docs.

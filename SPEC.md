@@ -1327,9 +1327,14 @@ Inference walks this list (availability still filters: a pair without its
 binary/image configured, or without its container runtime on `PATH`, is
 skipped) and picks the first engine whose formats cover the model and whose
 endpoints cover its tasks. A sidecar declares that set explicitly with
-`engines:` (P2; until it lands the same field is spelled `backend:`), and a
-declared engine that is disabled is an error that skips that model — the
-declaration bypasses *inference*, never policy. Registration
+`engines:` — bare engine names in preference order (`vllm`, not
+`vllm-podman`: the transport is the registry's choice). Resolution takes the
+first declared engine that is enabled, available, can load the file format
+and serves the task's endpoint; the declaration bypasses *inference*, never
+policy, so a declared engine that is disabled is an error that skips the
+model. When nothing resolves, the model is skipped and the log names every
+declared engine with its reason. `engines:` wins over `backend:`, and with
+neither declared, inference applies. Registration
 order: `llama-server`, `vllm`, `vllm-podman`, `vllm-docker`, `sd-server`,
 `whisper-server`, `audio-cpp`.
 
