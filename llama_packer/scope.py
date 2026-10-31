@@ -54,7 +54,8 @@ class ScopeStack:
     naturally gives inner > outer > global.
     """
 
-    def __init__(self, avail: dict | None = None, allowed: list[str] | None = None):
+    def __init__(self, avail: dict | None = None, allowed: list[str] | None = None,
+                 tasks=None):
         self._defaults: list[dict] = []          # one dict per open scope
         self._rule_counts: list[int] = []        # rules added by each scope
         self._rules: list[tuple] = []            # flat (when, settings), outer→inner
@@ -62,6 +63,9 @@ class ScopeStack:
         # ``backends:``); used by finalize().
         self.avail = avail or {}
         self.allowed = allowed
+        #: Declared tasks (profiles.yaml ``tasks:``); finalize() reads the
+        #: scheduling role a sidecar's task list implies.
+        self.tasks = tasks
 
     # ── scoping ──
 
@@ -147,6 +151,14 @@ class ScopeStack:
         ``model._override_error`` (already logged) for the writer to skip.
         """
         errors: list[str] = []
+        if model.task_ids:
+            role = self.tasks.role_of(model.task_ids) if self.tasks else None
+            if role is None:
+                errors.append(
+                    f"tasks: {', '.join(model.task_ids)} do not share one "
+                    "scheduling role")
+            else:
+                model.frontmatter["role"] = role
         engines = model.engines
         backend_name = model.frontmatter.get("backend")
         if backend_name is not None:

@@ -342,7 +342,7 @@ When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` 
 
 ### Tasks (`tasks:`)
 
-The global `min_context` is one floor for the whole fleet, which cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a closed catalog id that names one kind of work, the endpoint it is served at, the scheduling role it implies, and the demand that work needs. `llama_packer/tasks.py` owns the ids and their default demands; `profiles.yaml tasks:` overrides a demand without inventing a task:
+The global `min_context` is one floor for the whole fleet, which cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, the scheduling role it implies, and the demand that work needs. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids and the scheduling roles. A task whose endpoint or role is not in those sets is warned about and dropped:
 
 ```yaml
 tasks:
@@ -351,7 +351,7 @@ tasks:
   qa:     {min_context: 32k,  min_parallel: 2, require: [vision]}
 ```
 
-A sidecar claims its tasks with `tasks: [coding, chat]`. **The claim is the operator's declaration, not an inference** — nothing about the model or the GPU chooses it or overrides it, exactly as `hf_url` and `context_length` are declarations. An id not in the catalog is warned about and ignored, so the tasks in force are exactly the ones the operator wrote. That warning **names its sidecar** — and so does every log line about one sidecar: a diagnostic leads with the sidecar's name, so an operator can triage it by name without cross-referencing. Each satisfiable task emits its **own** entry; two entries for one model is therefore just two tasks in the sidecar, not a separate mechanism. Every model additionally gets a **fallback** entry with bare minimums and no task name in the id, so a model that declares nothing still reaches clients.
+A sidecar claims its tasks with `tasks: [coding, chat]`. The id is an operator-chosen name (lowercase, dots/dashes allowed), never a code symbol: `tasks: [zq7-odd-job]` is a task if `profiles.yaml` declares it, and is not one if it does not. **The claim is the operator's declaration, not an inference** — nothing about the model or the GPU chooses it or overrides it, exactly as `hf_url` and `context_length` are declarations. An id not in the catalog is warned about and ignored, so the tasks in force are exactly the ones the operator wrote. That warning **names its sidecar** — and so does every log line about one sidecar: a diagnostic leads with the sidecar's name, so an operator can triage it by name without cross-referencing. Each satisfiable task emits its **own** entry; two entries for one model is therefore just two tasks in the sidecar, not a separate mechanism. Every model additionally gets a **fallback** entry with bare minimums and no task name in the id, so a model that declares nothing still reaches clients.
 
 Tasks that share an endpoint are aliases of one serving: one process covers them, and they evict each other by request rather than loading twice.
 

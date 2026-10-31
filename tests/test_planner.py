@@ -10,7 +10,7 @@ import pytest
 
 from llama_packer.consts import _RESERVE_VIDEO
 from llama_packer.profiles import Profiles
-from conftest import entry_for, only_entry, entry_id
+from conftest import entry_for, only_entry, entry_id, tasks_section
 from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context, _sets_reference_coloads
 
 TVARS = {"llama_bin": "/opt/llama-server"}
@@ -527,8 +527,9 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
     # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     no_pin = Profiles({"defaults": {"cache_type": "q8_0"},
                        "profiles": {"default": {}},
-                       "tasks": {"qa": {"min_context": "4k",
-                                         "min_parallel": 1}}})
+                       "tasks": tasks_section(
+                           {"qa": {"min_context": "4k",
+                                   "min_parallel": 1}})})
     vllm_m = make_model("av", backend="vllm", min_context=4096,
                         tasks=["qa"])
     del vllm_m.frontmatter["context_length"]  # no pin: cap = design
@@ -1549,8 +1550,9 @@ def test_every_category_gets_an_entry(make_model, profiles):
     m.frontmatter["tasks"] = ["coding", "chat"]
     profs = Profiles({"defaults": {"cache_type": "q8_0"},
                       "profiles": {"default": {}},
-                      "tasks": {"coding": {"min_context": "4k"},
-                                "chat": {"min_context": "4k"}}})
+                      "tasks": tasks_section(
+                          {"coding": {"min_context": "4k"},
+                           "chat": {"min_context": "4k"}})})
     planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
                       min_context=4096)
     planner._bounded_ctx = lambda *a, **k: 131072
@@ -1573,7 +1575,8 @@ def test_every_model_gets_a_fallback(make_model, profiles):
     # coding asks for 1M, which nothing can serve; the fallback asks 4096.
     profs = Profiles({"defaults": {"cache_type": "q8_0"},
                       "profiles": {"default": {}},
-                      "tasks": {"coding": {"min_context": 1000000}}})
+                      "tasks": tasks_section(
+                          {"coding": {"min_context": 1000000}})})
     planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
                       min_context=4096)
     planner._bounded_ctx = lambda *a, **k: 131072
@@ -1627,8 +1630,9 @@ def test_require_prevents_the_entry_emitted(make_model, profiles, tmp_path):
     m.frontmatter["tasks"] = ["qa"]
     profs = Profiles({"defaults": {"cache_type": "q8_0"},
                       "profiles": {"default": {}},
-                      "tasks": {"qa": {"min_context": "4k",
-                                       "require": ["vision"]}}})
+                      "tasks": tasks_section(
+                          {"qa": {"min_context": "4k",
+                                  "require": ["vision"]}})})
     planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
                       min_context=4096)
     planner._bounded_ctx = lambda *a, **k: 131072
@@ -1747,8 +1751,9 @@ def test_resident_parallelism_is_ignored(make_model, profiles, caplog):
 
 def _mp_profiles():
     return Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
-                     "tasks": {"coding": {"min_context": 4096,
-                                          "sacrifice": ["vision"]}}})
+                     "tasks": tasks_section(
+                         {"coding": {"min_context": 4096,
+                                     "sacrifice": ["vision"]}})})
 
 
 def test_min_image_megapixels_keeps_vision(make_model, tmp_path):

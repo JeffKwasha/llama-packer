@@ -91,25 +91,48 @@ vllm:
 #                 floor wins, since the id advertises the context
 #   require       capabilities this category will not give up
 #   sacrifice     preference order for what to shed first, not a cost order
-usage:
-  coding:
-    min_context: 130k
-    min_parallel: 1
-    sacrifice: [vision]
-    # Refuses to drop the MTP draft, but a coding model with no draft
-    # companion is still coding -- `require` would gate it out entirely.
-    keep: [draft]
+tasks:
+  # Chat-endpoint tasks: one serving covers all of them; they evict each
+  # other by request. endpoint + role are required; the demand keys are the
+  # floors the planner must meet.
   chat:
+    endpoint: openai.chat.completions
+    role: chat
     min_context: 64k
     min_parallel: 2
     sacrifice: [draft, vision]
+  coding:
+    endpoint: openai.chat.completions
+    role: chat
+    min_context: 130k
+    min_parallel: 1
+    sacrifice: [vision]
+    keep: [draft]
   qa:
+    endpoint: openai.chat.completions
+    role: chat
     min_context: 32k
     min_parallel: 2
-  # One-off work: describe a picture, summarise a document. Not agentic, so
-  # it does not need an agentic window, and a slot is worth more than
-  # context -- which is the opposite trade from `coding`.
   aux:
+    endpoint: openai.chat.completions
+    role: chat
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
+  # Capability tasks: endpoint and role only; they are sized by their role.
+  embeddings:
+    endpoint: openai.embeddings
+    role: embeddings
+  rerank:
+    endpoint: openai.rerank
+    role: rerank
+  image:
+    endpoint: openai.images.generations
+    role: image
+  s2t:
+    endpoint: openai.audio.transcriptions
+    role: s2t
+  t2s:
+    endpoint: openai.audio.speech
+    role: t2s
+

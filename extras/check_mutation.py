@@ -336,6 +336,10 @@ MUTATIONS = {
         '                why = f"cannot load {fmt}"\n'
         '                continue\n'
         '            if False:'),
+    "test_a_declared_task_id_is_arbitrary": (
+        "llama_packer/tasks.py",
+        '_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")',
+        '_ID_RE = re.compile(r"^[a-z]+$")'),
     "test_resolve_tasks_ignores_unblessed_tag_with_warning": (
         "llama_packer/tasks.py",
         "        if task is None:",

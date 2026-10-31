@@ -9,6 +9,7 @@ import pytest
 import llama_packer.writer as writer
 from llama_packer.endpoints import CHAT
 from llama_packer import tasks
+from conftest import TASK_ENDPOINT, catalogue, task_cfg, tasks_section
 from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
 from llama_packer.utils import parse_ctx_size as _parse_ctx_size
 from llama_packer.writer import FALLBACK, KNOWN_CAPABILITIES
@@ -42,14 +43,14 @@ def test_parse_ctx_size_rejects_junk(raw):
 
 def test_catalogue_parses_full_spec():
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': the tasks: catalogue is parsed from profiles.yaml.
-    cat = TaskCatalogue.from_cfg({
+    cat = catalogue({
         "coding": {"min_context": "128k", "min_parallel": 1,
                    "sacrifice": ["vision", "draft"]},
         "chat": {"min_context": "64k", "min_parallel": 2,
                  "sacrifice": ["draft", "vision"]},
         "qa": {"min_context": "32k", "min_parallel": 2, "require": ["vision"]},
     })
-    assert cat.order == tasks.IDS
+    assert set(cat.order) == set(TASK_ENDPOINT)
     coding = _d(cat, "coding")
     assert (coding.min_context, coding.min_parallel) == (131072, 1)
     # sacrifice keeps the declared order -- it is a preference order
@@ -60,7 +61,7 @@ def test_catalogue_parses_full_spec():
 
 def test_catalogue_int_shorthand_is_min_context():
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': a bare integer is the category's min_context.
-    cat = TaskCatalogue.from_cfg({"coding": 65536})
+    cat = catalogue({"coding": 65536})
     assert cat.get("coding").min_context == 65536
     assert cat.get("coding").min_parallel == 1
 
@@ -68,23 +69,23 @@ def test_catalogue_int_shorthand_is_min_context():
 def test_catalogue_warns_and_drops_malformed_categories(caplog):
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': a malformed category is warned about and dropped.
     with caplog.at_level("WARNING"):
-        cat = TaskCatalogue.from_cfg({
+        cat = catalogue({
             "chat": {"min_context": "32k"},
             "coding": "garbage",
             "qa": {"min_context": "abc"},
             "aux": {"min_parallel": 0},
         })
-    assert cat.order == tasks.IDS
+    assert set(cat.order) == set(TASK_ENDPOINT) - {"coding"}
     assert "not a mapping" in caplog.text
     # an unusable minimum is dropped, the task survives with its default
-    assert cat.get("qa").min_context == 32 * 1024
-    assert cat.get("aux").min_parallel == 2
+    assert cat.get("qa").min_context == 0
+    assert cat.get("aux").min_parallel == 1
 
 
 def test_catalogue_warns_on_unknown_capability(caplog):
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': an unknown capability is warned about and dropped.
     with caplog.at_level("WARNING"):
-        cat = TaskCatalogue.from_cfg(
+        cat = catalogue(
             {"qa": {"require": ["vision", "telepathy"]}})
     assert "unknown capabilities" in caplog.text
     assert "telepathy" in caplog.text
@@ -93,9 +94,7 @@ def test_catalogue_warns_on_unknown_capability(caplog):
 
 def test_catalogue_empty_config_keeps_the_defaults():
     # Validates: SPEC.md, 'Tasks': an empty tasks: section keeps the catalog defaults.
-    cat = TaskCatalogue.from_cfg(None)
-    assert cat.order == tasks.IDS
-    assert cat.get("chat").min_context == 64 * 1024
+    assert not TaskCatalogue.from_cfg(None)
 
 
 def test_known_capabilities_are_the_ladder_axes():
@@ -108,7 +107,7 @@ def test_known_capabilities_are_the_ladder_axes():
 
 def test_resolve_tasks_accepts_blessed_tags():
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': only the tags the catalogue declares become demands.
-    cat = TaskCatalogue.from_cfg({"coding": {"min_context": "128k"},
+    cat = catalogue({"coding": {"min_context": "128k"},
                                    "chat": {"min_context": "64k"}})
     got = resolve_tasks(["coding", "chat"], cat)
     assert [d.id for d in got] == ["coding", "chat"]
@@ -116,17 +115,17 @@ def test_resolve_tasks_accepts_blessed_tags():
 
 def test_resolve_tasks_dedupes_repeats():
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': a repeated tag is one demand.
-    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    cat = catalogue({"chat": {"min_context": "64k"}})
     assert [d.id for d in resolve_tasks(["chat", "chat"], cat)] == ["chat"]
 
 
 def test_resolve_tasks_ignores_unblessed_tag_with_warning(caplog):
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': an undeclared tag is warned about and ignored.
-    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    cat = catalogue({"chat": {"min_context": "64k"}})
     with caplog.at_level("WARNING"):
         got = resolve_tasks(["chat", "code"], cat)
     assert [d.id for d in got] == ["chat"]
-    assert "is not a task" in caplog.text
+    assert "is not a declared task" in caplog.text
     assert "code" in caplog.text
     # the warning names what *is* blessed, so the operator can see the fix
     assert "chat" in caplog.text
@@ -134,13 +133,13 @@ def test_resolve_tasks_ignores_unblessed_tag_with_warning(caplog):
 
 def test_resolve_tasks_accepts_bare_string():
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': a bare string is one tag.
-    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    cat = catalogue({"chat": {"min_context": "64k"}})
     assert [d.id for d in resolve_tasks("chat", cat)] == ["chat"]
 
 
 def test_resolve_tasks_no_tags_means_no_demands(caplog):
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': no tags means no demands.
-    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    cat = catalogue({"chat": {"min_context": "64k"}})
     assert resolve_tasks(None, cat) == ()
     with caplog.at_level("WARNING"):
         assert resolve_tasks(42, cat) == ()
@@ -150,7 +149,7 @@ def test_resolve_tasks_no_tags_means_no_demands(caplog):
 
 
 def _cat(**specs) -> TaskCatalogue:
-    return TaskCatalogue.from_cfg(specs)
+    return catalogue(specs)
 
 
 def _d(cat: TaskCatalogue, name: str) -> Task:
@@ -387,7 +386,7 @@ TVARS = {"llama_bin": "/opt/llama-server"}
 
 
 def _id_cat() -> TaskCatalogue:
-    return TaskCatalogue.from_cfg({
+    return catalogue({
         "coding": {"min_context": "128k", "min_parallel": 1,
                    "sacrifice": ["vision"]},
         "chat": {"min_context": "64k", "min_parallel": 2},
@@ -439,7 +438,7 @@ def test_emit_id_names_heaviest_category_with_flags(make_model):
     # Validates: SPEC.md, 'Output Format': the id names the heaviest satisfied category and the served flags.
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
-    cat = TaskCatalogue.from_cfg(_profiles_with_usage().tasks_cfg)
+    cat = catalogue(_profiles_with_usage().tasks_cfg)
     usage = _demands(cat, "coding", "chat", "qa")
     config = emit_config([m], {"qwen38": [_variant(160000, usage)]},
                          _profiles_with_usage(), TVARS)
@@ -457,7 +456,7 @@ def test_ids_stable_when_context_changes(make_model):
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
-    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
+    cat = catalogue(profiles.tasks_cfg)
     usage = _demands(cat, "coding", "chat")
     a = emit_config([m], {"qwen38": [_variant(140000, usage)]}, profiles, TVARS)
     b = emit_config([m], {"qwen38": [_variant(155000, usage)]}, profiles, TVARS)
@@ -492,7 +491,7 @@ def test_same_model_two_groups_disambiguated(make_model):
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
-    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
+    cat = catalogue(profiles.tasks_cfg)
     usage = (cat.get("coding"),)
     variants = [_variant(150000, usage), _variant(140000, usage)]
     config = emit_config([m], {"qwen38": variants}, profiles, TVARS)
@@ -512,7 +511,7 @@ def test_duplicate_ids_do_not_move_when_context_moves(make_model):
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
-    usage = (TaskCatalogue.from_cfg(profiles.tasks_cfg).get("coding"),)
+    usage = (catalogue(profiles.tasks_cfg).get("coding"),)
     first = emit_config([m], {"qwen38": [_variant(150000, usage),
                                          _variant(140000, usage)]},
                         profiles, TVARS)
@@ -714,7 +713,7 @@ def test_keep_is_parsed_from_profiles():
     profiles = Profiles({"defaults": {}, "tasks": {
         "coding": {"min_context": "128k", "keep": ["draft"],
                    "sacrifice": ["vision"]}}})
-    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
+    cat = catalogue(profiles.tasks_cfg)
     d = cat.get("coding")
     assert d.keep == frozenset({"draft"})
     assert d.sacrifice == ("vision",)
@@ -733,7 +732,7 @@ def test_task_ids_resolve_to_declared_demands():
     profiles = Profiles({"defaults": {}, "tasks": {
         "coding": {"min_context": "130k", "min_parallel": 1},
         "aux": {"min_context": "80k", "min_parallel": 2}}})
-    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
+    cat = catalogue(profiles.tasks_cfg)
     got = resolve_tasks(["coding", "aux"], cat)
     assert [d.id for d in got] == ["coding", "aux"]
     assert [d.min_context for d in got] == [133120, 81920]
@@ -752,7 +751,7 @@ def test_usage_tag_not_declared_warns_and_is_ignored(caplog):
     import logging
     profiles = Profiles({"defaults": {}, "tasks": {
         "coding": {"min_context": "130k"}}})
-    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
+    cat = catalogue(profiles.tasks_cfg)
     with caplog.at_level(logging.WARNING):
         got = resolve_tasks(["coding", "invented"], cat)
     assert [d.id for d in got] == ["coding"]
@@ -767,7 +766,7 @@ def test_usage_warnings_lead_with_the_sidecar_name(caplog):
     with the sidecar's name, so an operator can triage it by name.
     """
     import logging
-    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    cat = catalogue({"chat": {"min_context": "64k"}})
     with caplog.at_level(logging.WARNING):
         # all three failure shapes: not a list, not a category, not declared
         assert resolve_tasks(42, cat, stem="s1") == ()
@@ -789,3 +788,56 @@ def test_audio_cpp_task_must_match_the_model_task(make_model, caplog):
     with caplog.at_level("WARNING"):
         _warn_unsupported_values(m, "tts.md")
     assert "audio_cpp.task 'tts' is a t2s task" in caplog.text
+
+
+# ── the catalogue is data, not a hardcoded list ────────────────────────────
+
+
+def test_a_declared_task_id_is_arbitrary(make_model, tmp_path):
+    """A task id that appears nowhere in the code still serves.
+
+    Validates: docs/plans/requirement-trace.md #99 -- task ids are declared
+    in profiles; only the endpoint and scheduling role are checked.
+    """
+    arbitrary = "zq7-odd-job"
+    cfg = {arbitrary: {"endpoint": CHAT, "role": "chat",
+                       "min_context": "8k"}}
+    cat = TaskCatalogue.from_cfg(cfg)
+    assert cat.get(arbitrary) is not None
+
+    m = make_model("qwen3-8b", tasks=[arbitrary])
+    from llama_packer.scope import ScopeStack
+    ScopeStack(avail={"llama_bin": "/opt/llama-server"},
+               tasks=cat).finalize(m)
+    assert m.role == "chat"
+    assert getattr(m, "_override_error", None) is None
+
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"},
+                         "profiles": {"default": {}},
+                         "tasks": cfg})
+    config = emit_config([m], {"qwen3-8b": [_variant(16000, (cat.get(arbitrary),))]},
+                         profiles, TVARS)
+    assert list(config["models"]) == [f"qwen3-8b.{arbitrary}"]
+
+
+def test_an_undeclared_task_id_fails(make_model, caplog):
+    """The same arbitrary id, undeclared, is not a task.
+
+    Validates: docs/plans/requirement-trace.md #99 -- an id outside the
+    declared catalogue warns and produces no task entry.
+    """
+    declared = "chat"
+    cat = TaskCatalogue.from_cfg({declared: task_cfg(declared)})
+    m = make_model("qwen3-8b", tasks=["zq7-odd-job"])
+    with caplog.at_level("WARNING"):
+        got = resolve_tasks(m.task_ids, cat, stem="qwen3-8b.md")
+    assert got == ()
+    assert "is not a declared task" in caplog.text
+    assert "zq7-odd-job" in caplog.text
+
+    profiles = Profiles({"defaults": {"cache_type": "q8_0"},
+                         "profiles": {"default": {}},
+                         "tasks": {declared: task_cfg(declared)}})
+    config = emit_config([m], {"qwen3-8b": [_variant(16000, ())]},
+                         profiles, TVARS)
+    assert list(config["models"]) == ["qwen3-8b"]

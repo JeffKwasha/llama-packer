@@ -24,7 +24,6 @@ from llama_packer.consts import (
     _PIXELS_PER_MEGAPIXEL,
     _WEIGHT_SUFFIXES,
 )
-from llama_packer import tasks
 from llama_packer.backends import DEFAULT_BACKEND
 
 if TYPE_CHECKING:
@@ -1518,9 +1517,6 @@ class Model:
         legacy ``role:`` key) for a model that declares no tasks. Defaults to
         ``chat``.
         """
-        role = tasks.role_of(self.task_ids)
-        if role is not None:
-            return role
         return str(self.frontmatter.get("role") or "chat")
 
     @property

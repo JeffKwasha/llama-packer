@@ -223,7 +223,7 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
         stack.pop()
 
 
-def _warn_unsupported_values(model: Model, label: str) -> None:
+def _warn_unsupported_values(model: Model, label: str, catalogue=None) -> None:
     """Warn when a known key carries a value this tool cannot honour.
 
     Unknown *keys* already warn (``Model.pass_through_metadata``).  An
@@ -235,9 +235,10 @@ def _warn_unsupported_values(model: Model, label: str) -> None:
         if alien in model.frontmatter:
             logger.warning("%s: %s: is not a sidecar key; declare tasks:",
                            label, alien)
-    for problem in tasks.validate_task_ids(
-            model.frontmatter.get("tasks")):
-        logger.warning("%s: %s", label, problem)
+    if catalogue is not None:
+        for problem in tasks.validate_task_ids(
+                model.frontmatter.get("tasks"), catalogue):
+            logger.warning("%s: %s", label, problem)
     for problem in validate_engines_value(model.frontmatter.get("engines")):
         logger.warning("%s: %s", label, problem)
 
@@ -304,7 +305,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     model.resolve_companions()
     model.sync_measured_file(write=not stub)
     stack.finalize(model)
-    _warn_unsupported_values(model, path.name)
+    _warn_unsupported_values(model, path.name, stack.tasks)
     # Guard: keep generative-media weights out of served text roles.  The
     # classification is header-only (GGUF metadata / safetensors names /
     # cached HF model card) and never blocks the run — one error log per
@@ -334,14 +335,6 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
 def _effective_role(fm: dict, role: str | None) -> str | None:
     """Role for a sidecar: its declared tasks, then an embeddings/rerank/image/
     s2t/t2s *directory*, then a ``type:`` field containing embed/rerank/image."""
-    declared = fm.get("tasks")
-    if declared is not None:
-        if isinstance(declared, str):
-            declared = [declared]
-        if isinstance(declared, (list, tuple)):
-            derived = tasks.role_of([str(x) for x in declared])
-            if derived is not None:
-                return derived
     if role in ("embeddings", "rerank", "image", "s2t", "t2s"):
         return role
     typ = str(fm.get("type") or "").lower()

@@ -127,3 +127,55 @@ def entry_for(config, stem: str, which: int = 0) -> dict:
     """The entry *config* emitted for a model stem (ids are namespaced)."""
     ids = config.entry_ids_by_stem[stem]
     return config["models"][ids[which]]
+
+
+#: The standard task ids tests declare, with the endpoint/role each maps to.
+TASK_ENDPOINT = {
+    "chat": "openai.chat.completions", "coding": "openai.chat.completions",
+    "qa": "openai.chat.completions", "aux": "openai.chat.completions",
+    "embeddings": "openai.embeddings", "rerank": "openai.rerank",
+    "image": "openai.images.generations",
+    "s2t": "openai.audio.transcriptions", "t2s": "openai.audio.speech",
+}
+TASK_ROLE = {
+    "chat": "chat", "coding": "chat", "qa": "chat", "aux": "chat",
+    "embeddings": "embeddings", "rerank": "rerank", "image": "image",
+    "s2t": "s2t", "t2s": "t2s",
+}
+
+
+def task_cfg(name: str, **demand) -> dict:
+    """One declared task: the standard endpoint/role for that id + demand."""
+    return {"endpoint": TASK_ENDPOINT[name], "role": TASK_ROLE[name], **demand}
+
+
+def tasks_cfg(**demands) -> dict:
+    """A ``tasks:`` section declaring every standard id."""
+    return {name: task_cfg(name, **demands.get(name, {}))
+            for name in TASK_ENDPOINT}
+
+
+def tasks_section(specs: dict | None = None) -> dict:
+    """A complete ``tasks:`` section: every standard id, *specs* overrides demand.
+
+    A non-mapping override is passed through untouched, so a test can assert
+    the parser's warning for it.
+    """
+    out = {}
+    for name in TASK_ENDPOINT:
+        override = (specs or {}).get(name)
+        if override is None:
+            out[name] = task_cfg(name)
+        elif isinstance(override, dict):
+            out[name] = task_cfg(name, **override)
+        elif isinstance(override, int) and not isinstance(override, bool):
+            out[name] = task_cfg(name, min_context=override)
+        else:
+            out[name] = override
+    return out
+
+
+def catalogue(specs: dict | None = None):
+    """A test TaskCatalogue built the way an operator declares one."""
+    from llama_packer.tasks import TaskCatalogue
+    return TaskCatalogue.from_cfg(tasks_section(specs))

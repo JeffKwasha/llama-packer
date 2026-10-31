@@ -305,8 +305,9 @@ refactor.
   (the file, the closed id set and the per-engine lists landed in P1);
   endpoint ids checked against the docs.
 - **P4 task catalog** *(landed 2026-10-31; fleet migration runs separately)*:
-  `tasks.py` owns the closed ids, their endpoints, scheduling roles and
-  demand defaults; `profiles.yaml tasks:` overrides a demand. A sidecar
+  `profiles.yaml tasks:` declares the ids, their endpoints, scheduling roles
+  and demands; `tasks.py` validates each against the hardcoded endpoint and
+  role sets. A sidecar
   declares `tasks:`; `role:` and `usage:` are alien keys. An unknown id
   warns and is ignored, and an `audio_cpp.task` that contradicts the model's
   task warns. `templates/models_AGENTS.md` documents the catalog. The fleet
