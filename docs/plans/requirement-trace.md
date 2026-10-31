@@ -192,6 +192,12 @@ and every one of them carries a `Validates:` citation.
 
 | 96 | An authored sidecar must declare `engines:` (missing refuses, naming the sidecar); `backend:` warns as an alien key and never selects an engine; a model with no authored sidecar keeps inference | `test_sidecar_without_engines_is_refused`, `test_orphan_without_engines_still_infers`, `test_engines_wins_over_the_alien_backend_key`, `test_apply_overrides_backend_is_alien` |
 
+## Endpoint registry (docs/plans/tasks-and-endpoints.md §P3)
+
+| # | Requirement | Test |
+|---|---|---|
+| 97 | One registry owns the closed endpoint set, the task→endpoint map and the engine→endpoints table; engines read their list from it, a bad sidecar value is reported, and the docs that state endpoints are checked against the table | `test_registry_invariants_hold`, `test_registry_task_mapping_is_total`, `test_registry_engine_table_matches_backends`, `test_registry_docs_agree`, `test_registry_unknown_endpoint_is_rejected`, `test_registry_engines_value_shape` |
+
 ## Composition validation (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |

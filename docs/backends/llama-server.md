@@ -4,7 +4,7 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
 `llama-server`.
 
 - **Engine:** llama.cpp · **Transports:** host only (`llama-server`).
-- **Roles:** `chat`, `embeddings`, `rerank`.
+- **Endpoints:** `openai.chat.completions`, `openai.embeddings`, `openai.rerank`.
 - **Formats:** `.gguf`.
 - **Binary:** `--llama-server` > `$LLAMA_BIN_DIR` > the run directory, scanned
   for the highest `llama-b<NNNN>/` (see `find_bin_dir`). There is no

@@ -42,7 +42,7 @@ import os
 from pathlib import Path
 
 from llama_packer import utils
-from llama_packer.backends import ENGINE_NAMES
+from llama_packer.endpoints import validate_engines_value
 from llama_packer.model import Model
 from llama_packer.scope import ScopeStack
 
@@ -240,23 +240,8 @@ def _warn_unsupported_values(model: Model, label: str) -> None:
         logger.warning("%s: role %r is not a served role%s; it must be one "
                        "of %s", label, role, hint,
                        ", ".join(utils.SERVED_ROLES))
-    engines = model.frontmatter.get("engines")
-    if engines is not None:
-        declared = [engines] if isinstance(engines, str) else engines
-        if not isinstance(declared, (list, tuple)) or not declared:
-            logger.warning("%s: engines: must be a list of engine names "
-                           "(one of %s)", label, ", ".join(ENGINE_NAMES))
-        else:
-            import difflib
-            for name in declared:
-                if isinstance(name, str) and name in ENGINE_NAMES:
-                    continue
-                close = difflib.get_close_matches(str(name), ENGINE_NAMES,
-                                                  n=1, cutoff=0.6)
-                hint = f" (did you mean {close[0]!r}?)" if close else ""
-                logger.warning("%s: engines: %r is not an engine%s; it must "
-                               "be one of %s", label, name, hint,
-                               ", ".join(ENGINE_NAMES))
+    for problem in validate_engines_value(model.frontmatter.get("engines")):
+        logger.warning("%s: %s", label, problem)
 
     dev = model.frontmatter.get("device")
     if dev is None or model.on_cpu:

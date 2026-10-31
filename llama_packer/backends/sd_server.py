@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
-from llama_packer.endpoints import IMAGES
+from llama_packer.endpoints import ENGINE_ENDPOINTS
 from llama_packer import utils
 
 if TYPE_CHECKING:
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class SdServerBackend(BaseBackend):
     name = "sd-server"
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
-    endpoints = frozenset({IMAGES})
+    endpoints = ENGINE_ENDPOINTS["sd-server"]
     handles = frozenset({"cli_args"})
     proxied = True
     host_requires = frozenset({"sd_bin"})

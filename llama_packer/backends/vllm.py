@@ -29,7 +29,7 @@ from llama_packer.consts import (
     VLLM_DEFAULT_IMAGE,
 )
 from llama_packer.backends.base import BaseBackend
-from llama_packer.endpoints import CHAT, EMBEDDINGS, RERANK
+from llama_packer.endpoints import ENGINE_ENDPOINTS
 from llama_packer.backends.transport import (
     CONTAINER_HF_HOME,
     HostTransport,
@@ -217,7 +217,7 @@ class VllmBackend(BaseBackend):
 
     name = "vllm"
     formats = frozenset({".safetensors", "hf_repo"})
-    endpoints = frozenset({CHAT, EMBEDDINGS, RERANK})
+    endpoints = ENGINE_ENDPOINTS["vllm"]
     handles = frozenset({
         "cli_args", "chat_template", "hf_repo",
         "vllm_quantization", "moe_backend", "mamba",

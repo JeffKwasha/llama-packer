@@ -4,7 +4,7 @@ Text-to-speech (`t2s`) and speech-to-text (`s2t`) via the native ggml
 [audio.cpp](https://github.com/0xShug0/audio.cpp) engine (`audiocpp_server`).
 
 - **Engine:** audio.cpp · **Transports:** host (`audio-cpp`); a container transport is future/optional.
-- **Roles:** `t2s`, `s2t`.
+- **Endpoints:** `openai.audio.transcriptions`, `openai.audio.speech`.
 - **Formats:** `.gguf`, `.safetensors`, `hf_repo`.
 - **Proxied:** yes — `proxy` + `checkEndpoint: /health`.
 - **Binary:** `--audio-cpp-server` > `profiles.yaml audio_cpp.bin` >

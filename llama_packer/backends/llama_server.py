@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
-from llama_packer.endpoints import CHAT, EMBEDDINGS, RERANK
+from llama_packer.endpoints import ENGINE_ENDPOINTS
 from llama_packer import utils
 from llama_packer.consts import _MTP_SPEC_TYPE
 
@@ -27,7 +27,7 @@ _warned_cli_batch: set[str] = set()
 class LlamaServerBackend(BaseBackend):
     name = "llama-server"
     formats = frozenset({".gguf"})
-    endpoints = frozenset({CHAT, EMBEDDINGS, RERANK})
+    endpoints = ENGINE_ENDPOINTS["llama-server"]
     handles = frozenset({
         "cli_args", "chat_template", "loras",
         "reasoning-format", "reasoning-preserve",

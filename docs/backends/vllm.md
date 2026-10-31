@@ -4,7 +4,7 @@ Serves safetensors / HF-repo models via vLLM — chat, embeddings and rerank.
 
 - **Engine:** vLLM · **Transports:** host, podman, docker.
 - **Registry names:** `vllm` (host), `vllm-podman`, `vllm-docker`.
-- **Roles:** `chat`, `embeddings` (`--task embed`), `rerank` (`--task score`).
+- **Endpoints:** `openai.chat.completions`, `openai.embeddings` (`--task embed`), `openai.rerank` (`--task score`).
 - **Formats:** `.safetensors`, `hf_repo` (serve straight from a repo id,
   resolved offline from the mounted HF hub).
 - **Proxied:** no — llama-swap manages the process; container entries add an
