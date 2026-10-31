@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 #: Every top-level ``profiles.yaml`` key something reads.  Unknown keys warn
 #: (a typo such as ``device_role`` must not silently do nothing).
 PROFILES_KEYS: frozenset[str] = frozenset({
-    "defaults", "usage", "models_dirs", "dirs", "hf_home", "backends",
+    "defaults", "tasks", "models_dirs", "dirs", "hf_home", "backends",
     "profiles", "llama_server", "vllm", "sd", "whisper", "audio_cpp",
     "hardware", "device_roles", "overrides", "matrix", "pools", "macros",
     "shed",
@@ -55,7 +55,7 @@ class Profiles:
         self._cfg = cfg or {}
         self.defaults: dict = self._cfg.get("defaults", {}) or {}
         self.profile_list: dict = self._cfg.get("profiles", {}) or {}
-        self.usage_list: dict = self._cfg.get("usage", {}) or {}
+        self.tasks_list: dict = self._cfg.get("tasks", {}) or {}
         #: Order in which capabilities a category did not name are shed.
         #: Configuration, not code: what "unnamed" means is the operator's
         #: call, and every category describes itself completely.
@@ -63,14 +63,14 @@ class Profiles:
             self._cfg.get("shed") or ()) or DEFAULT_SACRIFICE_ORDER
 
     @property
-    def usage_cfg(self) -> dict:
-        """Raw ``usage:`` section — the blessed usage categories.
+    def tasks_cfg(self) -> dict:
+        """Raw ``tasks:`` section — per-task demand overrides.
 
-        Declared here (not per sidecar) so the vocabulary of minimum
-        contexts is written down exactly once.  See
-        :class:`llama_packer.writer.UsageCatalogue`.
+        The catalogue owns the ids and their defaults; this section states
+        only the demand keys the operator changes.  See
+        :class:`llama_packer.tasks.TaskCatalogue`.
         """
-        return self.usage_list
+        return self.tasks_list
 
     # ── fleet-wide defaults ──
 

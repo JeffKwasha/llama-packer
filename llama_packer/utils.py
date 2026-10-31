@@ -160,6 +160,25 @@ def parse_mem_mb(value: str, vram_mb_for_hint: int = 0) -> int:
     return int(num)
 
 
+def parse_ctx_size(v: object) -> int | None:
+    """Parse a context minimum: a positive int, or a ``128k``/``1M`` string."""
+    if isinstance(v, str):
+        s = v.strip().lower().rstrip("k").rstrip("m")
+        mult = 1024 if v.strip().lower().endswith("k") else (
+            1024 * 1024 if v.strip().lower().endswith("m") else 1)
+        try:
+            n = int(s)
+        except ValueError:
+            return None
+        return n * mult
+    if isinstance(v, bool):
+        return None
+    if not isinstance(v, (int, float)):
+        return None
+    n = int(v)
+    return n if n > 0 else None
+
+
 def slugify(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)

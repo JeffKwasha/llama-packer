@@ -41,7 +41,7 @@ import logging
 import os
 from pathlib import Path
 
-from llama_packer import utils
+from llama_packer import tasks, utils
 from llama_packer.endpoints import validate_engines_value
 from llama_packer.model import Model
 from llama_packer.scope import ScopeStack
@@ -231,17 +231,25 @@ def _warn_unsupported_values(model: Model, label: str) -> None:
     later as "no backend supports", and ``device: gpu`` silently placed the
     model on the device exactly as if the key were absent.
     """
-    role = str(model.frontmatter.get("role") or "")
-    if role and role not in utils.SERVED_ROLES:
-        import difflib
-        close = difflib.get_close_matches(role, utils.SERVED_ROLES,
-                                          n=1, cutoff=0.6)
-        hint = f" (did you mean {close[0]!r}?)" if close else ""
-        logger.warning("%s: role %r is not a served role%s; it must be one "
-                       "of %s", label, role, hint,
-                       ", ".join(utils.SERVED_ROLES))
+    for alien in ("role", "usage"):
+        if alien in model.frontmatter:
+            logger.warning("%s: %s: is not a sidecar key; declare tasks:",
+                           label, alien)
+    for problem in tasks.validate_task_ids(
+            model.frontmatter.get("tasks")):
+        logger.warning("%s: %s", label, problem)
     for problem in validate_engines_value(model.frontmatter.get("engines")):
         logger.warning("%s: %s", label, problem)
+
+    block = model.frontmatter.get("audio_cpp")
+    if isinstance(block, dict) and block.get("task"):
+        engine_task = str(block["task"])
+        implied = {"tts": "t2s", "clon": "t2s", "asr": "s2t"}.get(engine_task)
+        claimed = set(model.task_ids) or {model.role}
+        if implied is not None and implied not in claimed:
+            logger.warning("%s: audio_cpp.task %r is a %s task, but the "
+                           "model declares %s", label, engine_task, implied,
+                           ", ".join(sorted(claimed)))
 
     dev = model.frontmatter.get("device")
     if dev is None or model.on_cpu:
@@ -283,7 +291,8 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     merged = stack.merge_defaults(frontmatter)
     # A model in embed//rerank/image/s2t/t2s inherits its role from the
     # location when its own data (sidecar or defaults) does not declare one.
-    if role in ("embeddings", "rerank", "image", "s2t", "t2s") and "role" not in merged:
+    if role in ("embeddings", "rerank", "image", "s2t", "t2s") \
+            and "role" not in merged and "tasks" not in merged:
         merged["role"] = role
     try:
         model = Model(path, merged, hf_home=hf_home)
@@ -323,13 +332,18 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
 
 
 def _effective_role(fm: dict, role: str | None) -> str | None:
-    """Role for a sidecar: an embeddings/rerank/image/s2t/t2s *directory* wins,
-    then the explicit ``role:``, then a ``type:`` field containing embed/rerank/image."""
+    """Role for a sidecar: its declared tasks, then an embeddings/rerank/image/
+    s2t/t2s *directory*, then a ``type:`` field containing embed/rerank/image."""
+    declared = fm.get("tasks")
+    if declared is not None:
+        if isinstance(declared, str):
+            declared = [declared]
+        if isinstance(declared, (list, tuple)):
+            derived = tasks.role_of([str(x) for x in declared])
+            if derived is not None:
+                return derived
     if role in ("embeddings", "rerank", "image", "s2t", "t2s"):
         return role
-    explicit = str(fm.get("role") or "")
-    if explicit:
-        return explicit
     typ = str(fm.get("type") or "").lower()
     if "rerank" in typ:
         return "rerank"

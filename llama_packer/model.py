@@ -24,6 +24,7 @@ from llama_packer.consts import (
     _PIXELS_PER_MEGAPIXEL,
     _WEIGHT_SUFFIXES,
 )
+from llama_packer import tasks
 from llama_packer.backends import DEFAULT_BACKEND
 
 if TYPE_CHECKING:
@@ -1467,25 +1468,6 @@ class Model:
         return self.frontmatter.get("allow_profiles")
 
     @property
-    def usage_tags(self) -> list[str] | None:
-        """Usage categories this model is *used for* (``usage:`` in the sidecar).
-
-        A tag is only a claim.  The planner honours it when an entry can
-        actually meet that category's minimums, and ignores it otherwise —
-        so declaring a category never guarantees it.  Tags must be blessed
-        in profiles.yaml ``usage:``; an unblessed tag is warned about and
-        dropped (see :func:`llama_packer.writer.resolve_usage`).
-        """
-        v = self.frontmatter.get("usage")
-        if v is None:
-            return None
-        if isinstance(v, str):
-            v = [v]
-        if not isinstance(v, (list, tuple)):
-            return None
-        return [str(x).strip() for x in v if isinstance(x, str) and x.strip()]
-
-    @property
     def allow_mtp_shed(self) -> bool:
         """Opt-in to shedding the MTP draft companion to buy context.
 
@@ -1530,13 +1512,29 @@ class Model:
 
     @property
     def role(self) -> str:
-        """Role this model plays: ``chat``, ``embeddings``, ``rerank``, or ``image``.
+        """The scheduling role this model's tasks imply.
 
-        Defaults to ``chat``. Discovery (``from_dir``) injects the role derived
-        from a model's directory (``embed/``/``rerank/``/``img/``) or ``type:`` field
-        when the sidecar does not declare one explicitly.
+        Falls back to the role discovery injected from the directory (or a
+        legacy ``role:`` key) for a model that declares no tasks. Defaults to
+        ``chat``.
         """
+        role = tasks.role_of(self.task_ids)
+        if role is not None:
+            return role
         return str(self.frontmatter.get("role") or "chat")
+
+    @property
+    def task_ids(self) -> tuple[str, ...]:
+        """Tasks this model claims (``tasks:`` in the sidecar)."""
+        v = self.frontmatter.get("tasks")
+        if v is None:
+            return ()
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, (list, tuple)):
+            return ()
+        return tuple(str(x).strip() for x in v
+                     if isinstance(x, str) and x.strip())
 
     @property
     def vllm_image(self) -> str | None:

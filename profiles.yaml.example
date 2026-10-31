@@ -19,16 +19,17 @@ defaults:
   min_p: 0.01
   pres_pen: 0.0
 
-# ── Usage categories (optional) ───────────────────────
-# The blessed vocabulary of what models are *used for*. A sidecar tags itself
-# with these names (`usage: [coding, qa]`) and the planner honours a tag only
-# when an entry can actually meet its minimums — a tag is a claim, never a
-# guarantee. An unblessed tag is warned about and ignored, so the categories
-# in force are exactly the ones written here.
+# ── Tasks (optional) ──────────────────────────────────
+# A task is a closed catalog id (llama_packer/tasks.py): what work a model
+# does, the endpoint it is served at, and the demand that work needs. A
+# sidecar claims its tasks with `tasks: [coding, chat]`; each satisfiable
+# task emits its own entry, and llama-swap routes by name. Only catalog ids
+# exist -- an unknown id warns and is ignored.
 #
+# This section overrides a task's default demand; it never invents a task.
 # min_context / min_parallel are floors, not requests: one entry at
-# ctx >= 128k and parallel >= 2 satisfies all four categories below, so
-# nothing forces four entries per model.
+# ctx >= 128k and parallel >= 2 satisfies all four tasks below, so nothing
+# forces four entries per model.
 #
 # require:   capabilities that survive every rung of the capability/context
 #            ladder. A model that cannot keep one is dropped from a set
@@ -41,13 +42,13 @@ defaults:
 #            draft, because an MTP draft roughly doubles generation speed.
 #            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
 #
-# Categories are applied per set: a model that meets `coding` beside the
+# Tasks are applied per set: a model that meets `coding` beside the
 # canonical RAG pair but not beside a heavier reranker joins `rag` and is
-# dropped from `ragz`. Only `role: chat` models are considered.
+# dropped from `ragz`. Only chat-task models are considered.
 #
-# shed: the default order for capabilities a category does not name.
+# shed: the default order for capabilities a task does not name.
 # shed: [vision, draft]
-usage:
+tasks:
   coding:
     min_context: 128k
     min_parallel: 1

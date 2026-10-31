@@ -25,6 +25,8 @@ from llama_packer.model import Model
 from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
+from llama_packer.endpoints import CHAT
+from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
 from llama_packer.consts import (
     DEFAULT_SACRIFICE_ORDER,
     KNOWN_CAPABILITIES,
@@ -306,7 +308,7 @@ def _build_entry(
     name_suffix: str = "",
     entry_id_tail: str = "",
     tools_demoted: bool = False,
-    usage: tuple["UsageDemand", ...] = (),
+    task_demands: tuple["Task", ...] = (),
     estimate_error: str | None = None,
     batch: int | None = None,
     ubatch: int | None = None,
@@ -556,11 +558,11 @@ def _build_entry(
     if kv_per_token_mib is not None:
         packing["kv_per_token"] = int(round(kv_per_token_mib * 1024 * 1024))
     metadata["packing"] = packing
-    # The blessed usage categories this serving actually satisfies — the same
-    # set the id's category segment names.  Client-facing so a metadata-aware
-    # client can filter without parsing the id.
-    if usage:
-        metadata["usage"] = [d.name for d in usage]
+    # The tasks this serving actually satisfies — the same set the id's
+    # task segment names.  Client-facing so a metadata-aware client can
+    # filter without parsing the id.
+    if task_demands:
+        metadata["tasks"] = [d.id for d in task_demands]
     # Client-facing estimate health: when no VRAM estimate source worked,
     # the entry is served at its minimum useful context with a conservative
     # matrix reserve — tell clients so they can treat it differently.
@@ -730,50 +732,6 @@ class MatrixKnobs:
         return getattr(self, knobs.ctx_knob)
 
 
-@dataclass(frozen=True)
-class UsageDemand:
-    """One usage category's minimum serving requirements.
-
-    Declared in ``profiles.yaml`` under ``usage:``, which is the single
-    blessed vocabulary — a sidecar may only *tag* itself with a category
-    declared here.  A tag that is not blessed is warned about and ignored
-    (see :func:`resolve_usage`), so an operator always knows exactly which
-    demands are in force without reading every sidecar.
-
-    ``min_context`` / ``min_parallel`` are *minimums*, not requests: an
-    entry serving ``ctx >= min_context`` and ``parallel >= min_parallel``
-    satisfies the category.  ``sacrifice`` is a *preference* order for what
-    to give up when the budget is short — it is deliberately not a cost
-    order, because shedding a capability may buy no context at all (a model
-    already at its design cap has no headroom to reclaim).
-
-    Two ways to protect a capability, and the difference matters:
-
-    ``require`` — must have it.  A rung that drops one is discarded, and a
-    model that lacks the capability outright does not satisfy the category,
-    so no entry claims it.  ``require: [vision]`` is a statement that the
-    work is impossible without seeing.
-
-    ``keep`` — don't drop what this model has, but a model without it still
-    qualifies.  ``coding`` declares ``keep: [draft]``: a coding entry will
-    not drop its MTP draft, but a coding model that has no draft companion
-    is still a perfectly good coding model and still gets an entry.  Making
-    that ``require`` would silently drop every coding model without MTP.
-    """
-
-    name: str
-    min_context: int = 0
-    min_parallel: int = 1
-    require: frozenset[str] = frozenset()
-    keep: frozenset[str] = frozenset()
-    sacrifice: tuple[str, ...] | None = ()
-
-    def satisfied_by(self, ctx: int, parallel: int) -> bool:
-        """True when an entry served at (ctx, parallel) meets this demand."""
-        return ctx >= self.min_context and parallel >= self.min_parallel
-
-
-
 def _parse_ctx_size(v: object) -> int | None:
     """Parse a context minimum: a positive int, or a ``128k``/``1M`` string."""
     if isinstance(v, str):
@@ -860,135 +818,8 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
 #:
 #: It joins no set. Routing is what categories are for, and this has no name
 #: to route on.
-FALLBACK: "UsageDemand" = UsageDemand(
-    name="", min_context=_MIN_CTX_SIZE, min_parallel=1,
-    require=frozenset(), sacrifice=())
-
-
-@dataclass(frozen=True)
-class UsageCatalogue:
-    """The blessed ``usage:`` categories from ``profiles.yaml``.
-
-    ``by_name`` is the lookup the planner uses; ``order`` preserves
-    declaration order so demand reporting and tie-breaks are deterministic.
-    """
-
-    by_name: Mapping[str, UsageDemand] = field(default_factory=dict)
-    order: tuple[str, ...] = ()
-
-    def __bool__(self) -> bool:
-        return bool(self.by_name)
-
-    def get(self, name: str) -> UsageDemand | None:
-        return self.by_name.get(name)
-
-    @classmethod
-    def from_cfg(cls, usage_cfg: dict | None) -> "UsageCatalogue":
-        """Parse ``usage:`` from profiles.yaml.
-
-        A malformed category is warned about and dropped rather than
-        failing the pack: a bad demand must not take the fleet offline.
-        """
-        by_name: dict[str, UsageDemand] = {}
-        order: list[str] = []
-        for name, spec in (usage_cfg or {}).items():
-            if not isinstance(name, str) or not name.strip():
-                logger.warning("usage: skipping unnamed category")
-                continue
-            name = name.strip()
-            if isinstance(spec, int) and not isinstance(spec, bool):
-                # Shorthand: `coding: 128k` == min_context only.
-                spec = {"min_context": spec}
-            if not isinstance(spec, dict):
-                logger.warning("usage: category %r is not a mapping; ignoring",
-                               name)
-                continue
-            kwargs: dict = {}
-            raw_ctx = spec.get("min_context")
-            if raw_ctx is not None:
-                ctx = _parse_ctx_size(raw_ctx)
-                if ctx is None:
-                    logger.warning("usage: %s.min_context=%r is not a positive "
-                                   "context; ignoring it", name, raw_ctx)
-                else:
-                    kwargs["min_context"] = ctx
-            raw_par = spec.get("min_parallel")
-            if raw_par is not None:
-                try:
-                    par = int(raw_par)
-                    assert par > 0
-                except (TypeError, ValueError, AssertionError):
-                    logger.warning("usage: %s.min_parallel=%r is not a "
-                                   "positive integer; ignoring it", name,
-                                   raw_par)
-                else:
-                    kwargs["min_parallel"] = par
-            for key in ("require", "keep", "sacrifice"):
-                if key not in spec:
-                    continue
-                listed = _parse_capability_list(spec[key])
-                if listed is None:
-                    logger.warning("usage: %s.%s=%r is not a list of "
-                                   "capability names; ignoring it", name, key,
-                                   spec[key])
-                    continue
-                unknown = set(listed) - KNOWN_CAPABILITIES
-                if unknown:
-                    logger.warning("usage: %s.%s names unknown capabilities "
-                                   "%s (known: %s); ignoring them", name, key,
-                                   sorted(unknown),
-                                   sorted(KNOWN_CAPABILITIES))
-                known = [c for c in listed if c in KNOWN_CAPABILITIES]
-                if key in ("require", "keep"):
-                    kwargs[key] = frozenset(known)
-                else:
-                    # The declared order *is* the preference order.
-                    kwargs["sacrifice"] = tuple(known)
-            by_name[name] = UsageDemand(name=name, **kwargs)
-            order.append(name)
-        return cls(by_name=by_name, order=tuple(order))
-
-
-def resolve_usage(tags: object, catalogue: UsageCatalogue,
-                  logger_: logging.Logger | None = None,
-                  stem: str | None = None) -> tuple[UsageDemand, ...]:
-    """Resolve a sidecar's ``usage:`` tags against the blessed catalogue.
-
-    An unblessed tag is warned about and ignored, so the effective demands
-    are always exactly the subset of ``profiles.yaml`` the operator wrote —
-    a sidecar can raise what it needs, never invent a category.
-
-    Accepts a bare string (one tag) or a list.  A sidecar with no tags gets
-    no demands, which leaves it governed by the global ``min_context``
-    floor as before.  ``stem`` names the sidecar in warnings — a diagnostic
-    about one sidecar leads with its name.
-    """
-    log = logger_ or logger
-    who = f"{stem}: usage:" if stem else "usage:"
-    if tags is None:
-        return ()
-    if isinstance(tags, str):
-        tags = [tags]
-    if not isinstance(tags, (list, tuple)):
-        log.warning("%s %r is not a list of category names; ignoring",
-                    who, tags)
-        return ()
-    out: list[UsageDemand] = []
-    for tag in tags:
-        if not isinstance(tag, str):
-            log.warning("%s %r is not a category name; ignoring", who, tag)
-            continue
-        name = tag.strip()
-        demand = catalogue.get(name)
-        if demand is None:
-            blessed = ", ".join(catalogue.order) or "(none declared)"
-            log.warning("%s tag %r is not declared in profiles.yaml "
-                        "`usage:`; ignoring it (blessed: %s)",
-                        who, name, blessed)
-            continue
-        if demand not in out:
-            out.append(demand)
-    return tuple(out)
+FALLBACK: "Task" = Task("", CHAT, "chat", min_context=_MIN_CTX_SIZE,
+                        min_parallel=1, require=frozenset(), sacrifice=())
 
 
 @dataclass(frozen=True)
@@ -1004,7 +835,7 @@ class Rung:
     shed: frozenset[str]
     ctx: int
     parallel: int
-    demand: UsageDemand
+    demand: Task
 
 
 
@@ -1603,11 +1434,11 @@ class Variant:
     #: this is normally a single demand; a tuple only so the emitter can
     #: express "nothing declared" without a second field. Empty for the
     #: fallback entry, which carries no category name in its id.
-    usage: tuple[UsageDemand, ...] = ()
+    task_demands: tuple[Task, ...] = ()
     #: The category this variant answers, or :data:`FALLBACK` for the null
     #: category. Singular, because a rung exists to serve one category -- which
     #: is what lets one model emit several entries and stay unambiguous.
-    category: UsageDemand | None = None
+    category: Task | None = None
     #: Non-None when the model has no usable VRAM estimate — surfaced to
     #: clients as metadata.estimated=false / metadata.estimate_error.
     estimate_error: str | None = None
@@ -1719,8 +1550,8 @@ class Planner:
         self.rerank_model = rerank_model
         # Blessed usage categories.  A model may only *tag* itself with one
         # of these; an unblessed tag is warned about and ignored.
-        self.usage = UsageCatalogue.from_cfg(
-            getattr(profiles, "usage_cfg", None))
+        self.tasks = TaskCatalogue.from_cfg(
+            getattr(profiles, "tasks_cfg", None))
         # Per-set co-resident overhead (MB) and the sets a chat model was
         # admitted to, filled in by _solve_usage_sets.
         self.set_overheads: dict[str, int] = {}
@@ -1835,7 +1666,7 @@ class Planner:
 
     # ── auto-parallel: value-function (ctx, slots) solve ──
 
-    def can_meet(self, model, demand: "UsageDemand") -> bool:
+    def can_meet(self, model, demand: "Task") -> bool:
         """Whether *model* has what the category ``require``s.
 
         ``require`` gates existence, which is a different thing from
@@ -1857,7 +1688,7 @@ class Planner:
                 return False
         return True
 
-    def solve_rung(self, model, demand: "UsageDemand", *,
+    def solve_rung(self, model, demand: "Task", *,
                    parallel: int, cache_type: str, spare_mb: int,
                    design_ctx: int | None = None,
                    context_length: int | None = None,
@@ -1915,7 +1746,7 @@ class Planner:
                 # that cannot load. This is the per-category form of the
                 # fleet-wide over-budget gate, and was lost with it.
                 logger.info("%s: %s (%s)", view.stem,
-                            demand.name or "fallback", over)
+                            demand.id or "fallback", over)
                 continue
             rung = Rung(shed=shed, ctx=ctx, parallel=max(1, parallel),
                         demand=demand)
@@ -2065,17 +1896,18 @@ class Planner:
     # ── planning passes ──
 
 
-    def demands_for(self, model: Model) -> tuple[UsageDemand, ...]:
+    def demands_for(self, model: Model) -> tuple[Task, ...]:
         """The usage demands in force for *model*.
 
         A tag is only a claim: it is honoured when an entry can actually
         meet the category's minimums, and silently ignored otherwise, so a
         model is never held to a demand the VRAM cannot satisfy.
         """
-        if not self.usage:
+        if not self.tasks:
             return ()
-        demands = resolve_usage(model.usage_tags, self.usage, logger,
-                                stem=model.stem)
+        resolved = resolve_tasks(model.task_ids, self.tasks, logger,
+                                 stem=model.stem)
+        demands = tuple(task for task in resolved if task.role == "chat")
         # A declared resolution budget means vision must actually be served at
         # that size, so it stops being shed-able for this model whatever the
         # category's sacrifice order says. ``keep`` rather than ``require``:
@@ -2159,7 +1991,7 @@ class Planner:
                 expr, var_mb, frozenset(), frozenset(coload_vars),
                 sets_cfg=sets_cfg)
         if self.set_overheads:
-            logger.info("usage: per-set co-resident overhead (MB): %s",
+            logger.info("tasks: per-set co-resident overhead (MB): %s",
                         ", ".join(f"{k}={v}" for k, v in
                                   sorted(self.set_overheads.items())))
 
@@ -2323,7 +2155,7 @@ class Planner:
         self._charge_sets.setdefault(model.stem, []).append(
             (frozenset(admitted), max(base, worst)))
         logger.info(
-            "usage: %s co-resident charge %d MB (sets: %s)",
+            "tasks: %s co-resident charge %d MB (sets: %s)",
             model.stem, max(base, worst),
             ", ".join(sorted(admitted)) or "none")
         return max(base, worst)
@@ -2350,13 +2182,13 @@ class Planner:
         if not admitted:
             # Meets the category nowhere beside a resident. It still serves
             # standalone -- as its own entry, outside every set.
-            logger.info("usage: %s.%s joins no set: it cannot hold its "
+            logger.info("tasks: %s.%s joins no set: it cannot hold its "
                         "%d-token minimum beside any resident",
-                        model.stem, demand.name, demand.min_context)
+                        model.stem, demand.id, demand.min_context)
         else:
-            logger.info("usage: %s.%s admitted to %s",
-                        model.stem, demand.name, ", ".join(sorted(admitted)))
-        self.set_admission[(model.stem, demand.name)] = frozenset(admitted)
+            logger.info("tasks: %s.%s admitted to %s",
+                        model.stem, demand.id, ", ".join(sorted(admitted)))
+        self.set_admission[(model.stem, demand.id)] = frozenset(admitted)
 
     def _serves_beside(self, model, demand, overhead_mb: int,
                        parallel: int) -> bool:
@@ -2749,7 +2581,7 @@ class Planner:
                             # nothing may be named for it.
                             logger.info("%s: %s requires %s, which this "
                                         "model lacks; not emitted",
-                                        model.stem, demand.name or "fallback",
+                                        model.stem, demand.id or "fallback",
                                         ", ".join(sorted(demand.require)))
                             continue
                         floor = resolve_min_ctx(
@@ -2846,7 +2678,7 @@ class Planner:
                 for demand, serve_view, serve_par, serve_ctx in serves:
                     shed_vision = serve_view is not view
                     demoted = self._tools_demoted(serve_view, serve_ctx)
-                    usage = () if demand is FALLBACK else (demand,)
+                    task_demands = () if demand is FALLBACK else (demand,)
                     if est_error is not None:
                         mem = (None, None, None)
                     else:
@@ -2874,7 +2706,7 @@ class Planner:
                             "%s: %s over_budget_reason: host pool — %d MiB "
                             "needed, %d MiB free after residents; entry "
                             "omitted", serve_view.stem,
-                            demand.name or "fallback", int(mem[1]), host_free)
+                            demand.id or "fallback", int(mem[1]), host_free)
                         continue
                     variants.append(Variant(
                         parallel=(0 if uncapped else serve_par),
@@ -2883,7 +2715,7 @@ class Planner:
                         include_mmproj=not shed_vision,
                         batch=batch, ubatch=ubatch,
                         coload=is_coload,
-                        tools_demoted=demoted, usage=usage,
+                        tools_demoted=demoted, task_demands=task_demands,
                         category=demand,
                         estimate_error=est_error,
                         mem_vram_mib=mem[0], mem_ram_mib=mem[1],
@@ -3456,7 +3288,7 @@ def emit_config(models: list[Model], plan: dict,
     :class:`EmittedConfig` whose ``entry_ids_by_stem`` maps each model stem to
     the ids it produced.
     """
-    catalogue = UsageCatalogue.from_cfg(getattr(profiles, "usage_cfg", None))
+    catalogue = TaskCatalogue.from_cfg(getattr(profiles, "tasks_cfg", None))
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}
@@ -3498,8 +3330,8 @@ def emit_config(models: list[Model], plan: dict,
         # The category is the variant's own, read straight off it: a rung
         # answers exactly one category, so there is no "heaviest satisfied"
         # search to run.
-        cats = v.usage
-        cat = cats[0].name if cats and cats[0].name else None
+        cats = v.task_demands
+        cat = cats[0].id if cats and cats[0].id else None
         # The category is operator-chosen; a name that does not survive id
         # slugging (or slugs empty) falls back to the context label so the id
         # stays within the model_id charset (opencode/llama-swap/shell-safe).
@@ -3537,7 +3369,7 @@ def emit_config(models: list[Model], plan: dict,
                 name_suffix=disp,
                 entry_id_tail=tail,
                 tools_demoted=v.tools_demoted,
-                usage=v.usage,
+                task_demands=v.task_demands,
                 estimate_error=v.estimate_error,
                 batch=v.batch, ubatch=v.ubatch,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
@@ -3551,7 +3383,7 @@ def emit_config(models: list[Model], plan: dict,
             entries[entry_id] = entry
             owner[entry_id] = model.stem
             ids_by_stem.setdefault(model.stem, []).append(entry_id)
-            category_of[entry_id] = (v.category.name if v.category else None)
+            category_of[entry_id] = (v.category.id if v.category else None)
 
     set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
     host_refused = tuple(sorted(plan.pop(HOST_REFUSED_KEY, ()) or ()))

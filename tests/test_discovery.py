@@ -128,8 +128,7 @@ def test_unknown_role_value_warns_with_a_hint(tmp_path, caplog):
     (root / "m.md").write_text("---\nrole: embedder\n---\n")
     with caplog.at_level(logging.WARNING):
         Model.from_dir([root], generate_stubs=False)
-    assert any("role 'embedder'" in r.message
-               and "did you mean 'embeddings'" in r.message
+    assert any("role: is not a sidecar key" in r.message
                for r in caplog.records)
 
 
