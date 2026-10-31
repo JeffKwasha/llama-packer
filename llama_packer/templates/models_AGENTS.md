@@ -16,9 +16,10 @@ names), point at the file with `model:`.
 ### Directory layout
 
 A sidecar is YAML frontmatter (between `---` lines) in a `.md` file whose stem
-matches the model file next to it. The directory sets the role:
+matches the model file next to it. The directory sets the task (today the
+sidecar spells it `role:`; `tasks:` lands with P4):
 
-| Directory | Role | Notes |
+| Directory | Task | Notes |
 |-----------|------|-------|
 | root, `chat/` (`t2t/`) | chat | text-output model |
 | `vision/` | chat | + colocated `*mmproj*.gguf` companion |
@@ -72,7 +73,7 @@ mmproj:
 ```
 
 Block keys must be builder-consumed serving keys — `name`, `model`,
-`ignore`, `mmproj`, `hf_repo`, `backend`, `role` are model-level and rejected
+`ignore`, `mmproj`, `hf_repo`, `backend`, `engines`, `role` are model-level and rejected
 in the block, as are intrinsic properties (`parameters`, `quantization`,
 `architecture`, …), which belong in the sidecar.
 
@@ -94,6 +95,33 @@ Diffusion/image-generation weights placed under a served text role are excluded
 from the config with an error in the pack log — move them to the image tree
 (`img/` with `dirs: {img: image}` and `backends: [sd-server]`) or set
 `ignore: true`. Filenames prove nothing: classify by headers.
+
+## Engines (required)
+
+`engines:` is the sidecar's compatibility claim: the engines that can load
+these weights, in preference order. Write bare engine names — `vllm`, never
+`vllm-podman`: the transport (host/podman/docker) is the registry's choice,
+not a model fact.
+
+| Weights | Engine |
+|---|---|
+| `.gguf` (chat, vision, doc, embed, rerank) | `llama-server` |
+| `.gguf` with an `audio_cpp:` block (s2t/t2s) | `audio-cpp` |
+| `.bin` (s2t) | `whisper-server` |
+| `.safetensors` or `hf_repo` | `vllm` |
+| image task (`img/` or `role: image`) | `sd-server` |
+
+```yaml
+engines: [llama-server]        # one claim
+engines: [vllm, llama-server]  # preference order: first that can serve wins
+```
+
+Resolution takes the first declared engine that is enabled in
+`profiles.yaml backends:`, available (binary/image/runtime present), can load
+the file format, and serves the task's endpoint. When none can, the model is
+skipped and the log names each engine with its reason. `engines:` wins over the
+retiring `backend:` spelling; a model with neither still falls back to
+inference until every sidecar is migrated.
 
 ## Sidecar format
 
@@ -126,6 +154,9 @@ hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one 
 # mtp: true                  # only when MTP heads are baked into the main GGUF
 # --- serving ---
 role: chat                   # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server / audio-cpp) | t2s (audio-cpp)
+engines: [llama-server]      # REQUIRED: engines that can load these weights, in preference order
+#                            #   llama-server | vllm | sd-server | whisper-server | audio-cpp
+#                            #   bare engine names — the transport is the registry's choice
 # cli_args: "--vae ae.safetensors --lora my.safetensors"  # extra backend flags (unstructured)
 # vram_mb: 1280              # fixed-overhead backends (s2t/image/t2s): pin total process VRAM
 # audio_cpp:                 # role t2s/s2t only (audio.cpp engine)
@@ -186,9 +217,10 @@ is. If a capability needs the companion file, it goes in the `mmproj:` block
 `defaults:` setting intrinsic keys (`capabilities`, `parameters`,
 `quantization`, `architecture`, …) warns: intrinsics belong in sidecars.
 
-Do not invent keys. `template:` is invalid (use fleet-level `chat_template:`);
-`backend:` is fleet-level and inferred from file type — don't set it unless
-pinning. `mmproj:` is a mapping (see Companions), not a capability: declare
+Do not invent keys. `template:` is invalid (use fleet-level `chat_template:`).
+`engines:` is the compatibility claim (see Engines above); `backend:` is its
+retiring spelling — don't write it in a new sidecar. `mmproj:` is a mapping
+(see Companions), not a capability: declare
 `capabilities: [image]` (or `[image, video]`) inside the block so the purpose
 is served exactly where the file is served. `vision` is not a
 capability — use `image`/`video`. Unknown keys pass through as `metadata` but
@@ -222,13 +254,15 @@ Convention: brand + major version; minor only when it changed the architecture
 * `name:` is an optional display label (≤30 chars); it never affects the id.
   Prefer a pretty variant of `model_id` (`GLM-4.7 Flash` for `glm47-flash`).
 
-## Roles and directories
+## Tasks and directories
 
-`role:` selects how a model is served: `chat` (default), `embeddings`, `rerank`,
-`image`, `s2t`, `t2s`. It is inferred from the directory (table above) or from
-`type:` containing `embedding`/`rerank`/`image`; set `role:` to override.
-`image`/`s2t`/`t2s` backends are opt-in via profiles.yaml (`dirs:` +
-`backends:`). See the `llama-packer` project's `SPEC.md` for the full map.
+`role:` selects the task the model performs: `chat` (default), `embeddings`,
+`rerank`, `image`, `s2t`, `t2s`. It is inferred from the directory (table above)
+or from `type:` containing `embedding`/`rerank`/`image`; set `role:` to
+override. `tasks:` is the same claim in the new vocabulary and replaces `role:`
+with P4 — write `role:` today, and never both. `image`/`s2t`/`t2s` engines are
+opt-in via profiles.yaml (`dirs:` + `backends:`). See the `llama-packer`
+project's `SPEC.md` for the full map.
 
 ## HuggingFace resolution
 
