@@ -28,7 +28,7 @@ matches the model file next to it. The directory sets the task:
 | `img/` | image | sd-server; opt-in via profiles.yaml `dirs:` |
 | `s2t/` | s2t | whisper.cpp `.bin` (whisper-server) or audio.cpp GGUFs (audio-cpp); opt-in; `.bin` needs an authored sidecar |
 | `t2s/` | t2s | audio-cpp; opt-in; sidecar declares `audio_cpp: {family, task}` |
-| (any) `<name>.safetensors` | by dir or `role:` | vLLM |
+| (any) `<name>.safetensors` | by dir or `tasks:` | vLLM |
 | (any) `<name>.md` | — | sidecar for the model file above |
 
 Orphan files under `embed/`/`rerank`/`doc/` are served with built-in defaults
@@ -108,7 +108,7 @@ not a model fact.
 | `.gguf` with an `audio_cpp:` block (s2t/t2s) | `audio-cpp` |
 | `.bin` (s2t) | `whisper-server` |
 | `.safetensors` or `hf_repo` | `vllm` |
-| image task (`img/` or `role: image`) | `sd-server` |
+| image task (`img/` or `tasks: [image]`) | `sd-server` |
 
 ```yaml
 engines: [llama-server]        # one claim
@@ -152,7 +152,7 @@ hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one 
 # speculative: model.mtp.gguf  # only if the snapshot actually contains *mtp*.gguf
 # mtp: true                  # only when MTP heads are baked into the main GGUF
 # --- serving ---
-role: chat                   # chat (default) | embeddings | rerank | image (sd-server) | s2t (whisper-server / audio-cpp) | t2s (audio-cpp)
+tasks: [chat]                # closed catalog: chat | coding | qa | aux | embeddings | rerank | image | s2t | t2s
 engines: [llama-server]      # REQUIRED: engines that can load these weights, in preference order
 #                            #   llama-server | vllm | sd-server | whisper-server | audio-cpp
 #                            #   bare engine names — the transport is the registry's choice
@@ -255,11 +255,13 @@ Convention: brand + major version; minor only when it changed the architecture
 
 ## Tasks and directories
 
-`role:` selects the task the model performs: `chat` (default), `embeddings`,
-`rerank`, `image`, `s2t`, `t2s`. It is inferred from the directory (table above)
-or from `type:` containing `embedding`/`rerank`/`image`; set `role:` to
-override. `image`/`s2t`/`t2s` engines are opt-in via profiles.yaml (`dirs:` +
-`backends:`). See the `llama-packer` project's `SPEC.md` for the full map.
+`tasks:` lists the work the model performs, from the closed catalog in
+`llama_packer/tasks.py`: `chat`, `coding`, `qa`, `aux` (chat endpoint),
+`embeddings`, `rerank`, `image`, `s2t`, `t2s`. A task is inferred from the
+directory (table above) or from `type:` containing `embedding`/`rerank`/`image`
+when the sidecar declares none. `image`/`s2t`/`t2s` engines are opt-in via
+profiles.yaml (`dirs:` + `backends:`). See the `llama-packer` project's
+`SPEC.md` for the full map.
 
 ## HuggingFace resolution
 

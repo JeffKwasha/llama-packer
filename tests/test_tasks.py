@@ -1,5 +1,5 @@
 # tests/test_usage.py
-"""Demand-driven planning: the blessed ``usage:`` catalogue and the
+"""Demand-driven planning: the blessed ``tasks:`` catalogue and the
 capability/context ladder."""
 
 from __future__ import annotations
@@ -7,14 +7,11 @@ from __future__ import annotations
 import pytest
 
 import llama_packer.writer as writer
-from llama_packer.writer import (
-    FALLBACK,
-    KNOWN_CAPABILITIES,
-    UsageCatalogue,
-    UsageDemand,
-    _parse_ctx_size,
-    resolve_usage,
-)
+from llama_packer.endpoints import CHAT
+from llama_packer import tasks
+from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
+from llama_packer.utils import parse_ctx_size as _parse_ctx_size
+from llama_packer.writer import FALLBACK, KNOWN_CAPABILITIES
 
 
 # ── context size parsing ───────────────────────────────────────────────────
@@ -44,15 +41,15 @@ def test_parse_ctx_size_rejects_junk(raw):
 
 
 def test_catalogue_parses_full_spec():
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': the usage: catalogue is parsed from profiles.yaml.
-    cat = UsageCatalogue.from_cfg({
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': the tasks: catalogue is parsed from profiles.yaml.
+    cat = TaskCatalogue.from_cfg({
         "coding": {"min_context": "128k", "min_parallel": 1,
                    "sacrifice": ["vision", "draft"]},
         "chat": {"min_context": "64k", "min_parallel": 2,
                  "sacrifice": ["draft", "vision"]},
         "qa": {"min_context": "32k", "min_parallel": 2, "require": ["vision"]},
     })
-    assert cat.order == ("coding", "chat", "qa")
+    assert cat.order == tasks.IDS
     coding = _d(cat, "coding")
     assert (coding.min_context, coding.min_parallel) == (131072, 1)
     # sacrifice keeps the declared order -- it is a preference order
@@ -62,42 +59,43 @@ def test_catalogue_parses_full_spec():
 
 
 def test_catalogue_int_shorthand_is_min_context():
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a bare integer is the category's min_context.
-    cat = UsageCatalogue.from_cfg({"chat": 65536})
-    assert cat.get("chat").min_context == 65536
-    assert cat.get("chat").min_parallel == 1
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': a bare integer is the category's min_context.
+    cat = TaskCatalogue.from_cfg({"coding": 65536})
+    assert cat.get("coding").min_context == 65536
+    assert cat.get("coding").min_parallel == 1
 
 
 def test_catalogue_warns_and_drops_malformed_categories(caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a malformed category is warned about and dropped.
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': a malformed category is warned about and dropped.
     with caplog.at_level("WARNING"):
-        cat = UsageCatalogue.from_cfg({
-            "good": {"min_context": "32k"},
-            "not-a-mapping": "garbage",
-            "bad-ctx": {"min_context": "abc"},
-            "bad-par": {"min_parallel": 0},
+        cat = TaskCatalogue.from_cfg({
+            "chat": {"min_context": "32k"},
+            "coding": "garbage",
+            "qa": {"min_context": "abc"},
+            "aux": {"min_parallel": 0},
         })
-    assert cat.order == ("good", "bad-ctx", "bad-par")
+    assert cat.order == tasks.IDS
     assert "not a mapping" in caplog.text
-    # an unusable minimum is dropped, the category survives with its default
-    assert cat.get("bad-ctx").min_context == 0
-    assert cat.get("bad-par").min_parallel == 1
+    # an unusable minimum is dropped, the task survives with its default
+    assert cat.get("qa").min_context == 32 * 1024
+    assert cat.get("aux").min_parallel == 2
 
 
 def test_catalogue_warns_on_unknown_capability(caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': an unknown capability is warned about and dropped.
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': an unknown capability is warned about and dropped.
     with caplog.at_level("WARNING"):
-        cat = UsageCatalogue.from_cfg(
+        cat = TaskCatalogue.from_cfg(
             {"qa": {"require": ["vision", "telepathy"]}})
     assert "unknown capabilities" in caplog.text
     assert "telepathy" in caplog.text
     assert cat.get("qa").require == frozenset({"vision"})
 
 
-def test_catalogue_empty_config_is_falsy():
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': an empty catalogue is falsy, so no category is ever invented.
-    assert not UsageCatalogue.from_cfg(None)
-    assert not UsageCatalogue.from_cfg({})
+def test_catalogue_empty_config_keeps_the_defaults():
+    # Validates: SPEC.md, 'Tasks': an empty tasks: section keeps the catalog defaults.
+    cat = TaskCatalogue.from_cfg(None)
+    assert cat.order == tasks.IDS
+    assert cat.get("chat").min_context == 64 * 1024
 
 
 def test_known_capabilities_are_the_ladder_axes():
@@ -108,61 +106,61 @@ def test_known_capabilities_are_the_ladder_axes():
 # ── tag resolution: only blessed tags count ────────────────────────────────
 
 
-def test_resolve_usage_accepts_blessed_tags():
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': only the tags the catalogue declares become demands.
-    cat = UsageCatalogue.from_cfg({"coding": {"min_context": "128k"},
+def test_resolve_tasks_accepts_blessed_tags():
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': only the tags the catalogue declares become demands.
+    cat = TaskCatalogue.from_cfg({"coding": {"min_context": "128k"},
                                    "chat": {"min_context": "64k"}})
-    got = resolve_usage(["coding", "chat"], cat)
-    assert [d.name for d in got] == ["coding", "chat"]
+    got = resolve_tasks(["coding", "chat"], cat)
+    assert [d.id for d in got] == ["coding", "chat"]
 
 
-def test_resolve_usage_dedupes_repeats():
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a repeated tag is one demand.
-    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
-    assert [d.name for d in resolve_usage(["chat", "chat"], cat)] == ["chat"]
+def test_resolve_tasks_dedupes_repeats():
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': a repeated tag is one demand.
+    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    assert [d.id for d in resolve_tasks(["chat", "chat"], cat)] == ["chat"]
 
 
-def test_resolve_usage_ignores_unblessed_tag_with_warning(caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': an undeclared tag is warned about and ignored.
-    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+def test_resolve_tasks_ignores_unblessed_tag_with_warning(caplog):
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': an undeclared tag is warned about and ignored.
+    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
     with caplog.at_level("WARNING"):
-        got = resolve_usage(["chat", "code"], cat)
-    assert [d.name for d in got] == ["chat"]
-    assert "not declared" in caplog.text
+        got = resolve_tasks(["chat", "code"], cat)
+    assert [d.id for d in got] == ["chat"]
+    assert "is not a task" in caplog.text
     assert "code" in caplog.text
     # the warning names what *is* blessed, so the operator can see the fix
     assert "chat" in caplog.text
 
 
-def test_resolve_usage_accepts_bare_string():
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a bare string is one tag.
-    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
-    assert [d.name for d in resolve_usage("chat", cat)] == ["chat"]
+def test_resolve_tasks_accepts_bare_string():
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': a bare string is one tag.
+    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    assert [d.id for d in resolve_tasks("chat", cat)] == ["chat"]
 
 
-def test_resolve_usage_no_tags_means_no_demands(caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': no tags means no demands.
-    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
-    assert resolve_usage(None, cat) == ()
+def test_resolve_tasks_no_tags_means_no_demands(caplog):
+    # Validates: SPEC.md, 'Usage categories (`tasks:`)': no tags means no demands.
+    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    assert resolve_tasks(None, cat) == ()
     with caplog.at_level("WARNING"):
-        assert resolve_usage(42, cat) == ()
+        assert resolve_tasks(42, cat) == ()
 
 
 # ── the ladder ─────────────────────────────────────────────────────────────
 
 
-def _cat(**specs) -> UsageCatalogue:
-    return UsageCatalogue.from_cfg(specs)
+def _cat(**specs) -> TaskCatalogue:
+    return TaskCatalogue.from_cfg(specs)
 
 
-def _d(cat: UsageCatalogue, name: str) -> UsageDemand:
+def _d(cat: TaskCatalogue, name: str) -> Task:
     """Narrowing accessor: a declared category always exists."""
     demand = cat.get(name)
     assert demand is not None, f"category {name!r} not declared"
     return demand
 
 
-def _demands(cat: UsageCatalogue, *names: str) -> tuple[UsageDemand, ...]:
+def _demands(cat: TaskCatalogue, *names: str) -> tuple[Task, ...]:
     return tuple(_d(cat, n) for n in names)
 
 
@@ -388,8 +386,8 @@ from llama_packer.profiles import Profiles  # noqa: E402
 TVARS = {"llama_bin": "/opt/llama-server"}
 
 
-def _id_cat() -> UsageCatalogue:
-    return UsageCatalogue.from_cfg({
+def _id_cat() -> TaskCatalogue:
+    return TaskCatalogue.from_cfg({
         "coding": {"min_context": "128k", "min_parallel": 1,
                    "sacrifice": ["vision"]},
         "chat": {"min_context": "64k", "min_parallel": 2},
@@ -425,13 +423,13 @@ def test_served_flags_drops_image_and_demoted_tools(make_model, tmp_path):
 def _variant(ctx, usage):
     return Variant(parallel=1, cache_type="q8_0", spare_mb=0,
                    profiles_group=[("default", {})], ctx_size=ctx,
-                   include_mmproj=True, usage=usage)
+                   include_mmproj=True, task_demands=usage)
 
 
 def _profiles_with_usage() -> Profiles:
     return Profiles({
         "defaults": {"cache_type": "q8_0", "parallel": 1},
-        "usage": {"coding": {"min_context": "128k", "min_parallel": 1},
+        "tasks": {"coding": {"min_context": "128k", "min_parallel": 1},
                   "chat": {"min_context": "64k", "min_parallel": 2},
                   "qa": {"min_context": "32k", "min_parallel": 2}},
     })
@@ -441,13 +439,13 @@ def test_emit_id_names_heaviest_category_with_flags(make_model):
     # Validates: SPEC.md, 'Output Format': the id names the heaviest satisfied category and the served flags.
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
-    cat = UsageCatalogue.from_cfg(_profiles_with_usage().usage_cfg)
+    cat = TaskCatalogue.from_cfg(_profiles_with_usage().tasks_cfg)
     usage = _demands(cat, "coding", "chat", "qa")
     config = emit_config([m], {"qwen38": [_variant(160000, usage)]},
                          _profiles_with_usage(), TVARS)
     assert list(config["models"]) == ["qwen38.coding.ti"]
     entry = config["models"]["qwen38.coding.ti"]
-    assert entry["metadata"]["usage"] == ["coding", "chat", "qa"]
+    assert entry["metadata"]["tasks"] == ["coding", "chat", "qa"]
     assert entry["metadata"]["ctx_size"] == 160000
     assert "coding" in entry["name"] and "156k" in entry["name"]
 
@@ -459,7 +457,7 @@ def test_ids_stable_when_context_changes(make_model):
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
     usage = _demands(cat, "coding", "chat")
     a = emit_config([m], {"qwen38": [_variant(140000, usage)]}, profiles, TVARS)
     b = emit_config([m], {"qwen38": [_variant(155000, usage)]}, profiles, TVARS)
@@ -494,7 +492,7 @@ def test_same_model_two_groups_disambiguated(make_model):
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
     usage = (cat.get("coding"),)
     variants = [_variant(150000, usage), _variant(140000, usage)]
     config = emit_config([m], {"qwen38": variants}, profiles, TVARS)
@@ -514,7 +512,7 @@ def test_duplicate_ids_do_not_move_when_context_moves(make_model):
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
     profiles = _profiles_with_usage()
-    usage = (UsageCatalogue.from_cfg(profiles.usage_cfg).get("coding"),)
+    usage = (TaskCatalogue.from_cfg(profiles.tasks_cfg).get("coding"),)
     first = emit_config([m], {"qwen38": [_variant(150000, usage),
                                          _variant(140000, usage)]},
                         profiles, TVARS)
@@ -530,10 +528,8 @@ def test_category_slugged_for_the_id(make_model):
     # (opencode excludes '#', llama-swap needs routeable/YAML-safe keys).
     # Validates: SPEC.md, 'Output Format': the category is slugged for the id.
     m = make_model("m", context_length=262144, capabilities=["tools"])
-    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
-                         "usage": {"My Code!": {"min_context": "64k"}}})
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
-    v = _variant(80000, (cat.get("My Code!"),))
+    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1}})
+    v = _variant(80000, (Task("My Code!", CHAT, "chat"),))
     config = emit_config([m], {"m": [v]}, profiles, TVARS)
     assert list(config["models"]) == ["m.my-code.t"]
 
@@ -545,10 +541,8 @@ def test_unusable_category_name_falls_back_to_a_bare_id(make_model):
     segment, not the entry.
     """
     m = make_model("m", context_length=262144)
-    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
-                         "usage": {"***": {"min_context": "64k"}}})
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
-    v = _variant(80000, (cat.get("***"),))
+    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1}})
+    v = _variant(80000, (Task("***", CHAT, "chat"),))
     config = emit_config([m], {"m": [v]}, profiles, TVARS)
     assert list(config["models"]) == ["m"]
 
@@ -589,17 +583,17 @@ def test_require_gates_existence(make_model, tmp_path):
                                           "capabilities": ["image"]})
     planner = Planner([text_only, with_vision], _profiles_with_usage(),
                       fit_bin="unused", vram_total=48 * 1024)
-    need_vision = UsageDemand(name="qa", min_context=32768,
+    need_vision = Task("qa", CHAT, "chat", min_context=32768,
                               require=frozenset({"vision"}))
     assert planner.can_meet(with_vision, need_vision)
     assert not planner.can_meet(text_only, need_vision)
 
     # And the draft case: no companion, no category.
-    need_draft = UsageDemand(name="c", min_context=32768,
+    need_draft = Task("c", CHAT, "chat", min_context=32768,
                              require=frozenset({"draft"}))
     assert not planner.can_meet(text_only, need_draft)
     # keep, by contrast, does not gate.
-    keeps = UsageDemand(name="c2", min_context=32768,
+    keeps = Task("c2", CHAT, "chat", min_context=32768,
                         keep=frozenset({"draft"}))
     assert planner.can_meet(text_only, keeps)
 
@@ -660,7 +654,7 @@ def test_fallback_is_a_bare_minimum_category():
 
     Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
     """
-    assert FALLBACK.name == ""
+    assert FALLBACK.id == ""
     assert FALLBACK.min_context == 4096
     assert FALLBACK.min_parallel == 1
     assert FALLBACK.sacrifice == ()      # default order, floor-gated
@@ -679,7 +673,7 @@ def test_keep_protects_from_shedding_without_gating_existence():
     Validates: SPEC.md: 'require and keep are different and both are honoured' -- keep
     forbids shedding; only require gates existence.
     """
-    d = UsageDemand(name="coding", min_context=133120, keep=frozenset({"draft"}))
+    d = Task("coding", CHAT, "chat", min_context=133120, keep=frozenset({"draft"}))
     assert d.require == frozenset()
     # MTP is protected from the ladder...
     levels = writer.shed_levels(d.sacrifice, required=d.require, kept=d.keep)
@@ -689,7 +683,7 @@ def test_keep_protects_from_shedding_without_gating_existence():
     # capability is not in the served flags -- satisfied_by itself only ever
     # looked at context and slots.
     assert _served_without_draft(d), "keep must NOT gate existence"
-    strict = UsageDemand(name="coding", min_context=133120,
+    strict = Task("coding", CHAT, "chat", min_context=133120,
                          require=frozenset({"draft"}))
     assert not _served_without_draft(strict), "require must gate existence"
     # satisfied_by itself only ever looked at context and slots; the
@@ -715,12 +709,12 @@ def _served_without_draft(demand):
 
 def test_keep_is_parsed_from_profiles():
     """
-    Validates: SPEC.md, `usage:` block: `keep:` parses like `require:`.
+    Validates: SPEC.md, `tasks:` block: `keep:` parses like `require:`.
     """
-    profiles = Profiles({"defaults": {}, "usage": {
+    profiles = Profiles({"defaults": {}, "tasks": {
         "coding": {"min_context": "128k", "keep": ["draft"],
                    "sacrifice": ["vision"]}}})
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
     d = cat.get("coding")
     assert d.keep == frozenset({"draft"})
     assert d.sacrifice == ("vision",)
@@ -730,21 +724,21 @@ def test_keep_is_parsed_from_profiles():
 # ── the category is a declaration, and these prove each rule ──────────────
 
 
-def test_usage_tags_resolve_to_declared_demands():
-    """A sidecar's `usage:` resolves to exactly what profiles.yaml declared.
+def test_task_ids_resolve_to_declared_demands():
+    """A sidecar's `tasks:` resolves to exactly what profiles.yaml declared.
 
     Validates: docs/plans/requirement-trace.md #1 -- the category comes from
     the sidecar tag; nothing infers or overrides it.
     """
-    profiles = Profiles({"defaults": {}, "usage": {
+    profiles = Profiles({"defaults": {}, "tasks": {
         "coding": {"min_context": "130k", "min_parallel": 1},
         "aux": {"min_context": "80k", "min_parallel": 2}}})
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
-    got = resolve_usage(["coding", "aux"], cat)
-    assert [d.name for d in got] == ["coding", "aux"]
+    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
+    got = resolve_tasks(["coding", "aux"], cat)
+    assert [d.id for d in got] == ["coding", "aux"]
     assert [d.min_context for d in got] == [133120, 81920]
     # Declaration order is preserved, not sorted by weight.
-    assert [d.name for d in resolve_usage(["aux", "coding"], cat)] == \
+    assert [d.id for d in resolve_tasks(["aux", "coding"], cat)] == \
         ["aux", "coding"]
 
 
@@ -756,31 +750,42 @@ def test_usage_tag_not_declared_warns_and_is_ignored(caplog):
     the operator wrote.
     """
     import logging
-    profiles = Profiles({"defaults": {}, "usage": {
+    profiles = Profiles({"defaults": {}, "tasks": {
         "coding": {"min_context": "130k"}}})
-    cat = UsageCatalogue.from_cfg(profiles.usage_cfg)
+    cat = TaskCatalogue.from_cfg(profiles.tasks_cfg)
     with caplog.at_level(logging.WARNING):
-        got = resolve_usage(["coding", "invented"], cat)
-    assert [d.name for d in got] == ["coding"]
+        got = resolve_tasks(["coding", "invented"], cat)
+    assert [d.id for d in got] == ["coding"]
     assert any("invented" in r.message for r in caplog.records), [
         r.message for r in caplog.records]
 
 
 def test_usage_warnings_lead_with_the_sidecar_name(caplog):
-    """Every `usage:` warning is about one sidecar, so it names it first.
+    """Every `tasks:` warning is about one sidecar, so it names it first.
 
-    Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic leads
+    Validates: SPEC.md, 'Usage categories (`tasks:`)': a diagnostic leads
     with the sidecar's name, so an operator can triage it by name.
     """
     import logging
-    cat = UsageCatalogue.from_cfg({"chat": {"min_context": "64k"}})
+    cat = TaskCatalogue.from_cfg({"chat": {"min_context": "64k"}})
     with caplog.at_level(logging.WARNING):
         # all three failure shapes: not a list, not a category, not declared
-        assert resolve_usage(42, cat, stem="s1") == ()
-        assert [d.name for d in resolve_usage(["chat", 7], cat, stem="s1")] \
+        assert resolve_tasks(42, cat, stem="s1") == ()
+        assert [d.id for d in resolve_tasks(["chat", 7], cat, stem="s1")] \
             == ["chat"]
-        assert [d.name for d in resolve_usage(["chat", "zork"], cat, stem="s1")] \
+        assert [d.id for d in resolve_tasks(["chat", "zork"], cat, stem="s1")] \
             == ["chat"]
     warned = [r.message for r in caplog.records]
     assert warned, "expected the three failures to warn"
     assert all(m.startswith("s1:") for m in warned), warned
+
+
+def test_audio_cpp_task_must_match_the_model_task(make_model, caplog):
+    # Validates: docs/plans/requirement-trace.md #98 -- an engine-level task cannot contradict the model's task.
+    from llama_packer.discover import _warn_unsupported_values
+
+    m = make_model("tts", tasks=["s2t"], audio_cpp={"family": "qwen3_tts",
+                                                    "task": "tts"})
+    with caplog.at_level("WARNING"):
+        _warn_unsupported_values(m, "tts.md")
+    assert "audio_cpp.task 'tts' is a t2s task" in caplog.text

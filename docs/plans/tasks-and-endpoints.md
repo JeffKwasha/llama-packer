@@ -304,10 +304,13 @@ refactor.
 - **P3 endpoint registry**: validation API and the doc/code agreement test
   (the file, the closed id set and the per-engine lists landed in P1);
   endpoint ids checked against the docs.
-- **P4 task catalog**: ids, endpoints, scheduler role, load semantics,
-  demand language, negative examples; generated section in
-  `templates/models_AGENTS.md`; sidecar `tasks:` accepted with warn-and-
-  ignore for undeclared ids; `audio_cpp.task ∈ tasks` check.
+- **P4 task catalog** *(landed 2026-10-31; fleet migration runs separately)*:
+  `tasks.py` owns the closed ids, their endpoints, scheduling roles and
+  demand defaults; `profiles.yaml tasks:` overrides a demand. A sidecar
+  declares `tasks:`; `role:` and `usage:` are alien keys. An unknown id
+  warns and is ignored, and an `audio_cpp.task` that contradicts the model's
+  task warns. `templates/models_AGENTS.md` documents the catalog. The fleet
+  is migrated by an operator run of `tasks-migrate.py`.
 - **P5 roles + persistence + TTL**: profiles `roles:` table (tasks list
   with persistence class, demand layer); matrix sets generated from it;
   per-entry TTL cascade (D11) and tier defaults; pinned reserve charged at

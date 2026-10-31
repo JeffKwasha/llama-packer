@@ -13,15 +13,15 @@ never removed on a call-graph reading alone.
 Run `python extras/check_trace.py` to verify every test named below exists
 and every one of them carries a `Validates:` citation.
 
-## The category is a declaration
+## The task is a declaration
 
 | # | Requirement | Test |
 |---|---|---|
-| 1 | The category comes from the sidecar `usage:` tag; nothing infers or overrides it | `test_usage_tags_resolve_to_declared_demands` |
-| 2 | An undeclared tag warns and is ignored — only declared categories exist | `test_usage_tag_not_declared_warns_and_is_ignored` |
-| 3 | Each satisfiable category emits its own id | `test_every_category_gets_an_entry` |
-| 4 | A category that cannot be met at any rung emits **nothing** | `test_rung_is_none_when_the_category_cannot_be_served`, `test_plan_vision_and_text_both_over_budget_disables` |
-| 5 | Every model also gets a fallback entry with no category segment | `test_untagged_gets_a_bare_id`, `test_every_model_gets_a_fallback` |
+| 1 | The task comes from the sidecar `tasks:` list; nothing infers or overrides it | `test_task_ids_resolve_to_declared_demands` |
+| 2 | An unknown task id warns and is ignored — only catalog ids exist | `test_resolve_tasks_ignores_unblessed_tag_with_warning` |
+| 3 | Each satisfiable task emits its own id | `test_every_category_gets_an_entry` |
+| 4 | A task that cannot be met at any rung emits **nothing** | `test_rung_is_none_when_the_category_cannot_be_served`, `test_plan_vision_and_text_both_over_budget_disables` |
+| 5 | Every model also gets a fallback entry with no task segment | `test_untagged_gets_a_bare_id`, `test_every_model_gets_a_fallback` |
 | 6 | The fallback can itself fail and emit nothing | `test_model_with_no_rung_at_all_emits_nothing` |
 
 ## Vision and the ladder
@@ -143,7 +143,7 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 66 | A `usage:` warning leads with the sidecar's name | `test_usage_warnings_lead_with_the_sidecar_name` |
+| 66 | A `tasks:` warning leads with the sidecar's name | `test_usage_warnings_lead_with_the_sidecar_name` |
 | 67 | An unhandled-setting warning leads with the sidecar's name | `test_warn_unhandled_names_the_sidecar` |
 | 68 | An invalid `allow_profiles` regex warning leads with the sidecar's name | `test_allow_profiles_bad_regex_names_the_sidecar` |
 | 69 | A failed `base *` expression warning names the layer it came from | `test_merge_bad_base_expression_names_the_origin` |
@@ -197,6 +197,12 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 97 | One registry owns the closed endpoint set, the task→endpoint map and the engine→endpoints table; engines read their list from it, a bad sidecar value is reported, and the docs that state endpoints are checked against the table | `test_registry_invariants_hold`, `test_registry_task_mapping_is_total`, `test_registry_engine_table_matches_backends`, `test_registry_docs_agree`, `test_registry_unknown_endpoint_is_rejected`, `test_registry_engines_value_shape` |
+
+## Task catalogue (docs/plans/tasks-and-endpoints.md §P4)
+
+| # | Requirement | Test |
+|---|---|---|
+| 98 | The catalogue is the only task vocabulary: `tasks:` ids come from it, `role:`/`usage:` are alien keys, and an `audio_cpp.task` cannot contradict the model's task | `test_task_ids_resolve_to_declared_demands`, `test_resolve_tasks_ignores_unblessed_tag_with_warning`, `test_unknown_role_value_warns_with_a_hint`, `test_audio_cpp_task_must_match_the_model_task` |
 
 ## Composition validation (SPEC.md §VRAM Allocation)
 

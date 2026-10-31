@@ -1331,7 +1331,7 @@ def main(argv: list[str] | None = None) -> None:
                         stems = sorted({id_stem.get(vars_[g], g) or g
                                         for g in gone})
                         logger.info(
-                            "usage: set %r excludes %d chat model(s) that "
+                            "tasks: set %r excludes %d chat model(s) that "
                             "cannot meet their demands beside it: %s",
                             sname, len(stems),
                             ", ".join(st[:24] for st in stems[:8])

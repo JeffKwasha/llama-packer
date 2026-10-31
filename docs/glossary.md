@@ -22,7 +22,7 @@ either way it should not be used in a commit message until it is.
 | **device** | Where a serving runs: `cpu` or `gpu`. The sidecar key is `device:`, emitted as `metadata.packing.device`. The only placement word — there is no `role: cpu`. | `Model.on_cpu` |
 | **host-resident** | A `device: cpu` model: charged to the host pool, 0 VRAM, `ttl: 0`, pinned into the chat sets. Do not call it "a CPU task" — placement is not identity. | `HostLedger` |
 | **`device_roles`** | Profiles declaration that places every model of a task on the host. A list of task ids, or a mapping **task → device**: `{embeddings: cpu}`. | `apply_device_roles` |
-| **profiles.yaml** | Fleet-wide sampling defaults, spare values, backend defaults, the blessed `usage:` categories, and the optional `matrix:` section. | `profiles.py` |
+| **profiles.yaml** | Fleet-wide sampling defaults, spare values, backend defaults, the `tasks:` demand overrides, and the optional `matrix:` section. | `profiles.py` |
 | **override** | A rule that beats the profiles default, scoped to a glob or a directory. Per-directory `models.yaml` is the directory-scoped form. | `overrides.py` |
 | **derived:** | The frontmatter block holding measured, machine-specific values (fingerprints, `model_mib`, KV coefficients). Deleting it costs a re-measure, never a probe. | `model.py:persist_measured` |
 | **`spare`** | VRAM deliberately left free, so another tenant (ComfyUI, a game) can have it. Re-pack with the same `--spare` to reproduce a config. | profiles `spare`, CLI `--spare` |
@@ -72,18 +72,17 @@ either way it should not be used in a commit message until it is.
 | **mmproj** | The vision projector. Shedding it makes a model text-only and frees its VRAM. | llama-server |
 | **MTP** | Multi-token prediction draft model. Roughly doubles generation speed and is the costly thing to lose, so it sits late in the sacrifice order. | SPEC "MTP Speculative Decoding" |
 
-## Usage and routing categories
+## Tasks and routing categories
 
-Two different things are called a category. Say which one. Under the
-tasks vocabulary a `usage:` tag is a **task alias** (same endpoint, other
-demand) and the routing var stays a **matrix category**:
+Two different things are called a category. Say which one: a **task** is
+what work is done (`coding`, `qa`, `embeddings`), a **matrix category** is
+the routing var a set names (`emb`, `rnk`):
 
 | Term | Means | Code |
 |---|---|---|
-| **task alias** | A named workload class on one task (`coding`, `chat`, `qa`), today a `usage:` tag: same endpoint, its own minimum context. Aliases of one endpoint share one serving and are never loaded per alias. | profiles `usage:` → task `aliases` (P4) |
-| **blessed** | Declared in profiles.yaml. An undeclared tag on a sidecar warns and is ignored — only declared categories exist. | `resolve_usage` |
-| **demand** | One usage category's requirement for one model, resolved from its tags. | `UsageDemand` |
-| **`min_context`** | The context a usage category requires. A model that cannot serve it at any rung emits nothing for that category. | profiles `usage:` |
+| **task catalogue** | The closed set of task ids and their defaults: endpoint, scheduling role, intent, demand. An id outside it is not a task. | `tasks.py` |
+| **demand** | One task's minimum serving (`min_context`, `min_parallel`, `require`, `keep`, `sacrifice`). | `tasks.Task` |
+| **`min_context`** | The context a task requires. A model that cannot serve it at any rung emits nothing for that task. | profiles `tasks:` |
 | **matrix category** | An operator-named routing var under `matrix.categories` that binds a model to a var a set can name (`emb`, `rnk`, or a bucket such as `one`). A routing name, not a workload claim. | `matrix.categories` |
 | **canonical category** | The category whose model is the task's pinned CPU resident: `emb`, `rnk`, else the first declared for that task. | `canonical_cpu_pins` |
 | **set** | The emitted form of a role: a composition of tasks/categories that must be live together — `rag: __CHAT_VARS__ & emb & rnk` is embed *and* rerank. `&` sums, `|` maxes, `+set` expands; the chat solve reserves the worst branch of the most expensive chat set. | `matrix.sets`, `set_overhead_mb` |

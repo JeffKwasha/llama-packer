@@ -90,9 +90,9 @@ MUTATIONS = {
          '                or "Mapped" in dev)'),
         '    return True'),
     "test_usage_warnings_lead_with_the_sidecar_name": (
-        "llama_packer/writer.py",
-        '    who = f"{stem}: usage:" if stem else "usage:"',
-        '    who = "usage:"'),
+        "llama_packer/tasks.py",
+        '    who = f"{stem}: tasks:" if stem else "tasks:"',
+        '    who = "tasks:"'),
     "test_warn_same_role_names_the_pair": (
         "llama_packer/__main__.py",
         "                if len(names) < 2:",
@@ -291,8 +291,8 @@ MUTATIONS = {
         "                for name, expr in chat_sets.items()}"),
     "test_unknown_role_value_warns_with_a_hint": (
         "llama_packer/discover.py",
-        '    if role and role not in utils.SERVED_ROLES:',
-        "    if False:"),
+        '        if alien in model.frontmatter:',
+        '        if False:'),
     "test_unknown_device_value_warns": (
         "llama_packer/discover.py",
         "    if problem:",
@@ -336,6 +336,10 @@ MUTATIONS = {
         '                why = f"cannot load {fmt}"\n'
         '                continue\n'
         '            if False:'),
+    "test_resolve_tasks_ignores_unblessed_tag_with_warning": (
+        "llama_packer/tasks.py",
+        "        if task is None:",
+        "        if task is None and False:"),
     "test_registry_docs_agree": (
         "llama_packer/endpoints.py",
         '    "vllm": frozenset({CHAT, EMBEDDINGS, RERANK}),',

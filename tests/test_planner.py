@@ -527,17 +527,17 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
     # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
     no_pin = Profiles({"defaults": {"cache_type": "q8_0"},
                        "profiles": {"default": {}},
-                       "usage": {"qa": {"min_context": "4k",
+                       "tasks": {"qa": {"min_context": "4k",
                                          "min_parallel": 1}}})
     vllm_m = make_model("av", backend="vllm", min_context=4096,
-                        usage=["qa"])
+                        tasks=["qa"])
     del vllm_m.frontmatter["context_length"]  # no pin: cap = design
     _fake_vram(vllm_m, (1000, 0.5, 100))
     planner = Planner([vllm_m], no_pin, fit_bin="unused",
                       vram_total=48 * 1024, min_context=4096)
     assert planner.plan()["av"][0].parallel == 16
 
-    llama_m = make_model("al", min_context=4096, usage=["qa"])
+    llama_m = make_model("al", min_context=4096, tasks=["qa"])
     del llama_m.frontmatter["context_length"]
     _fake_vram(llama_m, (1000, 0.5, 100))
     planner = Planner([llama_m], no_pin, fit_bin="unused",
@@ -1287,12 +1287,14 @@ def test_set_admission_is_per_entry_not_per_stem(make_model):
     Validates: SPEC.md, 'VRAM Allocation': each entry resolves its own
     serving against the same budget.
     """
-    from llama_packer.writer import FALLBACK, Planner, UsageDemand
+    from llama_packer.endpoints import CHAT
+    from llama_packer.tasks import Task
+    from llama_packer.writer import FALLBACK, Planner
     model = make_model("a")
     planner = _planner_for_sets(model)
     planner.set_overheads = {"rag": 1751, "voice": 1898}
-    coding = UsageDemand(name="coding", min_context=131072, min_parallel=1)
-    aux = UsageDemand(name="aux", min_context=81920, min_parallel=2)
+    coding = Task("coding", CHAT, "chat", min_context=131072, min_parallel=1)
+    aux = Task("aux", CHAT, "chat", min_context=81920, min_parallel=2)
 
     def probe_ctx(model, parallel, cache_type, spare_mb, **kw):
         return planner.probes[spare_mb]
@@ -1394,8 +1396,9 @@ def _single_planner(model):
 
 
 def _demand(name="coding", **kw):
-    from llama_packer.writer import UsageDemand
-    return UsageDemand(name=name, **kw)
+    from llama_packer.endpoints import CHAT
+    from llama_packer.tasks import Task
+    return Task(name, CHAT, "chat", **kw)
 
 
 def test_rung_drops_vision_when_it_buys_context(make_model):
@@ -1543,16 +1546,16 @@ def test_every_category_gets_an_entry(make_model, profiles):
     client can ask for the one it wants.
     """
     m = make_model("multi", role="chat")
-    m.frontmatter["usage"] = ["coding", "chat"]
+    m.frontmatter["tasks"] = ["coding", "chat"]
     profs = Profiles({"defaults": {"cache_type": "q8_0"},
                       "profiles": {"default": {}},
-                      "usage": {"coding": {"min_context": "4k"},
+                      "tasks": {"coding": {"min_context": "4k"},
                                 "chat": {"min_context": "4k"}}})
     planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
                       min_context=4096)
     planner._bounded_ctx = lambda *a, **k: 131072
     planner._auto_parallel = lambda *a, **k: (1, 131072)
-    cats = {v.category.name for v in planner.plan()["multi"] if v.category}
+    cats = {v.category.id for v in planner.plan()["multi"] if v.category}
     assert cats == {"coding", "chat", ""}, cats
     ids = list(emit_config([m], planner.plan(), profs, TVARS)["models"])
     assert {"multi.coding", "multi.chat", "multi"} <= set(ids), ids
@@ -1566,17 +1569,17 @@ def test_every_model_gets_a_fallback(make_model, profiles):
     model still reaches clients.
     """
     m = make_model("lonely", role="chat")
-    m.frontmatter["usage"] = ["coding"]
+    m.frontmatter["tasks"] = ["coding"]
     # coding asks for 1M, which nothing can serve; the fallback asks 4096.
     profs = Profiles({"defaults": {"cache_type": "q8_0"},
                       "profiles": {"default": {}},
-                      "usage": {"coding": {"min_context": 1000000}}})
+                      "tasks": {"coding": {"min_context": 1000000}}})
     planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
                       min_context=4096)
     planner._bounded_ctx = lambda *a, **k: 131072
     planner._auto_parallel = lambda *a, **k: (1, 131072)
     variants = planner.plan()["lonely"]
-    assert [v.category.name if v.category else "" for v in variants] == [""]
+    assert [v.category.id if v.category else "" for v in variants] == [""]
     assert list(emit_config([m], {"lonely": variants},
                             profs, TVARS)["models"]) == ["lonely"]
 
@@ -1621,16 +1624,16 @@ def test_require_prevents_the_entry_emitted(make_model, profiles, tmp_path):
     """
     (tmp_path / "t-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
     m = make_model("blind", role="chat")          # text only, no mmproj
-    m.frontmatter["usage"] = ["qa"]
+    m.frontmatter["tasks"] = ["qa"]
     profs = Profiles({"defaults": {"cache_type": "q8_0"},
                       "profiles": {"default": {}},
-                      "usage": {"qa": {"min_context": "4k",
+                      "tasks": {"qa": {"min_context": "4k",
                                        "require": ["vision"]}}})
     planner = Planner([m], profs, fit_bin="unused", vram_total=48 * 1024,
                       min_context=4096)
     planner._bounded_ctx = lambda *a, **k: 131072
     planner._auto_parallel = lambda *a, **k: (1, 131072)
-    names = {v.category.name if v.category else "" for v in planner.plan()["blind"]}
+    names = {v.category.id if v.category else "" for v in planner.plan()["blind"]}
     assert "qa" not in names, "emitted an id claiming a capability it lacks"
     assert "" in names, "the fallback must still serve it"
 
@@ -1744,7 +1747,7 @@ def test_resident_parallelism_is_ignored(make_model, profiles, caplog):
 
 def _mp_profiles():
     return Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
-                     "usage": {"coding": {"min_context": 4096,
+                     "tasks": {"coding": {"min_context": 4096,
                                           "sacrifice": ["vision"]}}})
 
 
@@ -1757,7 +1760,7 @@ def test_min_image_megapixels_keeps_vision(make_model, tmp_path):
     Validates: docs/models/vision-context.md.
     """
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
-    m = make_model("v", usage=["coding"],
+    m = make_model("v", tasks=["coding"],
                    mmproj={"file": "v-mmproj.gguf", "capabilities": ["image"]},
                    min_image_megapixels=2)
     demands = Planner([m], _mp_profiles(), fit_bin="unused",
@@ -1772,7 +1775,7 @@ def test_no_budget_leaves_vision_shed_able(make_model, tmp_path):
     Validates: docs/models/vision-context.md.
     """
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
-    m = make_model("v", usage=["coding"],
+    m = make_model("v", tasks=["coding"],
                    mmproj={"file": "v-mmproj.gguf", "capabilities": ["image"]})
     demands = Planner([m], _mp_profiles(), fit_bin="unused",
                       vram_total=64 * 1024).demands_for(m)
@@ -1785,7 +1788,7 @@ def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
     Validates: docs/models/vision-context.md.
     """
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
-    m = make_model("v", usage=["coding"],
+    m = make_model("v", tasks=["coding"],
                    mmproj={"file": "v-mmproj.gguf", "capabilities": ["image"]},
                    min_image_megapixels=0)
     demands = Planner([m], _mp_profiles(), fit_bin="unused",
