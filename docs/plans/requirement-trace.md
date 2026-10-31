@@ -184,6 +184,12 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every task maps to a closed endpoint that at least one engine serves (no orphan endpoint) | `test_role_registry_derives_its_sets`, `test_every_task_maps_to_a_served_endpoint`, `test_infer_backend_gguf_image_goes_to_sd_server` |
 
+## Engine declaration (docs/plans/tasks-and-endpoints.md §P2)
+
+| # | Requirement | Test |
+|---|---|---|
+| 95 | A sidecar's `engines:` list is the compatibility claim: bare engine names in preference order, resolved to the first one that is enabled, available, can load the format and serves the task's endpoint; `engines:` wins over `backend:`, nothing resolvable refuses by name, and an absent key keeps inference | `test_engines_vocabulary_is_bare_engine_names`, `test_engines_resolution_honours_declared_order`, `test_engines_resolution_picks_the_transport`, `test_engines_refusal_names_every_engine`, `test_engines_finalize_sets_the_backend`, `test_engines_finalize_refuses_by_name`, `test_engines_wins_over_backend`, `test_engines_absent_infers_as_before`, `test_engines_unknown_name_warns_with_a_hint` |
+
 ## Composition validation (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |

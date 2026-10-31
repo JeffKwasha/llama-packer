@@ -50,6 +50,11 @@ ENGINES: tuple[type[BaseBackend], ...] = (
     AudioCppBackend,
 )
 
+#: Bare engine names — the vocabulary a sidecar's ``engines:`` list uses.
+#: Bound names (``vllm-podman``) are a transport choice, not a model fact.
+ENGINE_NAMES: tuple[str, ...] = tuple(e.name for e in ENGINES)
+
+
 #: Transport instances by name.  Container runtimes share one implementation;
 #: only the runtime binary/tag differs.
 TRANSPORTS: dict[str, Transport] = {
@@ -179,6 +184,51 @@ def infer_backend(model: "Model", avail: dict | None = None,
                 continue
             return backend.name
     return None
+
+
+def resolve_engines(model: "Model", names: tuple[str, ...],
+                    avail: dict | None = None,
+                    allowed: list[str] | None = None
+                    ) -> tuple[str | None, dict[str, str]]:
+    """Resolve a sidecar's ``engines:`` list to one bound backend name.
+
+    *names* are bare engine names in the sidecar's preference order; the
+    transport is the registry's choice (host > podman > docker), filtered by
+    the profiles allow list, availability, the file format and the endpoint
+    the model's task needs.  Returns ``(bound_name, reasons)``; when nothing
+    resolves, *reasons* says why each declared name was rejected, so the
+    refusal can name the engines instead of saying "no backend supports".
+    """
+    avail = avail or {}
+    if model.gguf_path is not None:
+        fmt = model.gguf_path.suffix.lower()
+    elif model.hf_repo:
+        fmt = "hf_repo"
+    else:
+        fmt = "none"
+    reasons: dict[str, str] = {}
+    for name in names:
+        candidates = [b for b in BACKENDS.values() if b.engine.name == name]
+        if not candidates:
+            reasons[name] = "unknown engine"
+            continue
+        why = "no transport enabled"
+        for backend in candidates:
+            if allowed is not None and backend.name not in allowed:
+                why = "disabled by profiles.yaml backends:"
+                continue
+            if not backend.is_available(avail):
+                why = "not available (binary/image or runtime missing)"
+                continue
+            if fmt not in backend.formats:
+                why = f"cannot load {fmt}"
+                continue
+            if not endpoints.serves(backend.endpoints, model.role):
+                why = f"does not serve role {model.role!r}"
+                continue
+            return backend.name, reasons
+        reasons[name] = why
+    return None, reasons
 
 
 def validate_backend_names(names) -> str | None:

@@ -326,6 +326,16 @@ MUTATIONS = {
         "llama_packer/writer.py",
         "    kv_mb = int(kv_factor * ctx + slot_mib)",
         "    kv_mb = 0"),
+    "test_engines_refusal_names_every_engine": (
+        "llama_packer/backends/__init__.py",
+        '            if fmt not in backend.formats:\n'
+        '                why = f"cannot load {fmt}"\n'
+        '                continue\n'
+        '            if not endpoints.serves(backend.endpoints, model.role):',
+        '            if fmt not in backend.formats:\n'
+        '                why = f"cannot load {fmt}"\n'
+        '                continue\n'
+        '            if False:'),
     "test_fit_crash_records_argv_and_stderr": (
         "llama_packer/vram.py",
         '            artifact.write_text("\\n".join(header + body) + "\\n")',
