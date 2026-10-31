@@ -492,7 +492,9 @@ under: `&` sums, `|` maxes, `+set` expands, nesting prices recursively. It is
 not the sum of every declared category, and a category in no chat set
 reserves nothing (llama-swap can only hold it alone). A second category of
 the same role is an alternative, never an addition — one model per role per
-set. See `docs/plans/cpu-residency-budget.md` decisions 13–15.
+set. The rule is the sets' own: summing every declared category would make
+every chat solve pay for a bucket even when the set holding it is an
+alternative to a cheaper one.
 
 `tools_min_ctx`, `min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and
 `estimate_headroom` shape the shared solve, in that order: the RAG pair is
@@ -790,16 +792,18 @@ published to llama-swap's `${PORT}` host macro. Everything else works
 identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
 matrix routing.
 
-All three operations are supported, mapped onto vLLM's pooling interface:
+All three endpoints are supported, mapped onto vLLM's pooling interface:
 
-| Operation | Task flag | Endpoints |
-|-----------|-----------|-----------|
-| `generate` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
-| `embed` | `--task embed` | `/v1/embeddings` |
+| task | vLLM flag | endpoint |
+|------|-----------|----------|
+| `chat` | *(generation; speculative decoding applies)* | `/v1/chat/completions` |
+| `embeddings` | `--task embed` | `/v1/embeddings` |
 | `rerank` | `--task score` | `/v1/rerank`, `/v1/score` |
 
-Sidecars themselves carry no backend key — backend selection, chat templates and
-LoRA adapters are all chosen by pattern-scoped override rules in `profiles.yaml`.
+A sidecar declares the engines that can load it with `engines:` (P2; until
+that lands the same field is spelled `backend:`). Without a declaration,
+selection is inferred from file format, gated by the profiles allow list; chat
+templates and LoRA adapters come from pattern-scoped override rules.
 
 ```yaml
 # profiles.yaml
@@ -1282,20 +1286,20 @@ emit `--jinja --chat-template-file <path>` (llama-server) or `--chat-template
 server-side flag for it; clients pass it per-request (e.g. Qwen's
 `enable_thinking`).
 
-**Backend support matrix.** A backend that cannot serve a model — wrong file
-format (e.g. a `.gguf` under vLLM) or an operation its role needs (e.g.
-embeddings under sd-server) — logs an error and the model's entries are skipped
-entirely. A backend that recognizes a setting it cannot render (e.g. `loras`
+**Backend support matrix.** An engine that cannot serve a model — wrong file
+format (e.g. a `.gguf` under vLLM) or an endpoint its task needs (e.g.
+`openai.embeddings` under sd-server) — logs an error and the model's entries
+are skipped entirely. A backend that recognizes a setting it cannot render (e.g. `loras`
 under vLLM) logs a warning and ignores that one setting; settings that simply do
 not apply (e.g. `cache_type` under vLLM) are silently dropped.
 
-| Backend | Model formats | Operations |
-|---------|--------------|------------|
-| `llama-server` | `.gguf` | generate, embed, rerank |
-| `vllm` / `vllm-podman` / `vllm-docker` | safetensors, `hf_repo` | generate, embed, rerank |
-| `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | generate_image |
-| `whisper-server` | `.bin` (s2t dir only) | transcribe |
-| `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | transcribe, synthesize |
+| Engine | Model formats | Endpoints |
+|--------|--------------|-----------|
+| `llama-server` | `.gguf` | `openai.chat.completions`, `openai.embeddings`, `openai.rerank` |
+| `vllm` / `vllm-podman` / `vllm-docker` | safetensors, `hf_repo` | `openai.chat.completions`, `openai.embeddings`, `openai.rerank` |
+| `sd-server` | `.gguf`, `.safetensors`, `hf_repo` | `openai.images.generations` |
+| `whisper-server` | `.bin` (s2t dir only) | `openai.audio.transcriptions` |
+| `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | `openai.audio.transcriptions`, `openai.audio.speech` |
 
 ## Backend Selection
 
@@ -1317,10 +1321,11 @@ backends:
 
 Inference walks this list (availability still filters: a pair without its
 binary/image configured, or without its container runtime on `PATH`, is
-skipped) and picks the first backend whose formats cover the model and whose
-operations cover its role.
-An explicit sidecar/override `backend:` pin to a disabled name is an error that
-skips that model — pinning bypasses *inference*, never policy. Registration
+skipped) and picks the first engine whose formats cover the model and whose
+endpoints cover its tasks. A sidecar declares that set explicitly with
+`engines:` (P2; until it lands the same field is spelled `backend:`), and a
+declared engine that is disabled is an error that skips that model — the
+declaration bypasses *inference*, never policy. Registration
 order: `llama-server`, `vllm`, `vllm-podman`, `vllm-docker`, `sd-server`,
 `whisper-server`, `audio-cpp`.
 

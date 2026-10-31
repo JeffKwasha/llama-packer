@@ -1528,8 +1528,7 @@ class HostLedger:
     Committed residents (embed/rerank winners, one per role) are charged
     at build time; every other CPU-resident entry is judged go/no-go
     against the pool remaining after them — never solved down, mirror of
-    the VRAM `over_budget` refusal
-    (docs/plans/cpu-residency-budget.md §Budget).  ``pool_mb=None``
+    the VRAM `over_budget` refusal (SPEC.md §Host pool).  ``pool_mb=None``
     (detection unavailable) means the ledger cannot gate: it logs that
     once and reports an unbounded pool rather than inventing one.
     """

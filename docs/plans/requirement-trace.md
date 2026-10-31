@@ -121,7 +121,7 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 58 | A pack run logs at WARNING unless asked: `-v` lifts it to INFO, and only `--dry-run` lifts the floor on its own | `test_pack_run_is_quiet_by_default`, `test_verbose_flag_lifts_the_level`, `test_dry_run_preview_is_visible_without_a_flag`, `test_verbosity_ladder_and_floor` |
 
-## CPU-residency measurement (docs/plans/cpu-residency-budget.md)
+## CPU-residency measurement (SPEC.md §Host pool)
 
 | # | Requirement | Test |
 |---|---|---|
@@ -148,7 +148,7 @@ and every one of them carries a `Validates:` citation.
 | 68 | An invalid `allow_profiles` regex warning leads with the sidecar's name | `test_allow_profiles_bad_regex_names_the_sidecar` |
 | 69 | A failed `base *` expression warning names the layer it came from | `test_merge_bad_base_expression_names_the_origin` |
 
-## Host budget (docs/plans/cpu-residency-budget.md §Host-budget requirements)
+## Host budget (SPEC.md §Host pool)
 
 | # | Requirement | Test |
 |---|---|---|
@@ -165,7 +165,7 @@ and every one of them carries a `Validates:` citation.
 | 80 | CPU helper entries join every chat set **one per role** (never evicted, never preloaded, same-role alternatives never forced in) and carry `ttl: 0`; device entries keep no per-model TTL | `test_cpu_helpers_pinned_into_every_set`, `test_cpu_entry_ttl_zero`, `test_gpu_entry_has_no_ttl` |
 | 81 | A category selector defines the RAG pair too — solve, charge, `emb`/`rnk` vars and resident entry name one model | `test_detect_matrix_category_selector_defines_the_pair` |
 
-## Set composition (docs/plans/cpu-residency-budget.md §Set composition)
+## Set composition (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |
 |---|---|---|
@@ -178,13 +178,13 @@ and every one of them carries a `Validates:` citation.
 | 88 | A known key with an unsupported value warns at discovery: `role:` must be a canonical id (typo hint), `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
 
-## Roles (docs/architecture.md §Roles, models and engines)
+## Roles (docs/architecture.md §Models, tasks, engines and endpoints)
 
 | # | Requirement | Test |
 |---|---|---|
 | 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every role's operation is implemented by an engine (no orphan operation) | `test_role_registry_derives_its_sets`, `test_every_role_operation_is_implemented` |
 
-## Portion 2 (docs/plans/cpu-residency-budget.md §Portion 2)
+## Composition validation (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |
 |---|---|---|

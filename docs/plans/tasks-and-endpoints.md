@@ -1,7 +1,8 @@
 # Plan: tasks and endpoints — the serving-contract redesign
 
-Status: **proposal / design accepted in principle** (2026-10-29). Branch
-`feat/tasks-and-endpoints`, stacked on PR #4 (`feat/cpu-residency-budget`).
+Status: **design accepted in principle** (2026-10-29); **P0 landed**
+2026-10-30. Branch `feat/tasks-and-endpoints`, stacked on PR #4
+(`feat/cpu-residency-budget`).
 Supersedes `docs/plans/audio-roles.md`'s role proposal (cited, absorbed) and
 the operations-on-engines half of `llama_packer/roles.py` as landed in the
 `6ca96fd` roles refactor. Related: `docs/architecture.md`,
@@ -280,11 +281,13 @@ Each portion ships green: trace rows → tests → mutation anchors → suite �
 One portion in flight at a time; nothing mixes a behaviour fix with a
 refactor.
 
-- **P0 docs**: this file; `docs/glossary.md` + `docs/architecture.md`
-  vocabulary mapping below; `SPEC.md` deltas listed in "What this undoes";
-  `profiles.yaml.example` examples for `engines:`/`tasks:`/`roles:` (marked
-  as new); cross-reference `audio-roles.md` here and mark its role table
-  absorbed.
+- **P0 docs** *(landed 2026-10-30; docs only, no trace rows)*: this file;
+  `docs/glossary.md` + `docs/architecture.md` vocabulary mapping below;
+  `SPEC.md` deltas listed in "What this undoes"; `profiles.yaml.example`
+  examples for `engines:`/`tasks:`/`roles:` (marked as new);
+  `audio-roles.md` cross-referenced and its role table marked absorbed;
+  `cpu-residency-budget.md` pruned to shipped status with its followers and
+  open defects moved to `roadmap.md`.
 - **P1 undo operations**: remove `Role.operation`/`OPERATIONS`, backend
   `operations`, `supports_role`; keep the scheduling registry; rework
   affected tests; SPEC/architecture rewording.
