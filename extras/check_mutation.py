@@ -336,6 +336,10 @@ MUTATIONS = {
         '                why = f"cannot load {fmt}"\n'
         '                continue\n'
         '            if False:'),
+    "test_registry_docs_agree": (
+        "llama_packer/endpoints.py",
+        '    "vllm": frozenset({CHAT, EMBEDDINGS, RERANK}),',
+        '    "vllm": frozenset({CHAT, EMBEDDINGS}),'),
     "test_sidecar_without_engines_is_refused": (
         "llama_packer/scope.py",
         "        elif not model.stub:",

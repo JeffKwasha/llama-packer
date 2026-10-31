@@ -3,7 +3,7 @@
 Image (and video) generation via stable-diffusion.cpp's `sd-server`.
 
 - **Engine:** stable-diffusion.cpp · **Transports:** host (`sd-server`).
-- **Roles:** `image`.
+- **Endpoints:** `openai.images.generations`.
 - **Formats:** `.gguf`, `.safetensors`, `hf_repo`.
 - **Proxied:** yes — `proxy` + `checkEndpoint: "/"`.
 - **Binary:** `--sd-server` > `profiles.yaml sd.bin` > `$SD_BIN_DIR` >

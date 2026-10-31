@@ -4,7 +4,7 @@ Speech-to-text via whisper.cpp's `examples/server` (the long-lived analog of
 `llama-server`; `whisper-cli` is one-shot and cannot be proxied).
 
 - **Engine:** whisper.cpp · **Transports:** host (`whisper-server`).
-- **Roles:** `s2t`.
+- **Endpoints:** `openai.audio.transcriptions`.
 - **Formats:** `.bin` (GGML). There is no header fingerprint for GGML, so the
   directory is authoritative.
 - **Proxied:** yes — `proxy` + `checkEndpoint: "/"`.
