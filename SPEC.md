@@ -197,6 +197,15 @@ are stale by definition and are re-measured + rewritten on the next run.
 
 `llama-fit-params` is always invoked with `--fit off` so it measures the explicit `-c` (or design) context rather than auto-adjusting arguments — `--fit on` (the default) would otherwise change `-ngl`/`-c` when the GPU is busy, corrupting the measurement.
 
+**A failed run keeps its evidence.** fit-params reports the cause on stderr
+and exits non-zero (or dies on a signal); the warning is one line, so argv,
+the model facts, the binary identity, the exit/signal and the full
+stdout/stderr are written to
+`~/.cache/llama-packer/fit-params-failures/<ts>-<pid>-<model>-<outcome>.log`
+and indexed by one `mode: fit` row in `measure-journal.jsonl`. The warning
+names both the artifact and the last log line that carries the cause. A
+crash therefore costs a re-measure, never the evidence of why it happened.
+
 **Validation probe.** `llama-packer --probe-memory [ARCH...]` sweeps one
 representative per GGUF arch family at p ∈ {1,2,4,8}, derives `(c, D)`, and
 reports the max residual against the law (FAIL above 0.5%) — the fast

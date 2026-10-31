@@ -25,11 +25,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import shutil
 import re
+import signal
 import subprocess
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -526,6 +529,38 @@ class FitParams:
 _CORR_WARNED: set[str] = set()
 
 
+# ── fit-params failure evidence ──────────────────────────────────────────
+
+_FIT_FAILURE_DIR = "fit-params-failures"
+#: `-lv 5` logs are a few hundred KiB; cap a pathological run rather than
+#: fill the cache with one file.
+_FIT_LOG_CAP = 4 << 20
+
+
+def _tail(text: str, lines: int = 3, width: int = 500) -> str:
+    """Last non-empty lines of a log, for a one-line warning."""
+    kept = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return " | ".join(kept[-lines:])[-width:]
+
+
+def _signal_name(rc: int | None) -> str:
+    """The signal behind a negative exit code, empty otherwise."""
+    if rc is None or rc >= 0:
+        return ""
+    try:
+        return signal.Signals(-rc).name
+    except ValueError:
+        return ""
+
+
+def _exit_text(rc: int | None) -> str:
+    """An exit code a human can read: a negative one is a signal."""
+    if rc is None:
+        return "no exit"
+    name = _signal_name(rc)
+    return f"{name}, exit {rc}" if name else f"exit {rc}"
+
+
 # ── VramBudget: per-model VRAM calculator ────────────────────────────────
 
 
@@ -637,6 +672,30 @@ class VramBudget:
         cmd += llama_args.split()
 
         logger.info("measuring VRAM: %s via llama-fit-params", label)
+
+        def failed(outcome: str, rc: int | None = None, stdout: str = "",
+                   stderr: str = "", detail: str = "") -> None:
+            key = f"fit|{label}|{outcome}|{rc}|{shlex.join(cmd)}"
+            if key in self._logged:
+                return
+            self._logged.add(key)
+            artifact = self._record_fit_failure(
+                label=label, cmd=cmd, outcome=outcome, cache_type=cache_type,
+                parallel=parallel, fit_ctx=fit_ctx, llama_args=llama_args,
+                rc=rc, stdout=stdout, stderr=stderr, detail=detail)
+            cause = _tail(stderr) or _tail(detail) or "no stderr"
+            if outcome == "crash":
+                text = f"fit-params crashed for {label} ({_exit_text(rc)}): {cause}"
+            elif outcome == "timeout":
+                text = f"fit-params timeout for {label}"
+            elif outcome == "unparseable":
+                text = f"could not parse fit-params output for {label}: {cause}"
+            else:
+                text = f"fit-params failed for {label}: {cause}"
+            if artifact is not None:
+                text += f" — full log: {artifact}"
+            logger.warning(text)
+
         try:
             # errors="replace": fit-params logs can carry non-UTF-8 bytes
             # (tokenizer dumps, control chars); strict decoding would raise
@@ -644,16 +703,13 @@ class VramBudget:
             out = subprocess.run(cmd, capture_output=True, text=True,
                                  errors="replace", timeout=60)
         except subprocess.TimeoutExpired:
-            logger.warning("fit-params timeout for %s", label)
+            failed("timeout")
             return None
         except FileNotFoundError:
-            logger.warning("fit-params binary not found: %s", fit_bin)
+            failed("binary-missing", detail=f"not found: {fit_bin}")
             return None
-        except Exception as e:
-            msg = f"fit-params failed for {label}: {e}"
-            if msg not in self._logged:
-                self._logged.add(msg)
-                logger.warning(msg)
+        except Exception:
+            failed("launch-failed", detail=traceback.format_exc())
             return None
 
         parsed = parse_fit_log(out.stdout + "\n" + out.stderr)
@@ -662,17 +718,95 @@ class VramBudget:
             return parsed
 
         if out.returncode != 0:
-            msg = f"fit-params crashed for {label} (exit {out.returncode})"
-            if msg not in self._logged:
-                self._logged.add(msg)
-                logger.warning(msg)
+            failed("crash", rc=out.returncode,
+                   stdout=out.stdout[:_FIT_LOG_CAP],
+                   stderr=out.stderr[:_FIT_LOG_CAP])
         else:
             preview = "\n".join(out.stdout.splitlines()[:3])
-            msg = f"could not parse fit-params output for {label}: {preview}"
-            if msg not in self._logged:
-                self._logged.add(msg)
-                logger.warning(msg)
+            failed("unparseable", rc=out.returncode,
+                   stdout=out.stdout[:_FIT_LOG_CAP],
+                   stderr=out.stderr[:_FIT_LOG_CAP], detail=preview)
         return None
+
+    def _record_fit_failure(
+        self,
+        *,
+        label: str,
+        cmd: list[str],
+        outcome: str,
+        cache_type: str,
+        parallel: int,
+        fit_ctx: int | None,
+        llama_args: str,
+        rc: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+        detail: str = "",
+    ) -> Path | None:
+        """Persist everything a later diagnosis of a failed run needs.
+
+        fit-params reports its cause on stderr and exits 1, so the exit code
+        alone throws the cause away.  The artifact keeps argv, the model
+        facts and the whole log; one journal row indexes it.  Best effort:
+        failing to record must never mask the measurement failure.
+        """
+        model_path = str(self.model.gguf_path or "")
+        size = arch = ""
+        try:
+            if self.model.gguf_path is not None:
+                size = f"{self.model.gguf_path.stat().st_size} bytes"
+                arch = str(ggufmeta.read_metadata(self.model.gguf_path)
+                           .get("general.architecture", ""))
+        except Exception:
+            pass
+        try:
+            fit_stat = Path(cmd[0]).stat()
+            bin_facts = (f"{cmd[0]} ({fit_stat.st_size} bytes, "
+                         f"mtime {int(fit_stat.st_mtime)})")
+        except OSError:
+            bin_facts = cmd[0]
+        header = [
+            f"ts: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+            f"label: {label}",
+            f"model: {model_path}",
+            f"arch: {arch}",
+            f"size: {size}",
+            f"backend: {self.model.backend}",
+            f"device: {'cpu' if getattr(self.model, 'on_cpu', False) else 'gpu'}",
+            f"cache_type: {cache_type}",
+            f"parallel: {parallel}",
+            f"ctx: {fit_ctx}",
+            f"llama_args: {llama_args}",
+            f"outcome: {outcome}",
+            f"exit: {rc}" + (f" ({_signal_name(rc)})" if _signal_name(rc) else ""),
+            f"fit_bin: {bin_facts}",
+            f"cwd: {os.getcwd()}",
+            f"argv: {shlex.join(cmd)}",
+        ]
+        body = [
+            f"--- stdout ({len(stdout)} bytes) ---", stdout,
+            f"--- stderr ({len(stderr)} bytes) ---", stderr,
+            "--- detail ---", detail,
+        ]
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "model"
+        artifact: Path | None = (gpu_state.cache_dir() / _FIT_FAILURE_DIR
+                                 / f"{stamp}-{os.getpid()}-{slug}-{outcome}.log")
+        try:
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("\n".join(header + body) + "\n")
+        except OSError:
+            logger.warning("could not write fit-params failure artifact",
+                           exc_info=True)
+            artifact = None
+        gpu_state.journal({
+            "mode": "fit", "model": label, "path": model_path,
+            "cache_type": cache_type, "parallel": parallel, "ctx": fit_ctx,
+            "args": llama_args, "outcome": outcome, "exit": rc,
+            "stderr_tail": _tail(stderr, 5),
+            "artifact": str(artifact) if artifact is not None else None,
+        })
+        return artifact
 
     # ── serve-shaped llama-server measurement ──
 
