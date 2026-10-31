@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer.backends.base import BaseBackend
+from llama_packer.endpoints import SPEECH, TRANSCRIPTIONS
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -86,7 +87,7 @@ class AudioCppBackend(BaseBackend):
 
     name = "audio-cpp"
     formats = frozenset({".gguf", ".safetensors", "hf_repo"})
-    operations = frozenset({"transcribe", "synthesize"})
+    endpoints = frozenset({TRANSCRIPTIONS, SPEECH})
     handles = frozenset({"audio_cpp"})
     # Host first; a container transport is a later deployment (the engine
     # would reuse transport.py unchanged).

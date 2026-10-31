@@ -47,7 +47,7 @@ becoming a synonym for "engine" or "placement":
 |---|---|---|
 | **model** | *which weights*, what work they can do, and which engines can load them | the sidecar (`engines:`, `tasks:`, `device:`, `parallel:`, `context_length`, …) |
 | **task** | *what work* is being done | `tasks.py` — the closed catalog (P4) |
-| **endpoint** | *where* that work is served | `endpoints.py` — the one registry (P3) |
+| **endpoint** | *where* that work is served | `endpoints.py` — the one registry |
 | **engine** | *how* the weights are executed | `backends/<engine>.py` (`formats`, `endpoints`, `host_requires`) |
 
 The engine never names a task or a role. It declares the **formats** it can
@@ -115,14 +115,18 @@ the task's own terms — the role degrades before its tasks do. The matrix
 `sets:` are generated from this table (P5), not hand-authored: dual
 authorship is the drift this design exists to remove.
 
-### Where the registry lives
+### Where the registries live
 
 `roles.py` is the scheduling table: one row per id with the chat-pass flag,
-residency policy, context knob and `device_roles:` eligibility. P1 drops
-`Role.operation`/`OPERATIONS` — engines declare endpoints, not operations —
-and P4 moves the id list into the task catalog. Until then the table is the
-single home of the six ids, and every derived set (`SERVED_ROLES`,
-`NON_CHAT_ROLES`, `DEVICE_ROLES`) is read off it.
+residency policy, context knob and `device_roles:` eligibility. Every derived
+set (`SERVED_ROLES`, `NON_CHAT_ROLES`, `DEVICE_ROLES`) is read off it; P4
+moves the id list into the task catalog.
+
+`endpoints.py` is the other half: the closed set of endpoint ids and the one
+mapping from a task to the endpoint it is served at. An engine declares
+`endpoints`; compatibility is `endpoints.serves(engine.endpoints, task)`, so
+neither side has to learn the other's vocabulary. P3 adds the registry's
+validation API and the doc/code agreement test.
 
 Validation follows the same split: an unsupported *value* of a known sidecar
 key warns at discovery (`role:` against the registry with a near-miss hint,

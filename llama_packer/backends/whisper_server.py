@@ -15,6 +15,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from llama_packer.backends.base import BaseBackend
+from llama_packer.endpoints import TRANSCRIPTIONS
 from llama_packer import utils
 
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 class WhisperServerBackend(BaseBackend):
     name = "whisper-server"
     formats = frozenset({".bin"})
-    operations = frozenset({"transcribe"})
+    endpoints = frozenset({TRANSCRIPTIONS})
     handles = frozenset({"cli_args"})  # --language, --threads, etc.
     proxied = True
     host_requires = frozenset({"whisper_bin"})

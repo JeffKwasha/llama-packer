@@ -182,7 +182,7 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every role's operation is implemented by an engine (no orphan operation) | `test_role_registry_derives_its_sets`, `test_every_role_operation_is_implemented` |
+| 90 | The role registry is one table: served/non-chat/device/context facts derive from it, and every task maps to a closed endpoint that at least one engine serves (no orphan endpoint) | `test_role_registry_derives_its_sets`, `test_every_task_maps_to_a_served_endpoint`, `test_infer_backend_gguf_image_goes_to_sd_server` |
 
 ## Composition validation (SPEC.md §VRAM Allocation)
 

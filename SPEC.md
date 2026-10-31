@@ -1301,6 +1301,10 @@ not apply (e.g. `cache_type` under vLLM) are silently dropped.
 | `whisper-server` | `.bin` (s2t dir only) | `openai.audio.transcriptions` |
 | `audio-cpp` | `.gguf`, `.safetensors`, `hf_repo` | `openai.audio.transcriptions`, `openai.audio.speech` |
 
+Endpoint ids are a closed set (`llama_packer/endpoints.py`): a task maps to
+exactly one, an engine declares the ones it serves, and compatibility is that
+intersection. An id outside the set is not an endpoint.
+
 ## Backend Selection
 
 profiles.yaml's ordered `backends:` list both **enables** and **prioritizes**

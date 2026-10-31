@@ -25,6 +25,7 @@ from llama_packer.backends.base import (
     SETTING_KEYS,
     BaseBackend,
 )
+from llama_packer import endpoints
 from llama_packer.backends.audio_cpp import AudioCppBackend
 from llama_packer.backends.llama_server import LlamaServerBackend
 from llama_packer.backends.sd_server import SdServerBackend
@@ -73,7 +74,7 @@ class BoundBackend(BaseBackend):
         engine.transport = transport
         self.name = transport.bind_name(engine.name)
         self.formats = engine.formats
-        self.operations = engine.operations
+        self.endpoints = engine.endpoints
         self.handles = engine.handles
         self.proxied = engine.proxied
         self.check_endpoint = engine.check_endpoint
@@ -171,10 +172,10 @@ def infer_backend(model: "Model", avail: dict | None = None,
         candidates = [BACKENDS[n] for n in allowed if n in BACKENDS]
     for backend in candidates:
         if fmt in backend.formats and backend.is_available(avail):
-            # Role must be supported — otherwise a .gguf diffusion model under
-            # role=image would incorrectly infer llama-server and then be skipped
-            # as unsupported.  Infer the only backend that can actually serve it.
-            if not backend.supports_role(model.role):
+            # The endpoint must be served — otherwise a .gguf diffusion model
+            # under role=image would incorrectly infer llama-server and then be
+            # skipped as unsupported.  Infer the only backend that can serve it.
+            if not endpoints.serves(backend.endpoints, model.role):
                 continue
             return backend.name
     return None
