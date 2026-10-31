@@ -305,6 +305,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     except Exception as e:
         logger.error("failed to load model from %s: %s", path.name, e)
         return
+    model.stub = stub
     stack.apply_rules(model)
     model.resolve_companions()
     model.sync_measured_file(write=not stub)

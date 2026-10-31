@@ -401,16 +401,14 @@ def test_bin_outside_s2t_never_served(tmp_path, caplog):
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "mysterious.bin").write_bytes(b"x")
-    (root / "chat" / "mysterious.md").write_text(_sidecar("Mystery"))
+    (root / "chat" / "mysterious.md").write_text(
+        "---\nname: Mystery\nengines: [whisper-server]\n---\n")
 
     with caplog.at_level(logging.INFO):
         models = Model.from_dir(root, generate_stubs=False)
     assert len(models) == 1
-    assert getattr(models[0], "_override_error", None) is not None
-    assert any("No backend supports" in r.message for r in caplog.records)
-    assert not any(r.levelno >= logging.ERROR
-                   and "No backend supports" in r.message
-                   for r in caplog.records)
+    error = getattr(models[0], "_override_error", None)
+    assert error is not None and "does not serve role 'chat'" in error
 
 
 # ── audio (t2s) discovery is exercised by the audio-cpp backend tests ─────

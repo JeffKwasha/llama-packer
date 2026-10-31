@@ -900,16 +900,18 @@ def test_infer_backend_allowed_reorders_and_disables(make_model):
     assert infer_backend(m, avail, allowed=["nope", "vllm"]) == "vllm"
 
 
-def test_apply_overrides_pinned_backend_disabled(make_model):
-    # Validates: SPEC.md, 'Override Rules': Backend selection/inference + external file resolution for *model*. Runs after defaults and rules are fully applied, so inference sees the.
+def test_apply_overrides_backend_is_alien(make_model, caplog):
+    # Validates: docs/plans/requirement-trace.md #96 -- `backend:` is not a sidecar key; compatibility is `engines:`.
     from llama_packer.scope import ScopeStack
     m = make_model("p", backend="vllm-docker")
+    m.stub = False
     stack = ScopeStack(avail={"llama_bin": "/opt/llama-server",
                               "vllm_image": "img"},
                        allowed=["llama-server"])
     m.resolve_companions()
     stack.finalize(m)
-    assert getattr(m, "_override_error", None) and "disabled" in m._override_error
+    assert "not a sidecar key" in caplog.text
+    assert getattr(m, "_override_error", None) and "engines: required" in m._override_error
 
 
 def test_vllm_role_task_flags(make_model):

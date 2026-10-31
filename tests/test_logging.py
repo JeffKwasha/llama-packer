@@ -14,6 +14,7 @@ _SIDECAR = """---
 name: dummy
 context_length: 32768
 usage: chat
+engines: [llama-server]
 ---
 """
 

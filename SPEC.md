@@ -785,9 +785,9 @@ modes:
 
 ## vLLM Backend
 
-A model can be served with vLLM instead of llama-server by an override
-rule (see below) that sets `backend: vllm` (host binary), `backend: vllm-podman`
-or `backend: vllm-docker` (container). The emitted entry runs `vllm serve`,
+A model can be served with vLLM instead of llama-server when its sidecar
+declares `engines: [vllm]` (or an override rule sets it); the registry picks
+host, podman or docker. The emitted entry runs `vllm serve`,
 published to llama-swap's `${PORT}` host macro. Everything else works
 identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
 matrix routing.
@@ -800,16 +800,15 @@ All three endpoints are supported, mapped onto vLLM's pooling interface:
 | `embeddings` | `--task embed` | `/v1/embeddings` |
 | `rerank` | `--task score` | `/v1/rerank`, `/v1/score` |
 
-A sidecar declares the engines that can load it with `engines:` (P2; until
-that lands the same field is spelled `backend:`). Without a declaration,
-selection is inferred from file format, gated by the profiles allow list; chat
-templates and LoRA adapters come from pattern-scoped override rules.
+A sidecar declares the engines that can load it with `engines:`; a model
+with no sidecar is inferred from its file format. Chat templates and LoRA
+adapters come from pattern-scoped override rules.
 
 ```yaml
 # profiles.yaml
 overrides:
   - when: {base_model: 'qwen3\\.30b'}
-    backend: vllm            # or vllm-podman / vllm-docker
+    engines: [vllm]
     hf_repo: Qwen/Qwen3-30B-A3B-Instruct
 ```
 
@@ -967,7 +966,7 @@ a ~60 GB NVFP4 model gets ≥ 600 s.
 ## Image Backend (sd-server)
 
 A model with `role: image` (selected via `dirs: {img: image}` and/or `type: image`) is served with
-`sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`backend: sd-server`).
+`sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`engines: [sd-server]`).
 The emitted entry runs `sd-server --diffusion-model …` plus `cli_args` verbatim, proxied via llama-swap's `${PORT}`.
 
 All diffusion formats are supported: `.gguf` (flux, sdxl, sd3, wan, chroma, … — see `_DIFFUSION_ARCH_RES`) and
@@ -1004,7 +1003,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Binary precedence
 
-`sd-server` is resolved: `--sd-server` CLI flag > `sd.bin` in `profiles.yaml` > `$SD_BIN_DIR` (file or directory containing `sd-server`) > the run directory > `sd-server` on `PATH`. Absent binary disables format-based inference; an explicit `backend: sd-server` pin to a disabled setup is an error that skips the model. Docker variant is future work (tracked in `docs/plans/comfyui-sd.md`).
+`sd-server` is resolved: `--sd-server` CLI flag > `sd.bin` in `profiles.yaml` > `$SD_BIN_DIR` (file or directory containing `sd-server`) > the run directory > `sd-server` on `PATH`. Absent binary disables format-based inference; a declared `engines: [sd-server]` that is disabled is an error that skips the model. Docker variant is future work (tracked in `docs/plans/comfyui-sd.md`).
 
 ### Capabilities
 
@@ -1021,7 +1020,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 A model with `role: s2t` (opt-in: an `s2t/` directory plus `dirs: {s2t: s2t}` in
 `profiles.yaml`) is served with **whisper-server** from
-[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`backend: whisper-server`) —
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`engines: [whisper-server]`) —
 the long-lived HTTP server from `examples/server` (the analog of `llama-server`;
 `whisper-cli` is oneshot and cannot be proxied by llama-swap). Exposes
 OpenAI-compatible `POST /v1/audio/transcriptions`.
@@ -1064,7 +1063,7 @@ whisper-large-v3:
 `--whisper-server` CLI flag > `whisper.bin` in `profiles.yaml` `whisper:` section >
 `$WHISPER_BIN_DIR` (file or directory containing `whisper-server`) >
 the run directory > `whisper-server` on `PATH`. Absent binary disables format-based inference;
-an explicit `backend: whisper-server` pin to a disabled setup is an error that
+a declared `engines: [whisper-server]` that is disabled is an error that
 skips the model. Docker variant is future work.
 
 ### Capabilities and VRAM
@@ -1105,8 +1104,9 @@ audio.cpp has no whisper family and cannot load them.
 Sidecars carry model-intrinsic data. Cross-cutting serving choices —
 **backend**, **HF repo**, **chat template**, **LoRA adapters**, and extra
 **CLI args** — are selected by pattern-scoped rules under `overrides:` in
-`profiles.yaml` (a sidecar may still pin a `backend:` for one-off exceptions,
-but fleet-level policy belongs here).
+`profiles.yaml`. Engine compatibility is a model fact, so it is declared with
+`engines:` in the sidecar (or in a rule, for one-off exceptions); fleet-level
+policy belongs here.
 
 Rules can also live in a **directory-scoped** `models.yaml`: any subdirectory
 of a models root may carry one whose `overrides:` apply only to models in
@@ -1122,9 +1122,9 @@ overrides:
     chat_template: qwen_chat_template.jinja
     chat_template_kwargs: {enable_thinking: true}
 
-  # One-off: pin a specific model to the vLLM container backend.
+  # One-off: declare the engine for a specific model.
   - when: {name: 'Nail-Qwen'}
-    backend: vllm-docker
+    engines: [vllm]
     hf_repo: peculiar-ragdoll/Nail-Qwen3.6-35B-A3B-GGUF-MTP
 
   # A qwen finetune (still base_model: qwen3.8) also gets a LoRA adapter.
@@ -1333,8 +1333,9 @@ first declared engine that is enabled, available, can load the file format
 and serves the task's endpoint; the declaration bypasses *inference*, never
 policy, so a declared engine that is disabled is an error that skips the
 model. When nothing resolves, the model is skipped and the log names every
-declared engine with its reason. `engines:` wins over `backend:`, and with
-neither declared, inference applies. Registration
+declared engine with its reason. A sidecar must declare `engines:`; `backend:`
+is not a sidecar key and warns as alien, and only a model with no sidecar
+(an orphan) falls back to inference. Registration
 order: `llama-server`, `vllm`, `vllm-podman`, `vllm-docker`, `sd-server`,
 `whisper-server`, `audio-cpp`.
 
