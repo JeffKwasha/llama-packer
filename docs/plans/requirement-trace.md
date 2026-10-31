@@ -143,7 +143,7 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 66 | A `usage:` warning leads with the sidecar's name | `test_usage_warnings_lead_with_the_sidecar_name` |
+| 66 | A `tasks:` warning leads with the sidecar's name | `test_usage_warnings_lead_with_the_sidecar_name` |
 | 67 | An unhandled-setting warning leads with the sidecar's name | `test_warn_unhandled_names_the_sidecar` |
 | 68 | An invalid `allow_profiles` regex warning leads with the sidecar's name | `test_allow_profiles_bad_regex_names_the_sidecar` |
 | 69 | A failed `base *` expression warning names the layer it came from | `test_merge_bad_base_expression_names_the_origin` |
