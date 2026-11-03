@@ -586,7 +586,7 @@ class Model:
         "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "speculative_config",
-        "role", "allow_profiles", "capabilities",
+        "role", "allow_profiles", "capabilities", "tasks",
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel", "min_context",
@@ -608,6 +608,7 @@ class Model:
     # block.
     COMPANION_BLOCK_DENIED: ClassVar[frozenset[str]] = frozenset({
         "name", "model", "ignore", "mmproj", "hf_repo", "backend", "role",
+        "tasks",
     })
 
     # Known pass-through metadata keys (documented in models_AGENTS.md)
