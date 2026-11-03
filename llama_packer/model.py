@@ -629,6 +629,10 @@ class Model:
                  finder: WeightFinder | None = None):
         self.md_path = md_path
         self.frontmatter = frontmatter
+        #: Keys the sidecar authored (before defaults and rules merge in).
+        #: ``role`` is derived from a task claim during finalize, so the
+        #: authored-key check must not treat the derived value as alien.
+        self.sidecar_keys: frozenset[str] = frozenset(frontmatter)
         self.stem = md_path.stem
         self._hf_home = hf_home  # HF cache root override for hub snapshot resolution
         self._finder = finder or default_finder()
