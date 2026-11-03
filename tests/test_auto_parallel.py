@@ -199,6 +199,35 @@ def test_plan_stretch_wins_when_second_slot_too_thin(make_model):
     assert variants[0].ctx_size == 32768
 
 
+def test_task_parallel_power_overrides_the_matrix_knob(make_model):
+    # Validates: SPEC.md, 'Tasks (tasks:)': parallel_power is per task — a low B keeps the context, a high B buys slots, off the same model and VRAM
+    m = make_model("ap", backend="llama-server", role="chat",
+                   tasks=["coding", "describe"])
+    del m.frontmatter["context_length"]
+    _scripted_by_parallel(m, {1: 32768, 2: 16384, 3: 8192})
+    profiles = Profiles({
+        "defaults": {"cache_type": "q8_0"},
+        "profiles": {"default": {}},
+        "tasks": {
+            "coding": {"endpoint": "openai.chat.completions", "role": "chat",
+                       "min_context": 8192, "parallel_power": 0.1},
+            "describe": {"endpoint": "openai.chat.completions", "role": "chat",
+                         "min_context": 8192, "min_parallel": 2,
+                         "parallel_power": 2.0},
+        },
+    })
+    variants = Planner([m], profiles, fit_bin="unused",
+                       vram_total=48 * 1024,
+                       matrix_cfg={"auto_parallel": True}).plan()["ap"]
+    by_task = {v.category.id: v for v in variants if v.category and v.category.id}
+    # B=0.1: the second slot costs half the window for almost no score, so the
+    # stretch wins. B=2.0: slots are worth full value twice over, so it takes
+    # the maximum slot count.
+    assert (by_task["coding"].parallel, by_task["coding"].ctx_size) == (1, 32768)
+    assert by_task["describe"].parallel >= 2
+    assert by_task["describe"].ctx_size < by_task["coding"].ctx_size
+
+
 def test_plan_pinned_ctx_searches_slots_only(make_model):
     # Fixture default context_length=32768 is a serving pin: ctx is fixed,
     # the search runs over p alone. Both p1/p2 afford the pin → p2 wins.

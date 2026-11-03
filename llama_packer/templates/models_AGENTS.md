@@ -152,7 +152,7 @@ hf_url: https://huggingface.co/org/model  # alternative to hf_repo; keep on one 
 # speculative: model.mtp.gguf  # only if the snapshot actually contains *mtp*.gguf
 # mtp: true                  # only when MTP heads are baked into the main GGUF
 # --- serving ---
-tasks: [chat]                # closed catalog: chat | coding | qa | aux | embeddings | rerank | image | s2t | t2s
+tasks: [chat]                # claims from profiles.yaml tasks: — e.g. chat, coding, qa, aux, describe, embeddings, rerank, image, s2t, t2s
 engines: [llama-server]      # REQUIRED: engines that can load these weights, in preference order
 #                            #   llama-server | vllm | sd-server | whisper-server | audio-cpp
 #                            #   bare engine names — the transport is the registry's choice
@@ -255,13 +255,40 @@ Convention: brand + major version; minor only when it changed the architecture
 
 ## Tasks and directories
 
-`tasks:` lists the work the model performs, from the catalogue declared in
-`profiles.yaml tasks:` (typically `chat`, `coding`, `qa`, `aux` on the chat
-endpoint, plus `embeddings`, `rerank`, `image`, `s2t`, `t2s`). A task is inferred from the
-directory (table above) or from `type:` containing `embedding`/`rerank`/`image`
-when the sidecar declares none. `image`/`s2t`/`t2s` engines are opt-in via
-profiles.yaml (`dirs:` + `backends:`). See the `llama-packer` project's
-`SPEC.md` for the full map.
+`tasks:` claims the work this model is for, from the catalogue declared in
+`profiles.yaml tasks:`. The ids are a closed catalog: an id the catalogue does
+not declare is warned about and ignored, so a claim only counts when the
+operator declared that id. Capability ids are inferred from the directory
+(table above) or from `type:` containing `embedding`/`rerank`/`image`, and
+only need writing to override that inference; chat-endpoint ids are never
+inferred and must be claimed explicitly.
+
+Choosing them:
+
+- Claim the work you actually route to this model, not everything it could do.
+  Each satisfiable claim emits its own entry, so an unused claim is an extra
+  serving shape clients can pick and nobody calls.
+- Chat-endpoint ids (`chat`, `coding`, `qa`, `aux`, `describe`, …) carry the
+  demand: `min_context`, `min_parallel`, `require`/`keep`/`sacrifice`, and an
+  optional `parallel_power`. A claim is honoured only when the model meets it
+  — `require: [vision]` on `describe` means a text-only model cannot claim it
+  — and a model that misses every claim still gets a bare fallback entry.
+- Capability ids (`embeddings`, `rerank`, `image`, `s2t`, `t2s`) select the
+  endpoint and role. They are sized by the role, so they carry no floors.
+- `tasks:` is not `capabilities:`. `capabilities: [image]` says the model
+  accepts image input; `tasks: [describe]` says this is the model image
+  description is routed to. A vision model nobody asks to caption should not
+  claim `describe`.
+- Examples: a coding model that also answers chat → `tasks: [coding, chat]`;
+  the vision model for captioning → `tasks: [describe]`; an embedder →
+  `[embeddings]`, never `[chat]`.
+- `role:` and `usage:` are not sidecar keys. They are warned about and ignored.
+
+`image`/`s2t`/`t2s` engines are opt-in via profiles.yaml (`dirs:` +
+`backends:`). Floors (`min_context`, `min_parallel`, `require`, `keep`,
+`sacrifice`) and `parallel_power` live in the `profiles.yaml` task
+declaration, not in the sidecar. See the `llama-packer` project's `SPEC.md`
+for the full map.
 
 ## HuggingFace resolution
 

@@ -306,3 +306,13 @@ of record (`c` MiB/token, `D` MiB/slot, q8_0):
 - No runtime slot scaling — slots are fixed at load; changing p is a repack.
 - No cross-model slot sharing (one model's leftover never funds another's
   slots; chat models evict, they don't co-run, within a set).
+
+## Addendum: B follows the task (2026-11-02)
+
+`parallel_power` started as a fleet-wide knob because there was one flat
+`usage:` vocabulary and no per-demand solve. With `tasks:` each demand already
+solves its own `(ctx, parallel)` and emits its own entry, so B belongs to the
+task: `coding` can keep context while `describe` buys slots on the same model.
+`matrix.parallel_power` remains the default for tasks that do not declare
+`parallel_power:`; the null/fallback category keeps exponent 0. See `SPEC.md`,
+Tasks.

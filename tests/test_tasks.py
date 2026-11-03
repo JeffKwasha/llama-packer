@@ -82,6 +82,25 @@ def test_catalogue_warns_and_drops_malformed_categories(caplog):
     assert cat.get("aux").min_parallel == 1
 
 
+def test_catalogue_task_parallel_power():
+    # Validates: SPEC.md, 'Tasks (tasks:)': a task may carry parallel_power to override the matrix slot exponent for its own solve
+    cat = catalogue({"coding": {"parallel_power": 1.2}})
+    assert cat.get("coding").parallel_power == 1.2
+    assert cat.get("chat").parallel_power is None
+
+
+def test_catalogue_rejects_bad_parallel_power(caplog):
+    # Validates: SPEC.md, 'Tasks (tasks:)': a parallel_power that is not a finite non-negative number is warned about and ignored, falling back to the matrix knob
+    with caplog.at_level("WARNING"):
+        cat = catalogue({"coding": {"parallel_power": -1},
+                         "qa": {"parallel_power": "lots"},
+                         "chat": {"parallel_power": True}})
+    assert cat.get("coding").parallel_power is None
+    assert cat.get("qa").parallel_power is None
+    assert cat.get("chat").parallel_power is None
+    assert caplog.text.count("parallel_power") == 3
+
+
 def test_catalogue_warns_on_unknown_capability(caplog):
     # Validates: SPEC.md, 'Usage categories (`tasks:`)': an unknown capability is warned about and dropped.
     with caplog.at_level("WARNING"):

@@ -367,6 +367,8 @@ That tie rule is the whole of "coding drops vision to maximise context, and only
 
 `min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
 
+`parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on an unpinned chat model on a slot-based backend.
+
 ## VRAM Allocation
 
 Two tiers, and only two.
@@ -510,6 +512,9 @@ padded by `estimate_headroom`. Defaults: 128k, 64k, 20k, 4k, 1.25.
 
 The score is `(ctx/floor)^0.5 × slots^B`. The context exponent is fixed; `B`
 is the single knob, and it decides **when to trade context for concurrency.**
+`B` is the fleet default; a task may override it with `parallel_power:` (see
+Tasks), which is the useful scope — what a model is being asked to do decides
+whether its second slot is worth a smaller window.
 
 Slots and context compete for the same KV pool, so doubling the slot count
 costs context in proportion to how expensive that model's slots are. Writing

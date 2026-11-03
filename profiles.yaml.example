@@ -76,6 +76,8 @@ tasks:
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
+  # A task may also set parallel_power: (B) to override matrix.parallel_power
+  # for its own solve — low keeps context, high buys slots.
   # Capability tasks: endpoint and role only; they are sized by their role.
   embeddings:
     endpoint: openai.embeddings
@@ -404,8 +406,9 @@ profiles:
 #                               # solve for unpinned chat; false disables it
 #                               # fleet-wide
 #   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
-#   parallel_power: 0.75        # slot exponent: how much context one extra
-#                               # slot may cost. See SPEC.md
+#   parallel_power: 0.75        # fleet default slot exponent: how much context
+#                               # one extra slot may cost. A task's own
+#                               # parallel_power: overrides it. See SPEC.md
 #   categories:                 # var -> served model; `emb`/`rnk` are the
 #     emb: { role: embeddings } # canonical names of the RAG roles
 #     rnk: { role: rerank }
