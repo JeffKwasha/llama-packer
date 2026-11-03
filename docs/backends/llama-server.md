@@ -49,6 +49,9 @@ byte-identical to a `-c parallel*X` pool (validated against `llama-fit-params`).
   `n_batch = n_ubatch` when embeddings are enabled.
 - Reasoning flags and image-token flags are chat/vision-only and skipped
   elsewhere (with warnings when a declaration cannot apply).
+- A `draft-dflash`/`draft-dspark` draft is omitted when the entry serves more
+  than one slot: those engines are single-sequence and abort llama-server on
+  the first concurrent batch. See SPEC.md, "Single-sequence draft engines".
 
 ## profiles.yaml
 

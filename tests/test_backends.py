@@ -101,6 +101,31 @@ def test_llama_server_mtp_args(make_model):
                     "mtp_draft_p_min": 0.75}
 
 
+def test_llama_server_multi_slot_drops_single_slot_draft_engine(make_model, caplog):
+    # Validates: SPEC.md, 'Single-sequence draft engines': a dflash/dspark draft is omitted when the entry serves more than one slot, so the first concurrent batch cannot abort llama-server
+    import logging
+    b = LlamaServerBackend()
+    m = make_model("m", mtp=True, mtp_spec_type="draft-dspark")
+    with caplog.at_level(logging.WARNING):
+        cmd, meta = b.build_cmd(m, 32768, 4, "q8_0", _tvars())
+    assert "--spec-type" not in cmd
+    assert meta == {"mtp_enabled": False}
+    assert any("one sequence at a time" in r.message for r in caplog.records)
+
+    # One slot is the engine's native shape: the draft stays.
+    cmd, meta = b.build_cmd(m, 32768, 1, "q8_0", _tvars())
+    assert "--spec-type draft-dspark" in cmd
+    assert meta["mtp_enabled"] is True
+
+
+def test_llama_server_multi_slot_keeps_batchable_draft_engine(make_model):
+    # Validates: SPEC.md, 'Single-sequence draft engines': engines outside the single-sequence set (draft-mtp) keep their flags at every slot count
+    m = make_model("m", mtp=True)
+    cmd, meta = LlamaServerBackend().build_cmd(m, 32768, 4, "q8_0", _tvars())
+    assert "--spec-type draft-mtp" in cmd
+    assert meta["mtp_enabled"] is True
+
+
 def test_llama_server_mtp_draft_p_min_override(make_model):
     # Validates: SPEC.md, 'MTP Speculative Decoding': mtp_draft_p_min overrides the default acceptance probability
     m = make_model("m", mtp=True, mtp_draft_p_min=0.9)

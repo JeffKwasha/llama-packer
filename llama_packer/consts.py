@@ -107,6 +107,14 @@ _MTP_SPEC_TYPE = "draft-mtp"
 _MTP_DRAFT_N_MAX = 2
 _MTP_DRAFT_P_MIN = 0.75
 
+# Draft engines that serve one sequence at a time: the dflash/dspark family
+# keeps per-sequence hidden-state features, and llama.cpp aborts in
+# common_batch::get_sub_batch (out-of-vocabulary draft token) as soon as a
+# second slot decodes. Extra slots are worth more than the draft, so a
+# multi-slot entry drops the spec flags instead of pinning the slot count.
+# Observed on llama.cpp build 11988 (commit abb76ab38).
+_SINGLE_SLOT_SPEC_TYPES = frozenset({"draft-dflash", "draft-dspark"})
+
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # vLLM backend defaults
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -

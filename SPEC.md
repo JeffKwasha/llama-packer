@@ -626,6 +626,24 @@ If absent, the module-level defaults apply (see `llama_packer/consts.py`).
 - **Baked-in:** Draft heads are part of the main GGUF. Set `mtp: true` in frontmatter. No separate file needed.
 - **Companion:** A separate GGUF file containing draft heads. Set `speculative: <filename>` in frontmatter. The file is resolved by fuzzy match in the model directory.
 
+### Single-sequence draft engines
+
+`draft-dflash` and `draft-dspark` (the DFlash/DSpark family, selected with
+`mtp_spec_type:`) draft for **one sequence at a time**. llama.cpp keeps their
+per-sequence hidden-state features in a single buffer, so with two slots
+decoding it hands an out-of-vocabulary draft token to the batch builder and
+aborts (`common_batch::get_sub_batch`, observed on build 11988, commit
+`abb76ab38`) — the server dies mid-request and every client behind it gets a
+502.
+
+An entry solved for more than one slot therefore **omits the speculative
+flags** and reports `mtp_enabled: false`; the draft is served only at
+`parallel: 1`, which a sidecar `parallel:` pin can select. Extra slots win
+because they pay under load: on MiniCPM-V 4.7 1B, four concurrent 192-token
+requests measured 505 tok/s aggregate at four slots (no draft) versus 253 tok/s
+at one slot with DSpark, for a 14 % single-stream cost (216 vs 250 tok/s).
+Draft engines outside this set (e.g. `draft-mtp`) batch across slots normally.
+
 ### Speculative decoding under vLLM
 
 vLLM models get `--speculative-config '<json>'` (see

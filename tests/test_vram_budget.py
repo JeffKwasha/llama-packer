@@ -1151,3 +1151,10 @@ def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
     ctx = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
                               design_ctx=131072)
     assert ctx == 131072
+
+
+def test_serve_measurement_mirrors_single_slot_draft_drop(make_model):
+    # Validates: SPEC.md, 'Single-sequence draft engines': the serve-shaped probe drops a dflash/dspark draft at parallel > 1 exactly like the emitted command
+    model = make_model("m", mtp=True, mtp_spec_type="draft-dspark")
+    assert "--spec-type" not in model.vram._mtp_measure_flags(4)
+    assert "--spec-type" in model.vram._mtp_measure_flags(1)
