@@ -38,6 +38,50 @@ main()                                        (__main__.py — thin orchestratio
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
+## What we emit, and what llama-swap owns
+
+llama-packer is a config generator. Nothing here controls llama-swap's
+runtime: we choose the fields, llama-swap acts on them.
+
+| decision | our output | who acts |
+|---|---|---|
+| which entries exist | `models:` (`cmd`, `metadata`, `capabilities`, `name`) | llama-swap serves them |
+| when an idle entry unloads | `ttl:` per entry, `globalTTL:` top-level (seconds; `0` disables idle unload) | llama-swap's idle timer |
+| which entries may be wanted together | `routing.router.settings.matrix` (`vars`, `sets`, `evict_costs`) | llama-swap's matrix router |
+| what memory is pre-charged in the budget | pack-time arithmetic only | nobody at runtime |
+
+**`pinned` and `on_demand` are memory-accounting classes, not runtime
+states.** A pinned element is charged before the rest of the budget is
+solved, so the emitted config always leaves room for it. It is not a
+request to keep that entry loaded: an entry with a `ttl` still unloads and
+lazily reloads. An on_demand element is simply not pre-charged; its entry
+is still emitted and llama-swap may load it whenever a request names it.
+Neither class changes the entry's definition or its set membership.
+
+**`sets:` is co-residency vocabulary, not preload.** llama-swap does not
+start a set. The expression says which models may share the card in that
+use case; llama-swap loads/evicts within it under its own policy. We use
+the same expression to price the worst branch in the chat solve.
+
+Example of the emitted form (adapters, `emb`, `rnk`, … are the matrix vars
+from `vars:`):
+
+```yaml
+routing:
+  router:
+    use: matrix
+    settings:
+      matrix:
+        vars: {c1: qwen38-27b-dirk.coding.t, emb: jina-v5-small-retrieval, rnk: qwen3-reranker-0.6b}
+        sets:
+          rag:  (c1 | c2 | …) & emb & rnk
+          ragz: (c1 | c2 | …) & emb & rnk2
+```
+
+`rag` and `ragz` are two use cases that differ only in which model fills
+the rerank element. A request naming a var is routed through the sets that
+contain it.
+
 ## Models, tasks, engines and endpoints
 
 Four nouns, four owners. Keeping them apart is what stops "role" from
