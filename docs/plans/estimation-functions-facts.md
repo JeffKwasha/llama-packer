@@ -25,9 +25,12 @@ Source: `llama_packer/vram.py` docstrings and `glossary.md` ("the affine law").
    - `compute_mib = max(compute across the three runs)`.
    - `model_mib = r1["model"]` (from the first run).
    - Source is `"fit-estimate"`.
-4. Serve correction (`get_serve_correction`) — arch-level, machine-local
+4. ~~Serve correction (`get_serve_correction`) — arch-level, machine-local
    (`serve-corrections.yaml`), applied as deltas: `delta_c`, `delta_d`,
-   `delta_fixed`. Correction shape mismatch warns but still applies.
+   `delta_fixed`.~~ **Removed** by the sound-path plan (Phase 3,
+   2026-10-18). The probe now persists absolute `FitParams`
+   (`source: llama-server`) in the sidecar `derived:` block; the old table
+   is neither read nor written.
 5. `_fit_params_fast` — transient (no corrections, never persisted).
 6. `_estimate_safetensors` — from safetensors header.
 7. vLLM: `vllm-memory-estimator` on HF repo, or safetensors header. **UNTESTED — no vLLM installation on this hardware; this is a future roadmap item. No model in the live fleet declares the vllm backend. Nothing in this document is verified for this path.**
@@ -94,7 +97,8 @@ None of these constants have a documented basis (no "measured on X" or
 - `saved_for(cache_type, shape)` rejects blocks where `str(d["shape"]) != str(shape)`.
 - Blocks without a `shape` key are rejected (pre-shape legacy).
 - `_SHAPE_SOURCES = {"llama-server", "fit-estimate", "fit-params"}`.
-- `serve-corrections.yaml`: arch-level, shape mismatch warns but applies anyway.
+- `serve-corrections.yaml`: removed — the probe persists absolute
+  `FitParams` blocks instead; the old file is no longer read.
 
 ## Measured vs actual (Dirk, 2026-10-18)
 
@@ -181,13 +185,11 @@ Notes:
 - The probe measured at 65536, 32768, 16384 contexts with p=1 and p=2.
 - spill_mib = 0.0 for all measurements (no VRAM spill).
 - The correction row is keyed by arch "qwen35", cache_type "q8_0", mtp_on=1.
-- Dirk has MTP baked in (mtp_baked_in=True), so the correction was filed.
-- The correction is applied at pack time via get_serve_correction.
-- The fit-estimate block in the sidecar still says source: fit-estimate.
-  The correction is applied on top at pack time, not persisted to the sidecar.
-- serve-corrections.yaml (arch-level) is separate from per-model derived blocks.
-- The correction table's mtp dimension is baked-in drafts only.
-  A witness with --spec-draft-model carries companion weights separately.
+- Dirk has MTP baked in (mtp_baked_in=True), so the probe persists a
+  measured block for it.
+- The probe writes absolute `FitParams` (`source: llama-server`) into the
+  sidecar `derived:` block; nothing is applied on top at pack time.
+- Old `serve-corrections.yaml` rows are no longer read.
 
 
 ## VRAM measurement methodology — limitations

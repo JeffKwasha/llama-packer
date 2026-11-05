@@ -35,7 +35,7 @@ because `capabilities.in/out` are freeform lists.
 ## Sidecar
 
 ```yaml
-role: t2s                      # or s2t
+tasks: [t2s]                   # or [s2t]
 audio_cpp:
   family: kokoro_tts           # required — audio.cpp resolves package specs by family
   task: tts                    # default per family (see below), else by role

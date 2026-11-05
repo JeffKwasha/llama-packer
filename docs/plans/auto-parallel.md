@@ -1,6 +1,6 @@
 # Plan: Auto-parallel — spend leftover VRAM on concurrent chat slots
 
-Status: **implemented on branch `auto-parallel-requests`** (2026-09-07):
+Status: **implemented** (2026-09-07; merged to `main`):
 value-function solve (`parallel_value`), `resolve_min_ctx` cascade,
 `matrix:` knobs (`auto_parallel`, `auto_parallel_max`, `parallel_power`),
 shared `PoolLedger` + `pools:` config + size buckets, vLLM `--max-num-seqs`

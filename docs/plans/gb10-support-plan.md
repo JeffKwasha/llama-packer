@@ -1,9 +1,9 @@
 # GB10 / DGX Spark vLLM support — llama-packer change plan
 
-**Status:** implemented on `gb10-support` (261 tests passing; see "Amendment summary")
+**Status:** implemented (merged to `main`; see "Amendment summary")
 **Date:** 2026-09-09 (reviewed & amended, implemented 2026-09-09)
-**Branch:** `gb10-support` (new feature branch off `main`; supersedes the stale
-`vllm-gb10` scaffold branch — the backend scaffold itself is already on `main`)
+**Branch:** `gb10-support` (merged; supersedes the stale `vllm-gb10` scaffold
+branch — the backend scaffold itself is already on `main`)
 
 **Amendment summary (2026-09-09 review against llama-swap v253 public docs and
 the deployed code):** the old C6+C7 are merged and corrected into the new C6

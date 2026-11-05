@@ -1,8 +1,8 @@
 # Plan: tasks and endpoints — the serving-contract redesign
 
-Status: **design accepted in principle** (2026-10-29); **P0–P1 landed**
-2026-10-30. Branch `feat/tasks-and-endpoints`, stacked on PR #4
-(`feat/cpu-residency-budget`).
+Status: **design accepted in principle** (2026-10-29); **P0–P4 landed**
+(2026-10-30/31, PRs #6–#8, #10–#13); **P5 open**.
+Stacked on PR #4 (`feat/cpu-residency-budget`); all branches merged to `main`.
 Supersedes `docs/plans/audio-roles.md`'s role proposal (cited, absorbed) and
 the operations-on-engines half of `llama_packer/roles.py` as landed in the
 `6ca96fd` roles refactor. Related: `docs/architecture.md`,
@@ -296,7 +296,7 @@ design and tracked in [`roadmap.md`](roadmap.md).
 - Trace rows 90 (`docs/plans/requirement-trace.md`): replaced by per-
   portion rows as tests land.
 
-## Portions (this branch)
+## Portions
 
 Each portion ships green: trace rows → tests → mutation anchors → suite →
 `check_trace` → `check_mutation` → live dry-run → `llama-swap -validate`.
@@ -323,7 +323,7 @@ refactor.
   near-miss hint on an unknown name. `backend:` is an alien key; only an
   orphan (no authored sidecar) keeps inference. The fleet's sidecars are
   migrated by an operator run of `engines-migrate.py`.
-- **P3 endpoint registry**: validation API and the doc/code agreement test
+- **P3 endpoint registry** *(landed 2026-10-30)*: validation API and the doc/code agreement test
   (the file, the closed id set and the per-engine lists landed in P1);
   endpoint ids checked against the docs.
 - **P4 task catalog** *(landed 2026-10-31; fleet migration runs separately)*:

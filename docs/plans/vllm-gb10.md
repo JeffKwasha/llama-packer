@@ -1,9 +1,10 @@
 # vLLM / DGX Spark backend — design proposal
 
-**Status:** in progress — docker-vLLM scaffold implemented on `main`; recipe keys
-+ container correctness on `gb10-support` (see `docs/plans/gb10-support-plan.md`)
+**Status:** in progress — docker-VLLM scaffold, recipe keys and container
+correctness merged to `main` (see `docs/plans/gb10-support-plan.md`); the
+remaining followers are listed under "Planned" below.
 **Date:** 2026-08-15 (updated 2026-09-09)
-**Branch:** `gb10-support` (supersedes the stale `vllm-gb10` scaffold branch)
+**Branch:** `gb10-support` (merged; supersedes the stale `vllm-gb10` scaffold branch)
 **Primary backend:** llama-swap / llama.cpp (unchanged). vLLM is a second backend
 *inside llama-swap* for the DGX Spark, not a separate toolchain.
 
