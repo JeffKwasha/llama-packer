@@ -147,7 +147,7 @@ matrix sets entirely; there is no `roles:` table and no hand-authored
 `sets:`.
 
 `ttl` is the temporal knob: sidecar > task > placement default, `0` = never,
-non-chat CPU helpers default to 3600 s.
+CPU-resident servings default to 3600 s (chat is not special).
 
 ### Where the registries live
 

@@ -199,10 +199,10 @@ MUTATIONS = {
         "llama_packer/__main__.py",
         "    elif isinstance(roles_cfg, (list, tuple)):",
         "    elif True:"),
-    "test_cpu_chat_entry_inherits_global_ttl": (
+    "test_cpu_chat_entry_gets_cpu_default_ttl": (
         "llama_packer/writer.py",
-        '    if ttl is not None:\n        entry["ttl"] = ttl',
-        '    entry["ttl"] = ttl'),
+        "    if model.on_cpu:\n        return CPU_HELPER_TTL",
+        "    if model.on_cpu:\n        return None"),
     "test_gpu_entry_has_no_ttl": (
         "llama_packer/writer.py",
         '    if ttl is not None:\n        entry["ttl"] = ttl',

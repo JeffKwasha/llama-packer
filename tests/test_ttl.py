@@ -50,11 +50,11 @@ def test_ttl_cpu_helper_defaults_to_host_lifetime():
         _task(role="embeddings")) == CPU_HELPER_TTL
 
 
-def test_ttl_cpu_chat_inherits_global():
-    # Validates: SPEC.md, "TTL": a chat serving on CPU is not a helper; it
-    # inherits globalTTL.
+def test_ttl_cpu_serving_gets_cpu_default():
+    # Validates: SPEC.md, "TTL": every CPU-resident serving gets the host
+    # default; chat is not special.
     assert resolve_entry_ttl(_m(on_cpu=True, role="chat"),
-                             _task(role="chat")) is None
+                             _task(role="chat")) == CPU_HELPER_TTL
 
 
 def test_ttl_device_entry_inherits_global():

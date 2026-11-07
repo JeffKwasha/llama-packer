@@ -280,15 +280,13 @@ def test_explicit_max_context_still_pins_and_floors(make_model):
     assert variants[0].ctx_size == 32768
 
 
-def test_plan_floor_unreachable_falls_back(make_model):
+def test_plan_floor_unreachable_emits_nothing(make_model):
     # Validates: SPEC.md, 'VRAM gating and reservation notes': a rung that does not fit is not a candidate; the next along the order is tried
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=999999)
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768})
-    variants = _planner(m).plan()["ap"]
-    assert variants[0].parallel == 1
-    assert variants[0].ctx_size == 32768
+    assert "ap" not in _planner(m).plan()
 
 
 def test_plan_floor_unreachable_solves_once(make_model):
@@ -313,9 +311,8 @@ def test_plan_floor_unreachable_solves_once(make_model):
         view = m.view_for(flag)
         if view is not m:
             view.vram.calc_ctx = fake
-    variants = _planner(m).plan()["ap"]
-    assert variants[0].parallel == 1
-    assert variants[0].ctx_size == 32768
+    variants = _planner(m).plan()
+    assert "ap" not in variants
     assert calls, "nothing was solved at all"
 
 
@@ -590,3 +587,23 @@ def test_cpu_resident_chat_gets_no_auto_parallel(make_model):
                       fit_bin="unused", vram_total=64 * 1024)
     planner._bounded_ctx = lambda *a, **k: 131072
     assert [v.parallel for v in planner.plan()["cpu-chat"]] == [1]
+
+
+def test_pinned_parallel_below_min_parallel_emits_nothing(make_model):
+    # A sidecar/profile parallel: is a pin. If it is below a task's
+    # min_parallel, the task cannot be served to its floor; no entry.
+    m = make_model("ap", backend="llama-server", role="chat",
+                   parallel=1, tasks=["chat"])
+    del m.frontmatter["context_length"]
+    _scripted_by_parallel(m, {1: 32768, 2: 16384})
+    profiles = Profiles({
+        "defaults": {"cache_type": "q8_0"},
+        "profiles": {"default": {}},
+        "tasks": {
+            "chat": {"endpoint": "openai.chat.completions", "role": "chat",
+                     "min_context": 8192, "min_parallel": 2},
+        },
+    })
+    plan = Planner([m], profiles, fit_bin="unused",
+                   vram_total=48 * 1024).plan()
+    assert all(v.category.id != "chat" for v in plan.get("ap", []))

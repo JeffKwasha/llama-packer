@@ -437,7 +437,7 @@ decision quality (`docs/plans/cpu-residency-budget.md`):
 - **eviction is capacity-driven**: when `ram` is full, llama-swap evicts the
   cheapest resident instead of failing. There is no automatic offload.
 - a CPU model is not exempt from eviction; evicting it frees host RAM.
-  TTL defaults a non-chat CPU helper to 3600 s; set `ttl: 0` to keep it.
+  TTL defaults a CPU-resident serving to 3600 s; set `ttl: 0` to keep it.
 
 **Moving a whole usecase off VRAM** takes one declaration —
 `profiles.yaml device_roles: [embeddings, rerank]` (or the mapping
@@ -479,10 +479,11 @@ Defaults: 128k, 64k, 20k, 4k, 1.25.
 ### TTL
 
 Per-entry `ttl` resolves sidecar > task > placement default. `0` disables
-idle unload; otherwise the smallest declared lifetime wins. A non-chat
-`device: cpu` helper with nothing declared gets 3600 s; a chat or device
-entry emits no per-entry ttl and inherits `globalTTL`. TTL and capacity are
-independent: TTL yields time, capacity bounds memory.
+idle unload; otherwise the smallest declared lifetime wins. A `device: cpu`
+serving with nothing declared gets 3600 s — every role, chat included;
+override it with `ttl: 0` or an explicit number. A device entry emits no
+per-entry ttl and inherits `globalTTL`. TTL and capacity are independent:
+TTL yields time, capacity bounds memory.
 
 ### What `parallel_power` actually controls
 

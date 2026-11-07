@@ -306,10 +306,10 @@ def resolve_entry_ttl(model: Model, demand: "Task | None",
                       role_ttl: int | None = None) -> int | None:
     """The idle-unload lifetime for one entry, in seconds.
 
-    Declared scopes are sidecar and task; the smallest lifetime wins, and
-    ``0`` ("no idle unload") is the strongest keep. With nothing declared a
-    non-chat CPU helper gets :data:`CPU_HELPER_TTL`; everything else returns
-    None, leaving llama-swap's ``globalTTL`` in force.
+    Declared scopes are sidecar, task and role; the smallest lifetime wins,
+    and ``0`` ("no idle unload") is the strongest keep. With nothing
+    declared, a CPU-resident serving gets :data:`CPU_HELPER_TTL`; a device
+    entry returns None, leaving llama-swap's ``globalTTL`` in force.
     """
     declared: list[int] = []
     if "ttl" in getattr(model, "sidecar_keys", ()):
@@ -327,7 +327,7 @@ def resolve_entry_ttl(model: Model, demand: "Task | None",
         if any(v == 0 for v in declared):
             return 0
         return min(declared)
-    if model.on_cpu and (demand.role if demand is not None else model.role) != "chat":
+    if model.on_cpu:
         return CPU_HELPER_TTL
     return None
 
@@ -1886,7 +1886,7 @@ class Planner:
         power: float | None = None,
         min_parallel: int = 1,
         profile: dict | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int] | None:
         """Solve (parallel, ctx) for one unpinned chat variant.
 
         Scores ``(ctx/floor)^0.5 × slots^B`` over feasible candidates and
@@ -1894,13 +1894,13 @@ class Planner:
         existing budget path (:meth:`_bounded_ctx`); the score rises with
         ctx, so only the max affordable ctx per slot count is scored.  The
         loop breaks at the first unaffordable slot count (affordability
-        falls as slots rise).  Falls back to today's outcome (group
-        parallel, max affordable ctx) when the floor is unreachable.
+        falls as slots rise).
 
-        *min_parallel* is a soft floor from a usage demand: candidates that
-        meet it win outright, but meeting the context floor takes precedence,
-        because the context is the property the entry id advertises and
-        concurrency is only a throughput preference.
+        ``floor`` (the task's ``min_context``) and ``min_parallel`` are both
+        floors.  No candidate that meets them means no entry for this task —
+        the same rule as an unreachable context.  ``parallel_power`` is the
+        knob that makes the solver try harder for slots; it never lowers a
+        floor.
         """
         power = self.knobs.parallel_power if power is None else power
         # vLLM's continuous batching makes a slot cost KV only (no per-slot
@@ -1912,8 +1912,7 @@ class Planner:
         solved: dict[int, int] = {}
 
         def maxctx(p: int) -> int:
-            # Memoized: the eager fallback and the loop share one solve per
-            # slot count, so an unaffordable p=1 warns once, not twice.
+            # Memoized: the loop shares one solve per slot count.
             if p not in solved:
                 solved[p] = self._bounded_ctx(
                     view, parallel=p, cache_type=cache_type,
@@ -1922,8 +1921,6 @@ class Planner:
                     profile=profile)
             return solved[p]
 
-        fallback = (group_parallel,
-                    min(maxctx(group_parallel), cap_ctx))
         cands: list[tuple[int, int]] = []
         for p in range(1, pmax + 1):
             m = maxctx(p)
@@ -1937,13 +1934,13 @@ class Planner:
             if ctx < floor:
                 continue
             cands.append((p, ctx))
-        # A usage demand's min_parallel is preferred, but never at the cost
-        # of the context floor: the id advertises the context, and a client
-        # that cannot fit its prompt has nothing to gain from a spare slot.
         if min_parallel > 1:
-            preferred = [c for c in cands if c[0] >= min_parallel]
-            if preferred:
-                cands = preferred
+            cands = [c for c in cands if c[0] >= min_parallel]
+        if not cands:
+            logger.info("auto-parallel: %s has no serving at ctx>=%d and "
+                        "slots>=%d; no entry", view.stem, floor,
+                        min_parallel)
+            return None
         # Ties go to *more* slots. With power > 0 a model holding its cap
         # scores strictly higher at every slot count, so it never ties; the
         # flat case is power 0, where slots are worth nothing and the choice
@@ -1955,12 +1952,8 @@ class Planner:
             score = parallel_value(ctx, floor, p, power)
             if best is None or score >= best[0]:
                 best = (score, p, ctx)
-        if best is None:
-            logger.info("auto-parallel: %s floor %d unreachable; keeping "
-                        "parallel=%d", view.stem, floor, group_parallel)
-            return fallback
         _, p_star, ctx_star = best
-        if (p_star, ctx_star) != fallback:
+        if p_star != group_parallel:
             logger.info("auto-parallel: %s parallel=%d ctx=%d (floor %d)",
                         view.stem, p_star, ctx_star, floor)
         return p_star, ctx_star
@@ -2675,7 +2668,7 @@ class Planner:
                         shed_vision = "vision" in rung.shed
                         serve_view = model.view_for(not shed_vision)
                         if auto:
-                            par, ctx = self._auto_parallel(
+                            solved = self._auto_parallel(
                                 serve_view, cache_type=cache_type,
                                 spare_mb=spare_eff,
                                 include_mmproj=not shed_vision,
@@ -2685,6 +2678,9 @@ class Planner:
                                 min_parallel=demand.min_parallel,
                                 group_parallel=parallel,
                                 profile=group[0][1])
+                            if solved is None:
+                                continue
+                            par, ctx = solved
                         else:
                             par = parallel
                             ctx = self._bounded_ctx(
@@ -2695,6 +2691,13 @@ class Planner:
                                 context_length=cap_ctx,
                                 profile=group[0][1])
                             if ctx < demand.min_context:
+                                continue
+                            if par < demand.min_parallel:
+                                logger.info(
+                                    "%s: pinned parallel=%d is below the %s "
+                                    "min_parallel=%d; no entry", model.stem,
+                                    par, demand.id or "fallback",
+                                    demand.min_parallel)
                                 continue
                         # Admission is judged on the serving just resolved,
                         # per category -- not on a probe taken before the
