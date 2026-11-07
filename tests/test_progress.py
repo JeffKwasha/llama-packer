@@ -172,7 +172,6 @@ def test_fit_params_logs_before_run(make_model, fit_params_block, monkeypatch, c
 
 def test_fit_params_cache_hit_is_silent(make_model, fit_params_block,
                                         monkeypatch, caplog):
-    # Validates: docs/plans/estimation-functions-facts.md, 'FitParams sources (in priority order)': a cached measurement re-runs nothing and says nothing
     import subprocess
 
     m = make_model("pc", **{"derived": fit_params_block})

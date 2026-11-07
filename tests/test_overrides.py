@@ -71,7 +71,7 @@ def test_apply_overrides_sidecar_seed(make_model, tmp_path):
 
 
 def test_apply_overrides_backend_is_alien(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md #96 -- `backend:` is not a sidecar key and never selects an engine.
+    # Validates: docs/plans/requirement-trace.md, requirement #96
     import logging
     profiles = {"overrides": [{"when": {"base_model": "qwen"}, "backend": "bogus"}]}
     m = make_model("qwen3-8", base_model="qwen3.8", name="qwen3-8")

@@ -50,7 +50,6 @@ def test_filter_supported_allows_role_on_matching_backend(make_model):
 # ── shared matrix solve: degenerate inputs ────────────────────────────────
 
 def test_solve_matrix_no_chat_participants_returns_none(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a matrix with no chat participant has no shared solve.
     embed = _stub_vram(make_model("e", role="embeddings"))
     rerank = _stub_vram(make_model("r", role="rerank"))
     profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
@@ -79,7 +78,6 @@ def _matrix_fixture(make_model, monkeypatch, chat_backend, chat_parallel):
 
 
 def test_matrix_parallel_zero_vllm_is_treated_as_single_seq(make_model, monkeypatch):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a vLLM entry with parallel 0 is one sequence, not zero.
     result, captured = _matrix_fixture(make_model, monkeypatch, "vllm", 0)
     assert result is not None
     # vLLM uncapped -> the shared solve evaluates one max-length sequence.
@@ -87,7 +85,6 @@ def test_matrix_parallel_zero_vllm_is_treated_as_single_seq(make_model, monkeypa
 
 
 def test_matrix_parallel_zero_llama_cpp_falls_back_to_default(make_model, monkeypatch):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a llama.cpp entry with parallel 0 falls back to the default count.
     result, captured = _matrix_fixture(make_model, monkeypatch, "llama-server", 0)
     assert result is not None
     assert captured["chat_models"][0][5] == 4

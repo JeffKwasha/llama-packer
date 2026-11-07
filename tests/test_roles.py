@@ -7,7 +7,7 @@ from llama_packer.backends import BACKENDS
 
 
 def test_role_registry_derives_its_sets():
-    # Validates: docs/plans/cpu-residency-budget.md #30 -- served,
+    # Validates: docs/plans/requirement-trace.md, requirement #90
     # non-chat, device and context facts all come from one table.
     assert roles.SERVED_ROLES == ("chat", "embeddings", "rerank",
                                   "image", "s2t", "t2s")
@@ -22,7 +22,7 @@ def test_role_registry_derives_its_sets():
 
 
 def test_every_task_maps_to_a_served_endpoint():
-    # Validates: docs/plans/requirement-trace.md #90 -- every task maps to a
+    # Validates: docs/plans/requirement-trace.md, requirement #90
     # closed endpoint that at least one engine serves, and no engine
     # advertises an endpoint no task uses.
     from llama_packer import endpoints

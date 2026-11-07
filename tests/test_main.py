@@ -72,7 +72,7 @@ def test_health_check_explicit_speed_and_env(tmp_path, monkeypatch):
 
 
 def test_matrix_resolution_measures_with_fit_binary(monkeypatch):
-    # Validates: docs/plans/roadmap.md, "--fit-print": the measurement runs
+    # Validates: docs/plans/requirement-trace.md, requirement #104
     # llama-fit-params, never llama-server.
     import logging
     import llama_packer.__main__ as main_mod
@@ -147,7 +147,6 @@ def _stub_model(stem, role):
 
 
 def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -165,7 +164,6 @@ def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
 
 
 def test_detect_matrix_silent_without_rag_models(caplog):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -181,7 +179,6 @@ def test_detect_matrix_silent_without_rag_models(caplog):
 
 
 def test_detect_matrix_selects_when_section_present(caplog):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -204,7 +201,6 @@ def test_detect_matrix_selects_when_section_present(caplog):
 
 
 def test_detect_matrix_custom_categories(caplog):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -235,7 +231,6 @@ def test_detect_matrix_custom_categories(caplog):
 
 
 def test_detect_matrix_warns_retired_evict_costs(caplog):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
 
@@ -376,7 +371,7 @@ def _role_model(stem, mb, role="embeddings", **fm):
 
 
 def test_select_model_prefers_cpu_candidate():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- a device: cpu
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # candidate wins the resident role over a smaller device model.
     gpu_small = _role_model("voyage", 355)
     cpu_big = _role_model("jina", 472, device="cpu")
@@ -384,7 +379,7 @@ def test_select_model_prefers_cpu_candidate():
 
 
 def test_select_model_smallest_among_cpu_candidates():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no measured
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # cost available, the smallest footprint is the fallback among CPU
     # candidates.
     cpu_big = _role_model("qwen3-embed", 640, device="cpu")
@@ -394,7 +389,7 @@ def test_select_model_smallest_among_cpu_candidates():
 
 
 def test_select_model_no_cpu_keeps_size_rule():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no CPU
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # candidate the selection is unchanged (smallest footprint).
     big = _role_model("big", 900)
     small = _role_model("small", 355)
@@ -402,7 +397,7 @@ def test_select_model_no_cpu_keeps_size_rule():
 
 
 def test_select_model_selector_overrides_cpu_preference():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- an explicit
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # selector overrides the CPU preference.
     cpu = _role_model("jina", 472, device="cpu")
     gpu = _role_model("voyage", 355)
@@ -410,7 +405,7 @@ def test_select_model_selector_overrides_cpu_preference():
 
 
 def test_selection_reason_names_the_arm():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- the resident pick
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # logs why it won (explicit CPU placement vs smallest footprint).
     cpu = _role_model("jina", 472, device="cpu")
     gpu = _role_model("voyage", 355)
@@ -419,7 +414,7 @@ def test_selection_reason_names_the_arm():
 
 
 def test_selection_reason_names_the_cost_terms():
-    # Validates: docs/plans/cpu-residency-budget.md #27 -- a priced pick names
+    # Validates: docs/plans/requirement-trace.md, requirement #87
     # weights/compute/KV, so two residents that both cost 1050 MiB can be seen
     # to be the same shape rather than a repeated number hiding a bug.
     m = _role_model("jina", 1050, device="cpu")
@@ -434,7 +429,7 @@ def test_selection_reason_names_the_cost_terms():
 
 
 def test_device_roles_place_every_role_model(make_model, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #19 -- device_roles names
+    # Validates: docs/plans/requirement-trace.md, requirement #79
     # roles whose every model is CPU-placed, logged with the count.
     import logging
     from llama_packer.__main__ import apply_device_roles
@@ -449,7 +444,7 @@ def test_device_roles_place_every_role_model(make_model, caplog):
 
 
 def test_device_roles_absent_and_unmatched(make_model, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #19 -- absent key changes
+    # Validates: docs/plans/requirement-trace.md, requirement #79
     # nothing; a role matching no model warns.
     import logging
     from llama_packer.__main__ import apply_device_roles
@@ -462,7 +457,7 @@ def test_device_roles_absent_and_unmatched(make_model, caplog):
 
 
 def test_device_roles_rejects_unknown_role(make_model, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #19 -- unknown role names
+    # Validates: docs/plans/requirement-trace.md, requirement #79
     # warn and are ignored (placement stays an explicit, known-role act).
     import logging
     from llama_packer.__main__ import apply_device_roles
@@ -474,7 +469,7 @@ def test_device_roles_rejects_unknown_role(make_model, caplog):
 
 
 def test_device_roles_rejects_a_non_cpu_value(make_model, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #19 -- the mapping is
+    # Validates: docs/plans/requirement-trace.md, requirement #79
     # role -> device: a value that is not `cpu` places nothing and says so.
     # A silent no-op is how `role: cpu` thinking survives a repack.
     import logging
@@ -487,7 +482,7 @@ def test_device_roles_rejects_a_non_cpu_value(make_model, caplog):
 
 
 def test_device_roles_rejects_a_scalar(make_model, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #19 -- device_roles is a
+    # Validates: docs/plans/requirement-trace.md, requirement #79
     # list of roles or a role->device mapping; a bare scalar is a typo, not a
     # shorthand, and must warn instead of crashing on iteration.
     import logging
@@ -500,7 +495,7 @@ def test_device_roles_rejects_a_scalar(make_model, caplog):
 
 
 def test_select_model_picks_measured_cheapest_over_file_size():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- the resident is the
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # cheapest *measured serving at its ctx*, not the smallest file: a big
     # file with cheap KV beats a small file with expensive KV.
     cheap = _role_model("cheap-big", 900, device="cpu")
@@ -513,7 +508,7 @@ def test_select_model_picks_measured_cheapest_over_file_size():
 
 
 def test_select_model_falls_back_to_size_when_unmeasurable():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- with no measurable
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # candidate the size rule is the fallback, never an invented cost.
     a = _role_model("a", 900, device="cpu")
     b = _role_model("b", 300, device="cpu")
@@ -522,7 +517,7 @@ def test_select_model_falls_back_to_size_when_unmeasurable():
 
 
 def test_select_model_cpu_preference_beats_cheaper_device():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- the CPU candidate
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # wins the role before cost is compared (placement is the operator's).
     gpu = _role_model("gpu-cheap", 100)
     cpu = _role_model("cpu-costly", 900, device="cpu")
@@ -532,7 +527,7 @@ def test_select_model_cpu_preference_beats_cheaper_device():
 
 
 def test_select_model_selector_prices_only_the_pick():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- a selector names the
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # resident and prices it; it never re-ranks the other candidates.
     a = _role_model("jina", 472, device="cpu")
     b = _role_model("voyage", 355, device="cpu")
@@ -546,7 +541,7 @@ def test_select_model_selector_prices_only_the_pick():
 
 
 def test_selection_reason_measured_and_selector_arms():
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- the log names the
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     # arm that won: measured cost, selector, or the size fallback.
     m = _role_model("jina", 472, device="cpu")
     assert _selection_reason(m, 1050) == "cheapest measured resident, 1050 MiB"
@@ -556,7 +551,7 @@ def test_selection_reason_measured_and_selector_arms():
 
 
 def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatch):
-    # Validates: docs/plans/cpu-residency-budget.md #17 -- the category
+    # Validates: docs/plans/requirement-trace.md, requirement #81
     # selector is the RAG pair too: one answer per role, never a solve on one
     # model while the `emb` var points at another.
     import logging

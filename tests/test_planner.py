@@ -223,7 +223,6 @@ FP_PARAMS = (1000.0, 0.5, 0.0, 100.0)
 
 def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
         make_model, profiles, monkeypatch):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     from llama_packer import writer
 
     chat_a = make_model("chat_a", role="chat")
@@ -584,7 +583,6 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
     # reserving its VRAM against every chat solve buys nothing and only
     # shrinks context.  Regression (2026-09-26): two unreferenced ASR
     # co-loads charged 4725 MB and collapsed a 27B from 188416 to 32768.
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -616,7 +614,6 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
 
 
 def test_prune_leaves_removes_refused_members():
-    # Validates: docs/plans/cpu-residency-budget.md #33 -- a refused CPU
     # category disappears from the emitted sets without leaving a dangling
     # var; sizes keep their members and empty groups collapse.
     from llama_packer.writer import _prune_leaves as prune_leaves
@@ -634,7 +631,7 @@ def test_prune_leaves_removes_refused_members():
 
 
 def test_category_ctx_caps_at_one_seam(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #32 -- a per-category
+    # Validates: docs/plans/requirement-trace.md, requirement #92
     # ctx is a cap honoured by the served context and never a floor.
     from llama_packer.writer import resident_ctx
     m = make("stt2", role="s2t", context_length=32768, device="cpu")
@@ -648,7 +645,6 @@ def test_category_ctx_caps_at_one_seam(profiles):
 
 
 def test_host_unit_refusals_drop_the_unit(profiles, monkeypatch):
-    # Validates: docs/plans/cpu-residency-budget.md #33 -- a CPU
     # composition that cannot fit is refused as a unit: each category in
     # the unit gets no id, nothing commits, and the emitted set loses
     # both leaves.
@@ -680,7 +676,6 @@ def test_host_unit_refusals_drop_the_unit(profiles, monkeypatch):
 
 def test_host_unit_refusals_survive_one_fitting_set(profiles, monkeypatch,
                                                    caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #33 -- a category that
     # any fitting composition admits survives (it is an alternative of the
     # failing one, not co-resident); the failing composition warns.
     import logging
@@ -714,7 +709,6 @@ def test_host_unit_refusals_survive_one_fitting_set(profiles, monkeypatch,
 
 
 def test_resident_options_branch_alternatives_not_co_resident():
-    # Validates: docs/plans/cpu-residency-budget.md #31 -- membership is
     # judged per and-branch: an alternation never reports same-role
     # co-residency, only a genuine conjunction does.
     from llama_packer.writer import _resident_options
@@ -725,7 +719,6 @@ def test_resident_options_branch_alternatives_not_co_resident():
 
 
 def test_sets_reference_coloads():
-    # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the co-load pass only fires when a routing set can actually co-locate
     assert _sets_reference_coloads(COLOAD_SETS) is True
     assert _sets_reference_coloads({"rag": "__CHAT_VARS__ & emb & rnk"}) is False
     assert _sets_reference_coloads({}) is False
@@ -756,7 +749,6 @@ def _solve_sets(profiles, cats, sets, vram_total=32 * 1024):
 
 
 def test_solve_matrix_reserves_worst_set_not_category_union(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #23 -- the chat solve is
     # charged the worst branch of the most expensive chat set, not the sum of
     # every declared category.  (three | (two & one)) costs max(4000, 3000).
     cats = [("one", _bucket("one", 1000)),
@@ -775,7 +767,6 @@ def test_solve_matrix_reserves_worst_set_not_category_union(profiles):
 
 
 def test_solve_matrix_prices_a_nested_and_branch(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #22 -- (one | (two & three))
     # costs two + three when that branch is larger, so a nested group is never
     # priced as an unknown var worth 0.
     cats = [("one", _bucket("one", 1000)),
@@ -790,7 +781,6 @@ def test_solve_matrix_prices_a_nested_and_branch(profiles):
 
 
 def test_solve_matrix_unreferenced_category_reserves_nothing(profiles, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #24 -- a category no set
     # names can only run alone, so it must not shrink the chat solve.
     cats = [("three", _bucket("three", 4000))]
     sets = {"rag": "__CHAT_VARS__ & emb & rnk"}
@@ -803,7 +793,7 @@ def test_solve_matrix_unreferenced_category_reserves_nothing(profiles, caplog):
 
 
 def test_resident_cost_detail_names_the_terms(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #27 -- the cost the log
+    # Validates: docs/plans/requirement-trace.md, requirement #87
     # prints is the same quad the budget charges, broken into its terms.
     from llama_packer.writer import resident_cost_detail
     m = make("jina", role="embeddings", context_length=4096)
@@ -818,7 +808,6 @@ def test_resident_cost_detail_names_the_terms(profiles):
 
 
 def test_solve_matrix_includes_smallest_coload_skips_big(profiles):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -887,7 +876,6 @@ def test_solve_matrix_reads_block_tokens_from_on_view(
 
 
 def test_solve_matrix_floor_blocks_all_coloads(profiles):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -913,7 +901,6 @@ def test_solve_matrix_floor_blocks_all_coloads(profiles):
 
 
 def test_solve_matrix_tools_floor_blocks_coload(profiles):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat", capabilities=["tools"])
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -939,7 +926,6 @@ def test_solve_matrix_tools_floor_blocks_coload(profiles):
 
 
 def test_solve_matrix_squeeze_adopted(profiles):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=32768)
     rerank = make("r", role="rerank", context_length=32768)
@@ -964,7 +950,6 @@ def test_solve_matrix_squeeze_adopted(profiles):
 
 
 def test_coload_on_cpu_costs_zero(profiles):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -1088,7 +1073,6 @@ def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
 def test_coload_estimate_gets_headroom(profiles):
     # No pin, no fit-params: the file-size + buffer estimate is padded by
     # estimate_headroom (1.25x default) so a bad guess errs toward reserving.
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings", context_length=8192)
     rerank = make("r", role="rerank", context_length=8192)
@@ -1211,7 +1195,6 @@ def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
 
 
 def test_solve_matrix_aborts_when_nothing_measurable(profiles):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     chat = make("chat", role="chat")
     embed = make("e", role="embeddings")
     chat.vram.effective_static = lambda *a, **k: None
@@ -1300,8 +1283,7 @@ def test_the_fallback_entry_joins_no_set(make_model):
     """Routing is what categories are for; the fallback has no name to
     route on, so it never joins a set and serves standalone.
 
-    Validates: docs/plans/category-semantics.md, 'The null category
-    (fallback)': it joins no set.
+    Validates: docs/plans/requirement-trace.md, requirement #42.
     """
     from llama_packer.writer import FALLBACK
     model = make_model("a")
@@ -1447,8 +1429,7 @@ def test_fallback_keeps_capability_until_the_minimum_forces_it(make_model):
     category never asked for would be a pointless trade. It sheds only when
     holding the capability would leave no legal serving at all.
 
-    Validates: docs/plans/category-semantics.md, 'The null category (fallback)':
-    it keeps mmproj and MTP even when that costs it all of its context.
+    Validates: docs/plans/requirement-trace.md, requirement #11.
     """
     from llama_packer.writer import FALLBACK
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -1468,7 +1449,7 @@ def test_fallback_keeps_capability_until_the_minimum_forces_it(make_model):
 def test_fallback_sheds_when_nothing_else_fits(make_model):
     """The other direction: no legal serving with the capability attached.
 
-    Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
+    Validates: docs/plans/requirement-trace.md, requirement #12.
     """
     from llama_packer.writer import FALLBACK
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -1782,7 +1763,7 @@ def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
 
 
 def test_cpu_resident_charges_host_not_vram(profiles, monkeypatch):
-    # Validates: docs/plans/cpu-residency-budget.md #74 -- a CPU resident charges
+    # Validates: docs/plans/requirement-trace.md, requirement #74
     # the host ledger (VRAM charge stays 0), and two committed quads for one
     # role are a planner bug.
     from llama_packer import writer
@@ -1818,7 +1799,7 @@ def test_cpu_resident_charges_host_not_vram(profiles, monkeypatch):
 
 
 def test_cpu_variant_refused_on_small_pool(profiles, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #12 -- a CPU entry whose
+    # Validates: docs/plans/requirement-trace.md, requirement #70, #75
     # quad exceeds the host pool emits no id and logs the shortfall.
     import logging
     m = make("cpu", role="chat", device="cpu")
@@ -1832,7 +1813,7 @@ def test_cpu_variant_refused_on_small_pool(profiles, caplog):
 
 
 def test_cpu_parallel_charge_flips_refusal(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #15 -- declared parallel
+    # Validates: docs/plans/requirement-trace.md, requirement #75
     # multiplies D and the KV pool and can flip the refusal.
     m = make("cpu", role="chat", device="cpu", parallel=2)
     _fake_vram(m, (466, 0.057, 346))
@@ -1846,7 +1827,7 @@ def test_cpu_parallel_charge_flips_refusal(profiles):
 
 
 def test_no_host_pool_never_gates(profiles, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #16 -- without a detected
+    # Validates: docs/plans/requirement-trace.md, requirement #76
     # pool the planner never refuses on host grounds.
     import logging
     m = make("cpu", role="chat", device="cpu")
@@ -1859,7 +1840,7 @@ def test_no_host_pool_never_gates(profiles, caplog):
 
 
 def test_host_resident_sizing_lifts_cpu_gate(profiles, monkeypatch):
-    # Validates: docs/plans/cpu-residency-budget.md #74 -- the host ledger
+    # Validates: docs/plans/requirement-trace.md, requirement #74
     # sizes CPU-resident residents through allow_cpu=True (fit_params_static
     # otherwise returns None for a device: cpu model and the charge reads 0).
     m = make("e", role="embeddings", device="cpu", context_length=8192)
@@ -1886,7 +1867,7 @@ def test_host_resident_sizing_lifts_cpu_gate(profiles, monkeypatch):
 
 
 def test_metadata_packing_cpu_entry(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #77 -- CPU entries name device/ctx/parallel/ram and carry no vram_mib.
+    # Validates: docs/plans/requirement-trace.md, requirement #77
     m = make("cpk", role="chat", device="cpu")
     _fake_vram(m, (466, 0.057, 346))
     variants = Planner([m], profiles, fit_bin="unused",
@@ -1905,7 +1886,7 @@ def test_metadata_packing_cpu_entry(profiles):
 
 
 def test_metadata_packing_gpu_entry(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #77 -- every entry carries packing; gpu entries carry vram_mib when decided.
+    # Validates: docs/plans/requirement-trace.md, requirement #77
     m = make("gpk", role="chat")
     _fake_vram(m, (466, 0.057, 346))
     variants = Planner([m], profiles, fit_bin="unused",
@@ -1934,7 +1915,7 @@ def test_cpu_chat_entry_gets_cpu_default_ttl(profiles):
 
 
 def test_gpu_entry_has_no_ttl(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #20 -- device entries keep
+    # Validates: docs/plans/requirement-trace.md, requirement #80
     # the inherited/global TTL (no per-model ttl key emitted).
     m = make("ttlgpu", role="chat")
     _fake_vram(m, (466, 0.057, 346))
@@ -1945,7 +1926,7 @@ def test_gpu_entry_has_no_ttl(profiles):
 
 
 def test_cpu_fixed_category_resident_charged_host(profiles, monkeypatch):
-    # Validates: docs/plans/cpu-residency-budget.md #74 -- a declared fixed
+    # Validates: docs/plans/requirement-trace.md, requirement #74
     # category (rnk2/stt/…) on device: cpu is a resident too and charges the
     # host pool, one per category.
     from llama_packer import writer

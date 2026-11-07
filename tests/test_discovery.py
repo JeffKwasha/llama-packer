@@ -133,7 +133,7 @@ def test_derived_role_is_not_an_alien_sidecar_key(make_model, caplog):
 
 
 def test_unknown_role_value_warns_with_a_hint(tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #28 -- role has one
+    # Validates: docs/plans/requirement-trace.md, requirement #88, #98
     # canonical spelling per role; a human alias warns instead of falling
     # through to "no backend supports" much later.
     import logging
@@ -148,7 +148,7 @@ def test_unknown_role_value_warns_with_a_hint(tmp_path, caplog):
 
 
 def test_unknown_device_value_warns(tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #28 -- device is `cpu`
+    # Validates: docs/plans/requirement-trace.md, requirement #88
     # or a non-negative index; anything else used to place the model on the
     # default GPU as if the key were absent.
     import logging

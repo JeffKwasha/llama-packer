@@ -291,7 +291,6 @@ def test_vllm_batch_flag_and_llama_only_strip(make_model):
 
 def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
                                                           monkeypatch):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     from llama_packer import writer
 
     chat = make_model("chat", context_length=32768)
@@ -329,7 +328,6 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
 def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
     # A declared non-RAG category (e.g. tts) is reserved as fixed overhead:
     # the solver sees fixed_overhead_mb > 0 for it.
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared VRAM budget for chat context plus co-loads. Runs the affine measurement once per model to get static constants, then.
     from llama_packer import writer
 
     chat = make_model("chat", context_length=32768)
@@ -465,7 +463,7 @@ def test_infer_backend_gguf_prefers_llama_server(make_model):
 
 
 def test_infer_backend_gguf_image_goes_to_sd_server(make_model):
-    # Validates: docs/plans/requirement-trace.md #90 -- an engine is chosen by the endpoint its task needs, not by format alone.
+    # Validates: docs/plans/requirement-trace.md, requirement #90
     from llama_packer.backends import infer_backend
     m = make_model("img", role="image")
     assert infer_backend(m, {"llama_bin": "/opt/llama-server",
@@ -688,7 +686,7 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
 
 
 def test_measurement_shape_stamps_cpu_device(make_model):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``device: cpu`` measures (and shape-stamps) with ``--n-gpu-layers 0`` instead of ``-ngl 999``, stamp included by ``measurement_args``.
+    # Validates: docs/plans/requirement-trace.md, requirement #61
     """A CPU-resident model's measurement shape carries the device pin:
     fit-params reports host buffers under it, and a later device flip
     (sidecar edit) invalidates the persisted block by shape."""
@@ -926,7 +924,7 @@ def test_infer_backend_allowed_reorders_and_disables(make_model):
 
 
 def test_apply_overrides_backend_is_alien(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md #96 -- `backend:` is not a sidecar key; compatibility is `engines:`.
+    # Validates: docs/plans/requirement-trace.md, requirement #96
     from llama_packer.scope import ScopeStack
     m = make_model("p", backend="vllm-docker")
     m.stub = False

@@ -137,7 +137,7 @@ def test_render_unit_lists_only_present_hidden_dirs(monkeypatch):
     # service never starts. Only what exists may be listed.
     #
     # Validates: docs/install.md, the systemd unit the installer writes.
-    # Validates: docs/plans/requirement-trace.md #53: `InaccessiblePaths=` lists only directories present on this host
+    # Validates: docs/plans/requirement-trace.md, requirement #53
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
     monkeypatch.setattr(ins, "inaccessible_paths",
@@ -162,7 +162,7 @@ def test_unit_is_enableable():
     # never comes back after a reboot.
     #
     # Validates: docs/install.md, the systemd unit the installer writes.
-    # Validates: docs/plans/requirement-trace.md #52: The unit is enableable: it carries `[Install] WantedBy=`
+    # Validates: docs/plans/requirement-trace.md, requirement #52
     body = ins.TEMPLATE.read_text()
     assert "[Install]" in body
     assert "WantedBy=multi-user.target" in body
@@ -473,7 +473,6 @@ def test_report_resolved_warns_on_missing_hf_home(tmp_path, caplog):
 
 
 def test_report_resolved_quiet_when_hf_home_exists(tmp_path, caplog):
-    # Validates: docs/plans/requirement-trace.md #51: an unreadable HF_HOME warns instead of crashing the installer
     existing = tmp_path / "hfcache"
     existing.mkdir()
     (tmp_path / "config.env").write_text(f"HF_HOME={existing}\n")

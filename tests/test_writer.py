@@ -49,7 +49,7 @@ def test_cpu_resident_uses_cpu_layers(make_model):
 
 
 def test_capabilities_context_is_served_window(make_model):
-    # Validates: docs/plans/requirement-trace.md #56: capabilities.context is the served per-slot window, not the trained maximum
+    # Validates: docs/plans/requirement-trace.md, requirement #56
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -67,7 +67,7 @@ def test_capabilities_context_is_served_window(make_model):
 def test_sidecar_lowers_max_output_tokens(make_model):
     # Validates: SPEC.md, 'Model Metadata': a sidecar may lower the
     # generation ceiling below the served window.
-    # Validates: docs/plans/requirement-trace.md #57: The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window
+    # Validates: docs/plans/requirement-trace.md, requirement #57
     model = make_model("m", backend="llama-server", max_output_tokens=32768)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -81,7 +81,7 @@ def test_sidecar_lowers_max_output_tokens(make_model):
 def test_max_output_tokens_never_exceeds_the_served_window(make_model):
     # Validates: SPEC.md, 'Model Metadata': the emitted ceiling is clamped
     # to the served window even when the sidecar asks for more.
-    # Validates: docs/plans/requirement-trace.md #57: The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window
+    # Validates: docs/plans/requirement-trace.md, requirement #57
     model = make_model("m", backend="llama-server", max_output_tokens=262144)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",

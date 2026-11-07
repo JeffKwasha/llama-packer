@@ -37,7 +37,6 @@ def _entry(make_model, stem="m", mem_vram=None, mem_ram=None, **frontmatter):
 
 
 def test_fmt_mib_gb_and_mb():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a size is printed in GB or MB, and a small but nonzero value stays visible.
     assert _fmt_mib(9318.0) == "9.1GB"
     assert _fmt_mib(1024.0) == "1.0GB"
     assert _fmt_mib(64.4) == "64MB"
@@ -51,29 +50,24 @@ def test_fmt_mib_gb_and_mb():
 
 
 def test_format_gpu_fit():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a GPU entry is tagged with its VRAM and its RAM.
     assert format_mem_tag(9318.0, 1228.0) == "[VRAM 9.1GB RAM 1.2GB]"
 
 
 def test_format_gpu_small_ram_uses_mb():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a small RAM figure is printed in MB.
     assert format_mem_tag(9318.0, 64.0) == "[VRAM 9.1GB RAM 64MB]"
 
 
 def test_format_cpu_only_is_ram_only():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a CPU-resident entry is tagged with RAM only.
     assert format_mem_tag(None, 2355.0) == "[RAM 2.3GB]"
 
 
 def test_format_verbatim_no_capping():
     # The decided number is reported even when physically impossible —
     # the tag never re-solves or caps.
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': the tag reports the decided numbers; it never re-solves or caps them.
     assert format_mem_tag(73.0 * 1024, 512.0) == "[VRAM 73.0GB RAM 512MB]"
 
 
 def test_format_reserved_spill_ssd_grammar():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': a spilling entry names the VRAM it keeps, the RAM it spills to and the SSD.
     tag = format_mem_tag(22.0 * 1024, 512.0, spill_mib=1.2 * 1024, ssd_mib=50.0 * 1024)
     assert tag == "[VRAM 22.0GB + 1.2GB RAM 512MB SSD 50.0GB]"
 
@@ -82,7 +76,6 @@ def test_format_reserved_spill_ssd_grammar():
 
 
 def test_with_mem_tag_appends_and_idempotent():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': the tag is appended, and re-tagging replaces it instead of doubling it.
     first = _with_mem_tag("Abliterated Gemma 3 12B.", "[VRAM 9.1GB RAM 1.2GB]")
     assert first == "Abliterated Gemma 3 12B. [VRAM 9.1GB RAM 1.2GB]"
     # Re-tagging (e.g. description copied back into a sidecar) replaces.
@@ -92,12 +85,10 @@ def test_with_mem_tag_appends_and_idempotent():
 
 
 def test_with_mem_tag_no_description():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': with no description the tag is the whole description.
     assert _with_mem_tag(None, "[RAM 2.3GB]") == "[RAM 2.3GB]"
 
 
 def test_with_mem_tag_none_passthrough():
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': no tag leaves the description alone.
     assert _with_mem_tag("text", None) == "text"
     assert _with_mem_tag(None, None) is None
 

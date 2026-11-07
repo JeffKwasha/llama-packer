@@ -26,7 +26,6 @@ from llama_packer.vram import (FitParams, parse_device_buffers,
 # ── serve-shaped log parsing ──────────────────────────────────────────────
 
 def test_parse_device_buffers_sums_device_only():
-    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     """Real Dirk (-text) numbers: weights max, both contexts' KV/RS/compute,
     host-visible buffers excluded."""
     text = """\
@@ -50,7 +49,6 @@ def test_parse_device_buffers_sums_device_only():
 
 
 def test_parse_device_buffers_empty_log():
-    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     assert parse_device_buffers("garbage") == {
         "weights": 0.0, "kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
 
@@ -77,7 +75,7 @@ _CPU_SERVE_LOG = """\
 
 
 def test_parse_host_buffers_reads_final_pass():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': The parse reads the **final pass** — the buffer lines between the last two breakdown headers — instead of summing duplicated pass lines; and: reports host-side (non-device) sums.
+    # Validates: docs/plans/requirement-trace.md, requirement #59
     """Host sums from the final pass only: pass-1's real compute (36.10)
     must not double count, and the host weights equal the breakdown's
     model column (two CPU_Mapped buffers sum, 121.50 + 344.78)."""
@@ -90,7 +88,7 @@ def test_parse_host_buffers_reads_final_pass():
 
 
 def test_parse_host_buffers_headerless_log_parses_whole():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a log with no breakdown header parses whole (fixture/fit-params compatible).
+    # Validates: docs/plans/requirement-trace.md, requirement #60
     text = """\
 0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =   344.78 MiB
 0.05.263.779 I llama_kv_cache:        CPU KV buffer size =   476.00 MiB
@@ -101,7 +99,7 @@ def test_parse_host_buffers_headerless_log_parses_whole():
 
 
 def test_parse_device_buffers_whole_log_device_path():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': the device path keeps its whole-log sums — the projection pass of a device run measures 0 — and never touches host sums.
+    # Validates: docs/plans/requirement-trace.md, requirement #65
     """Device sums are unchanged by this refactor: host-side values of a
     CPU-shaped run contribute nothing to them (excluded upstream by the
     spill check)."""
@@ -111,7 +109,6 @@ def test_parse_device_buffers_whole_log_device_path():
 
 
 def test_parse_spill_rejects_vulkanless_fullcpu_launch():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a ``-ngl 999`` launch that lost Vulkan still measures nothing — the spill check rejects it exactly as before.
     """A `-ngl 999` run that never got the GPU serves the full-CPU shape;
     the device-shaped spill formula sees host-visible KV and refuses."""
     assert parse_spill_mib(_CPU_SERVE_LOG) == pytest.approx(476.00)
@@ -119,7 +116,7 @@ def test_parse_spill_rejects_vulkanless_fullcpu_launch():
 
 def test_run_measure_server_cpu_shape_returns_host_buffers(
         make_model, tmp_path, guard_env):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``device: cpu`` measures (and shape-stamps) with ``--n-gpu-layers 0`` instead of ``-ngl 999`` … and never runs the device-shaped spill rejection.
+    # Validates: docs/plans/requirement-trace.md, requirement #61, #62
     model = make_model("a", device="cpu")
     stub = _stub_server(
         tmp_path,
@@ -140,7 +137,7 @@ def test_run_measure_server_cpu_shape_returns_host_buffers(
 
 def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
         make_model, tmp_path, guard_env):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a ``-ngl 999`` launch that lost Vulkan still measures nothing.
+    # Validates: docs/plans/requirement-trace.md, requirement #62
     model = make_model("a")
     stub = _stub_server(
         tmp_path,
@@ -156,7 +153,7 @@ def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
 
 
 def test_parse_fit_log_host_row_fallback():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``parse_fit_log`` falls back to the ``Host`` report row when no device row exists.
+    # Validates: docs/plans/requirement-trace.md, requirement #63
     """Captured CPU-shaped fit-params run: the affine report row is named
     ``Host`` — today the parse rejects the whole run."""
     text = """\
@@ -177,7 +174,7 @@ Host 466 476 316
 
 
 def test_parse_fit_log_prefers_device_row():
-    # Validates: docs/plans/estimation-functions-facts.md: the device report row; a ``Host`` row beside it never wins.
+    # Validates: docs/plans/requirement-trace.md, requirement #63
     text = """\
 Vulkan0 18904 8704 1552
 Host 466 476 316
@@ -190,7 +187,7 @@ Host 466 476 316
 
 def test_measure_affine_trio_cpu_shape_persists_host_quad(
         make_model, tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': the affine trio (``c`` from ``(C, C/2)``, ``D`` from the p pair) derives CPU quads without measuring anything anew.
+    # Validates: docs/plans/requirement-trace.md, requirement #64
     """Stub fit-params replays the three captured CPU-shaped runs
     (8192/1, 8192/2, 4096/1); c = (476−238)/4096, D = 0, weights 466.
     The persisted block carries the CPU device in its shape stamp."""
@@ -217,7 +214,7 @@ def test_measure_affine_trio_cpu_shape_persists_host_quad(
 
 def test_host_measurement_does_not_leak_into_vram_pricing(make_model,
                                                          tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md #11/#27 -- a host-RAM
+    # Validates: docs/plans/requirement-trace.md, requirement #74
     # measurement (allow_cpu=True, the host ledger) caches the same quad; a
     # VRAM-priced call must still see None, or the CPU resident is charged to
     # the chat solve after all.
@@ -288,7 +285,6 @@ def _stub_fit_run(tmp_path):
 # ── spill validity check (2026-09-07 post-mortem) ─────────────────────────
 
 def test_parse_spill_mib_host_kv_is_spill():
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib rejects host-KV capacity spills
     """Host KV = the capacity-spill signature; structural CPU-mapped
     weights (<= 2 GiB) and host compute/output staging are not spill."""
     text = """\
@@ -303,7 +299,6 @@ def test_parse_spill_mib_host_kv_is_spill():
 
 
 def test_parse_spill_mib_cpu_map_beyond_tolerance():
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib tolerates llama.cpp's structural CPU weight placement
     """CPU-mapped weights above the structural headroom = offload failure."""
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size =  8000.00 MiB
@@ -314,7 +309,6 @@ def test_parse_spill_mib_cpu_map_beyond_tolerance():
 
 
 def test_parse_spill_mib_clean_log_is_zero():
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib rejects host-KV capacity spills while tolerating llama.cpp's structural CPU weight placement
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB
 0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  8704.00 MiB
@@ -353,7 +347,6 @@ def guard_env(tmp_path, monkeypatch):
 
 
 def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     buffers = model.vram._run_measure_server(
         _stub_server(tmp_path, _OK_BODY), "q8_0", 8192, 1, "")
@@ -367,7 +360,6 @@ def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
 
 
 def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     body = ("echo '0.00 I llama_kv_cache: Vulkan_Host KV buffer size = "
             "8704.00 MiB'\necho listening on http://127.0.0.1:1\nexec sleep 30\n")
     model = make_model("a")
@@ -380,7 +372,6 @@ def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
 
 def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
                                                      monkeypatch):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     monkeypatch.setattr(vram.gpu_state, "llama_residents",
                         lambda: ["123 jk /x/llama-server -m y"])
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
@@ -395,7 +386,6 @@ def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
 
 def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
                                                    guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     stub = _stub_server(tmp_path, "echo starting\nexec sleep 60\n")
     buffers = model.vram._run_measure_server(stub, "q8_0", 8192, 1, "")
@@ -408,7 +398,6 @@ def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
 
 
 def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     stub = _stub_server(tmp_path, "exit 1\n")
     assert model.vram._run_measure_server(stub, "q8_0", 8192, 1, "") is None
@@ -713,7 +702,6 @@ def test_fit_params_static_measure_failure_uses_transient_fit_params(
 
 
 def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     """The persisted constants predict memory for any (context, slots)."""
     model = make_model("pred", **{"derived": fit_params_block})
     fp = model.vram.fit_params_static("unused")
@@ -723,7 +711,6 @@ def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
 
 
 def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     model = make_model("pf", **{"derived": None})
     monkeypatch.setattr(model.vram, "fit_params", lambda *a, **k: None)
     assert model.vram.fit_params_static("/bin/fit") is None
@@ -733,7 +720,6 @@ def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
 
 
 def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     legacy = dict(fit_params_block)
     legacy.pop("kv_per_token_mib")
     legacy.pop("slot_mib")
@@ -747,7 +733,6 @@ def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
 
 def test_fit_params_static_cache_type_mismatch_remeasures(
         make_model, fit_params_block):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     model = make_model("s", **{"derived": fit_params_block})
     assert model.vram.fit_params_static("unused", cache_type="q8_0") is not None
     # A different cache type has no readable block and no binary: None.
@@ -925,7 +910,6 @@ def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog)
 
 
 def test_solve_matrix_ctx_basic(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     chat = make_model("chat", context_length=32768)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768,
@@ -943,7 +927,6 @@ def test_solve_matrix_ctx_basic(make_model):
 
 
 def test_solve_matrix_ctx_no_chat_models():
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0, chat_models=[],
         embed_params=None, rerank_params=None,
@@ -952,7 +935,6 @@ def test_solve_matrix_ctx_no_chat_models():
 
 
 def test_solve_matrix_ctx_exhausted_budget(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     chat = make_model("chat", context_length=32768)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0,
@@ -964,7 +946,6 @@ def test_solve_matrix_ctx_exhausted_budget(make_model):
 
 
 def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     """An unestimable rider (zero-cost placeholder, kv_factor 0) rides the
     measurable models' solve — its native max must not inflate the shared
     chat context (which would suppress tools demotion fleet-wide and serve
@@ -985,7 +966,6 @@ def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
 
 
 def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     rider = make_model("rider", context_length=262144)
     ctx = solve_matrix_ctx(
         vram_total_mb=32768, spare_mb=0,
@@ -1000,7 +980,6 @@ def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
 
 
 def test_measure_affine_trio_small_design_exact(make_model):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': VRAM follows a validated affine law: model + kv x ctx x slots + slot + compute
     """The pool difference divides by the ACTUAL ctx delta: designs below
     8192 (the former r3 floor at 4096) previously mis-derived c by ~1.5x
     and persisted it as a trusted fit-estimate block."""
@@ -1022,7 +1001,6 @@ def test_measure_affine_trio_small_design_exact(make_model):
 
 
 def test_measure_affine_trio_sub4k_design_still_measures(make_model):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': VRAM follows a validated affine law, measured live over a (ctx, parallel) grid
     """Even a sub-4k design (an error or a testcase for text models) now
     measures exactly instead of returning None — no per-run retry tax."""
     model = make_model("t", context_length=4096)
@@ -1041,7 +1019,6 @@ def test_measure_affine_trio_sub4k_design_still_measures(make_model):
 
 
 def test_design_context_sub4k_text_warns(make_model, caplog):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Context ceiling vs design context': the design context is the model's ceiling, and a sub-4k one is warned about
     """A text model with a sub-4k context ceiling is almost certainly a
     mislabeled/corrupt GGUF — one note, not a crash."""
     import logging
@@ -1061,7 +1038,6 @@ def test_design_context_sub4k_text_warns(make_model, caplog):
 
 
 def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
     chat = make_model("chat", context_length=32768)
     chat_models = [(chat, 8000, 0.2, 0.0, 500, 1, 0)]
     # available = 14336; budget = 5836 -> 29180 -> round 24576
