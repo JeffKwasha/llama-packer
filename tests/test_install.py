@@ -696,3 +696,79 @@ def test_existing_group_proceeds(tmp_path, monkeypatch):
     added = [c[2] for c in ran if c[:2] == ["usermod", "-aG"]]
     assert "grp" not in added, added
     assert set(added) == set(ins._GPU_GROUPS), added
+
+
+# --- installed profiles.yaml ----------------------------------------------
+
+
+def test_install_creates_profiles_from_source_and_never_overwrites(
+        tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'profiles.yaml is yours': the installer
+    # copies a default only when the run directory has none.
+    src = tmp_path / "src.yaml"
+    src.write_text("defaults: {}\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setattr(ins.shutil, "chown", lambda *a, **k: None)
+    got = ins.ensure_profiles(ins.Runner(False), run, "svc", "grp", src)
+    assert got == run / "profiles.yaml"
+    assert got.read_text() == src.read_text()
+    got.write_text("user: edit\n")
+    again = ins.ensure_profiles(ins.Runner(False), run, "svc", "grp", src)
+    assert again.read_text() == "user: edit\n"
+
+
+def test_install_dry_run_does_not_create_profiles(tmp_path):
+    # Validates: docs/install.md, 'profiles.yaml is yours': --dry-run makes
+    # no files.
+    src = tmp_path / "src.yaml"
+    src.write_text("defaults: {}\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    ins.ensure_profiles(ins.Runner(True), run, "svc", "grp", src)
+    assert not (run / "profiles.yaml").exists()
+
+
+def test_install_agent_guide_lands_beside_the_config(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Agent guide in the run directory': the
+    # guide is installed under <dir>/.opencode/skills/profiles-authoring.
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "profiles-authoring.md").write_text("---\nname: X\n---\n")
+    monkeypatch.setattr(ins, "REPO", repo)
+    monkeypatch.setattr(ins.shutil, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(ins.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(ins.pwd, "getpwnam",
+                        lambda _n: type("P", (), {"pw_uid": 0})())
+    monkeypatch.setattr(ins.grp, "getgrnam",
+                        lambda _n: type("G", (), {"gr_gid": 0})())
+    run = tmp_path / "run"
+    run.mkdir()
+    ins.install_agent_guide(ins.Runner(False), run, "svc", "grp")
+    target = run / ".opencode" / "skills" / "profiles-authoring" / "SKILL.md"
+    assert target.read_text().startswith("---")
+
+
+def test_generate_config_uses_the_installed_profiles_path(monkeypatch, tmp_path):
+    # Validates: docs/install.md, 'profiles.yaml is yours': re-packing reads
+    # the run directory's copy, not the repo source.
+    seen = {}
+    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    monkeypatch.setattr(ins, "report_resolved", lambda _d: None)
+
+    class _R:
+        dry_run = False
+
+        def run(self, argv, **kw):
+            seen["argv"] = argv
+            cwd = kw.get("cwd")
+            (cwd / "config.yaml").write_text("models: {}\n")
+            (cwd / "config.env").write_text("")
+            return type("R", (), {"stdout": "", "returncode": 0})()
+
+    args = _args(models_dir=["/models"], profiles=Path("/repo/profiles.yaml"),
+                 spare=None, vram=None, hf_home=None)
+    ins.generate_config(_R(), "svc", tmp_path, args, "llama-packer",
+                        tmp_path / "profiles.yaml")
+    i = seen["argv"].index("--profiles")
+    assert seen["argv"][i + 1] == str(tmp_path / "profiles.yaml")

@@ -17,8 +17,10 @@ it never recreates the user and never drops an existing config.
 | Preflight | root, systemd, at least one GPU device node |
 | Account | `useradd --system --no-create-home --shell /usr/sbin/nologin` if absent; added to `render`, `video` and `--group` |
 | Run directory | `<dir>` as `root:<group>` mode `2775` |
+| Profiles | `<dir>/profiles.yaml` created from the bundled default (or `--profiles`) **only when absent**; never overwritten |
 | Binaries | `extras/update.py all`, every engine pinned with `--dir <engine>=<dir>` |
 | Config | llama-packer run **as the service user** from `<dir>`, writing `<dir>/config.yaml` and the sibling `config.env` |
+| Agent guide | `docs/profiles-authoring.md` copied to `<dir>/.opencode/skills/profiles-authoring/SKILL.md` (default; `--no-agent-guide` skips it) |
 | Unit | [`extras/llama-swap.service.in`](../extras/llama-swap.service.in) rendered, `systemd-analyze verify`-ed, written to `/etc/systemd/system/llama-swap.service` |
 | Start | `llama-swap -validate` first, then `systemctl enable --now`, then a `/v1/models` probe |
 
@@ -27,8 +29,59 @@ before being overwritten — both are gitignored and machine-local, so there
 is no other way back.
 
 Useful flags: `--dir` (run directory), `--listen` (default
-`127.0.0.1:8123`), `--spare`/`--vram` (passed to llama-packer), `--dry-run`,
-`--no-start`, `--memory-high/--memory-max/--swap-max`.
+`127.0.0.1:8123`), `--spare`/`--vram` (passed to llama-packer), `--profiles`
+(source copied only when `<dir>/profiles.yaml` is absent),
+`--no-agent-guide`, `--dry-run`, `--no-start`,
+`--memory-high/--memory-max/--swap-max`.
+
+## `profiles.yaml` is yours
+
+The installer creates `<dir>/profiles.yaml` from the bundled
+`llama_packer/profiles.yaml` when the run directory has none, owned by the
+service account and group-writable. It **never overwrites an existing
+file** — your edits survive reinstalls. `--profiles <file>` chooses a
+different source for that first copy.
+
+Edit `<dir>/profiles.yaml` for this host, not the repo copy:
+
+- `models_dirs`, `dirs`, `hf_home` — where the models are;
+- `backends` — which engines this host enables;
+- `hardware` — `vram`, `baseline_mb`, `memory_margin`;
+- `device_roles` / `device: cpu` — what runs from host RAM;
+- `tasks` — the task ids the fleet uses and their demand/TTL;
+- `matrix.categories` — which model fills each role, and its context cap;
+- `capacity` — `pp_tps` / `drive_mbps` for derived eviction cost;
+- `pools` — per-pool VRAM/spare overrides.
+
+Then re-pack and validate:
+
+```sh
+cd <dir>
+sudo -u <service-user> llama-packer --profiles profiles.yaml \
+  --output config.yaml --spare <same-as-install>
+llama-swap -config config.yaml -validate
+```
+
+`docs/profiles-authoring.md` is the full authoring guide. The installer
+also places it at `<dir>/.opencode/skills/profiles-authoring/SKILL.md`, so
+an agent started in `<dir>` can load it; `--no-agent-guide` skips that.
+
+## After a llama-packer update, re-check the profiles syntax
+
+`extras/update.py` updates **binaries**, not `profiles.yaml`. A new
+llama-packer can retire a key (for example `matrix.sets:` was replaced by
+capacity pools) and the packer warns about alien keys during a run. After
+updating:
+
+```sh
+cd <dir>
+sudo -u <service-user> llama-packer --profiles profiles.yaml \
+  --output /tmp/config.yaml --spare <same-as-install> -v
+```
+
+Read the warnings, migrate the named keys using `docs/profiles-authoring.md`,
+then re-pack for real and `-validate`. Do not assume an old profiles file is
+still valid just because the binaries updated cleanly.
 
 ## Pass `--hf-home` if your models come from an HF cache
 
@@ -111,10 +164,12 @@ llama.cpp build changes the binary that VRAM constants were measured
 against — `derived: shape` records the flag string, not the build — so
 binaries moving without a re-pack would leave the config silently serving
 with a stale compute term. `-watch-config` watches the config only, so the
-swap would not even be visible as a reload. If you want this automated, the
-safe shape is a timer that updates **and** re-packs together, and refuses
-the swap when `llama-swap -validate` rejects the result; that is a separate
-piece of work from this installer.
+swap would not even be visible as a reload. It also does not migrate
+`profiles.yaml`; after a llama-packer update, re-run the packer and read its
+key warnings (see "After a llama-packer update"). If you want this
+automated, the safe shape is a timer that updates **and** re-packs together,
+and refuses the swap when `llama-swap -validate` rejects the result; that is
+a separate piece of work from this installer.
 
 ## The updater command line
 
@@ -271,11 +326,13 @@ The service itself never writes to `<dir>` — the unit runs with
 
 ## Running llama-packer afterwards
 
-The install runs llama-packer as the service user, so re-packing by hand
-should match:
+The install runs llama-packer as the service user, from the run directory,
+with the installed profiles file, so re-packing by hand should match:
 
 ```sh
-sudo -u lemonade llama-packer --models-dir /mnt/ai/models --output /opt/llama/config.yaml
+cd /opt/llama
+sudo -u lemonade llama-packer --models-dir /mnt/ai/models \
+  --profiles profiles.yaml --output /opt/llama/config.yaml
 ```
 
 For the re-pack to land, the model tree must be writable by that user — the
@@ -287,19 +344,22 @@ loss.
 ## Agent guide in the run directory
 
 `docs/profiles-authoring.md` is a guide for agents editing
-`<dir>/profiles.yaml`. To let an OpenCode agent started in `<dir>` discover
-it, place it at `<dir>/.opencode/skills/profiles-authoring/SKILL.md`:
-
-```sh
-mkdir -p /opt/llama/.opencode/skills/profiles-authoring
-cp docs/profiles-authoring.md \
-   /opt/llama/.opencode/skills/profiles-authoring/SKILL.md
-```
+`<dir>/profiles.yaml`. The installer places it at
+`<dir>/.opencode/skills/profiles-authoring/SKILL.md` by default, owned by
+the service account; `--no-agent-guide` skips it.
 
 OpenCode checks `<cwd>/.opencode/skills` and walks up to the project root, so
-the agent must be started in `/opt/llama` (or below it). For a global
-install that works from any directory, use
+the agent must be started in `<dir>` (or below it). For a global install
+that works from any directory, use
 `~/.config/opencode/skills/profiles-authoring.md` instead.
+
+For an existing install without the guide, copy it in:
+
+```sh
+mkdir -p <dir>/.opencode/skills/profiles-authoring
+cp docs/profiles-authoring.md \
+   <dir>/.opencode/skills/profiles-authoring/SKILL.md
+```
 
 This is optional: llama-swap itself does not read `.opencode/`.
 

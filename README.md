@@ -234,11 +234,11 @@ probe itself refuses to start beside a resident process.
 [`docs/profiles-authoring.md`](docs/profiles-authoring.md) is a self-contained
 guide (with OpenCode skill frontmatter) covering discovery, `tasks:`,
 sampling profiles, CPU/GPU placement, matrix sizing, capacity routing, pools,
-TTL, and the dry-run/validate loop.
+TTL, updates, and the dry-run/validate loop.
 
-The repo does not install anything into `.opencode/`; the file is a normal
-document. To expose it to OpenCode, copy or symlink it into the global skills
-directory under the ID you want:
+The repo itself does not contain an `.opencode/` tree; the file is a normal
+document. To expose it to OpenCode on your machine, copy or symlink it into
+the global skills directory under the ID you want:
 
 ```sh
 mkdir -p ~/.config/opencode/skills
@@ -266,17 +266,22 @@ relative paths resolve from the active working directory:
 }
 ```
 
-**Installed deployments.** Put the guide beside the `profiles.yaml` it
-describes, then start the agent in that run directory (e.g. `/opt/llama`):
+**Installed deployments.** `extras/install.py` creates `<run-dir>/profiles.yaml`
+from the bundled default when it is absent (never overwriting an existing
+one) and places this guide at
+`<run-dir>/.opencode/skills/profiles-authoring/SKILL.md`, owned by the
+service account. Pass `--no-agent-guide` to skip the guide. An agent started
+in the run directory then discovers it; see
+[docs/install.md](docs/install.md#profilesyaml-is-yours) for editing and
+re-packing.
+
+For an existing install without the guide, copy it in:
 
 ```sh
-mkdir -p /opt/llama/.opencode/skills/profiles-authoring
+mkdir -p <run-dir>/.opencode/skills/profiles-authoring
 cp docs/profiles-authoring.md \
-   /opt/llama/.opencode/skills/profiles-authoring/SKILL.md
+   <run-dir>/.opencode/skills/profiles-authoring/SKILL.md
 ```
-
-Unlike the repo path, this copy travels with the installation and is visible
-to any agent started there.
 
 OpenCode reloads skills on save; no restart is needed. Load it with
 `@profiles-authoring` or let the model pick it from the description.

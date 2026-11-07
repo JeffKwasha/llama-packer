@@ -10,6 +10,18 @@ emits `config.yaml` for llama-swap. Start from the annotated
 [`profiles.yaml.example`](https://github.com/JeffKwasha/llama-packer/blob/main/profiles.yaml.example) and the contract in
 [`SPEC.md`](https://github.com/JeffKwasha/llama-packer/blob/main/SPEC.md); do not invent keys.
 
+## Where the file lives
+
+In an installed deployment it is `<run-dir>/profiles.yaml` (for example
+`/opt/llama/profiles.yaml`). The installer creates it from the bundled
+`llama_packer/profiles.yaml` **only when absent**; it never overwrites an
+existing file. Edit that copy, not the repo's. It is owned by the service
+account and group-writable so the operator's agent can update it.
+
+The repo's `docs/profiles-authoring.md` is this guide; the installer also
+places it at `<run-dir>/.opencode/skills/profiles-authoring/SKILL.md` so an
+agent started in the run directory can load it.
+
 ## Workflow
 
 1. Read the example and `SPEC.md`. Copy the example's section order.
@@ -83,3 +95,31 @@ Check the dry run:
   host pool is full; `ttl` is the separate idle timer.
 - **Aliases are not model ids.** Category vars and `+ref` names resolve to
   emitted entry ids; use a real model id/selector.
+
+## After a llama-packer update
+
+`extras/update.py` moves binaries; it does not migrate `profiles.yaml`.
+A new packer can retire a key, and the packer reports alien keys while it
+runs. After updating:
+
+```sh
+cd <run-dir>
+sudo -u <service-user> llama-packer --profiles profiles.yaml \
+  --output /tmp/config.yaml --spare <same-as-install> -v
+```
+
+Read the warnings, fix the named keys, then re-pack for real and validate.
+Keep a copy of the working `profiles.yaml` before editing; the installer
+only protects the first creation, not later edits.
+
+Retired spellings seen so far:
+
+| old | new |
+|---|---|
+| `matrix.sets:` / `matrix.evict_costs:` | removed; routing is capacity, `capacities`/`evict_cost` are emitted |
+| sidecar `role:` / `usage:` | sidecar `tasks: [...]` from `profiles.yaml tasks:` |
+| sidecar `backend:` | sidecar `engines: [...]` |
+| `pinned` persistence | explicit `ttl:` (sidecar or task) |
+
+Warnings are the migration list. Do not assume an old file is valid because
+the binaries updated cleanly.
