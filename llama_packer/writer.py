@@ -2692,7 +2692,7 @@ class Planner:
                                 profile=group[0][1])
                             if ctx < demand.min_context:
                                 continue
-                            if par < demand.min_parallel:
+                            if par < demand.min_parallel and not uncapped:
                                 logger.info(
                                     "%s: pinned parallel=%d is below the %s "
                                     "min_parallel=%d; no entry", model.stem,
