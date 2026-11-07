@@ -396,7 +396,8 @@ profiles:
 #   pools.default = detected VRAM - reserve - spare
 #   pools.ram     = detected host pool
 #   pools.<role>  = 1 (one live serving per role)
-# The solve fills pools.default on purpose; reserve + spare is the headroom.
+# Allocations fill pools.default on purpose; reserve + spare is every bit of
+# headroom, so a nearly full pool is normal.
 # plus per-model `capacities` and `evict_cost`. evict_cost is a
 # capacity-router field: reload time plus lost prefill (chat only).
 # `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
