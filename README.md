@@ -229,6 +229,40 @@ For an unattended nightly calibration, wrap it in a script that checks
 `gpu_state.llama_residents()` is empty, then fires `--probe-memory`. The
 probe itself refuses to start beside a resident process.
 
+## Agent skill: authoring `profiles.yaml`
+
+The repo ships an OpenCode skill at
+[`.opencode/skills/profiles-authoring/SKILL.md`](.opencode/skills/profiles-authoring/SKILL.md).
+It walks an agent through discovery, `tasks:`, sampling profiles, CPU/GPU
+placement, matrix sizing, capacity routing, pools, TTL, and validation.
+
+**Use it in this repo (automatic).** OpenCode discovers `.opencode/skills/`
+from the working directory up to the project root. Load it with
+`@profiles-authoring`, or let the model pick it from its description.
+
+**Install it globally.** Copy or symlink the directory under
+`~/.config/opencode/skills/`:
+
+```sh
+mkdir -p ~/.config/opencode/skills
+cp -r .opencode/skills/profiles-authoring ~/.config/opencode/skills/
+# or: ln -s "$PWD/.opencode/skills/profiles-authoring" \
+#           ~/.config/opencode/skills/profiles-authoring
+```
+
+**Add another source.** List it in `opencode.json(c)`; relative paths resolve
+from the active working directory:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": ["./team-skills", "~/shared/opencode-skills"]
+}
+```
+
+The skill ID is the directory name (`profiles-authoring`), not the display
+name. OpenCode reloads skills on save; no restart is needed.
+
 ## See also
 
 - [docs/glossary.md](docs/glossary.md) — the vocabulary, if a word in a commit message or a PR does not mean what you think it means
@@ -237,6 +271,7 @@ probe itself refuses to start beside a resident process.
 - [docs/install.md](docs/install.md) — systemd deployment from a run directory ([extras/install.py](extras/install.py))
 - [docs/backends/](docs/backends/) — per-engine notes: llama-server, vLLM, sd-server, whisper-server, audio-cpp
 - [profiles.yaml.example](profiles.yaml.example) — commented starter for `profiles.yaml`; [llama_packer/profiles.yaml](llama_packer/profiles.yaml) is the bundled fallback
+- [.opencode/skills/profiles-authoring/SKILL.md](.opencode/skills/profiles-authoring/SKILL.md) — agent skill for authoring and validating `profiles.yaml`
 
 ## Limitations
 
