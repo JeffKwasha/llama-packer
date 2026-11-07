@@ -20,7 +20,7 @@ Features:
 - want all Qwen3.5+ models to use the sharp chat template? 3 lines in models.yaml
 - Add low-temperature `coding` aliases to every model? 2 lines in profiles.yaml
 - Want 'text-only' variants that skip mmproj to maximize context or parallel? Automatic.
-- budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the matrix squeezes chat context to keep them loaded instead of evicted.
+- budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the capacity budget charges them to host RAM or a small VRAM slice, so chat keeps its context.
 - pick some models to use `q8_0` KV cache for longer context? YES
 - ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. `--idle-unload SECONDS` additionally emits `globalTTL` so llama-swap releases VRAM after idle.
 
@@ -91,8 +91,8 @@ Now you have capabilities, context windows, MTP support where available.
 mv profiles.yaml.example profiles.yaml
 
 - **Aliases.** Give one model several names — `instruct`, `coding`, `thinking` — each with its own sampling parameters, switched per-request with no reload. Declared once in the sidecar's `modes:` (or generated from `profiles.yaml`); emitted as `filters.setParamsByID` overrides.
-- **A packed matrix.** Keep small models (embedders, rerankers, a quick draft model) loaded simultaneously alongside your main chat model, with VRAM budgeted across all of them so nothing OOMs. Each gets its own context sized to what actually fits.
-- **Auto-parallel.** Unpinned chat models automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
+- **Capacity-budgeted co-residency.** Keep small models (embedders, rerankers, a quick draft model) loaded alongside your main chat model. Every serving declares its VRAM/host-RAM capacity, llama-swap evicts the cheapest one when a pool is full, and a size-1 role pool keeps one model per role live.
+- **Auto-parallel.** Chat models without a `parallel:` pin automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
 - **Standard discovery.** Model info flows straight off the running server, so you never hand-edit your client config when you add a model. A maintained discovery plugin works against the config unchanged.
 - **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a vision-less variant that drops the projection to reclaim VRAM for a much larger context (plus a vision companion entry keeping image input available at reduced context). The `i`/`v` capability flags on the id tell them apart; the exact context is in the display name and metadata.
@@ -178,7 +178,8 @@ Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](p
 | `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
-| `matrix` | co-resident `categories` (default `emb`/`rnk`; e.g. add `tts`/`stt`), sets via `__CHAT_VARS__` |
+| `matrix` | sizing knobs and `categories` (model picks, default `emb`/`rnk`; e.g. add `tts`/`stt`) |
+| `capacity` | `pp_tps` / `drive_mbps` for derived `evict_cost` |
 
 Profiles overlay `defaults` and emit `filters.setParamsByID`; sidecar `modes:` / `allow_profiles:` replace or filter them per-model. See [SPEC → profiles.yaml](SPEC.md#profilesyaml) for the full table.
 
@@ -255,4 +256,4 @@ probe itself refuses to start beside a resident process.
 - Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
 - Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as `role: t2s` / `role: s2t` with `dirs: {t2s: t2s, s2t: s2t}` and `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
-- Configurable matrix categories — **available**: declare co-resident classes beyond `emb`/`rnk` (e.g. `tts`/`stt`) and reference them in `sets:`; see [SPEC → Matrix Context Solving](SPEC.md#matrix-context-solving)
+- Capacity routing — **available**: the packer emits llama-swap pools (VRAM, host RAM, one per role), per-model `capacities`, and derived `evict_cost`; `matrix.sets:` is retired. See [SPEC → Capacity routing](SPEC.md#capacity-routing)

@@ -162,18 +162,14 @@ and every one of them carries a `Validates:` citation.
 | 77 | Every entry carries `metadata.packing`; `device: cpu` entries name device/ctx/parallel/ram and carry no `vram_mib` | `test_metadata_packing_cpu_entry`, `test_metadata_packing_gpu_entry` |
 | 78 | `device: cpu` wins the resident role; inside that set the cheapest **measured serving at the role's ctx** wins (file size only when unmeasurable); a selector overrides and is priced; every arm is logged | `test_select_model_prefers_cpu_candidate`, `test_select_model_smallest_among_cpu_candidates`, `test_select_model_no_cpu_keeps_size_rule`, `test_select_model_selector_overrides_cpu_preference`, `test_selection_reason_names_the_arm`, `test_selection_reason_measured_and_selector_arms`, `test_select_model_picks_measured_cheapest_over_file_size`, `test_select_model_falls_back_to_size_when_unmeasurable`, `test_select_model_cpu_preference_beats_cheaper_device`, `test_select_model_selector_prices_only_the_pick` |
 | 79 | `profiles.yaml device_roles:` places every model of a named role on the host (logged with its count); absent key is a no-op; unmatched or unknown roles warn; a mapping value other than `cpu` (the key is a role, the value a device) places nothing and warns | `test_device_roles_place_every_role_model`, `test_device_roles_absent_and_unmatched`, `test_device_roles_rejects_unknown_role`, `test_device_roles_rejects_a_non_cpu_value`, `test_device_roles_rejects_a_scalar` |
-| 80 | CPU helper entries join every chat set **one per role** (never evicted, never preloaded, same-role alternatives never forced in) and carry `ttl: 0`; device entries keep no per-model TTL | `test_cpu_helpers_pinned_into_every_set`, `test_cpu_entry_ttl_zero`, `test_gpu_entry_has_no_ttl` |
+| 80 | TTL resolves sidecar > task > placement default: `0` disables idle unload, the smallest declared lifetime wins, an undeclared non-chat CPU helper gets 3600 s, and chat/device entries carry none | `test_ttl_sidecar_wins_when_tighter`, `test_ttl_task_wins_when_tighter`, `test_ttl_zero_means_never_unload_and_wins`, `test_ttl_cpu_helper_defaults_to_host_lifetime`, `test_cpu_chat_entry_inherits_global_ttl`, `test_gpu_entry_has_no_ttl` |
 | 81 | A category selector defines the RAG pair too — solve, charge, `emb`/`rnk` vars and resident entry name one model | `test_detect_matrix_category_selector_defines_the_pair` |
 
 ## Set composition (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |
 |---|---|---|
-| 82 | A set expression prices as a boolean tree — `&` sums, `|` maxes, `+set` expands, nesting recurses, a `+set` cycle terminates | `test_set_overhead_prices_nested_branches`, `test_set_overhead_expands_named_sets`, `test_expr_leaves_walks_nested_branches`, `test_solve_matrix_prices_a_nested_and_branch` |
-| 83 | The chat solve reserves the worst branch of the most expensive chat set, never the union of declared categories | `test_solve_matrix_reserves_worst_set_not_category_union` |
-| 84 | A category no set names reserves nothing and is logged as unreferenced | `test_solve_matrix_unreferenced_category_reserves_nothing` |
 | 85 | Exactly one canonical CPU category per role is pinned; device categories are never pinned; same-role alternatives are not | `test_cpu_pin_is_one_canonical_category_per_role` |
-| 86 | A set that already names a category of the pinned role keeps its own choice | `test_cpu_pin_skips_a_set_that_chose_the_role` |
 | 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
 | 88 | An alien sidecar key warns at discovery: `role:`/`usage:` are not keys (the warning points at `tasks:`), and `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
@@ -214,6 +210,13 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 91 | Same-role co-residence warns per and-branch, naming the set, role and both categories; alternation across roles (operator buckets) never reports co-residency | `test_warn_same_role_names_the_pair`, `test_resident_options_branch_alternatives_not_co_resident` |
 | 92 | A per-category `ctx:` caps the served context at one seam (`resident_ctx`) and is never a floor | `test_category_ctx_caps_at_one_seam` |
-| 93 | A chat-capable composition's CPU residents are judged as one unit: not fitting refuses the unit together (no ids, vars pruned from sets and pins), a category any fitting composition admits survives, and the committed pair is never refused | `test_host_unit_refusals_drop_the_unit`, `test_host_unit_refusals_survive_one_fitting_set`, `test_prune_leaves_removes_refused_members`, `test_drop_refused_categories_prunes_sets_and_pins` |
+
+## Capacity routing (SPEC.md §Capacity routing)
+
+| # | Requirement | Test |
+|---|---|---|
+| 100 | The emitted pools are the packer's available VRAM (`default`), the detected host pool (`ram`), and one size-1 pool per scheduling role | `test_capacity_pools_are_gpu_budget_host_pool_and_role_singletons` |
+| 101 | Every entry declares the pools it charges, carrying the solve's measurement margin; an unmeasured serving gets a file-size floor, never zero | `test_capacity_fields_charge_gpu_ram_and_role`, `test_capacity_unestimated_serving_gets_a_file_size_floor` |
+| 102 | A `device: cpu` serving charges `ram` only, never a GPU pool | `test_capacity_fields_cpu_helper_charges_host_only` |
+| 103 | `evict_cost` prices reload time plus lost prefill for chat only; a sidecar `pp_tps:` overrides the fleet rate | `test_capacity_evict_cost_ignores_prefill_for_stateless_roles`, `test_capacity_evict_cost_uses_sidecar_prompt_rate` |

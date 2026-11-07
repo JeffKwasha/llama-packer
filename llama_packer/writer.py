@@ -302,7 +302,8 @@ def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
 CPU_HELPER_TTL = 3600
 
 
-def resolve_entry_ttl(model: Model, demand: "Task | None") -> int | None:
+def resolve_entry_ttl(model: Model, demand: "Task | None",
+                      role_ttl: int | None = None) -> int | None:
     """The idle-unload lifetime for one entry, in seconds.
 
     Declared scopes are sidecar and task; the smallest lifetime wins, and
@@ -320,6 +321,8 @@ def resolve_entry_ttl(model: Model, demand: "Task | None") -> int | None:
             declared.append(raw)
     if demand is not None and demand.ttl is not None:
         declared.append(demand.ttl)
+    if role_ttl is not None:
+        declared.append(role_ttl)
     if declared:
         if any(v == 0 for v in declared):
             return 0
@@ -327,6 +330,26 @@ def resolve_entry_ttl(model: Model, demand: "Task | None") -> int | None:
     if model.on_cpu and (demand.role if demand is not None else model.role) != "chat":
         return CPU_HELPER_TTL
     return None
+
+
+def _role_ttl(profiles: Profiles) -> dict[str, int]:
+    """Per-role TTL defaults, from the task catalogue.
+
+    A helper entry is planned from its role, not a task id, so the task's
+    declared lifetime reaches it through the role. ``0`` wins.
+    """
+    out: dict[str, int] = {}
+    for task in TaskCatalogue.from_cfg(profiles.tasks_cfg).by_id.values():
+        if task.ttl is None:
+            continue
+        prev = out.get(task.role)
+        if prev is None:
+            out[task.role] = task.ttl
+        elif prev == 0 or task.ttl == 0:
+            out[task.role] = 0
+        else:
+            out[task.role] = min(prev, task.ttl)
+    return out
 
 
 def _build_entry(
@@ -3369,7 +3392,8 @@ def emit_config(models: list[Model], plan: dict,
                 capacity_pools: dict[str, int] | None = None,
                 drive_mbps: int = 100,
                 pp_tps: float = 1000.0,
-                memory_margin: float = _MEMORY_MARGIN) -> EmittedConfig:
+                memory_margin: float = _MEMORY_MARGIN,
+                role_ttl: dict[str, int] | None = None) -> EmittedConfig:
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
@@ -3481,7 +3505,9 @@ def emit_config(models: list[Model], plan: dict,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
                 kv_per_token_mib=v.kv_per_token_mib,
                 vram_note=v.vram_note,
-                ttl=resolve_entry_ttl(view, demand),
+                ttl=resolve_entry_ttl(
+                    view, demand,
+                    (role_ttl or {}).get(view.role)),
             )
             if capacity_pools:
                 entry.update(_capacity_fields(
@@ -3704,7 +3730,8 @@ def build_config(
     config = emit_config(supported, plan, profiles, template_vars,
                          capacity_pools=planner.capacity_pools,
                          drive_mbps=drive_mbps, pp_tps=pp_tps,
-                         memory_margin=memory_margin)
+                         memory_margin=memory_margin,
+                         role_ttl=_role_ttl(profiles))
     _verify_no_overallocation(config, plan, supported, planner)
     config.set_overheads = dict(planner.set_overheads)
     return config

@@ -70,7 +70,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Resident RAG classes at a fixed small context, plus the knobs that allocate the remainder to chat (`embed_context`, `rerank_context`, `auto_parallel*`, `parallel_power`) | [VRAM Allocation](#vram-allocation) |
+| `matrix` | Sizing knobs (context caps, `auto_parallel*`, `parallel_power`, shared-solve floors) and `categories` model picks | [VRAM Allocation](#vram-allocation) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
@@ -318,7 +318,7 @@ A model with several profile groups can land two servings on the same category+f
 
 Why not put the context in the id? Because opencode/hermes resolve and cache model ids at startup and do not re-pull them per request — an id that tracks the solve would force a restart on every repack. The context is still exact and client-visible in `metadata.ctx_size`, in `metadata.tasks` (the satisfied tasks), and in the display `name` (e.g. `qwen38-27B-Dirk · coding 156k [ti]`); only the id is frozen. This is a deliberate priority order: **task > stability > fine-grained accuracy**, and a task dropping off under memory pressure is correct — that serving genuinely cannot meet the task.
 
-Anything that *references* an entry must resolve through `entry_ids_by_stem` (stem → emitted ids) rather than `Model.template_id`. A matrix var pointing at a `template_id` makes llama-swap reject the whole config. Validate with `llama-swap -config <file> -validate`.
+Anything that *references* an entry must resolve through `entry_ids_by_stem` (stem → emitted ids) rather than `Model.template_id`. A reference pointing at an unemitted id makes llama-swap reject the whole config. Validate with `llama-swap -config <file> -validate`.
 
 ### VRAM gating and reservation notes
 
@@ -329,9 +329,8 @@ When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` 
   leaves ≤ 0 available). `solve_rung` skips that rung and tries the next along
   the declared order; if none fits, that **category emits nothing** — and a model
   whose every rung is over budget, fallback included, produces no entry at all.
-  Skipped stems never reach the matrix vars, so routing auto-prunes; if *every*
-  chat model is gated away, matrix routing is omitted entirely (warning logged)
-  rather than emitting a degenerate empty OR-list.
+  Skipped stems produce no entry, so routing auto-prunes; the emitted pools
+  still describe the survivors.
 - **Vision is a rung, not a fallback.** There is no "vision → text" retry and
   no companion to suppress: the shed order already decides whether dropping the
   projector is worth it, and a rung that does not fit is simply not a candidate.
@@ -367,7 +366,7 @@ That tie rule is the whole of "coding drops vision to maximise context, and only
 
 `min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
 
-`parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on an unpinned chat model on a slot-based backend.
+`parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on a chat model without a `parallel:` pin on a slot-based backend.
 
 ## VRAM Allocation
 
@@ -375,39 +374,57 @@ Two tiers, and only two.
 
 ### Residents
 
-Pinned for as long as the service is up, because losing them means losing
-the KV cache and reloading on every lookup. Embeddings and rerank are the
-clear case; speech (STT/TTS) are optional residents.
+Embeddings and rerank serve a fixed small context (`embed_context` /
+`rerank_context`, default 4096): clients chunk to one size, and a fixed
+footprint makes the chat budget computable. A `device: cpu` sidecar charges
+host RAM instead of VRAM. Residents serve single-slot; a declared
+`parallel:` on an embeddings/rerank model is ignored.
 
-Each resident serves a **fixed small context** — `embed_context` /
-`rerank_context`, default 4096. Two reasons, and the second is what makes
-the rest of this section work:
+The RAG pair is a budgeting convention, not a runtime guarantee: a model is
+charged because it is an emitted serving with a capacity, and llama-swap
+decides whether it stays resident.
 
-- clients standardise on one RAG context and chunk to it, so the embed size
-  is a stable contract rather than a function of what else is loaded;
-- **a fixed small context makes the resident tier's VRAM a number you can
-  compute up front**, which is what makes the remainder meaningful. A
-  context that flexed with load would make the budget move under you.
+### Capacity routing
 
-The cap is not a concession to revisit when VRAM is tight. If VRAM binds,
-context in main chat is worth more than context in RAG.
+llama-swap's capacity engine replaces matrix sets. The packer emits:
 
-A sidecar declaring `device: cpu` pins that resident (or any model) to
-**host RAM instead**: it charges the host pool, never VRAM — one of the
-two budgets, never both.
+```yaml
+routing:
+  router:
+    use: capacity
+    settings:
+      capacity:
+        pools: {default: <available VRAM>, ram: <host pool>, chat: 1, embeddings: 1, ...}
+models:
+  <id>:
+    capacities: {default: <MiB>, ram: <MiB>, chat: 1}
+    evict_cost: <seconds>
+```
 
-Residents are selected by role, or by `--embed` / `--rerank` CLI selectors.
-**They always serve single-slot**: resident parallelism must never buy
-context away from the chat it serves. A declared `parallel:` on an
-embeddings/rerank model is ignored with a note.
+- Any combination whose summed capacities fit every pool may coexist.
+- One size-1 pool per scheduling role means one live serving per role:
+  requesting another chat model evicts the current one, whatever its
+  `evict_cost`.
+- `capacities` carry the same measurement margin as the solve. A pool set
+  to the whole card admits an overcommit; the packer emits `available`
+  (total − reserve − spare).
+- `evict_cost` is `load_seconds + prefill_seconds`; prefill applies only to
+  chat (stateless helpers keep no KV). The rate is a sidecar `pp_tps:` or
+  the `capacity:` fleet default. Long context makes a dense chat serving
+  expensive to evict.
+- Nothing is preloaded; only the requested model starts.
+- `matrix.sets:` and `matrix.evict_costs:` are retired: they warn and are
+  ignored. `matrix:` keeps the sizing knobs (context caps, auto_parallel,
+  parallel_power, the shared-solve floors).
+
+Every emitted entry declares its pools. A model that declares none can only
+run alone.
 
 ### Host pool (`device: cpu`)
 
-A `device: cpu` sidecar places the serving entirely in host RAM: it
-competes for no VRAM — charged by neither the resident tier nor a chat
-set, it cannot be evicted on VRAM grounds, and once warm it stays.
-Its price is a host-RAM budget with the same decision quality
-(`docs/plans/cpu-residency-budget.md`):
+A `device: cpu` sidecar places the serving entirely in host RAM: it charges
+the `ram` pool, never VRAM. Its price is a host-RAM budget with the same
+decision quality (`docs/plans/cpu-residency-budget.md`):
 
 - **detection** finds the pool at pack time — `MemAvailable` minus a sysctl
   pressure zone (per-zone high-watermark sum; declared fallback 25% of
@@ -415,23 +432,17 @@ Its price is a host-RAM budget with the same decision quality
   (`memory.high`/`memory.max` − `memory.current`). Every term is
   overridable from `profiles.yaml hardware:`; each chosen value is logged
   with the arm that picked it.
-- **the charge** is the serving's own measured quad at its design context
-  — the same `derived:` block family the VRAM budget uses, measured
-  under a `--n-gpu-layers 0` shape stamp. A declared `parallel:` on a CPU
-  chat model is honoured and multiplies the pool terms; residents stay
-  single-slot.
-- **the check is go/no-go**: a quad that will not fit the pool remaining
-  after committed residents logs the shortfall and emits no id — no
-  solve-down, no automatic offload. `device: cpu` is the only gate.
+- **the charge** is the serving's own measured quad at its served context,
+  emitted as `capacities.ram`.
+- **eviction is capacity-driven**: when `ram` is full, llama-swap evicts the
+  cheapest resident instead of failing. There is no automatic offload.
+- a CPU model is not exempt from eviction; evicting it frees host RAM.
+  TTL defaults a non-chat CPU helper to 3600 s; set `ttl: 0` to keep it.
 
 **Moving a whole usecase off VRAM** takes one declaration —
 `profiles.yaml device_roles: [embeddings, rerank]` (or the mapping
 `{embeddings: cpu, rerank: cpu}`) places every model of those roles on the
-host, exactly as if each sidecar carried `device: cpu`. The key is a role
-and the value is a device; there is no `role: cpu` field. A CPU helper entry
-also joins every routing set and serves with `ttl: 0`: a request names
-it, it loads once, and no later swap evicts it — evicting it would
-reclaim no device memory. Set subsets mean nothing is preloaded.
+host, exactly as if each sidecar carried `device: cpu`.
 
 `metadata.packing` names the placement (`device: cpu|gpu`) and the decided
 byte facts (`ram_mib`/`vram_mib`, `kv_per_token`) so clients can filter
@@ -440,73 +451,38 @@ without parsing ids.
 ### Remainder
 
 ```
-reserve        = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
-available      = vram_total - reserve - spare
-resident_vram  = Σ VRAM(resident, at its own fixed context)
-chat_budget    = available - resident_vram
+reserve     = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
+available   = vram_total - reserve - spare
+chat_budget = available - Σ(capacities of GPU servings reserved beside chat)
 ```
 
-The matrix solve turns `chat_budget` into **one shared per-slot
-`chat_ctx`** — the target every co-resident chat model is sized against.
-Each chat model then resolves its own serving against that target, through
-its category:
-
-```
-for each chat model:
-    for each declared category, and the fallback:
-        solve (shed, ctx, parallel) from chat_ctx
-```
-
-Two chat models can therefore serve different contexts — a 27B stops at its
-design window, a 4B takes the full target — but they are priced against the
-same number. The worst set branch is charged once, before `chat_ctx` is
-solved; there is no per-set re-solve.
-
-A model smaller than its own category's `min_context` at every rung emits
-**nothing** for that category. The fallback entry is the floor on that: every
-model gets one, and it too can fail.
+Helpers on CPU cost zero VRAM, so `chat_budget` is the whole GPU budget;
+a GPU helper is reserved only if the operator wants it co-resident. The
+solve turns `chat_budget` into each model's `(ctx, parallel)`. A model that
+cannot meet its task floor at any rung emits **nothing** for that task; the
+fallback entry is the floor on that.
 
 ### Knobs (matrix section keys)
 
 | key | default | meaning |
 | --- | --- | --- |
-| `embed_context` | 4096 | Context the resident embeddings model serves at |
-| `rerank_context` | 4096 | Context the resident rerank model serves at |
-| `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins. Set `false` to disable fleet-wide; a sidecar `parallel:` pin opts a single model out |
+| `embed_context` | 4096 | Context an embeddings serving is capped at |
+| `rerank_context` | 4096 | Context a rerank serving is capped at |
+| `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: a value-function `(ctx, slots)` solve, best feasible pair wins. `false` disables it fleet-wide; a sidecar `parallel:` pin opts one model out |
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
-| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth. See "What `parallel_power` actually controls" below — the neutral point is model-dependent, so a fleet-wide value is a *bias*, not a target |
+| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score |
 
-### What is left from the old design
+`tools_min_ctx`, `min_chat_ctx`, `coload_min_ctx` and `ctx_gain_min` shape
+the shared solve. `estimate_headroom` pads an estimated overhead.
+Defaults: 128k, 64k, 20k, 4k, 1.25.
 
-Two different things, and they should not be confused:
+### TTL
 
-`sets:`, `evict_costs:` and `categories:` are **still live** — they are
-forwarded verbatim to llama-swap's matrix router, which is their consumer.
-What changed is that admission is now per entry rather than per model: a
-`.coding` entry and a `.aux` entry of the same model get independent
-verdicts, because they are independently sized servings. A `.aux` entry
-that cannot hold its 80k minimum beside the 5.7 GB reranker is dropped from
-`ragz` while the `.coding` entry stays in it.
-
-`sets:` is also the **budget contract**. A set is a role composition
-(`rag: __CHAT_VARS__ & emb & rnk` is embed *and* rerank; `talk:
-__CHAT_VARS__ & stt & tts` is 2-way speech), and the chat solve reserves the
-worst branch of the most expensive chat-capable set it can be requested
-under: `&` sums, `|` maxes, `+set` expands, nesting prices recursively. It is
-not the sum of every declared category, and a category in no chat set
-reserves nothing (llama-swap can only hold it alone). A second category of
-the same role is an alternative, never an addition — one model per role per
-set. The rule is the sets' own: summing every declared category would make
-every chat solve pay for a bucket even when the set holding it is an
-alternative to a cheaper one.
-
-`tools_min_ctx`, `min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and
-`estimate_headroom` shape the shared solve, in that order: the RAG pair is
-squeezed only when chat falls below `tools_min_ctx`, no further than
-`coload_min_ctx`, and only if the gain reaches `ctx_gain_min`; a co-load is
-admitted only while chat stays at `min_chat_ctx` (or `tools_min_ctx` when
-the chat model still has tools); an estimated, not measured, overhead is
-padded by `estimate_headroom`. Defaults: 128k, 64k, 20k, 4k, 1.25.
+Per-entry `ttl` resolves sidecar > task > placement default. `0` disables
+idle unload; otherwise the smallest declared lifetime wins. A non-chat
+`device: cpu` helper with nothing declared gets 3600 s; a chat or device
+entry emits no per-entry ttl and inherits `globalTTL`. TTL and capacity are
+independent: TTL yields time, capacity bounds memory.
 
 ### What `parallel_power` actually controls
 

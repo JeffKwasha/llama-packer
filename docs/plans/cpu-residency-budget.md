@@ -2,6 +2,10 @@
 
 Status: **shipped** — portions 1–2 in PR #4 (2026-10-30); portion 3 moved to
 [`tasks-and-endpoints.md`](tasks-and-endpoints.md). Recorded 2026-10-23.
+**Amended 2026-11-07:** the "never evicted, `ttl: 0`, joined every chat set"
+rule is retired. CPU models charge the capacity `ram` pool and are evicted
+under pressure like any other resident; a non-chat helper defaults to
+`ttl: 3600`. See `SPEC.md` §Host pool / §Capacity routing.
 Related: `docs/plans/memory-allocation-tags.md` (§3 measured host
 RAM — this plan is its minimal form), `docs/plans/opportunistic-coload.md`
 (CPU-resident coload at 0 GPU cost, today's rule),

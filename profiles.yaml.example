@@ -336,63 +336,25 @@ profiles:
 #   - when: {name: 'tiny-.*'}
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
-# ── Roles (optional; NEW — lands in P5) ─────────────────
-# A role is a use case that *hosts* tasks; it does not require them — RAG
-# with the rerank slot empty is thinner but valid. `pinned` tasks are
-# resident, `on_demand` (the default) load when requested and evict their
-# siblings. Role terms reach every element's serving and degrade before the
-# task's own terms do. The matrix `sets:` below are generated from this
-# table, so hand-authored sets become alien when this lands.
-# roles:
-#   chat:
-#     tasks:
-#       - chat: pinned
-#       - agent: on_demand
-#   rag:
-#     min_context: 4k
-#     sacrifice: [concurrency, vision]
-#     tasks:
-#       - embed: pinned
-#       - rerank: pinned
-#   voice:
-#     tasks:
-#       - stt: pinned
-#       - tts: pinned
+# ── Matrix sizing (optional) ───────────────────────────
+# The packer emits llama-swap's capacity router (pools + per-model
+# capacities); there are no matrix sets. `matrix:` keeps the context-solve
+# knobs, and `categories` chooses which model fills each role.
 #
-# ── Matrix: shared VRAM and routing sets (optional) ────
-# Residents are pinned and served at a fixed small context, so their
-# footprint is a number you can compute up front; whatever is left goes to
-# chat, and each chat model resolves its own serving against it through its
-# usage category (see `usage:` above and SPEC.md "VRAM Allocation").
-#
-# `embed_context` / `rerank_context` are that fixed context. They are small
-# on purpose: clients chunk to one stable RAG size, and a flexing context
-# would make the resident tier's VRAM move under the budget. If VRAM is the
-# binding constraint, context in main chat is worth more than context in RAG.
-# Select the residents with --embed / --rerank or a category `selector:`;
+# `embed_context` / `rerank_context` cap the resident helpers at a fixed
+# small context: clients chunk to one RAG size, and a fixed footprint makes
+# the chat budget computable. Select the helpers with a category `selector:`;
 # they always serve single-slot.
 #
-# The shared solve's floors and guards, in the order it applies them:
+# The shared solve's floors and guards:
 #   tools_min_ctx     below this chat context, the RAG pair is squeezed to
 #                     buy context back (default 128k)
 #   coload_min_ctx    how far the RAG pair may be squeezed (default 20k)
 #   ctx_gain_min      the minimum chat gain that makes the squeeze worth it
-#                     (default 4k)
-#   min_chat_ctx      the floor kept for a co-load; below it nothing else is
-#                     admitted (default 64k; tools_min_ctx when tools still
-#                     have it)
-#   estimate_headroom pads an estimated, not measured, co-load overhead
-#                     (default 1.25; must be >= 1.0)
+#   min_chat_ctx      the floor kept for a co-load (default 64k)
+#   estimate_headroom pads an estimated, not measured, overhead (1.25)
 #
-# A routing set is a use case — a composition of roles that must be live
-# together. `rag` is embed AND rerank (two roles); `talk` is stt AND tts.
-# One set names one model per role; a second category of the same role is an
-# alternative (`rnk | rnk2`), never an addition. Operators may declare their
-# own buckets (one/two/three) and compose them without naming a task.
-# The sets are also the VRAM budget contract: the chat solve reserves the
-# worst branch of the most expensive chat set (`&` sums, `|` maxes, `+set`
-# expands a named set), not the sum of every declared category. A category
-# no chat set references reserves nothing (it can only run alone).
+# `sets:` and `evict_costs:` are retired: they warn and are ignored.
 #
 # matrix:
 #   embed_context: 4096
@@ -403,24 +365,26 @@ profiles:
 #   # min_chat_ctx: 65536
 #   # estimate_headroom: 1.25
 #   auto_parallel: false        # on by default: value-function (ctx, slots)
-#                               # solve for unpinned chat; false disables it
-#                               # fleet-wide
 #   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
-#   parallel_power: 0.75        # fleet default slot exponent: how much context
-#                               # one extra slot may cost. A task's own
-#                               # parallel_power: overrides it. See SPEC.md
-#   categories:                 # var -> served model; `emb`/`rnk` are the
-#     emb: { role: embeddings } # canonical names of the RAG roles
+#   parallel_power: 0.75        # slot exponent; a task's own overrides it
+#   categories:                 # var -> model pick; each is a role
+#     emb: { role: embeddings }
 #     rnk: { role: rerank }
 #     rnk2: { role: rerank, selector: zerank }   # alternative, not additive
 #     stt: { role: s2t }
 #     tts: { role: t2s }
-#   sets:
-#     rag:   "__CHAT_VARS__ & emb & rnk"
-#     ragz:  "__CHAT_VARS__ & emb & rnk2"
-#     talk:  "__CHAT_VARS__ & stt & tts"           # 2-way speech
-#     combo: "__CHAT_VARS__ & (three | (two & one))"  # operator buckets
-#   # evict_costs: {one: 10, two: 10, three: 10}  # forwarded to llama-swap
+#
+# ── Capacity routing knobs (optional) ──────────────────
+# The packer emits `routing.router.use: capacity` with:
+#   pools.default = detected VRAM - reserve - spare
+#   pools.ram     = detected host pool
+#   pools.<role>  = 1 (one live serving per role)
+# plus per-model `capacities` and `evict_cost`. evict_cost is reload time
+# plus lost prefill (chat only); a sidecar `pp_tps:` overrides the fleet
+# rate. Set `drive_mbps:` only to override the detected read speed.
+# capacity:
+#   pp_tps: 1000
+#   # drive_mbps: 1000
 
 # ── VRAM pools (optional) ───────────────────────────────────
 # One shared ledger per pool: per-pool spare override, unmodelled residents,

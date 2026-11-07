@@ -20,7 +20,7 @@ either way it should not be used in a commit message until it is.
 | **endpoint** | A standardized serving surface: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`, `openai.images.generations`, `openai.audio.transcriptions`, `openai.audio.speech`, `native.*`. Engine-owned; servers and clients choose it, a model never does. | `endpoints.py` |
 | **family** | The interchangeability unit: serving one member taught you how to serve the other (same launch options, template, quantization conventions). Agent-assigned with evidence; the arch string is a confirm-only hint. Not the audio.cpp loader `family`, which is `audio_cpp.family`. | sidecar `family:` |
 | **device** | Where a serving runs: `cpu` or `gpu`. The sidecar key is `device:`, emitted as `metadata.packing.device`. The only placement word — there is no `role: cpu`. | `Model.on_cpu` |
-| **host-resident** | A `device: cpu` model: charged to the host pool, 0 VRAM, `ttl: 0`, pinned into the chat sets. Do not call it "a CPU task" — placement is not identity. | `HostLedger` |
+| **host-resident** | A `device: cpu` model: charged to the `ram` capacity pool, 0 VRAM. Do not call it "a CPU task" — placement is not identity. A non-chat helper defaults to `ttl: 3600`; set `ttl: 0` to keep it. | `HostLedger` |
 | **`device_roles`** | Profiles declaration that places every model of a task on the host. A list of task ids, or a mapping **task → device**: `{embeddings: cpu}`. | `apply_device_roles` |
 | **profiles.yaml** | Fleet-wide sampling defaults, spare values, backend defaults, the `tasks:` demand overrides, and the optional `matrix:` section. | `profiles.py` |
 | **override** | A rule that beats the profiles default, scoped to a glob or a directory. Per-directory `models.yaml` is the directory-scoped form. | `overrides.py` |
@@ -37,24 +37,25 @@ either way it should not be used in a commit message until it is.
 | **slot** | One concurrent conversation. `parallel` is how many a model serves at once. | `parallel:` |
 | **budget** (`VramBudget`) | The object that answers "what fits", from either measured coefficients or a pin. | `vram.py` |
 | **matrix** | The shared-budget solve: one context across all co-resident models, so a resident embedder is paid for out of the chat context. | `solve_matrix_ctx`, SPEC "Matrix Context Solving" |
-| **co-resident** | Loaded at the same time as others. Chat models take turns and share the pool; embed/rerank are pinned resident. | SPEC "Matrix Context Solving" |
+| **co-resident** | Allowed to be loaded at the same time because their capacities fit every pool. Chat models take turns; embed/rerank are resident at a small context. | SPEC §Capacity routing |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
 | **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | writer, SPEC 305 |
 | **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same context, the least shed wins for the null category and the first qualifier stands. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
 
-## Precedence and lifetime
+## Capacity, eviction and lifetime
 
 | Term | Means | Code |
 |---|---|---|
-| **tier** | Precedence class of an element: `pinned` / `role` / `task` / `any` (working names). It decides which routing sets an entry joins and what may evict it. | profiles `roles:` (P5) |
-| **persistence** | A task's declared default inside a role: `pinned` (resident) or `on_demand` (loads on request, evicting its siblings). `on_demand` is the default. | profiles `roles:` (P5) |
-| **TTL** | The temporal complement of `spare`: eventually the serving is freed for duties this tool cannot see. Cascade most-specific first — sidecar > task > role > CLI/global (`--idle-unload`); the **smallest** lifetime wins, and a conflict names both scopes. | writer, SPEC §TTL |
+| **capacity pool** | An independent integer limit in the emitted `routing.router.settings.capacity.pools`. `default` is the packer's usable VRAM, `ram` the host pool, and each scheduling role has a size-1 pool so only one serving of that role is live. | `Planner.capacity_pools`, SPEC §Capacity routing |
+| **capacity** | What one entry claims from a pool, in that pool's units (MiB). Emitted per model; the sum of resident capacities must fit every pool. | `_capacity_fields`, `capacities:` |
+| **evict_cost** | Relative cost of losing a resident, used only to choose *which* model leaves under pool pressure. Derived from reload time plus lost prefill for chat; never a reservation. | `_capacity_fields`, `evict_cost` |
+| **TTL** | The temporal complement of `spare`: eventually the serving is freed for duties this tool cannot see. Sidecar > task > placement default; `0` disables idle unload, otherwise the smallest lifetime wins. | `resolve_entry_ttl`, SPEC §TTL |
 
 ## Host RAM
 
 | Term | Means | Code |
 |---|---|---|
-| **resident** | A task declared `pinned` in its role: served for the role's lifetime at a fixed small context, because losing it loses its KV cache. One live serving per endpoint. | SPEC §Residents |
+| **resident** | A model of a resident role (embeddings/rerank) served at a fixed small context. It is charged a capacity, not pinned by name; llama-swap may still evict it under pool pressure. | SPEC §Residents |
 | **host pool** | The host RAM the ledger may spend: `min(sys_free, cgroup_free)`, each term logged with the arm (`declared`/`sysctl`/`fallback-25%`/`skipped-cgroup`) that chose it. | `hardware.py:HostProfile` |
 | **host ledger** | Sibling of `PoolLedger` that charges host-resident quads. Go/no-go, never a solve-down. | `HostLedger` |
 
@@ -72,20 +73,20 @@ either way it should not be used in a commit message until it is.
 | **mmproj** | The vision projector. Shedding it makes a model text-only and frees its VRAM. | llama-server |
 | **MTP** | Multi-token prediction draft model. Roughly doubles generation speed and is the costly thing to lose, so it sits late in the sacrifice order. | SPEC "MTP Speculative Decoding" |
 
-## Tasks and routing categories
+## Tasks, roles and categories
 
-Two different things are called a category. Say which one: a **task** is
-what work is done (`coding`, `qa`, `embeddings`), a **matrix category** is
-the routing var a set names (`emb`, `rnk`):
+Three different things. Say which one: a **role** is what a model is for
+(`chat`, `embeddings`, `rerank`, …), a **task** is the endpoint contract
+that implements a role (`coding`, `embeddings`), and a **matrix category**
+is the model pick a capacity-charged entry is emitted for (`emb`, `rnk`).
 
 | Term | Means | Code |
 |---|---|---|
 | **task catalogue** | The declared set of task ids: endpoint, scheduling role, intent, demand. An id outside it is not a task. | `profiles.yaml tasks:`, validated by `tasks.py` |
+| **role** | What a model is for; the substitutable slot. One live serving per role, enforced by that role's size-1 capacity pool. | `roles.py`, SPEC §Capacity routing |
 | **demand** | One task's minimum serving (`min_context`, `min_parallel`, `require`, `keep`, `sacrifice`). | `tasks.Task` |
 | **`min_context`** | The context a task requires. A model that cannot serve it at any rung emits nothing for that task. | profiles `tasks:` |
-| **matrix category** | An operator-named routing var under `matrix.categories` that binds a model to a var a set can name (`emb`, `rnk`, or a bucket such as `one`). A routing name, not a workload claim. | `matrix.categories` |
-| **canonical category** | The category whose model is the task's pinned CPU resident: `emb`, `rnk`, else the first declared for that task. | `canonical_cpu_pins` |
-| **set** | The emitted form of a role: a composition of tasks/categories that must be live together — `rag: __CHAT_VARS__ & emb & rnk` is embed *and* rerank. `&` sums, `|` maxes, `+set` expands; the chat solve reserves the worst branch of the most expensive chat set. | `matrix.sets`, `set_overhead_mb` |
+| **matrix category** | An operator-named model pick under `matrix.categories` (`emb`, `rnk`, `rnk2`), used to select a model and cap its context. It is not a capacity pool. | `matrix.categories` |
 
 ## Emission
 
@@ -104,7 +105,7 @@ the routing var a set names (`emb`, `rnk`):
 | **backend** | Retired spelling of **engine**; survives only as a code identifier (`backends/`, `BoundBackend`). A sidecar declaring `backend:` warns as an alien key. | `backends/` |
 | **transport** | *How* a backend runs: host, podman, docker. An independent axis from the engine. | `backends/transport.py` |
 | **engine resolution** | The sidecar `engines:` list names the engines that can load the model (order, allow list, format, endpoint, availability); refusal by name when none applies. Required on an authored sidecar; only an orphan is inferred. | SPEC "Backend Selection" |
-| **coload** | A second entry placed in a slot that is otherwise idle — opportunistic, not reserved. | `coload_stems` |
+| **coload** | A second entry placed in a slot that is otherwise idle — opportunistic, not reserved. Legacy matrix vocabulary; capacity pools now govern co-residency. | `coload_stems` |
 
 ## Deploy
 

@@ -4,6 +4,8 @@ Status: **implemented** (approach (a): declared non-RAG categories are
 fixed-overhead residents). `matrix.categories` + `evict_costs` validation +
 category vars shipped 2026-09-12; the remaining "fully general N-category
 solved-context" idea is future work. **Set composition and worst-branch
+pricing are superseded** (2026-11-07) by llama-swap's capacity router: see
+`SPEC.md` §Capacity routing. `matrix.sets:`/`evict_costs:` are retired.
 pricing: portion 1 landed 2026-10-27** (see "Sets are role compositions").
 Recorded 2026-08-24.
 Related: `docs/plans/comfyui-sd.md`, `docs/plans/audio-roles.md`, `SPEC.md`

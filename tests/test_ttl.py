@@ -63,6 +63,12 @@ def test_ttl_device_entry_inherits_global():
     assert resolve_entry_ttl(_m(), _task()) is None
 
 
+def test_ttl_role_default_reaches_a_helper_without_a_task_demand():
+    # Validates: SPEC.md, "TTL": a helper planned from its role still gets
+    # the role's declared task lifetime.
+    assert resolve_entry_ttl(_m(on_cpu=True, role="embeddings"), None, 0) == 0
+
+
 def test_ttl_invalid_sidecar_value_warns(caplog):
     # Validates: SPEC.md, "TTL": a malformed declared lifetime is ignored,
     # not silently applied.

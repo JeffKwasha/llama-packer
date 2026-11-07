@@ -1,7 +1,8 @@
 # Plan: tasks and endpoints — the serving-contract redesign
 
-Status: **design accepted in principle** (2026-10-29); **P0–P4 landed**
-(2026-10-30/31, PRs #6–#8, #10–#13); **P5 open**.
+Status: **P0–P4 landed** (2026-10-30/31, PRs #6–#8, #10–#13).
+**P5 superseded** (2026-11-07): llama-swap's capacity router replaces the
+roles/sets design; see SPEC.md §Capacity routing and docs/architecture.md.
 Stacked on PR #4 (`feat/cpu-residency-budget`); all branches merged to `main`.
 Supersedes `docs/plans/audio-roles.md`'s role proposal (cited, absorbed) and
 the operations-on-engines half of `llama_packer/roles.py` as landed in the
@@ -273,11 +274,11 @@ design and tracked in [`roadmap.md`](roadmap.md).
 | D4 compatibility is declared (`engines:`) | `SPEC.md` §Backend Selection; `templates/models_AGENTS.md` | landed |
 | D5 tasks come from the catalog | `SPEC.md` §Tasks; `docs/glossary.md` §Tasks and routing categories | landed |
 | D6 family is the interchangeability unit | `docs/glossary.md` | landed |
-| D7 a role hosts elements | `docs/architecture.md` §A role is a composition | design (P5) |
-| D8 roles declare their tasks | `docs/architecture.md` §A role is a composition | design (P5) |
-| D9 tasks are sacrifice-by-default | `docs/architecture.md` §A role is a composition | design (P5) |
+| D7 a role hosts elements | superseded: a role is a purpose, a category is a model pick | retired |
+| D8 roles declare their tasks | superseded by capacity pools + roles.py | retired |
+| D9 tasks are sacrifice-by-default | task demand ladder (SPEC §Tasks) | landed |
 | D10 CPU placement flips the cost pool | `SPEC.md` §Host pool | landed |
-| D11 TTL is orthogonal to precedence | `docs/glossary.md` §Precedence and lifetime | design (P5) |
+| D11 TTL is orthogonal to precedence | `docs/glossary.md` §Capacity, eviction and lifetime | landed |
 | D12 the one allocation problem | [`roadmap.md`](roadmap.md) | design (branch C) |
 | D13 clean break on config syntax | `SPEC.md` §Backend Selection, §Tasks; `templates/models_AGENTS.md` | landed |
 
@@ -334,10 +335,10 @@ refactor.
   warns and is ignored, and an `audio_cpp.task` that contradicts the model's
   task warns. `templates/models_AGENTS.md` documents the catalog. The fleet
   is migrated by an operator run of `tasks-migrate.py`.
-- **P5 roles + persistence + TTL**: profiles `roles:` table (tasks list
-  with persistence class, demand layer); matrix sets generated from it;
-  per-entry TTL cascade (D11) and tier defaults; pinned reserve charged at
-  role floors; CPU-helper TTL default re-tuned.
+- **P5 roles + persistence + TTL** — *superseded 2026-11-07*: the
+  roles/sets table is retired. Capacity pools + per-model `capacities` and
+  `evict_cost` replace matrix sets; TTL resolves sidecar > task > placement
+  default. See SPEC.md §Capacity routing / §TTL.
 
 The unified solver (D12) is **branch C**, after this branch's vocabulary
 lands — it consumes tasks/roles/endpoints as inputs.

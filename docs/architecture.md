@@ -47,40 +47,35 @@ runtime: we choose the fields, llama-swap acts on them.
 |---|---|---|
 | which entries exist | `models:` (`cmd`, `metadata`, `capabilities`, `name`) | llama-swap serves them |
 | when an idle entry unloads | `ttl:` per entry, `globalTTL:` top-level (seconds; `0` disables idle unload) | llama-swap's idle timer |
-| which entries may be wanted together | `routing.router.settings.matrix` (`vars`, `sets`, `evict_costs`) | llama-swap's matrix router |
-| what memory is pre-charged in the budget | pack-time arithmetic only | nobody at runtime |
+| which entries may be wanted together | `routing.router.settings.capacity` (`pools`, per-entry `capacities`, `evict_cost`) | llama-swap's capacity router |
+| what memory each serving claims | `capacities:` on each model | llama-swap, at request time |
+| what memory the packer budgets | pack-time arithmetic only | nobody at runtime |
 
-**`pinned` and `on_demand` are memory-accounting classes, not runtime
-states.** A pinned element is charged before the rest of the budget is
-solved, so the emitted config always leaves room for it. It is not a
-request to keep that entry loaded: an entry with a `ttl` still unloads and
-lazily reloads. An on_demand element is simply not pre-charged; its entry
-is still emitted and llama-swap may load it whenever a request names it.
-Neither class changes the entry's definition or its set membership.
+**The packer decides numbers; llama-swap enforces them.** `capacities` are
+declarations, so the packer emits the same measurement margin it solved
+with. `evict_cost` only orders evictions under pressure; it does not
+reserve or preload. A size-1 pool per scheduling role turns "one live
+serving per role" into a capacity constraint, so a same-role request evicts
+its sibling without any set vocabulary.
 
-**`sets:` is co-residency vocabulary, not preload.** llama-swap does not
-start a set. The expression says which models may share the card in that
-use case; llama-swap loads/evicts within it under its own policy. We use
-the same expression to price the worst branch in the chat solve.
+Nothing is preloaded: llama-swap starts the requested model and evicts
+whatever the pools require. `ttl` is independent — it yields time, not
+memory.
 
-Example of the emitted form (adapters, `emb`, `rnk`, … are the matrix vars
-from `vars:`):
+Example of the emitted form:
 
 ```yaml
 routing:
   router:
-    use: matrix
+    use: capacity
     settings:
-      matrix:
-        vars: {c1: qwen38-27b-dirk.coding.t, emb: jina-v5-small-retrieval, rnk: qwen3-reranker-0.6b}
-        sets:
-          rag:  (c1 | c2 | …) & emb & rnk
-          ragz: (c1 | c2 | …) & emb & rnk2
+      capacity:
+        pools: {default: 27747, ram: 50000, chat: 1, embeddings: 1, rerank: 1}
+models:
+  qwen38-27b-dirk.coding.t:
+    capacities: {default: 27443, ram: 1300, chat: 1}
+    evict_cost: 250
 ```
-
-`rag` and `ragz` are two use cases that differ only in which model fills
-the rerank element. A request naming a var is routed through the sets that
-contain it.
 
 ## Models, tasks, engines and endpoints
 
@@ -134,32 +129,25 @@ never does. A role's required endpoints are the union of its tasks'
 endpoints, and one live serving covers every task sharing an endpoint —
 those tasks are aliases of one serving, never one load each.
 
-### A role is a composition
+### A role is a purpose; a category is a model pick
 
-A role hosts elements; it does not require them — RAG with the rerank slot
-empty is thinner but valid. Roles live in `profiles.yaml` and list their
-tasks with a persistence class:
+The levels are not interchangeable:
 
-```yaml
-roles:
-  chat:
-    tasks:
-      - chat:  pinned
-      - agent: on_demand
-  rag:
-    min_context: 4k
-    sacrifice: [concurrency, vision]
-    tasks:
-      - embed:  pinned
-      - rerank: pinned
-```
+| level | answers | example |
+|---|---|---|
+| **role** | what a model is *for*; the substitutable slot — one live serving per role | `chat`, `embeddings`, `rerank`, `s2t`, `t2s` |
+| **task** | the endpoint contract that implements a role | `openai.chat.completions`, `/v1/embeddings` |
+| **category** | a model chosen to fill a role (a matrix var) | `emb`→embeddings, `rnk`/`rnk2`→rerank |
+| **capacity pool** | what may be co-resident | `default` VRAM, `ram`, one size-1 pool per role |
 
-`pinned` is resident; `on_demand` (the default) loads when requested and
-evicts its siblings. Role terms (`require:`/`keep:`/`sacrifice:`/`min_*:`)
-reach every element's serving and rank earlier in the sacrifice order than
-the task's own terms — the role degrades before its tasks do. The matrix
-`sets:` are generated from this table (P5), not hand-authored: dual
-authorship is the drift this design exists to remove.
+A role is not a composition and does not "host" anything. Co-residency is
+what the emitted capacities allow: any combination that fits every pool may
+coexist, and a size-1 role pool keeps one model per role live. This replaces
+matrix sets entirely; there is no `roles:` table and no hand-authored
+`sets:`.
+
+`ttl` is the temporal knob: sidecar > task > placement default, `0` = never,
+non-chat CPU helpers default to 3600 s.
 
 ### Where the registries live
 
