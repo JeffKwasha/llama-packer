@@ -252,10 +252,11 @@ def test_detect_matrix_selects_when_section_present(caplog):
         cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({"matrix": matrix_cfg},
                                                     models, args,
                                                     logging.getLogger("test"))
-    assert cfg is matrix_cfg
+    assert cfg == {}
     assert emb.stem == "emb1" and rnk.stem == "rnk1"
     assert cats == {"emb": emb, "rnk": rnk}
     assert fixed == []
+    assert "sets: is retired" in caplog.text
     assert "matrix: disabled" not in caplog.text
 
 
@@ -281,15 +282,16 @@ def test_detect_matrix_custom_categories(caplog):
     with caplog.at_level(logging.WARNING):
         cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix(
             {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
-    assert cfg is matrix_cfg
+    assert "sets" not in cfg and "evict_costs" not in cfg
     assert set(cats) == {"emb", "rnk", "tts", "stt"}
     assert cats["tts"].stem == "tts1" and cats["stt"].stem == "stt1"
     # Non-RAG categories are fixed-overhead residents, in declaration order.
     assert [n for n, _ in fixed] == ["tts", "stt"]
-    assert "evict_costs key" not in caplog.text
+    assert "sets: is retired" in caplog.text
+    assert "evict_costs: is retired" in caplog.text
 
 
-def test_detect_matrix_warns_unknown_evict_cost(caplog):
+def test_detect_matrix_warns_retired_evict_costs(caplog):
     # Validates: docs/plans/matrix-categories.md, 'Design sketch': Resolve the swap-matrix configuration before build_config. Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed)``.
     import logging
     from types import SimpleNamespace
@@ -301,7 +303,7 @@ def test_detect_matrix_warns_unknown_evict_cost(caplog):
     with caplog.at_level(logging.WARNING):
         _detect_matrix({"matrix": {"evict_costs": {"nope": 5}}}, models, args,
                        logging.getLogger("test"))
-    assert "evict_costs key" in caplog.text
+    assert "evict_costs: is retired" in caplog.text
 
 
 def test_build_matrix_vars_includes_categories():

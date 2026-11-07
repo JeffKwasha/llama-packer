@@ -589,7 +589,7 @@ class Model:
         "role", "allow_profiles", "capabilities", "tasks",
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
-        "cache_type", "parallel", "min_context",
+        "cache_type", "parallel", "min_context", "pp_tps", "ttl",
         "usage", "allow_mtp_shed",
         "image_min_tokens", "image_max_tokens",
         "min_image_megapixels", "image_output_reserve",

@@ -25,7 +25,7 @@ PROFILES_KEYS: frozenset[str] = frozenset({
     "defaults", "tasks", "models_dirs", "dirs", "hf_home", "backends",
     "profiles", "llama_server", "vllm", "sd", "whisper", "audio_cpp",
     "hardware", "device_roles", "overrides", "matrix", "pools", "macros",
-    "shed",
+    "shed", "capacity",
 })
 
 
@@ -92,6 +92,23 @@ class Profiles:
         """Spare VRAM in MB for one resolution: *preferred* (profile value)
         > *cli_override* (global ``--spare``) > 0."""
         return parse_spare_mb(preferred or cli_override, vram_total)
+
+    @property
+    def capacity_cfg(self) -> dict:
+        """Raw ``capacity:`` section — capacity-router cost knobs.
+
+        ``pp_tps`` is the fleet default prompt-processing rate (tokens/s)
+        used to price a chat serving's lost prefill in ``evict_cost``;
+        a sidecar ``pp_tps:`` overrides it. ``drive_mbps`` overrides the
+        detected read speed used to price reload time.
+        """
+        raw = self._cfg.get("capacity")
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("capacity: section is not a mapping; ignoring")
+            return {}
+        return raw
 
     @property
     def pools_cfg(self) -> dict:

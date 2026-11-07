@@ -211,14 +211,14 @@ MUTATIONS = {
         "llama_packer/__main__.py",
         '            expr = f"{expr.strip()} & {name}"',
         '            expr = expr.strip()'),
-    "test_cpu_entry_ttl_zero": (
+    "test_cpu_chat_entry_inherits_global_ttl": (
         "llama_packer/writer.py",
-        "    if model.on_cpu:\n        entry[\"ttl\"] = 0",
-        "    if model.on_cpu:\n        pass"),
+        '    if ttl is not None:\n        entry["ttl"] = ttl',
+        '    entry["ttl"] = ttl'),
     "test_gpu_entry_has_no_ttl": (
         "llama_packer/writer.py",
-        "    if model.on_cpu:\n        entry[\"ttl\"] = 0",
-        '    if model.on_cpu: \n        entry["ttl"] = 0\n    entry["ttl"] = 0'),
+        '    if ttl is not None:\n        entry["ttl"] = ttl',
+        '    entry["ttl"] = ttl'),
     "test_select_model_picks_measured_cheapest_over_file_size": (
         "llama_packer/__main__.py",
         "            return min(priced, key=lambda t: t[1])[0]",

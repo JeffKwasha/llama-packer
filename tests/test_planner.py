@@ -1945,15 +1945,15 @@ def test_metadata_packing_gpu_entry(profiles):
     assert p["kv_per_token"] == 59769
 
 
-def test_cpu_entry_ttl_zero(profiles):
-    # Validates: docs/plans/cpu-residency-budget.md #20 -- a device: cpu entry
-    # carries ttl 0 (no idle expiry); device entries carry no ttl key.
+def test_cpu_chat_entry_inherits_global_ttl(profiles):
+    # Validates: SPEC.md, "TTL" -- a chat serving on CPU is not a helper; it
+    # inherits globalTTL and carries no per-entry ttl.
     m = make("ttlcpu", role="chat", device="cpu")
     _fake_vram(m, (466, 0.057, 346))
     variants = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
                        host_pool_mb=8192).plan()["ttlcpu"]
     entry = only_entry(emit_config([m], {"ttlcpu": variants}, profiles, TVARS))
-    assert entry["ttl"] == 0
+    assert "ttl" not in entry
 
 
 def test_gpu_entry_has_no_ttl(profiles):

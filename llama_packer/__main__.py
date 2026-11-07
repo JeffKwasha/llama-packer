@@ -503,12 +503,16 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
         rerank_model = categories["rnk"]
         rnk_by_selector = True
 
-    known = set(categories)
-    for key in (matrix_cfg.get("evict_costs") or {}):
-        if key not in known:
-            logger.warning("matrix: evict_costs key %r is not a declared "
-                           "category %s; llama-swap will ignore it",
-                           key, sorted(known))
+    if matrix_cfg.get("sets"):
+        logger.warning(
+            "matrix: sets: is retired — routing is capacity; the key is "
+            "ignored (remove it and declare pools/capacities instead)")
+    if matrix_cfg.get("evict_costs"):
+        logger.warning(
+            "matrix: evict_costs: is retired — evict_cost is derived per "
+            "entry from load and prefill time; the key is ignored")
+    matrix_cfg = {k: v for k, v in matrix_cfg.items()
+                  if k not in ("sets", "evict_costs")}
 
     fixed = [(n, m) for n, m in categories.items()
              if m is not embed_model and m is not rerank_model]
@@ -649,6 +653,24 @@ def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
     return vars_, coload_vars
 
 
+def _drive_speed(models, args) -> int:
+    """Read speed for model loads: CLI > env > detected > 100 MB/s."""
+    drive_speed = args.drive_speed
+    if drive_speed is None:
+        env_speed = os.environ.get("GEN_CONFIG_DRIVE_SPEED")
+        if env_speed:
+            try:
+                drive_speed = int(env_speed)
+            except ValueError:
+                logger.warning("GEN_CONFIG_DRIVE_SPEED=%r is not numeric; ignoring", env_speed)
+                drive_speed = None
+    if drive_speed is None:
+        model_paths = [m.gguf_path for m in models
+                       if m.gguf_path and m.gguf_path.is_file()]
+        drive_speed = _detect_drive_speed(model_paths)
+    return drive_speed
+
+
 def _health_check_timeout(models, args) -> int:
     """Auto-calculated healthCheckTimeout when not set explicitly.
 
@@ -664,19 +686,7 @@ def _health_check_timeout(models, args) -> int:
          for m in models if m.gguf_path and m.gguf_path.is_file()),
         default=0,
     )
-    # Resolve drive speed: CLI > env > auto-detect > default 100 MB/s
-    drive_speed = args.drive_speed
-    if drive_speed is None:
-        env_speed = os.environ.get("GEN_CONFIG_DRIVE_SPEED")
-        if env_speed:
-            try:
-                drive_speed = int(env_speed)
-            except ValueError:
-                logger.warning("GEN_CONFIG_DRIVE_SPEED=%r is not numeric; ignoring", env_speed)
-                drive_speed = None
-    if drive_speed is None:
-        model_paths = [m.gguf_path for m in models if m.gguf_path and m.gguf_path.is_file()]
-        drive_speed = _detect_drive_speed(model_paths)
+    drive_speed = _drive_speed(models, args)
     hct = max(120, int(1.2 * largest_mb / drive_speed))
     # vLLM floor: assumed 100 MB/s load rate on the largest measurable model.
     vllm_size_mb = max(
@@ -1204,6 +1214,16 @@ def main(argv: list[str] | None = None) -> None:
         except (TypeError, ValueError):
             fatal("profiles.yaml hardware.memory_margin: %r is not a "
                   "non-negative number", raw_margin)
+    cap_cfg = Profiles(profiles_cfg).capacity_cfg
+    drive_mbps = int(cap_cfg.get("drive_mbps") or _drive_speed(models, args))
+    try:
+        pp_tps = float(cap_cfg.get("pp_tps", 1000))
+        if pp_tps < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning("capacity: pp_tps=%r is not a non-negative number; "
+                       "using 1000", cap_cfg.get("pp_tps"))
+        pp_tps = 1000.0
     progress = PackerProgress(enabled=sys.stderr.isatty())
     progress.start(len(models), "budgeting")
     try:
@@ -1218,6 +1238,8 @@ def main(argv: list[str] | None = None) -> None:
             min_context_explicit=min_ctx is not None,
             memory_margin=margin,
             host_pool_mb=host.pool_mb,
+            drive_mbps=drive_mbps,
+            pp_tps=pp_tps,
             progress_cb=lambda stem: progress.advance(stem),
         )
     except ValueError as e:
@@ -1272,104 +1294,18 @@ def main(argv: list[str] | None = None) -> None:
     config["macros"] = merged_macros
 
     # ── Swap matrix: build matrix vars if configured ──
-    if matrix_cfg and embed_model and rerank_model:
-        vars_, coload_vars = _build_matrix_vars(
-            models, embed_model, rerank_model, matrix_categories,
-            config.coload_stems, config.entry_ids_by_stem, logger)
-        chat_var_names = [k for k in vars_ if re.fullmatch(r"c\d+", k)]
-        if not chat_var_names:
-            # Every chat model was disabled by VRAM gating — a degenerate
-            # empty OR-list would be a syntactically valid but semantically
-            # broken set.  Skip matrix routing entirely: models serve
-            # individually (no co-loading) until a looser budget brings
-            # chat entries back.
-            logger.warning(
-                "matrix: no chat models survived VRAM gating; skipping "
-                "matrix routing (models will serve individually)")
-        else:
-            # Parenthesized OR-lists: '&' binds tighter than '|' in the DSL.
-            chat_expr = "(" + " | ".join(chat_var_names) + ")"
-            # CPU helpers join every chat set (design decision 12), but one
-            # per role: the canonical category (`emb`, `rnk`, …).  Pinning
-            # every CPU model made same-role alternatives co-resident
-            # (jina + voyage + qwen3-embedding, both rerankers) and added
-            # catalog noise to every set.  A set that already names another
-            # category of the same role keeps that choice — the alternative
-            # is not forced back in.
-            role_of = {name: m.role
-                       for name, m in (matrix_categories or {}).items()}
-            cpu_pins = canonical_cpu_pins(matrix_categories or {})
-            if cpu_pins:
-                logger.info("matrix: CPU helper pinned per role: %s",
-                            ", ".join(cpu_pins))
-            sets_cfg = matrix_cfg.get("sets") or {}
-            # Per-set chat lists: a model that cannot meet its usage demands
-            # beside a set's residents is dropped from that set only.  An
-            # untagged model is in every set, exactly as before.
-            id_stem = {eid: stem
-                       for stem, ids in config.entry_ids_by_stem.items()
-                       for eid in ids}
-            # Admission is per entry: (stem, category). The fallback entry has
-            # no category name and joins no set.
-            id_cat = {eid: config.entry_category.get(eid)
-                      for eid, _ in id_stem.items()}
-            per_set: dict[str, list[str]] = {}
-            if config.set_admission:
-                for sname in sets_cfg:
-                    per_set[sname] = []
-                for var in chat_var_names:
-                    key = (id_stem.get(vars_[var], "") or var,
-                           id_cat.get(vars_[var]))
-                    admitted = config.set_admission.get(key)
-                    # No entry means this serving was never judged against a
-                    # set -- an untagged model belongs everywhere, as before.
-                    if admitted is None or sname in admitted:
-                        per_set[sname].append(var)
-                dropped = {s: sorted(set(chat_var_names) - set(v))
-                           for s, v in per_set.items()
-                           if set(v) != set(chat_var_names)}
-                for sname, gone in sorted(dropped.items()):
-                    if gone:
-                        stems = sorted({id_stem.get(vars_[g], g) or g
-                                        for g in gone})
-                        logger.info(
-                            "tasks: set %r excludes %d chat model(s) that "
-                            "cannot meet their demands beside it: %s",
-                            sname, len(stems),
-                            ", ".join(st[:24] for st in stems[:8])
-                            + (" ..." if len(stems) > 8 else ""))
-            sets = _expand_matrix_sets(sets_cfg, chat_expr, coload_vars,
-                                       logger,
-                                       chat_expr_by_set={
-                                           s: "(" + " | ".join(v) + ")"
-                                           for s, v in per_set.items() if v},
-                                       pinned=cpu_pins, role_of=role_of)
-            refused = tuple(sorted(config.host_unit_refused))
-            if refused:
-                logger.info("host ledger: refused %s — no ids; set leaves "
-                            "pruned", ", ".join(refused))
-                sets, cpu_pins = _drop_refused_categories(
-                    sets, cpu_pins, refused, logger)
-            _warn_same_role(sets, sets, role_of, logger)
-            if coload_vars:
-                joined = " ".join(str(s) for s in sets_cfg.values())
-                if "__COLOAD_VARS__" not in joined:
-                    logger.info(
-                        "matrix: co-loads %s included but no set references "
-                        "__COLOAD_VARS__; they stay outside the co-loading "
-                        "sets", coload_vars)
-            # llama-swap schema: matrix lives under routing.router.settings.
-            # matrix, not at the top level.
-            config["routing"] = {
-                "router": {
-                    "use": "matrix",
-                    "settings": {"matrix": {
-                        "vars": vars_,
-                        "evict_costs": matrix_cfg.get("evict_costs", {}),
-                        "sets": sets,
-                    }},
-                },
-            }
+    # Capacity routing: the pool limits are the packer's own budget (GPU),
+    # the detected host pool, and one size-1 pool per scheduling role.
+    # Per-entry capacities/evict_cost were attached by the emitter.
+    if config.capacity_pools:
+        config["routing"] = {
+            "router": {
+                "use": "capacity",
+                "settings": {"capacity": {
+                    "pools": dict(config.capacity_pools),
+                }},
+            },
+        }
 
     # Top-level llama-swap settings
     config["healthCheckTimeout"] = hct

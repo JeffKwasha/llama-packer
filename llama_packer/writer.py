@@ -36,6 +36,7 @@ from llama_packer.consts import (
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
+    _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
     ESTIMATE_ERROR_REASON,
 )
@@ -295,6 +296,39 @@ def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
     return set_params
 
 
+#: Default idle lifetime for a host-resident helper with no declared value.
+#: Capacity pools bound RAM; TTL additionally yields to duties llama-swap
+#: cannot see. A chat serving on CPU inherits the global default instead.
+CPU_HELPER_TTL = 3600
+
+
+def resolve_entry_ttl(model: Model, demand: "Task | None") -> int | None:
+    """The idle-unload lifetime for one entry, in seconds.
+
+    Declared scopes are sidecar and task; the smallest lifetime wins, and
+    ``0`` ("no idle unload") is the strongest keep. With nothing declared a
+    non-chat CPU helper gets :data:`CPU_HELPER_TTL`; everything else returns
+    None, leaving llama-swap's ``globalTTL`` in force.
+    """
+    declared: list[int] = []
+    if "ttl" in getattr(model, "sidecar_keys", ()):
+        raw = model.frontmatter.get("ttl")
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            logger.warning("%s: ttl=%r is not a non-negative integer; "
+                           "ignored", model.label, raw)
+        else:
+            declared.append(raw)
+    if demand is not None and demand.ttl is not None:
+        declared.append(demand.ttl)
+    if declared:
+        if any(v == 0 for v in declared):
+            return 0
+        return min(declared)
+    if model.on_cpu and (demand.role if demand is not None else model.role) != "chat":
+        return CPU_HELPER_TTL
+    return None
+
+
 def _build_entry(
     model: Model,
     parallel: int,
@@ -316,6 +350,7 @@ def _build_entry(
     mem_ram_mib: float | None = None,
     kv_per_token_mib: float | None = None,
     vram_note: str | None = None,
+    ttl: int | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -596,12 +631,11 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # CPU entries never idle-expire (design decision 12): a host-resident
-    # helper is cheap to keep and expensive to reload (process start +
-    # page-cache warmup), so ttl 0 keeps it up between requests. Device
-    # entries keep the inherited/global ttl.
-    if model.on_cpu:
-        entry["ttl"] = 0
+    # Idle unload is a resolved lifetime, not a placement rule.  A declared
+    # sidecar/task value wins (smallest; 0 = never); otherwise a host helper
+    # gets the CPU default and a device entry inherits llama-swap's globalTTL.
+    if ttl is not None:
+        entry["ttl"] = ttl
 
     # Proxied backends (sd-server, whisper-server, audio-cpp) are proxied HTTP
     # services, not llama-swap managed inference — expose the standard proxy
@@ -1588,6 +1622,21 @@ class Planner:
         self.memory_margin = memory_margin
         self.ledger = PoolLedger(vram_total, self.profiles.pools_cfg)
         self.host_ledger = HostLedger(host_pool_mb)
+        # Capacity-router pools.  The GPU limit is the same budget the solve
+        # used (total minus reserve and spare); the host limit is the
+        # detected/declared host pool.  One size-1 pool per scheduling role
+        # makes "one live serving per role" a capacity constraint.
+        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
+        spare_mb = profiles.global_spare_mb(spare, vram_total)
+        pools: dict[str, int] = {}
+        gpu_pool = int(vram_total - reserve - spare_mb)
+        if gpu_pool > 0:
+            pools["default"] = gpu_pool
+        if host_pool_mb is not None and host_pool_mb > 0:
+            pools["ram"] = int(host_pool_mb)
+        for role in roles.SERVED_ROLES:
+            pools[role] = 1
+        self.capacity_pools = pools
         # Stems committed to the host ledger as residents: their serving is
         # charged once (the unit pass), never re-checked at emission.
         self.host_ledger_stems: set[str] = set()
@@ -3263,8 +3312,64 @@ def _coload_overhead(
 # ── Emission ──────────────────────────────────────────────────────────────
 
 
+def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
+                     drive_mbps: int, pp_tps: float,
+                     memory_margin: float) -> dict:
+    """Capacity-router fields for one entry: pools it charges, eviction cost.
+
+    ``capacities`` is what llama-swap enforces; it must carry the same
+    measurement margin the solve used or the router can admit an overcommit.
+    A size-1 pool per scheduling role makes "one live serving per role" a
+    capacity constraint, so the requested model evicts its siblings without
+    any set vocabulary.
+    """
+    caps: dict[str, int] = {}
+    if model.on_cpu:
+        if variant.mem_ram_mib is not None and "ram" in pools:
+            caps["ram"] = max(1, int(round(
+                variant.mem_ram_mib * (1.0 + memory_margin))))
+    else:
+        vram = variant.mem_vram_mib
+        if vram is None:
+            # Unmeasured: a file-size floor is still better than zero, so the
+            # router cannot silently over-admit an unestimated serving.
+            vram = float(model.size_mb or 0) * 1.25
+        if vram and "default" in pools:
+            caps["default"] = max(1, int(round(
+                vram * (1.0 + memory_margin))))
+        if variant.mem_ram_mib and variant.mem_ram_mib > 0 \
+                and "ram" in pools:
+            caps["ram"] = max(1, int(round(
+                variant.mem_ram_mib * (1.0 + memory_margin))))
+    role = (variant.task_demands[0].role if variant.task_demands
+            else model.role)
+    if role in pools:
+        caps[role] = 1
+
+    cost = 0.0
+    size_mb = float(model.size_mb or 0)
+    if size_mb > 0 and drive_mbps > 0:
+        cost += size_mb / drive_mbps
+    if role == "chat":
+        pp = None
+        if "pp_tps" in getattr(model, "sidecar_keys", ()):
+            try:
+                pp = float(model.frontmatter.get("pp_tps"))
+            except (TypeError, ValueError):
+                pp = None
+        if pp is None:
+            pp = pp_tps
+        if pp and pp > 0:
+            cost += variant.ctx_size * max(1, variant.parallel) / pp
+    return {"capacities": caps, "evict_cost": max(0, int(round(cost)))}
+
+
 def emit_config(models: list[Model], plan: dict,
-                profiles: Profiles, template_vars: dict) -> EmittedConfig:
+                profiles: Profiles, template_vars: dict, *,
+                capacity_pools: dict[str, int] | None = None,
+                drive_mbps: int = 100,
+                pp_tps: float = 1000.0,
+                memory_margin: float = _MEMORY_MARGIN) -> EmittedConfig:
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
@@ -3362,6 +3467,7 @@ def emit_config(models: list[Model], plan: dict,
             tail = unique_tail(model.stem, tail,
                                 f"{v.cache_type}"
                                 f"{'-vis' if v.include_mmproj else ''}")
+            demand = v.task_demands[0] if v.task_demands else None
             entry_id, entry = _build_entry(
                 view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
@@ -3375,7 +3481,12 @@ def emit_config(models: list[Model], plan: dict,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
                 kv_per_token_mib=v.kv_per_token_mib,
                 vram_note=v.vram_note,
+                ttl=resolve_entry_ttl(view, demand),
             )
+            if capacity_pools:
+                entry.update(_capacity_fields(
+                    view, v, capacity_pools, drive_mbps, pp_tps,
+                    memory_margin))
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "
@@ -3391,7 +3502,8 @@ def emit_config(models: list[Model], plan: dict,
                            coload_stems=sorted(coload_stems),
                            set_admission=set_admission,
                            entry_category=category_of,
-                           host_unit_refused=host_refused)
+                           host_unit_refused=host_refused,
+                           capacity_pools=dict(capacity_pools or {}))
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -3420,7 +3532,8 @@ class EmittedConfig(dict):
                  set_admission: dict | None = None,
                  entry_category: dict[str, str | None] | None = None,
                  set_overheads: dict[str, int] | None = None,
-                 host_unit_refused: tuple[str, ...] = (), **kwargs):
+                 host_unit_refused: tuple[str, ...] = (),
+                 capacity_pools: dict[str, int] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
         self.coload_stems: list[str] = coload_stems or []
@@ -3438,6 +3551,9 @@ class EmittedConfig(dict):
         # and any fixed categories).  Emitted as a comment above each `sets:`
         # entry so the config documents its own memory split.
         self.set_overheads: dict[str, int] = set_overheads or {}
+        # Capacity-router pool limits (gpu default, host ram, one size-1
+        # pool per scheduling role). Emitted under routing.router.settings.
+        self.capacity_pools: dict[str, int] = capacity_pools or {}
 
     def plain(self) -> dict:
         return dict(self)
@@ -3530,6 +3646,8 @@ def build_config(
     min_context_explicit: bool = False,
     memory_margin: float = _MEMORY_MARGIN,
     host_pool_mb: int | None = None,
+    drive_mbps: int = 100,
+    pp_tps: float = 1000.0,
     progress_cb=None,
 ) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
@@ -3583,7 +3701,10 @@ def build_config(
         progress_cb=progress_cb,
     )
     plan = planner.plan()
-    config = emit_config(supported, plan, profiles, template_vars)
+    config = emit_config(supported, plan, profiles, template_vars,
+                         capacity_pools=planner.capacity_pools,
+                         drive_mbps=drive_mbps, pp_tps=pp_tps,
+                         memory_margin=memory_margin)
     _verify_no_overallocation(config, plan, supported, planner)
     config.set_overheads = dict(planner.set_overheads)
     return config

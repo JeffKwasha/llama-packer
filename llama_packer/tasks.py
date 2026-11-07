@@ -47,6 +47,9 @@ class Task:
     #: Slot exponent B for this task's solve; None falls back to
     #: ``matrix.parallel_power``.  High buys slots, low keeps context.
     parallel_power: float | None = None
+    #: Idle-unload lifetime for an entry serving this task, in seconds.
+    #: ``0`` means "no idle unload". Smallest declared lifetime wins.
+    ttl: int | None = None
 
     def satisfied_by(self, ctx: int, parallel: int) -> bool:
         """True when an entry served at (ctx, parallel) meets this demand."""
@@ -141,6 +144,13 @@ def _parse(name: object, spec: object) -> Task | None:
                             "number; ignoring it", task_id, value)
                 continue
             changes["parallel_power"] = float(value)
+        elif key == "ttl":
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or value < 0:
+                log.warning("tasks: %s.ttl=%r is not a non-negative integer; "
+                            "ignoring it", task_id, value)
+                continue
+            changes["ttl"] = value
         elif key in ("require", "keep"):
             if not isinstance(value, (list, tuple)):
                 log.warning("tasks: %s.%s=%r is not a list of capabilities; "
