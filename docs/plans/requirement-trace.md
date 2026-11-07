@@ -169,7 +169,6 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 85 | Exactly one canonical CPU category per role is pinned; device categories are never pinned; same-role alternatives are not | `test_cpu_pin_is_one_canonical_category_per_role` |
 | 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
 | 88 | An alien sidecar key warns at discovery: `role:`/`usage:` are not keys (the warning points at `tasks:`), and `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
@@ -217,6 +216,6 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 100 | The emitted pools are the packer's available VRAM (`default`), the detected host pool (`ram`), and one size-1 pool per scheduling role | `test_capacity_pools_are_gpu_budget_host_pool_and_role_singletons` |
-| 101 | Every entry declares the pools it charges, carrying the solve's measurement margin; an unmeasured serving gets a file-size floor, never zero | `test_capacity_fields_charge_gpu_ram_and_role`, `test_capacity_unestimated_serving_gets_a_file_size_floor` |
+| 101 | Every entry declares the pools it charges, carrying the solve's measurement margin; an unmeasured serving reserves the whole pool and runs alone | `test_capacity_fields_charge_gpu_ram_and_role`, `test_capacity_unestimated_serving_reserves_the_whole_pool` |
 | 102 | A `device: cpu` serving charges `ram` only, never a GPU pool | `test_capacity_fields_cpu_helper_charges_host_only` |
 | 103 | `evict_cost` prices reload time plus lost prefill for chat only; a sidecar `pp_tps:` overrides the fleet rate | `test_capacity_evict_cost_ignores_prefill_for_stateless_roles`, `test_capacity_evict_cost_uses_sidecar_prompt_rate` |

@@ -79,11 +79,11 @@ def test_capacity_evict_cost_uses_sidecar_prompt_rate():
     assert caps["evict_cost"] == 267  # 200 s load + 67 s prefill
 
 
-def test_capacity_unestimated_serving_gets_a_file_size_floor():
+def test_capacity_unestimated_serving_reserves_the_whole_pool():
     # Validates: SPEC.md, "Capacity routing": an unmeasured entry is never
-    # declared as zero capacity.
+    # declared as a guessed floor; it reserves the pool and runs alone.
     caps = _capacity_fields(
         _model(size_mb=20000),
         _variant(mem_vram_mib=None),
         {"default": 30000, "chat": 1}, 100, 1000, 0.04)
-    assert caps["capacities"]["default"] == 26000
+    assert caps["capacities"]["default"] == 30000

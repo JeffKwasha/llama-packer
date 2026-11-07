@@ -36,10 +36,8 @@ from llama_packer.consts import (
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
 from llama_packer.writer import (
-    build_config, write_yaml, dump_yaml, EmittedConfig, coload_var_name,
-    MatrixKnobs, resident_cost_detail, resident_ctx,
-    _expr_leaves, _has_chat_slot, _prune_leaves,
-    _resident_options)
+    build_config, write_yaml, dump_yaml, EmittedConfig,
+    MatrixKnobs, resident_cost_detail, resident_ctx)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -535,124 +533,6 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
 # (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
 
 
-def _drop_refused_categories(sets: dict[str, str], cpu_pins: list[str],
-                            refused: tuple[str, ...], logger):
-    """Reshape the emitted config for host-unit refusals (requirement 33).
-
-    A refused category has no id, so its var must vanish both from the
-    ``vars`` map (which the emitter already omit — the stem drew no
-    variants) and from every set expression, or llama-swap rejects the
-    whole config.  Returns (pruned sets, surviving pins).
-    """
-    kept: dict[str, str] = {}
-    for sname, expr in sets.items():
-        clean = _prune_leaves(expr, frozenset(refused), sets)
-        if clean:
-            kept[sname] = clean
-        else:
-            logger.info("matrix: set %r emptied by refused categories; "
-                        "omitted", sname)
-    return kept, [p for p in cpu_pins if p not in refused]
-
-
-def _warn_same_role(sets: dict[str, str], sets_cfg: dict[str, str],
-                    role_of: dict[str, str], logger) -> None:
-    """Warn when a set may hold two categories of one role at once.
-
-    Requirement 31: one live model per role per set — `rnk` beside `rnk2`
-    is two rerankers resident. Membership is judged per *and-branch*:
-    alternation across roles is a legitimate composition (operator
-    buckets), so only an option that actually holds both warns, naming
-    the set, the role and the two categories.
-    """
-    seen: set[tuple[str, str]] = set()
-    for sname, expr in sets.items():
-        for option in _resident_options(expr, sets_cfg):
-            by_role: dict[str, list[str]] = {}
-            for leaf in option:
-                role = role_of.get(leaf)
-                if role:
-                    by_role.setdefault(role, []).append(leaf)
-            for role, names in sorted(by_role.items()):
-                if len(names) < 2:
-                    continue
-                key = (sname, role)
-                if key in seen:
-                    continue
-                seen.add(key)
-                logger.warning(
-                    "matrix: set %r may hold two categories of role %r "
-                    "(%s) — one live model per role; the extra is an "
-                    "alternative, never a co-resident", sname, role,
-                    ", ".join(sorted(names)))
-
-
-def _build_matrix_vars(models: list, embed_model, rerank_model, categories,
-                       coload_stems: list[str],
-                       entry_ids_by_stem: dict[str, list[str]], logger) -> tuple[dict, list[str]]:
-    """Auto-collect matrix vars: chat entries + selected embed/rerank + co-loads.
-
-    Each chat model contributes a var per emitted entry id (the vision
-    serving and, when present, its vision-less variant), so those variants
-    join the same co-loading sets as their parent entry.  The
-    stem → ids mapping comes from the emitter (EmittedConfig) so naming is
-    owned in exactly one place.  Opportunistically included non-chat models
-    (``coload_stems``, from the matrix solve) contribute one role-prefixed
-    var each (``s2t``, ``img``; numbered on collision).
-
-    Returns (vars, coload_var_names) — the latter feeds the
-    ``__COLOAD_VARS__`` placeholder in set expressions.
-    """
-    vars_: dict[str, str] = {}
-    chat_idx = 0
-    for m in models:
-        if m.role in NON_CHAT_ROLES:
-            continue
-        for eid in entry_ids_by_stem.get(m.stem, []):
-            chat_idx += 1
-            vars_[f"c{chat_idx}"] = eid
-    # Declared categories contribute one var each (emb, rnk, tts, stt, …);
-    # the category names are what `sets:` expressions reference.  Each must
-    # point at an EMITTED entry id, which now carries the served context
-    # (zerank-2 -> zerank-2-4k) — template_id no longer names an entry, and
-    # llama-swap rejects a var that points at a model not in the roster.
-    def entry_of(model) -> str | None:
-        ids = entry_ids_by_stem.get(model.stem) or []
-        return ids[0] if ids else None
-
-    for name, model in (categories or {}).items():
-        if name in vars_:
-            logger.warning("matrix: category var %r collides with an existing "
-                           "var; skipped", name)
-            continue
-        eid = entry_of(model)
-        if eid is None:
-            logger.warning("matrix: category var %r: %s emitted no entry; "
-                           "omitted", name, model.stem)
-            continue
-        vars_[name] = eid
-    for name, model in (("emb", embed_model), ("rnk", rerank_model)):
-        if model is not None and name not in vars_:
-            eid = entry_of(model)
-            if eid is not None:
-                vars_[name] = eid
-    by_stem = {m.stem: m for m in models}
-    coload_vars: list[str] = []
-    for stem in coload_stems:
-        m = by_stem.get(stem)
-        if m is None:
-            continue
-        eid = entry_of(m)
-        if eid is None:
-            continue
-        name = coload_var_name(m.role, vars_)
-        vars_[name] = eid
-        coload_vars.append(name)
-    logger.info("matrix vars: %d chat + %d category + %d coload",
-                chat_idx, len(categories or {}), len(coload_vars))
-    return vars_, coload_vars
-
-
 def _drive_speed(models, args) -> int:
     """Read speed for model loads: CLI > env > detected > 100 MB/s."""
     drive_speed = args.drive_speed
@@ -704,84 +584,6 @@ def _health_check_timeout(models, args) -> int:
                 hct, largest_mb, drive_speed,
                 f", vllm-largest={vllm_size_mb}MB" if vllm_size_mb else "")
     return hct
-
-
-def canonical_cpu_pins(categories: dict) -> list[str]:
-    """One CPU-placed category per role — the helper that stays warm.
-
-    Placement is per model, residency is per role: several CPU categories may
-    share a role, but only one of them can be the resident (decision 2), so
-    pinning all of them into every set would make the alternatives
-    co-resident.  ``emb``/``rnk`` are the canonical names; otherwise the
-    first declared category for the role wins.
-    """
-    canonical: dict[str, str] = {}
-    for name, m in categories.items():
-        role = getattr(m, "role", None)
-        if role is None:
-            continue
-        if role not in canonical or name in ("emb", "rnk"):
-            canonical[role] = name
-    return sorted(name for name in canonical.values()
-                  if categories[name] is not None and categories[name].on_cpu)
-
-
-def _expand_matrix_sets(sets_cfg: dict, chat_expr: str,
-                        coload_vars: list[str], logger,
-                        chat_expr_by_set: dict[str, str] | None = None,
-                        pinned: list[str] | None = None,
-                        role_of: dict[str, str] | None = None,
-                        ) -> dict:
-    """Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs.
-
-    Placeholders expand to parenthesized OR-lists of VAR NAMES (not model
-    IDs — the llama-swap sets DSL references var names, which map to model
-    IDs via ``vars``).  With no co-loads included, a ``__COLOAD_VARS__`` term
-    is dropped from the expression entirely.
-
-    *chat_expr_by_set* overrides the chat OR-list per set, so a model that
-    cannot hold its context alongside a set's residents is left out of that
-    set alone instead of every set.
-
-    *pinned* lists var names or entry ids that join every chat set unless
-    already a leaf — the CPU-helper rule (design decision 12): evicting
-    them buys no device memory, and sets permit subsets, so membership
-    never preloads one.
-
-    *role_of* maps every category var to its role.  With it, a pin is
-    skipped when the set already names a *different* category of the same
-    role: ``(rnk2 | emb)`` is an alternative, and forcing the canonical
-    ``rnk`` in would make both rerankers resident at once.
-    """
-    if pinned and not role_of:
-        raise ValueError("pinned CPU helpers need role_of to stay one per role")
-    coload_expr = ("(" + " | ".join(coload_vars) + ")") if coload_vars else None
-    expanded: dict[str, str] = {}
-    for sname, sexpr in sets_cfg.items():
-        this_chat = (chat_expr_by_set or {}).get(sname, chat_expr)
-        expr = sexpr.replace("__CHAT_VARS__", this_chat)
-        if coload_expr:
-            expr = expr.replace("__COLOAD_VARS__", coload_expr)
-        else:
-            expr = (expr.replace("& __COLOAD_VARS__", "")
-                        .replace("__COLOAD_VARS__ &", "")
-                        .replace("__COLOAD_VARS__", ""))
-            if "__COLOAD_VARS__" in sexpr:
-                logger.warning(
-                    "matrix: set %r references __COLOAD_VARS__ but no "
-                    "co-loads were included; term dropped", sname)
-        for name in (pinned or []):
-            if not _has_chat_slot(expr, sets_cfg):
-                continue  # a non-chat set has no helper to keep warm
-            leaves = _expr_leaves(expr, sets_cfg)
-            if name in leaves:
-                continue
-            role = role_of.get(name)
-            if role and any(role_of.get(leaf) == role for leaf in leaves):
-                continue  # the set already chose this role's alternative
-            expr = f"{expr.strip()} & {name}"
-        expanded[sname] = expr.strip()
-    return expanded
 
 
 def resolve_host_binary(

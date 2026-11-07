@@ -121,82 +121,6 @@ def test_backend_args_validation(caplog):
     assert "stringified container" in caplog.text
 
 
-def test_build_matrix_vars_includes_text_variants():
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
-    import logging
-    from llama_packer.__main__ import _build_matrix_vars
-
-    def m(role, tid):
-        return SimpleNamespace(role=role, template_id=tid, stem=tid)
-
-    models = [m("chat", "alpha"), m("chat", "beta"), m("embeddings", "emb-1"),
-              m("rerank", "rnk-1")]
-    # Only emitted entries become vars: alpha kept vision (has -text), beta
-    # was auto-dropped (its main entry IS beta-text), ghost never emitted.
-    entry_ids_by_stem = {"alpha": ["alpha", "alpha-text"],
-                         "beta": ["beta-text"],
-                         "emb-1": ["emb-1-4k"], "rnk-1": ["rnk-1-4k"]}
-    vars_, coload_vars = _build_matrix_vars(
-        models, m("embeddings", "emb-1"), m("rerank", "rnk-1"), {},
-        [], entry_ids_by_stem, logging.getLogger("test"))
-    assert vars_ == {"c1": "alpha", "c2": "alpha-text", "c3": "beta-text",
-                     "emb": "emb-1-4k", "rnk": "rnk-1-4k"}
-    assert coload_vars == []
-
-
-def test_build_matrix_vars_includes_coloads():
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
-    import logging
-    from llama_packer.__main__ import _build_matrix_vars
-
-    def m(role, tid):
-        return SimpleNamespace(role=role, template_id=tid, stem=tid)
-
-    models = [m("chat", "alpha"), m("s2t", "parakeet"), m("image", "flux"),
-              m("image", "flux2")]
-    # co-load vars resolve to emitted entry ids too
-    ids = {"alpha": ["alpha-128k"], "parakeet": ["parakeet-32k"],
-           "flux": ["flux-64k"], "flux2": ["flux2-64k"]}
-    vars_, coload_vars = _build_matrix_vars(
-        models, None, None, {}, ["parakeet", "flux", "flux2"],
-        ids, logging.getLogger("test"))
-    assert vars_["c1"] == "alpha-128k"
-    assert vars_["s2t"] == "parakeet-32k"
-    assert vars_["img"] == "flux-64k"
-    assert vars_["img2"] == "flux2-64k"
-    assert coload_vars == ["s2t", "img", "img2"]
-
-
-def test_expand_matrix_sets_placeholders():
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs. Placeholders expand to parenthesized OR-lists of VAR NAMES (not model.
-    import logging
-    from llama_packer.__main__ import _expand_matrix_sets
-
-    log = logging.getLogger("test")
-    out = _expand_matrix_sets(
-        {"rag": "__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__",
-         "chat_only": "__CHAT_VARS__"},
-        "(c1 | c2)", ["s2t", "img"], log)
-    assert out["rag"] == "(c1 | c2) & emb & rnk & (s2t | img)"
-    assert out["chat_only"] == "(c1 | c2)"
-
-
-def test_expand_matrix_sets_no_coloads_drops_placeholder(caplog):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Expand ``__CHAT_VARS__``/``__COLOAD_VARS__`` placeholders in set exprs. Placeholders expand to parenthesized OR-lists of VAR NAMES (not model.
-    import logging
-    from llama_packer.__main__ import _expand_matrix_sets
-
-    log = logging.getLogger("test")
-    with caplog.at_level(logging.WARNING):
-        out = _expand_matrix_sets(
-            {"rag": "__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__",
-             "leading": "__COLOAD_VARS__ & __CHAT_VARS__"},
-            "(c1)", [], log)
-    assert out["rag"] == "(c1) & emb & rnk"
-    assert out["leading"] == "(c1)"
-    assert "__COLOAD_VARS__" in caplog.text
-
-
 def _stub_model(stem, role):
     from types import SimpleNamespace
     return SimpleNamespace(stem=stem, role=role, frontmatter={},
@@ -304,30 +228,6 @@ def test_detect_matrix_warns_retired_evict_costs(caplog):
         _detect_matrix({"matrix": {"evict_costs": {"nope": 5}}}, models, args,
                        logging.getLogger("test"))
     assert "evict_costs: is retired" in caplog.text
-
-
-def test_build_matrix_vars_includes_categories():
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Auto-collect matrix vars.
-    import logging
-
-    from llama_packer.__main__ import _build_matrix_vars
-
-    def m(role, tid):
-        return SimpleNamespace(role=role, template_id=tid, stem=tid)
-
-    emb, rnk, tts = (m("embeddings", "emb-1"), m("rerank", "rnk-1"),
-                     m("t2s", "tts-1"))
-    models = [m("chat", "alpha"), emb, rnk, tts]
-    cats = {"emb": emb, "rnk": rnk, "tts": tts}
-    # Category vars resolve through the emitted entry ids, which carry the
-    # served context -- template_id is not an entry name.
-    ids = {"alpha": ["alpha-128k"], "emb-1": ["emb-1-4k"],
-           "rnk-1": ["rnk-1-4k"], "tts-1": ["tts-1-32k"]}
-    vars_, coload_vars = _build_matrix_vars(
-        models, emb, rnk, cats, [], ids, logging.getLogger("test"))
-    assert vars_ == {"c1": "alpha-128k", "emb": "emb-1-4k",
-                     "rnk": "rnk-1-4k", "tts": "tts-1-32k"}
-    assert coload_vars == []
 
 
 def test_parse_args_idle_unload():
@@ -578,88 +478,6 @@ def test_device_roles_rejects_a_scalar(make_model, caplog):
         apply_device_roles([a], 3, logging.getLogger("t"))
     assert not a.on_cpu
     assert any("expected a list" in r.message for r in caplog.records)
-
-
-def test_warn_same_role_names_the_pair(caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #31 -- same-role
-    # co-residence warns per and-branch, naming both categories;
-    # alternation (operator buckets) never reports a co-residency.
-    import logging
-    from llama_packer.__main__ import _warn_same_role
-    sets = {"bad": "__CHAT_VARS__ & rnk & rnk2",
-            "bucket": "__CHAT_VARS__ & (three | (two & one))",
-            "alts": "__CHAT_VARS__ & emb & (rnk | rnk2)"}
-    role_of = {"emb": "embeddings", "rnk": "rerank", "rnk2": "rerank",
-               "three": "rerank", "two": "embeddings", "one": "rerank"}
-    _warn_same_role(sets, sets, role_of, logging.getLogger("t"))
-    text = caplog.text
-    assert "'bad'" in text and "'rerank'" in text
-    assert "(rnk, rnk2)" in text
-    for sname in ("bucket", "alts"):
-        assert sname not in text, text
-
-
-def test_drop_refused_categories_prunes_sets_and_pins(caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #33 -- a refused
-    # category's var vanishes from vars (no id), the sets and the pins;
-    # a set emptied entirely is omitted.
-    import logging
-    from llama_packer.__main__ import _drop_refused_categories
-    sets = {"voice": "__CHAT_VARS__ & tts & music",
-            "solo": "__CHAT_VARS__ & tts"}
-    kept, pins = _drop_refused_categories(sets, ["tts", "music"],
-                                          ("music",), logging.getLogger("t"))
-    assert kept["voice"] == "__CHAT_VARS__ & tts"
-    assert pins == ["tts"]
-    sets["cpu_part"] = "music"
-    gone, gone_pins = _drop_refused_categories(sets, ["tts", "music"],
-                                               ("music", "tts"),
-                                               logging.getLogger("t"))
-    assert gone["voice"] == "__CHAT_VARS__"
-    assert "cpu_part" not in gone
-    assert gone_pins == []
-
-
-def test_cpu_helpers_pinned_into_every_set():
-    # Validates: docs/plans/cpu-residency-budget.md #25 -- the canonical CPU
-    # category of each role joins the chat sets that do not name that role,
-    # so a transcription does not evict RAG.
-    from llama_packer.__main__ import _expand_matrix_sets
-    out = _expand_matrix_sets(
-        {"rag": "__CHAT_VARS__ & emb & rnk",
-         "talk": "__CHAT_VARS__ & tts"},
-        "(c1 | c2)", ["tts"], None, pinned=["emb", "rnk"],
-        role_of={"emb": "embeddings", "rnk": "rerank", "tts": "t2s"})
-    assert out["rag"] == "(c1 | c2) & emb & rnk"
-    assert out["talk"] == "(c1 | c2) & tts & emb & rnk"
-
-
-def test_cpu_pin_skips_a_set_that_chose_the_role():
-    # Validates: docs/plans/cpu-residency-budget.md #26 -- a set that already
-    # names a category of the pinned role keeps its own choice: appending the
-    # canonical `rnk` beside `rnk2` would make two rerankers resident.
-    from llama_packer.__main__ import _expand_matrix_sets
-    out = _expand_matrix_sets(
-        {"ragz": "__CHAT_VARS__ & emb & rnk2",
-         "voice": "__CHAT_VARS__ & stt"},
-        "(c1 | c2)", [], None, pinned=["emb", "rnk"],
-        role_of={"emb": "embeddings", "rnk": "rerank", "rnk2": "rerank",
-                 "stt": "s2t"})
-    assert out["ragz"] == "(c1 | c2) & emb & rnk2"
-    assert out["voice"] == "(c1 | c2) & stt & emb & rnk"
-
-
-def test_cpu_pin_is_one_canonical_category_per_role():
-    # Validates: docs/plans/cpu-residency-budget.md #25 -- placement is per
-    # model, residency is per role: one CPU category per role is pinned, and
-    # a device category is never pinned.
-    from llama_packer.__main__ import canonical_cpu_pins
-    cats = {"jina": _role_model("jina", 1050, device="cpu"),
-            "emb": _role_model("voyage", 797, device="cpu"),
-            "rnk": _role_model("rnk", 1050, role="rerank", device="cpu"),
-            "rnk2": _role_model("zerank", 3042, role="rerank", device="cpu"),
-            "tts": _role_model("kokoro", 1204, role="t2s")}
-    assert canonical_cpu_pins(cats) == ["emb", "rnk"]
 
 
 def test_select_model_picks_measured_cheapest_over_file_size():

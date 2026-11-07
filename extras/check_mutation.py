@@ -93,10 +93,6 @@ MUTATIONS = {
         "llama_packer/tasks.py",
         '    who = f"{stem}: tasks:" if stem else "tasks:"',
         '    who = "tasks:"'),
-    "test_warn_same_role_names_the_pair": (
-        "llama_packer/__main__.py",
-        "                if len(names) < 2:",
-        "                if False:"),
     "test_resident_options_branch_alternatives_not_co_resident": (
         "llama_packer/writer.py",
         '                elif op == "&":',
@@ -105,10 +101,6 @@ MUTATIONS = {
         "llama_packer/writer.py",
         'kept.append(pruned if other not in pruned',
         "                                    kept.append(pruned if other in pruned"),
-    "test_drop_refused_categories_prunes_sets_and_pins": (
-        "llama_packer/__main__.py",
-        "    return kept, [p for p in cpu_pins if p not in refused]",
-        "    return kept, list(cpu_pins)"),
     "test_category_ctx_caps_at_one_seam": (
         "llama_packer/writer.py",
         "    ctx = (model.design_context if model.role not in (",
@@ -207,10 +199,6 @@ MUTATIONS = {
         "llama_packer/__main__.py",
         "    elif isinstance(roles_cfg, (list, tuple)):",
         "    elif True:"),
-    "test_cpu_helpers_pinned_into_every_set": (
-        "llama_packer/__main__.py",
-        '            expr = f"{expr.strip()} & {name}"',
-        '            expr = expr.strip()'),
     "test_cpu_chat_entry_inherits_global_ttl": (
         "llama_packer/writer.py",
         '    if ttl is not None:\n        entry["ttl"] = ttl',
@@ -309,15 +297,6 @@ MUTATIONS = {
         "llama_packer/profiles.py",
         "        if key in PROFILES_KEYS:",
         "        if True:"),
-    "test_cpu_pin_is_one_canonical_category_per_role": (
-        "llama_packer/__main__.py",
-        '        if role not in canonical or name in ("emb", "rnk"):',
-        "        if True:"),
-    "test_cpu_pin_skips_a_set_that_chose_the_role": (
-        "llama_packer/__main__.py",
-        "            if role and any(role_of.get(leaf) == role for leaf in leaves):\n"
-        "                continue",
-        "            if False:\n                continue"),
     "test_selection_reason_names_the_cost_terms": (
         "llama_packer/__main__.py",
         '    suffix = f" = {detail}" if detail else ""',

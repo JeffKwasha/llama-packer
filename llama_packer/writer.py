@@ -3354,10 +3354,11 @@ def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
     else:
         vram = variant.mem_vram_mib
         if vram is None:
-            # Unmeasured: a file-size floor is still better than zero, so the
-            # router cannot silently over-admit an unestimated serving.
-            vram = float(model.size_mb or 0) * 1.25
-        if vram and "default" in pools:
+            # Unmeasured: reserve the whole pool so the router can only run
+            # it alone. A guessed floor could over-admit and OOM.
+            if "default" in pools:
+                caps["default"] = pools["default"]
+        elif vram and "default" in pools:
             caps["default"] = max(1, int(round(
                 vram * (1.0 + memory_margin))))
         if variant.mem_ram_mib and variant.mem_ram_mib > 0 \
