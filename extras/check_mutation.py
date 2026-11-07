@@ -297,6 +297,10 @@ MUTATIONS = {
         "llama_packer/profiles.py",
         "        if key in PROFILES_KEYS:",
         "        if True:"),
+    "test_matrix_resolution_measures_with_fit_binary": (
+        "llama_packer/__main__.py",
+        "                          fit_bin=fit_bin or llama_bin,",
+        "                          fit_bin=llama_bin,"),
     "test_selection_reason_names_the_cost_terms": (
         "llama_packer/__main__.py",
         '    suffix = f" = {detail}" if detail else ""',

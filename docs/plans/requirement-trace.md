@@ -219,3 +219,4 @@ and every one of them carries a `Validates:` citation.
 | 101 | Every entry declares the pools it charges, carrying the solve's measurement margin; an unmeasured serving reserves the whole pool and runs alone | `test_capacity_fields_charge_gpu_ram_and_role`, `test_capacity_unestimated_serving_reserves_the_whole_pool` |
 | 102 | A `device: cpu` serving charges `ram` only, never a GPU pool | `test_capacity_fields_cpu_helper_charges_host_only` |
 | 103 | `evict_cost` prices reload time plus lost prefill for chat only; a sidecar `pp_tps:` overrides the fleet rate | `test_capacity_evict_cost_ignores_prefill_for_stateless_roles`, `test_capacity_evict_cost_uses_sidecar_prompt_rate` |
+| 104 | Matrix measurement runs the sibling `llama-fit-params` binary; `llama-server` rejects `--fit-print` | `test_matrix_resolution_measures_with_fit_binary` |

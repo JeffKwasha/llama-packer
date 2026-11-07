@@ -377,6 +377,20 @@ def apply_device_roles(models: list, roles_cfg, logger) -> None:
                     f", {placed} newly placed" if placed else ", all already")
 
 
+def _resolve_matrix(profiles_cfg: dict, models: list, args, logger, *,
+                    llama_bin: str, fit_bin: str,
+                    llama_args: str = "") -> tuple:
+    """Resolve the matrix, measuring with ``llama-fit-params``.
+
+    ``--fit-print`` belongs to the sibling fit binary; handing it to
+    ``llama-server`` fails with ``invalid argument`` and loses the whole
+    measurement.  Keeping the choice here makes the call site testable.
+    """
+    return _detect_matrix(profiles_cfg, models, args, logger,
+                          fit_bin=fit_bin or llama_bin,
+                          llama_args=llama_args)
+
+
 def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
                    *, fit_bin: str = "", llama_args: str = "") -> tuple:
     """Resolve the swap-matrix configuration before build_config.
@@ -980,11 +994,13 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("vllm gpu-memory-utilization: %s (derived from budget)",
                     template_vars["gpu_mem_util"])
 
-    # Detect matrix configuration before build_config
+    # Detect matrix configuration before build_config.  Measure with the
+    # sibling llama-fit-params binary: --fit-print is not a llama-server flag.
     (matrix_cfg, embed_model, rerank_model, matrix_categories,
-     matrix_fixed, matrix_ctx) = _detect_matrix(
+     matrix_fixed, matrix_ctx) = _resolve_matrix(
         profiles_cfg, models, args, logger,
-        fit_bin=llama_bin, llama_args=template_vars["llama_args"])
+        llama_bin=llama_bin, fit_bin=fit_bin,
+        llama_args=template_vars["llama_args"])
 
     # ── Degenerate-budget refusal ──
     # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):

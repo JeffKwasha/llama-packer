@@ -71,6 +71,25 @@ def test_health_check_explicit_speed_and_env(tmp_path, monkeypatch):
     assert _health_check_timeout(models, _args(drive_speed=None)) == 120
 
 
+def test_matrix_resolution_measures_with_fit_binary(monkeypatch):
+    # Validates: docs/plans/roadmap.md, "--fit-print": the measurement runs
+    # llama-fit-params, never llama-server.
+    import logging
+    import llama_packer.__main__ as main_mod
+
+    seen = {}
+
+    def fake(cfg, models, args, logger, *, fit_bin="", llama_args=""):
+        seen["fit_bin"] = fit_bin
+        return ("cfg", None, None, {}, (), {})
+
+    monkeypatch.setattr(main_mod, "_detect_matrix", fake)
+    main_mod._resolve_matrix({}, [], None, logging.getLogger("t"),
+                             llama_bin="/bin/llama-server",
+                             fit_bin="/bin/llama-fit-params")
+    assert seen["fit_bin"] == "/bin/llama-fit-params"
+
+
 def test_apply_env_subst_longest_prefix_wins():
     # Manual prefix map: compute_env_prefixes groups by mount, which is
     # environment-dependent; this test targets substitution ordering only.

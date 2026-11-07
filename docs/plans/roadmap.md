@@ -39,6 +39,8 @@ when the plan that produced them is pruned.
   has `--fit` but not `--fit-print`. The flag belongs to the sibling
   `llama-fit-params` binary, which accepts the same argv and exits 0. The fix
   is the call site (pass `fit_bin`, not `llama_bin`) plus a regression test.
+  **Fixed 2026-11-07:** `_resolve_matrix` takes both binaries and passes the
+  fit one; `test_matrix_resolution_measures_with_fit_binary` holds it.
   A failed run now writes
   `~/.cache/llama-packer/fit-params-failures/<ts>-<pid>-<model>-<outcome>.log`
   (argv, model facts, binary identity, full stdout/stderr, exit/signal) and
