@@ -1,4 +1,4 @@
-# ── Sidecar syntax (NEW — lands in P2/P4) ───────────────
+# ── Sidecar syntax ─────────────────────────────────────
 # Compatibility and capability are declared, never inferred. In a model
 # sidecar (the `<model>.md` beside the weights):
 #   engines: [llama-server]    # engine names that can load the weights;
@@ -6,13 +6,19 @@
 #   tasks: [embeddings]        # closed catalog ids; unset/empty = unverified
 #                              # (never an invented name)
 # `backend:` (compatibility) and `usage:` (workload tags) are the old
-# spellings: they warn as alien keys once their portion lands, and there is
-# no tolerated dual vocabulary.
+# spellings: they warn as alien keys, and there is no tolerated dual
+# vocabulary.
 #
 # ── Global defaults ────────────────────────────────────
 defaults:
   cache_type: q8_0
-  parallel: 1
+  # Do not set `parallel` here unless you intend to pin every model and
+  # disable auto-parallel; leaving it unset lets the value function choose.
+  #
+  # Headroom for the desktop, browser, or other tenants. This is what
+  # `pools.default` subtracts after the fixed reserve; measure it with
+  # `python -m llama_packer.vram_log --once` / `--report`.
+  spare: 1G
   temperature: 1.0
   top_p: 0.95
   top_k: 20
@@ -27,13 +33,13 @@ defaults:
 # exist -- an unknown id warns and is ignored.
 #
 # This section overrides a task's default demand; it never invents a task.
-# min_context / min_parallel are floors, not requests: one entry at
-# ctx >= 128k and parallel >= 2 satisfies all four tasks below, so nothing
-# forces four entries per model.
+# min_context and min_parallel are both floors. Leave a key undefined if you
+# do not want that floor; one entry at ctx >= 128k and parallel >= 2 can
+# satisfy several tasks, so nothing forces four entries per model.
 #
 # require:   capabilities that survive every rung of the capability/context
-#            ladder. A model that cannot keep one is dropped from a set
-#            rather than degraded.
+#            ladder. A model that cannot keep one emits nothing for that
+#            task rather than being degraded.
 # sacrifice: what to give up first when the budget is short. This is a
 #            *preference*, not a cost order — shedding can buy no context at
 #            all (a model already at its design cap has nothing to reclaim),
@@ -42,9 +48,8 @@ defaults:
 #            draft, because an MTP draft roughly doubles generation speed.
 #            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
 #
-# Tasks are applied per set: a model that meets `coding` beside the
-# canonical RAG pair but not beside a heavier reranker joins `rag` and is
-# dropped from `ragz`. Only chat-task models are considered.
+# Each task is satisfied per entry: a model that cannot meet a floor emits
+# nothing for that task. Only chat-task models are considered here.
 #
 # shed: the default order for capabilities a task does not name.
 # shed: [vision, draft]
@@ -82,15 +87,18 @@ tasks:
   embeddings:
     endpoint: openai.embeddings
     role: embeddings
+    ttl: 0                 # keep the RAG pair warm
   rerank:
     endpoint: openai.rerank
     role: rerank
+    ttl: 0
   image:
     endpoint: openai.images.generations
     role: image
   s2t:
     endpoint: openai.audio.transcriptions
     role: s2t
+    # CPU default is 3600 s; set ttl: 0 to keep it warm.
   t2s:
     endpoint: openai.audio.speech
     role: t2s
@@ -280,9 +288,13 @@ profiles:
 # ── Hardware (optional) ─────────────────────────────────
 # Override the auto-detected VRAM pool and host-RAM budget. CLI --vram /
 # --baseline / --unified-system-mb win over the VRAM side.
+# Use `defaults.spare` for ordinary tenant/desktop headroom. `baseline_mb`
+# is an advanced override for a known fixed pre-existing load; it only
+# matters above the fixed 1 GiB video reserve and subtracts from the same
+# pool.
 # hardware:
 #   vram: 48G
-#   # baseline_mb: 512m        # extra reserve on top of fixed 2 GiB (default 0)
+#   # baseline_mb: 512m        # known pre-existing load, above the 1 GiB floor
 #   # unified_system_mb: 8192  # system slice on unified hosts (default 8192)
 #   # memory_margin: 0.04      # fraction inflated against every measured VRAM
 #   #                          # term when solving (default 0.04: covers the
@@ -302,9 +314,11 @@ profiles:
 
 # ── Role-wide host placement (optional) ─────────────────
 # Every model of a named role runs from RAM — identical to tagging each
-# sidecar `device: cpu`: no VRAM charge, same host budget, -ngl 0, never
-# evicted by a swap, ttl 0. Only the four resident roles can be named here
-# (embeddings, rerank, s2t, t2s); a chat model is placed per sidecar.
+# sidecar `device: cpu`: no VRAM charge, same host budget, -ngl 0. It still
+# charges the `ram` capacity pool and is evicted under RAM pressure; an
+# undeclared CPU serving defaults to ttl 3600 s (override with ttl: 0 or a
+# number). Only the four resident roles can be named here (embeddings,
+# rerank, s2t, t2s); a chat model is placed per sidecar.
 # The key is a role, the value is a device — there is no `role: cpu`.
 # Unset = per-sidecar tags only.
 # device_roles: [embeddings, rerank]
@@ -379,9 +393,11 @@ profiles:
 #   pools.default = detected VRAM - reserve - spare
 #   pools.ram     = detected host pool
 #   pools.<role>  = 1 (one live serving per role)
-# plus per-model `capacities` and `evict_cost`. evict_cost is reload time
-# plus lost prefill (chat only); a sidecar `pp_tps:` overrides the fleet
-# rate. Set `drive_mbps:` only to override the detected read speed.
+# plus per-model `capacities` and `evict_cost`. evict_cost is a
+# capacity-router field: reload time plus lost prefill (chat only).
+# `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
+# `pp_tps:` overrides the fleet fallback; estimate it from hardware TOPS x
+# active parameters, or measure it with extras/bench.py / llama-bench.
 # capacity:
 #   pp_tps: 1000
 #   # drive_mbps: 1000

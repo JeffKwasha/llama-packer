@@ -46,12 +46,24 @@ Edit `<dir>/profiles.yaml` for this host, not the repo copy:
 
 - `models_dirs`, `dirs`, `hf_home` — where the models are;
 - `backends` — which engines this host enables;
-- `hardware` — `vram`, `baseline_mb`, `memory_margin`;
+- `defaults.spare` — the headroom for the desktop/other tenants; measure it
+  with `python -m llama_packer.vram_log --once` (or `--report` after
+  logging). `hardware.vram`/`baseline_mb`/`memory_margin` are the lower-level
+  overrides; `baseline_mb` only matters for a known fixed load above the
+  1 GiB video floor;
+- `defaults.parallel` — leave it unset; a value here is a pin and disables
+  auto-parallel for every model;
 - `device_roles` / `device: cpu` — what runs from host RAM;
-- `tasks` — the task ids the fleet uses and their demand/TTL;
+- `tasks` — the task ids the fleet uses; `min_context` and `min_parallel`
+  are floors (leave a key undefined for no floor), and `ttl` sets the idle
+  lifetime;
 - `matrix.categories` — which model fills each role, and its context cap;
 - `capacity` — `pp_tps` / `drive_mbps` for derived eviction cost;
 - `pools` — per-pool VRAM/spare overrides.
+
+A CPU-resident serving defaults to `ttl: 3600`; use `ttl: 0` to keep it
+warm or an explicit number. A task floor the budget cannot meet emits no
+entry rather than a serving below it.
 
 Then re-pack and validate:
 
