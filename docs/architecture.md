@@ -27,7 +27,7 @@ main()                                        (__main__.py — thin orchestratio
 | `Model` | `model.py` | Sidecar aggregate: frontmatter accessors, companion resolution (mmproj/MTP), design context, pass-through metadata. One instance per servable model |
 | `ScopeStack` | `scope.py` | The single select-and-set engine for sidecar data: folds `models.yaml` defaults outermost→innermost, applies override rules last-match-wins per key, finalizes backend inference + path refs |
 | `Profiles` | `profiles.py` | The profiles.yaml mapping as a typed view: fleet defaults (`cache_type`, `parallel`, spare), `allow_profiles` gating, expression resolution (`base * N`), per-model variant grouping |
-| `Planner` | `writer.py` | Every *context decision*: per-category rung search, shared matrix solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
+| `Planner` | `writer.py` | Every *context decision*: per-category rung search, shared context solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx, optional `vram_note` (over-budget squeeze tag for the description) |
 | `emit_config` | `writer.py` | Pure rendering: plans → entry dicts. Zero VRAM contact, zero I/O |
 | `_filter_supported` | `writer.py` | **The** validation boundary: backend format/task compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
@@ -152,8 +152,7 @@ CPU-resident servings default to 3600 s (chat is not special).
 ### Where the registries live
 
 `roles.py` is the scheduling table: one row per scheduling role with the
-chat-pass flag, default residency policy, context knob and `device_roles:`
-eligibility. Every derived set (`SERVED_ROLES`, `NON_CHAT_ROLES`,
+chat-pass flag, context knob and `device_roles:` eligibility. Every derived role collection (`SERVED_ROLES`, `NON_CHAT_ROLES`,
 `DEVICE_ROLES`) is read off it. The task vocabulary itself comes from
 `profiles.yaml tasks:`; each declaration names one of these roles.
 
@@ -218,6 +217,6 @@ plain data — see `tests/test_planner.py`.
 - [backends/](backends/) — one doc per engine: formats/endpoints, command shape, config keys, VRAM
 - [transports/](transports/) — host / docker / podman: launch wrapping, path translation, lifecycle
 - [SPEC.md](../SPEC.md) — behavioral contract (discovery, fit-params
-  estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch
+  estimate, measurement shape, shared context solve, auto-parallel, batch/ubatch
   keys, and what deleting a `derived:` block costs)
   (seconds of header-only work — never a server, never a probe).

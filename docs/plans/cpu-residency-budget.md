@@ -1,13 +1,13 @@
 # Plan: CPU-residency budget — a host-RAM pool for `device: cpu` models
 
-Status: **shipped** — portions 1–2 in PR #4 (2026-10-30); portion 3 moved to
-[`tasks-and-endpoints.md`](tasks-and-endpoints.md). Recorded 2026-10-23.
+Status: **shipped** — portions 1–2 in PR #4 (2026-10-30); portion 3 was
+superseded by capacity routing. Recorded 2026-10-23.
 **Amended 2026-11-07:** the "never evicted, `ttl: 0`, joined every chat set"
 rule is retired. CPU models charge the capacity `ram` pool and are evicted
 under pressure like any other resident; a non-chat helper defaults to
 `ttl: 3600`. See `SPEC.md` §Host pool / §Capacity routing.
-Related: `docs/plans/memory-allocation-tags.md` (§3 measured host
-RAM — this plan is its minimal form), `docs/plans/opportunistic-coload.md`
+Related: the retired memory-tag plan (§3 measured host RAM — this plan is
+its minimal form), `docs/plans/opportunistic-coload.md`
 (CPU-resident coload at 0 GPU cost, today's rule),
 [`roadmap.md`](roadmap.md) (followers and open defects this plan produced),
 `SPEC.md` §VRAM Allocation, `llama_packer/{vram,hardware,writer,model}.py`.
@@ -198,9 +198,8 @@ Portions 1–2 shipped in PR #4: recursive set pricing and the canonical CPU
 pin, then composition validation, per-category `ctx:` and host-ledger unit
 judgement. Their requirements are citable in
 [`requirement-trace.md`](requirement-trace.md); the rules they produced are
-in `SPEC.md` §VRAM Allocation. Portion 3 (solver generalisation) moved to
-[`tasks-and-endpoints.md`](tasks-and-endpoints.md) D12 — the solver consumes
-that branch's vocabulary, so generalising it here would be rewritten.
+in `SPEC.md` §VRAM Allocation. Portion 3 (solver generalisation) is superseded by the capacity router;
+the solver consumes the current vocabulary (SPEC.md §Capacity routing).
 
 ## Host pool equation
 
@@ -260,7 +259,7 @@ the `--n-gpu-layers 0` pin rides the `shape` stamp, so a sidecar
 `device:` flip invalidates the block by shape (a device flip re-measures
 for the other budget) instead of needing a parallel host block family.
 Nothing second-guesses the measurement: tag/report rules per
-`memory-allocation-tags.md` v1 contract apply verbatim.
+the v1 memory-tag contract applies verbatim (SPEC.md §Metadata).
 
 `llama-fit-params` acceptance of extra flags (`llama_args` passthrough
 in `fit_params`) is already sufficient for both shapes — no new tool;
@@ -542,5 +541,5 @@ probe), vLLM host offload, and unified-memory pools (GB10).
 
 Moved to [`roadmap.md`](roadmap.md) §Open defects: the `fit-params crashed
 (exit 1)` first-measurement warnings (with the 2026-10-30 evidence), and the
-PR #4 body's stale vocabulary section, which `tasks-and-endpoints.md`
-supersedes.
+PR #4 body's stale vocabulary section; SPEC.md and docs/architecture.md are
+the current contract.

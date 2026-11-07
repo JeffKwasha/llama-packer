@@ -51,7 +51,7 @@ Also emits:
 1. **`_filter_supported()`** — the validation boundary (backend format/role,
    reasoning flags, cache-type knowability); runs before any VRAM work.
 2. **`Planner.plan()`** — context decisions per (model, category): vision rung,
-   pre-pass, shared matrix solve, profile grouping, bounded-context clamp.
+   pre-pass, shared context solve, profile grouping, bounded-context clamp.
    Returns `Variant` values.
 3. **`emit_config()`** — pure rendering of plans into llama-swap entry dicts.
 
@@ -155,7 +155,7 @@ The tool calculates `ctx_size` dynamically based on measured VRAM costs, not sta
 ### Measurement via `llama-fit-params`
 
 VRAM follows a validated affine law (see `llama_packer/memory_probe.py` and
-docs/plans/auto-parallel.md):
+§`parallel_power`):
 
 ```
 VRAM(C, p) = model_mib + compute_mib + c*C + p*D
@@ -244,7 +244,7 @@ Semantics:
 - **max**: large images are downscaled to this token ceiling — the control for bounding KV cost and prompt size. Diminishing quality returns beyond ~4k tokens.
 - **Static-resolution archs** (Gemma 3/4, SigLIP: fixed resize, ~256 tokens/image) ignore both flags; declaring them there logs a one-time warning and skips emission, as does declaring them on a model with no mmproj companion.
 
-VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the matrix solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
+VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the shared solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
 
 ### Context calculation formula
 
@@ -364,7 +364,7 @@ That tie rule is the whole of "coding drops vision to maximise context, and only
 
 `require` and `keep` are different and both are honoured: `require` gates existence (a model lacking the capability does not satisfy the category, so no entry claims it), while `keep` only forbids shedding — a coding model with no MTP draft is still coding. A category that cannot meet `min_context` at any rung emits **nothing**. Capabilities named by neither list are shed last, in the order from `shed:` in profiles.yaml, which defaults to vision before draft.
 
-`min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
+`min_parallel` is a floor too: a candidate must meet both it and `min_context`. If no serving does, the task emits nothing. `parallel_power` is the knob that makes the solver try harder for slots; it never lowers a floor.
 
 `parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on a chat model without a `parallel:` pin on a slot-based backend.
 
@@ -792,7 +792,7 @@ declares `engines: [vllm]` (or an override rule sets it); the registry picks
 host, podman or docker. The emitted entry runs `vllm serve`,
 published to llama-swap's `${PORT}` host macro. Everything else works
 identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
-matrix routing.
+capacity routing.
 
 All three endpoints are supported, mapped onto vLLM's pooling interface:
 
@@ -1014,7 +1014,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 ### Limitations
 
 - Single `sd-server` per diffusion model; no multi-UNet or distributed setup.
-- VRAM sizing is fixed and deliberately conservative — large flux/sdxl models should be sized via `spare` / `baseline` or explicit `hardware.vram` tuning, not matrix sharing.
+- VRAM sizing is fixed and deliberately conservative — large flux/sdxl models should be sized via `spare` / `baseline` or explicit `hardware.vram` tuning, not shared co-residency.
 - `cli_args` pass-through works, but backend-specific flags (`--diffusion-fa`, `--offload-to-cpu`, `--lora-model-dir`) are operator-provided via sidecar `cli_args:` until first-class `sd_*` keys are added.
 - ComfyUI (`comfyui-boot`) remains future work via the same `image` role — see `docs/plans/comfyui-sd.md` for `compat.ignoreWebsockets` / `upstream.ignorePaths` shape.
 

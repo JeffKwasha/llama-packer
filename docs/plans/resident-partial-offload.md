@@ -1,7 +1,7 @@
 # Roadmap note: partial offload of resident helper weights to host RAM
 
 Status: **proposal — not scheduled**, recorded 2026-10-22. Related:
-`docs/plans/memory-allocation-tags.md` §1 (split representation — the `+`
+the retired memory-allocation-tags plan (git history) §1 (split representation — the `+`
 tag grammar), §3 (measured host RAM), §4 (MoE partial offload — same decider
 shape), `docs/plans/opportunistic-coload.md` §2b (the *context*-squeeze
 counterpart, which already ships a rung of this idea).

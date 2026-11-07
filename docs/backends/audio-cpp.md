@@ -28,9 +28,9 @@ audio.cpp `task` values map onto llama-packer roles:
 | `vc`, `s2s` | `vc` (later) | audio → audio |
 | `sep` | (later) | audio → audio × tracks |
 
-Shipped now: `t2s` + `s2t`. Additional roles are recorded in
-[`docs/plans/audio-roles.md`](../plans/audio-roles.md); they are schema-stable
-because `capabilities.in/out` are freeform lists.
+Shipped now: `t2s` + `s2t`. Additional roles are not part of the closed
+role vocabulary; `capabilities.in/out` are freeform lists, so a future role
+is a contract change, not a schema change.
 
 ## Sidecar
 

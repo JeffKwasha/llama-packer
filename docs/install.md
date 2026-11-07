@@ -157,7 +157,7 @@ naming the build it will actually run.
 **`--spare` decides whether contexts move.** Regenerating re-solves the
 whole fleet. Without `--spare` the budget comes from auto-detected VRAM,
 which may differ from whatever produced the config being replaced — every
-context, id and matrix set can shift. Pass the same `--spare` the current
+context, id and capacity allocation can shift. Pass the same `--spare` the current
 config was built with to reproduce it.
 
 ## The updater is the installer for binaries

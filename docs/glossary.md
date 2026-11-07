@@ -14,8 +14,8 @@ either way it should not be used in a commit message until it is.
 | **sidecar** | The `<model>.md` file next to a model file, holding its metadata as YAML frontmatter. The name comes from the printer's word for the separate insert the model is printed on. | any `*.md` beside a `.gguf` |
 | **orphan** | A model file with no sidecar. Still discovered and served with built-in defaults — the sidecar is an editing surface, not a requirement. | `discover.py` |
 | **stub** | An *empty* sidecar, written only with `--create-stubs`, as something to fill in. | `discover.py:_write_stub` |
-| **task** | What a model *does*: a closed catalog id — `chat`, `embeddings`, `rerank`, `image`, `s2t`, `t2s` today. Claimed by the sidecar `tasks:` list, or the directory it sits in (`dirs:`). One task maps to one **endpoint**. It is not a placement, and an unknown id is not a task. `docs/architecture.md` §"Models, tasks, engines and endpoints". | `tasks.py` (P4); the endpoint map is in `endpoints.py` |
-| **role** | A composition that *hosts* tasks — a use case, not a kind of work. Declared in `profiles.yaml roles:` with a persistence class per task; it does not require its elements. The matrix `sets:` are generated from it. | profiles `roles:` (P5) |
+| **task** | What a model *does*: a declared id under `profiles.yaml tasks:` (e.g. `coding`, `chat`, `embeddings`), with its endpoint, scheduling role and demand. Claimed by the sidecar `tasks:` list, or the directory it sits in (`dirs:`). One task maps to one **endpoint**. It is not a placement, and an undeclared id is not a task. | `profiles.yaml tasks:`, validated by `tasks.py` |
+| **role** | What a model is *for*: the scheduling slot (`chat`, `embeddings`, `rerank`, `image`, `s2t`, `t2s`). A category is a model pick that fills one; one live serving per role is enforced by that role's size-1 capacity pool. | `roles.py`, SPEC §Capacity routing |
 | **engine** | The serving engine: llama-server, vLLM, sd-server, whisper-server, audio-cpp. It declares the file formats it loads and the endpoints it serves — never a task or a role. (`backend` is the retired spelling, kept only as a code identifier.) | `backends/` |
 | **endpoint** | A standardized serving surface: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`, `openai.images.generations`, `openai.audio.transcriptions`, `openai.audio.speech`, `native.*`. Engine-owned; servers and clients choose it, a model never does. | `endpoints.py` |
 | **family** | The interchangeability unit: serving one member taught you how to serve the other (same launch options, template, quantization conventions). Agent-assigned with evidence; the arch string is a confirm-only hint. Not the audio.cpp loader `family`, which is `audio_cpp.family`. | sidecar `family:` |
@@ -36,7 +36,7 @@ either way it should not be used in a commit message until it is.
 | **`D`** (`slot_mib`) | Fixed cost per parallel slot: SWA ring buffers plus slot overhead. | `vram.py` |
 | **slot** | One concurrent conversation. `parallel` is how many a model serves at once. | `parallel:` |
 | **budget** (`VramBudget`) | The object that answers "what fits", from either measured coefficients or a pin. | `vram.py` |
-| **matrix** | The shared-budget solve: one context across all co-resident models, so a resident embedder is paid for out of the chat context. | `solve_matrix_ctx`, SPEC "Matrix Context Solving" |
+| **shared solve** (`matrix:`) | The pack-time context solve: one budget across the servings the operator wants co-resident, so a helper is paid for out of the chat context. The name `matrix` survives in the config key and the solver, not in routing (capacity pools replaced matrix sets). | `solve_matrix_ctx`, SPEC §Capacity routing |
 | **co-resident** | Allowed to be loaded at the same time because their capacities fit every pool. Chat models take turns; embed/rerank are resident at a small context. | SPEC §Capacity routing |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
 | **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | writer, SPEC 305 |
@@ -117,4 +117,4 @@ is the model pick a capacity-charged entry is emitted for (`emb`, `rnk`).
 | **versioned entry** | `llama-bNNNNN`, `llama-swap-vNNN`, `<engine>-vX.Y.Z`. Kept newest-N; never pruned while a symlink points at it. | `update.py` |
 | **stable primary** | The unversioned name beside a versioned entry — `llama-server` -> `./llama-b12345/llama-server`. What a config names; updating and rolling back both move this one link. | `update.py:_ensure_stable_primary` |
 | **tools dir** | `<run dir>/tools`: where a deployment's engines live, so the run directory holds only generated config. Searched before the run directory itself. | `llama_packer/utils.py:binary_search_dirs` |
-| **the fleet tag table** | Which upstream release is installed, per engine. | `docs/plans/usage-tag-table.md` |
+| **the fleet tag table** | Which upstream release is installed, per engine. | `extras/update.py`, `config.env` |

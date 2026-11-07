@@ -16,7 +16,7 @@ when the plan that produced them is pruned.
 - **resident-partial-offload** — see
   [resident-partial-offload.md](resident-partial-offload.md).
 - **Measured host RAM** beyond the minimal keys in
-  [cpu-residency-budget.md](cpu-residency-budget.md) (memory-allocation-tags
+  [cpu-residency-budget.md](cpu-residency-budget.md) (the retired memory-allocation-tags
   §3).
 - **Alias rework** (Option A) — pending the llama-swap alias-routing probe.
 - **vLLM host offload.**

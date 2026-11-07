@@ -1,7 +1,7 @@
 # Plan: Opportunistic co-loading of small models + main-chat context
 
 Status: **proposal — not scheduled**. Recorded 2026-08-30.
-Related: `docs/plans/matrix-categories.md` (declarative categories — this plan is the automatic counterpart), `SPEC.md` Matrix Context Solving, `llama_packer/{vram,writer,__main__}.py`.
+Related: the retired matrix-categories design (git history), `SPEC.md` §Capacity routing, `llama_packer/{vram,writer,__main__}.py`.
 
 ## Current state
 
@@ -197,7 +197,7 @@ serving may clear 128K where the vision serving does not). Optionally expose
 "not tool capable" from "demoted for context". No llama-swap change needed —
 it just reflects what we emit.
 
-### 5. Sequencing vs matrix-categories.md
+### 5. Sequencing vs the retired matrix categories
 
 This plan is the **automatic default**; categories (that proposal) are the
 **declarative override**. They compose: the opportunistic pass computes the
@@ -211,7 +211,7 @@ pin/extend it. Ship this first — it needs no new config surface.
 * Estimate headroom: **1.25×** for `source: estimate` candidates
   (`matrix.estimate_headroom`), configurable.
 * emb/rnk stay **unconditional** residents regardless of the floor (revisit
-  when `matrix-categories.md` lands), but their *context* yields: squeeze to
+  when matrix categories landed), but their *context* yields: squeeze to
   20K (`matrix.coload_min_ctx`) when chat is below 128K, adopted only if it
   buys chat ≥ 4K (`matrix.ctx_gain_min`).
 * Compute constants: whisper.cpp's own table puts runtime at disk +
@@ -331,7 +331,7 @@ README). The big open question — runtime story — is **resolved**:
 * `llama_packer/writer.py:383` `_bounded_ctx` (per-model clamp)
 * `llama_packer/__main__.py:230` `_build_matrix_vars` (var emission to extend)
 * `llama_packer/model.py:296` `design_context`
-* `docs/plans/matrix-categories.md` (declarative categories, phase 2)
+* the retired matrix-categories design (git history)
 * https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 (model card; q8_0
   GGUF quickstart, "≥2 GB RAM" note, 24-min/3-h audio limits)
 * https://github.com/NVIDIA/NeMo-Speech.cpp (ggml runtime; server.md:
