@@ -13,13 +13,14 @@
 defaults:
   cache_type: q8_0
   # Do not set `parallel` here unless you intend to pin every model and
-  # disable auto-parallel; leaving it unset lets the value function choose.
+  # disable auto-parallel; leaving it unset lets the packer choose the
+  # context size and slot count.
   #
-  # Headroom for the desktop, browser, or other tenants. This is additional
-  # to the fixed reserve: reserve = 1024 + max(1024, baseline_mb), and
+  # Headroom for the desktop, browser, or other tenants. This comes on top
+  # of the fixed reserve: reserve = 1024 + max(1024, baseline_mb), and
   # pools.default = VRAM - reserve - spare. Pick it from vram_log --report
-  # over days; --once is a snapshot that includes loaded models. The solve
-  # fills the pool by design, so spare + reserve is the whole headroom.
+  # over days; --once is a snapshot that includes loaded models. Allocations
+  # fill the pool on purpose, so reserve + spare is the whole headroom.
   spare: 1G
   temperature: 1.0
   top_p: 0.95
@@ -28,30 +29,27 @@ defaults:
   pres_pen: 0.0
 
 # ── Tasks (optional) ──────────────────────────────────
-# A task is a closed catalog id (llama_packer/tasks.py): what work a model
-# does, the endpoint it is served at, and the demand that work needs. A
-# sidecar claims its tasks with `tasks: [coding, chat]`; each satisfiable
-# task emits its own entry, and llama-swap routes by name. Only catalog ids
-# exist -- an unknown id warns and is ignored.
+# A task is a named kind of work (coding, chat, embeddings...) with the
+# endpoint it is served at and the least context and slots it needs. A
+# model claims tasks in its sidecar with `tasks: [coding, chat]`; each task
+# a model can satisfy gets its own entry, and llama-swap routes by name. An
+# unknown name warns and is ignored.
 #
-# This section overrides a task's default demand; it never invents a task.
-# min_context and min_parallel are both floors. Leave a key undefined if you
-# do not want that floor; one entry at ctx >= 128k and parallel >= 2 can
-# satisfy several tasks, so nothing forces four entries per model.
+# This section sets a task's minimums; it cannot invent a task.
+# min_context and min_parallel are both minimums. Leave a key out for no
+# minimum; one entry at context >= 128k and slots >= 2 can satisfy several
+# tasks, so nothing forces four entries per model.
 #
-# require:   capabilities that survive every rung of the capability/context
-#            ladder. A model that cannot keep one emits nothing for that
-#            task rather than being degraded.
-# sacrifice: what to give up first when the budget is short. This is a
-#            *preference*, not a cost order — shedding can buy no context at
-#            all (a model already at its design cap has nothing to reclaim),
-#            so the ladder enumerates rungs rather than walking them.
-#            Unlisted capabilities follow the default order: vision before
-#            draft, because an MTP draft roughly doubles generation speed.
-#            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
+# require:   capabilities that must survive. A model that cannot keep one is
+#            not offered for that task rather than being degraded.
+# sacrifice: what to give up first when memory is short. This is a
+#            *preference*, not a cost order — giving something up may buy no
+#            context at all (a model already at its design cap has nothing
+#            to reclaim). Unlisted capabilities go vision before draft,
+#            because an MTP draft roughly doubles generation speed. Shedding
+#            a draft is opt-in per model (`allow_mtp_shed:`).
 #
-# Each task is satisfied per entry: a model that cannot meet a floor emits
-# nothing for that task. Only chat-task models are considered here.
+# Only chat-task models are considered here.
 #
 # shed: the default order for capabilities a task does not name.
 # shed: [vision, draft]
@@ -83,8 +81,8 @@ tasks:
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
-  # A task may also set parallel_power: (B) to override matrix.parallel_power
-  # for its own solve — low keeps context, high buys slots.
+  # A task may also set parallel_power to override matrix.parallel_power for
+  # that task: low keeps context, high buys slots.
   # Capability tasks: endpoint and role only; they are sized by their role.
   embeddings:
     endpoint: openai.embeddings
@@ -143,8 +141,8 @@ models_dirs:
 #   - whisper-server
 
 # ── Profile definitions ────────────────────────────────
-# Each profile overlays `defaults` and emits llama-swap setParamsByID
-# overrides. `allow_profiles` in a model sidecar can filter which profiles
+# Each profile overlays `defaults` and becomes llama-swap's per-request
+# sampling overrides. `allow_profiles` in a model sidecar can filter which profiles
 # apply to that model. Sidecar `modes:` layer over the same-named profile
 # (single merge rule: dicts merge, lists append, None deletes) and replace
 # the profile sampling overrides per-model when present.
@@ -181,8 +179,8 @@ profiles:
 
   # ── Grouping / placement params ──────────────────────
   # Distinct (parallel, cache_type, spare, batch, ubatch) combos get their
-  # own VRAM solve and llama-swap entry; profile names within a group become
-  # setParamsByID keys. `spare` reserves VRAM headroom (e.g. "512m", "6G").
+  # own memory allocation and llama-swap entry; profile names within a group
+  # become per-request overrides. `spare` reserves VRAM headroom.
   # `parallel` is the slot count — and a pin: declaring it opts the model
   # out of auto-parallel.
   # server:
@@ -352,17 +350,17 @@ profiles:
 #   - when: {name: 'tiny-.*'}
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
-# ── Matrix sizing (optional) ───────────────────────────
-# The packer emits llama-swap's capacity router (pools + per-model
-# capacities); there are no matrix sets. `matrix:` keeps the context-solve
-# knobs, and `categories` chooses which model fills each role.
+# ── Context limits (optional) ──────────────────────────
+# The config uses llama-swap's capacity router: memory pools plus a
+# per-model allowance, and no named sets. `matrix:` keeps the context
+# limits, and `categories` chooses which model fills each role.
 #
 # `embed_context` / `rerank_context` cap the resident helpers at a fixed
 # small context: clients chunk to one RAG size, and a fixed footprint makes
 # the chat budget computable. Select the helpers with a category `selector:`;
 # they always serve single-slot.
 #
-# The shared solve's floors and guards:
+# Limits and guards for shared context:
 #   tools_min_ctx     below this chat context, the RAG pair is squeezed to
 #                     buy context back (default 128k)
 #   coload_min_ctx    how far the RAG pair may be squeezed (default 20k)
@@ -380,7 +378,7 @@ profiles:
 #   # ctx_gain_min: 4096
 #   # min_chat_ctx: 65536
 #   # estimate_headroom: 1.25
-#   auto_parallel: false        # on by default: value-function (ctx, slots)
+#   auto_parallel: false        # on by default: the packer chooses context and slots
 #   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
 #   parallel_power: 0.75        # slot exponent; a task's own overrides it
 #   categories:                 # var -> model pick; each is a role
@@ -391,25 +389,24 @@ profiles:
 #     tts: { role: t2s }
 #
 # ── Capacity routing knobs (optional) ──────────────────
-# The packer emits `routing.router.use: capacity` with:
+# The generated config uses capacity routing:
 #   reserve       = 1024 + max(1024, baseline_mb)
 #   pools.default = detected VRAM - reserve - spare
 #   pools.ram     = detected host pool
 #   pools.<role>  = 1 (one live serving per role)
 # Allocations fill pools.default on purpose; reserve + spare is every bit of
 # headroom, so a nearly full pool is normal.
-# plus per-model `capacities` and `evict_cost`. evict_cost is a
-# capacity-router field: reload time plus lost prefill (chat only).
-# `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
-# `pp_tps:` overrides the fleet fallback; estimate it from hardware TOPS x
+# Each model also gets an eviction cost: reload time plus lost prefill (chat
+# only). `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
+# `pp_tps:` overrides the fleet value; estimate it from hardware TOPS x
 # active parameters, or measure it with extras/bench.py / llama-bench.
 # capacity:
 #   pp_tps: 1000
 #   # drive_mbps: 1000
 
 # ── VRAM pools (optional) ───────────────────────────────────
-# One shared ledger per pool: per-pool spare override, unmodelled residents,
-# and explicit claimant reservations. "auto" keeps the derived math.
+# One shared allowance per pool: per-pool spare override, unmodelled
+# residents, and explicit reservations. "auto" keeps the calculated limits.
 # pools:
 #   default:
 #     spare: 2G

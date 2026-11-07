@@ -27,23 +27,20 @@ in the run directory can load it.
 
 ## The words used here
 
-- **Serving** — one model loaded into memory and answering requests.
-- **Context** — how many tokens one request may use.
-- **Slots** — how many requests a serving handles at the same time
-  (`parallel`).
+- **Serving** — one loaded model answering requests.
+- **Context** — tokens one request may use.
+- **Slots** — requests one serving handles at once (`parallel`).
 - **Role** — what a model is for: chat, embeddings, rerank, image,
   speech-to-text (`s2t`), text-to-speech (`t2s`).
-- **Task** — a named kind of work at an endpoint (for example `coding` or
-  `chat`), with the least context and the fewest slots it needs.
-- **Pool** — a memory budget. The router keeps the servings in a pool inside
-  that budget and unloads a serving when the next one would overflow it.
+- **Task** — a named kind of work (for example `coding`), with the smallest
+  context and slot count it needs.
+- **Pool** — a memory allowance. Models sharing the GPU must fit inside it;
+  the router unloads one to make room.
 
 ## How much memory models get
 
-Two things come off the top of the GPU:
-
-- a **reserve** for the operating system and the display;
-- **spare**, extra memory for other programs that come and go.
+Two deductions come off the top of the GPU: a **reserve** for the OS and
+display, and **spare** for other programs that come and go.
 
 ```
 reserve       = 1 GiB + max(1 GiB, fixed baseline)
@@ -52,119 +49,107 @@ model memory  = total GPU memory - reserve - spare
 
 The reserve is 1 GiB for the OS plus at least 1 GiB for the driver,
 compositor and scanout. If something is *always* on the GPU (a VM, a game
-left running), declare it as `hardware.baseline_mb`; for ordinary headroom,
-raise `spare`.
+left running), set `hardware.baseline_mb`; for ordinary headroom, raise
+`spare`.
 
-`spare` comes on top of the reserve, so it is not the only headroom. The
-packer gives each serving it keeps loaded an allocation of that model
-memory, and the allocations are meant to fill it. An allocation that nearly
-fills the pool is normal — a nearly full pool does not mean "no headroom".
-
-For example, a 32 GiB card, a declared 1 GiB fixed baseline, and 1 GiB of
-spare:
+A 32 GiB card with 1 GiB spare and no fixed baseline:
 
 ```
-reserve       = 1 + max(1, 1) = 2 GiB
-model memory  = 32 - 2 - 1    = 29 GiB
+reserve       = 1 + 1      = 2 GiB
+model memory  = 32 - 2 - 1 = 29 GiB
 ```
 
-Measure `spare`; do not guess it from one reading:
+`spare` is on top of the reserve. That memory is divided among the models
+kept loaded, and is meant to be used up: a nearly full pool is normal, not
+a sign of no headroom.
+
+Measure `spare` over days, not once:
 
 ```
 fixed base  = lowest GPU usage over several days   (driver + desktop)
 spare      >= peak usage of other programs - fixed base
 ```
 
-Run `python -m llama_packer.vram_log` for a few days and read
-`--report`: the floor is the fixed base, and the per-program peaks above it
-are what `spare` has to cover. A single `--once` sample is misleading
-because it includes whatever models happen to be loaded at that moment.
+`python -m llama_packer.vram_log --report` gives both. `--once` includes
+whatever models happen to be loaded, so it cannot tell the base from
+transient programs. `llama-packer --probe-memory` measures a model family's
+memory at a given context and slot count; it is not a headroom measurement.
 
-`llama-packer --probe-memory` measures how much memory one model family
-takes at a given context and slot count. It is not a headroom measurement.
-
-Check the result: every serving's allocation in the generated config must be
-no larger than the model memory. The headroom is already inside
-`reserve + spare`, so do not shrink contexts to create more.
+Check: no model gets more memory than that. It already excludes the
+headroom, so do not shrink contexts for more.
 
 ## How context and slots are chosen
 
-Unless you pin `parallel`, the packer tries combinations of context size and
-slot count and keeps the one with the best score:
+Unless you pin `parallel`, the packer picks the best-scoring pair:
 
 ```
 score = sqrt(context / required context) * slots ^ power
 ```
 
-Bigger context scores higher, and more slots score higher. `parallel_power`
-(fleet-wide under `matrix:`, or per task) says how much one extra slot is
-worth: a low power favours context, a high power favours slots. "Required
-context" is the smallest context a task will accept (`min_context`).
+The score rewards context and slots. `parallel_power` (fleet-wide under
+`matrix:`, or per task) sets the trade: low favours context, high favours
+slots. "Required context" is the task's minimum (`min_context`).
 
-This is why `defaults.parallel` is a big hammer. Set it and every model in
-that group keeps that slot count; the packer stops choosing.
+Setting `defaults.parallel` skips this: every model in that group keeps that
+slot count.
 
 ## Workflow
 
 1. Read the example and `SPEC.md`. Copy the example's section order.
 2. **Where models are** — `models_dirs` for the roots; `dirs` maps a
    subdirectory to a role; `hf_home` points at the Hugging Face cache;
-   `backends` is the ordered list of engines you allow. Omit `backends` to
-   allow every installed engine.
+   `backends` lists the engines you allow (omit it to allow all installed
+   engines).
 3. **Defaults** — sampling values, `cache_type`, and `spare`. Leave
    `parallel` unset unless you mean to fix the slot count.
-4. **Tasks** — declare the kinds of work the fleet serves. Each task names
-   an endpoint and a role, plus whatever minimums you want:
+4. **Tasks** — each task names an endpoint, a role, and its minimums:
 
    ```
    context >= min_context
    slots   >= min_parallel
    ```
 
-   Both are hard minimums: a model that cannot meet both is not offered for
-   that task. Leave a minimum out to mean "no minimum". One serving can
-   satisfy several tasks; it does not need one entry per task.
+   Both are hard: a model that misses either is not offered for that task.
+   Omit a minimum for no minimum. One serving can cover several tasks.
 5. **Sampling profiles** — a profile overlays the defaults and becomes a
    named set of sampling values that llama-swap applies per request. Split
    `(parallel, cache_type, spare)` combinations into separate profiles.
 6. **Placement** — `device_roles: [embeddings, rerank, s2t]` (or a
    `{role: cpu}` mapping) runs whole roles from system RAM. Per-model
    `device: cpu` / `device: N` lives in the model's sidecar, not here. A
-   model in RAM charges the RAM pool and can be unloaded when that pool is
+   model in RAM uses the RAM pool and can be unloaded when that pool is
    full.
 7. **Context limits and role picks** — `matrix:` holds the limits that shape
-   context sizing and the choice of which model fills each role. The
-   `embed_context` and `rerank_context` limits cap how much context the
-   retrieval helpers get (4096 by default), so they take little memory.
-   `categories` picks the model for a role (`emb`, `rnk`, `rnk2`, `stt`,
-   `tts`); a pick may name a `selector:` and give it its own `ctx:`.
+   context sizing and the choice of which model fills each role.
+   `embed_context` and `rerank_context` cap how much context the retrieval
+   helpers get (4096 by default), so they take little memory. `categories`
+   picks the model for a role (`emb`, `rnk`, `rnk2`, `stt`, `tts`); a pick
+   may name a `selector:` and give it its own `ctx:`.
    **Do not write `matrix.sets:` or `matrix.evict_costs:`** — they are
-   retired and produce a warning. What can be loaded together is decided by
-   memory, not by named sets.
-8. **Eviction** — when a pool is full, llama-swap unloads the serving whose
-   eviction cost is lowest. Reloading costs two things:
+   retired and produce a warning. Memory decides what can be loaded
+   together, not named sets.
+8. **Eviction** — when a pool is full, llama-swap unloads the serving with
+   the lowest eviction cost:
 
    ```
    eviction cost = weight size / disk read speed
                  + context * slots / prompt speed        (chat only)
    ```
 
-   The first term is the time to read the model file back from disk. The
-   second is the chat work lost when the loaded conversation is thrown
-   away. Both are in seconds: GiB ÷ GiB/s, and tokens ÷ tokens/s.
-   `capacity.pp_tps` is the fleet's prompt speed in tokens per second;
-   `capacity.drive_mbps` is the disk read speed (detected if you leave it
-   out). A model that is much faster or slower can give its own `pp_tps` in
-   its sidecar. Estimate prompt speed from hardware TOPS × active parameter
-   count, or measure it with `extras/bench.py` / `llama-bench`.
+   First term: time to read the model file from disk. Second: chat prefill
+   lost when its context is discarded. Units: GiB ÷ GiB/s and tokens ÷
+   tokens/s. `capacity.pp_tps` is prompt speed (tokens/s);
+   `capacity.drive_mbps` is disk speed (detected if omitted). A sidecar
+   `pp_tps` overrides the fleet value. Estimate prompt speed from hardware
+   TOPS × active parameter count, or measure it with `extras/bench.py` /
+   `llama-bench`.
 
-   For example, a 20 GiB model on a 1 GiB/s disk costs about 20 s to
-   reload; its 32k context at 2 slots and 1000 prompt tokens/s adds about
-   66 s of lost prefill.
-9. **Pools** — the config starts with one GPU pool, one system-RAM pool, and
-   one pool per role limited to a single serving. `pools:` lets you change
-   those limits or reserve extra memory for something the packer does not
-   model.
+   A 20 GiB model on a 1 GiB/s disk costs about 20 s to reload; its 32k
+   context at 2 slots and 1000 prompt tokens/s adds about 66 s of lost
+   prefill.
+9. **Pools** — the default config has one GPU pool, one RAM pool, and one
+   1-model pool per role. `pools:` changes those limits or reserves memory
+   for something the packer does not model.
 10. **Hardware** — physical overrides: `hardware.vram`, `baseline_mb`,
     `unified_system_mb`, `gpu_family`, `memory_margin`, `fast_storage`.
 11. **Idle unloading (TTL)** — declare `ttl:` per task or per model:
@@ -191,10 +176,9 @@ log lines — that is where dropped models and retired keys appear.
 
 Check:
 
-- every serving's allocation is no larger than the model memory;
+- no model gets more memory than the pool allows;
 - no warning about `matrix.sets:` or `matrix.evict_costs:`;
-- every serving offered for a task meets that task's minimum context and
-  slots (a minimum that cannot be met means no entry);
+- every model offered for a task meets its minimum context and slot count;
 - idle timeouts are what you intend for keep-warm roles;
 - eviction cost is high for long-context chat and low for small helpers;
 - no model was dropped because its engine is not enabled;
@@ -207,14 +191,14 @@ Check:
   sidecars; memory decides what can be loaded together.
 - **A category is a model choice, not a kind of work.** `emb`/`rnk` name the
   model that fills the embeddings/rerank role. Kinds of work are `tasks:`.
-- **Allocations are measured, not written.** They describe how much memory
-  the model actually takes. If you need a model to run alone, leave it
+- **Memory is measured, not written.** It describes how much memory the
+  model actually takes. If you need a model to run alone, leave it
   unmeasured or give it the whole pool; do not hand-write its allocation.
-- **One serving per role.** The router unloads the current model of a role
+- **One model per role.** The router unloads the current model of a role
   when you request another model of that role, whatever the eviction cost.
-- **A model in RAM is not "never unloaded".** It uses the RAM pool and can
-  be unloaded when that pool is full; TTL is a separate idle timer.
-- **Aliases are not model ids.** Category names and `+ref` names resolve to
+- **RAM models can be unloaded too.** They use the RAM pool; TTL is a
+  separate idle timer.
+- **A name is not a model id.** Category names and `+ref` names resolve to
   entry ids in the config; use a real model id or selector.
 
 ## After a llama-packer update
