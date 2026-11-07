@@ -3262,7 +3262,11 @@ def _solve_matrix_context(
         #     co-load nothing can co-locate charges every chat solve for
         #     residency that never happens.  Models too big to live beside
         #     chat belong in __CHAT_VARS__ (they evict chat instead).
-        if not _sets_reference_coloads(coload_sets):
+        if coload_sets is None:
+            # Capacity routing has no set tree; capacities govern
+            # co-residency, so there is no placeholder to gate on.
+            pass
+        elif not _sets_reference_coloads(coload_sets):
             logger.info(
                 "matrix: no routing set references __COLOAD_VARS__; "
                 "skipping opportunistic co-loads (they cannot be "
