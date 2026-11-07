@@ -1,12 +1,12 @@
 ---
 name: Authoring profiles.yaml
-description: Build or migrate a llama-packer profiles.yaml — discovery roots, tasks, sampling profiles, CPU/GPU placement, matrix sizing, capacity routing, pools, TTL, and validation.
+description: Build or migrate a llama-packer profiles.yaml — discovery roots, tasks, sampling profiles, CPU/GPU placement, context knobs, capacity routing, pools, TTL, and validation.
 ---
 
 # Authoring `profiles.yaml`
 
-`profiles.yaml` is the packer's input. It declares the fleet; the packer
-emits `config.yaml` for llama-swap. Start from the annotated
+`profiles.yaml` declares the fleet; llama-packer turns it into `config.yaml`
+for llama-swap. Start from the annotated
 [`profiles.yaml.example`](https://github.com/JeffKwasha/llama-packer/blob/main/profiles.yaml.example)
 and the contract in
 [`SPEC.md`](https://github.com/JeffKwasha/llama-packer/blob/main/SPEC.md);
@@ -16,41 +16,53 @@ do not invent keys.
 
 In an installed deployment it is `<run-dir>/profiles.yaml` (for example
 `/opt/llama/profiles.yaml`). The installer creates it from the bundled
-`llama_packer/profiles.yaml` **only when absent**; it never overwrites an
-existing file. Edit that copy, not the repo's. It is owned by the service
-account and group-writable so the operator's agent can update it.
+default **only when absent**; it never overwrites an existing file. Edit
+that copy, not the repo's. It is owned by the service account and
+group-writable so the operator's agent can update it.
 
 The installer also places this guide at
-`<run-dir>/.opencode/skills/profiles-authoring/SKILL.md`; an agent started in
-the run directory can load it.
+`<run-dir>/.opencode/skills/profiles-authoring/SKILL.md`; an agent started
+in the run directory can load it.
 
 ## Decide the budget
 
 ```
-reserve       = 1024 + max(1024, baseline_mb)
-pools.default = total VRAM - reserve - spare
+reserve        = 1024 + max(1024, baseline_mb)          MiB
+pools.default  = VRAM_total - reserve - spare           MiB
 ```
 
 `spare` is headroom **on top of** the reserve, not the whole headroom. The
-reserve already covers the driver, compositor and scanout; `spare` covers
-the tenants that come and go. The capacity solve then fills
-`pools.default` by design — a small gap between the pool and the largest
-`capacities.default` is normal and is not the headroom.
+reserve covers the driver, compositor and scanout; `spare` covers the
+tenants that come and go. Every serving is then sized up to the pool:
+
+```
+sum(capacities.default of co-resident servings) ~= pools.default
+```
+
+A full pool is the design — a small gap between `pools.default` and the
+largest `capacities.default` is not headroom.
 
 - Use `defaults.spare` for ordinary headroom: the desktop, a browser, or
   other tenants that appear later. It is subtracted after the fixed reserve.
 - `hardware.baseline_mb` is an advanced override for a **known fixed**
   pre-existing VRAM load. It only matters above the fixed 1 GiB video
   reserve; for normal headroom prefer `spare`.
-- Choose `spare` from `python -m llama_packer.vram_log --report` over days,
-  not from `--once`. A single sample includes whatever models are loaded at
-  that moment, so it cannot separate the resident base from the variable
-  tenant envelope; the report's floor is the base and the gap to the tenant
-  medians is the spare. `llama-packer --probe-memory` measures a model
-  family's serve-shaped VRAM law — it is not a headroom measurement.
-- Check each entry's `capacities.default` is ≤ `pools.default`. The pool
-  already has the headroom deducted, so do not add slack on top by
-  shrinking contexts.
+- Choose `spare` once the tenant envelope is known. With `used(t)` sampled
+  over days:
+
+  ```
+  base    = floor(used(t))                       driver + compositor
+  spare  >= max(tenant_vram(t)) - base           audio, image, browsers
+  ```
+
+  Loaded models are excluded: the pool already accounts for them.
+  `python -m llama_packer.vram_log --report` gives the floor and the
+  per-tenant medians/max. Do not use `--once`: a single sample includes
+  whatever models are loaded at that moment and cannot separate the base
+  from the tenants. `llama-packer --probe-memory` measures a model family's
+  serve-shaped VRAM law — it is not a headroom measurement.
+- Check `capacities.default <= pools.default` for every entry. The pool
+  already has the headroom deducted, so do not shrink contexts for slack.
 
 ## Workflow
 
@@ -59,25 +71,38 @@ the tenants that come and go. The capacity solve then fills
    `hf_home`, `backends` (ordered allow/prefer list). Omit `backends` to use
    all registered engines.
 3. **Defaults** — `defaults.cache_type`, sampling values, and `spare`.
-   Do not set `defaults.parallel` unless you intend to pin every model:
-   any `parallel:` in `defaults`/a profile is a pin and disables
-   auto-parallel for the models in that group. Leave it unset to let the
-   value function choose `(ctx, slots)`.
+   Leave `parallel` unset unless you intend to fix the slot count: any
+   `parallel:` in `defaults`/a profile pins every model in that group and
+   disables auto-parallel. Unset, the packer maximizes
+
+   ```
+   score = (ctx / min_context) ** 0.5 * slots ** parallel_power
+   ```
+
+   subject to the task floors and the pool.
 4. **Tasks** — declare the task ids the fleet uses under `tasks:`; each needs
    `endpoint` and `role`, plus optional `min_context`, `min_parallel`,
    `require`, `keep`, `sacrifice`, `parallel_power`, `ttl`. A sidecar claims
-   them with `tasks: [...]`; an undeclared id is not a task.
-   `min_context` and `min_parallel` are both **floors**. Leave a key
-   undefined if you do not want that floor. `parallel_power` is the knob
-   that makes the solver try harder for slots; it never lowers a floor.
+   them with `tasks: [...]`; an undeclared id is not a task. Both floors are
+   hard inequalities:
+
+   ```
+   ctx   >= min_context
+   slots >= min_parallel
+   ```
+
+   A serving that cannot meet both produces no entry for that task. Leave a key
+   undefined for no floor. `parallel_power` weights slots against context in
+   the score above; it never lowers a floor.
 5. **Profiles** — at least one key under `profiles:`. A profile overlays
-   `defaults` and becomes `setParamsByID` aliases. Split
-   `(parallel, cache_type, spare)` combinations into separate profiles.
+   `defaults` and becomes per-profile sampling overrides (`setParamsByID`).
+   Split `(parallel, cache_type, spare)` combinations into separate profiles.
 6. **Placement** — `device_roles: [embeddings, rerank, s2t]` (or a
    `{role: cpu}` mapping) moves whole roles to host RAM. Per-model
    `device: cpu` / `device: N` lives in the sidecar, not here. A CPU serving
-   charges the `ram` pool and is evicted under RAM pressure.
-7. **Matrix sizing** — `matrix:` keeps the context-solve knobs
+   charges the `ram` pool (`capacities.ram`) and is evicted under RAM
+   pressure.
+7. **Context knobs** — `matrix:` holds the context-solve knobs
    (`embed_context`, `rerank_context`, `auto_parallel`, `auto_parallel_max`,
    `parallel_power`, `tools_min_ctx`, `min_chat_ctx`, `coload_min_ctx`,
    `ctx_gain_min`, `estimate_headroom`) and `categories`, which selects the
@@ -86,21 +111,31 @@ the tenants that come and go. The capacity solve then fills
    **Do not author `matrix.sets:` or `matrix.evict_costs:`** — they are
    retired and warn. Routing is capacity-based.
 8. **Capacity knobs** — optional `capacity: {pp_tps: 1000, drive_mbps: N}`.
-   `evict_cost` is a capacity-router field: reload time plus lost prefill.
-   `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
-   `pp_tps:` overrides the fleet fallback; estimate it from hardware TOPS ×
-   active parameter count, or measure it with `extras/bench.py` /
-   `llama-bench`. Leave `drive_mbps` unset to use the detected read speed.
+   llama-swap evicts the lowest `evict_cost` first:
+
+   ```
+   evict_cost = weights_MB / drive_mbps + ctx * slots / pp_tps   (chat only)
+   ```
+
+   `pp_tps` is prompt tokens/s; estimate it from hardware TOPS × active
+   parameter count, or measure it with `extras/bench.py` / `llama-bench`. A
+   sidecar `pp_tps:` overrides the fleet value. `drive_mbps` defaults to the
+   detected read speed.
 9. **Pools** — optional `pools:` overrides a pool's `vram`, `spare`,
-   `reserve_extra`, or explicit `pins`. The packer emits
+   `reserve_extra`, or explicit `pins`. The output contains
    `pools.default` (usable VRAM), `pools.ram` (host pool), and one size-1
    pool per role.
 10. **Hardware** — optional `hardware.vram`, `baseline_mb`,
     `unified_system_mb`, `gpu_family`, `memory_margin`, `fast_storage`.
-11. **TTL** — declare `ttl:` per sidecar or per task. `0` = never unload;
-    otherwise the smallest declared lifetime wins. A CPU-resident serving
-    with nothing declared defaults to 3600 s — override with `ttl: 0` or an
-    explicit number. A device entry carries none and inherits `globalTTL`.
+11. **TTL** — declare `ttl:` per sidecar or per task:
+
+    ```
+    ttl = 0                     never unload
+    ttl = min(declared)         otherwise
+    ttl = 3600 s                CPU-resident, nothing declared
+    ```
+
+    A device entry carries none and inherits `globalTTL`.
 
 ## Validate before handing back
 
@@ -111,16 +146,15 @@ current flags. A dry run writes YAML to stdout, so redirect it, then:
 llama-swap -config /tmp/config.yaml -validate
 ```
 
-`-validate` only checks the emitted config. Read the packer's `E |`/`W |`
+`-validate` only checks the generated config. Read the packer's `E |`/`W |`
 log lines — that is where dropped models and retired keys appear.
 
 Check:
 
-- `pools.default` equals detected VRAM − reserve − spare, and every
-  entry's `capacities.default` is ≤ the pool;
+- `capacities.default <= pools.default` for every entry;
 - no `matrix.sets:`/`matrix.evict_costs:` warning;
-- each emitted `parallel` meets the task's `min_parallel`, and each
-  `ctx_size` meets `min_context` (a floor that cannot be met emits nothing);
+- `ctx_size >= min_context` and `parallel >= min_parallel` per task (a floor
+  that cannot be met produces no entry);
 - `ttl` is what you intend for keep-warm roles;
 - `evict_cost` is high for long-context chat and low for stateless helpers;
 - no model was dropped by an `engines:`/`backends:` mismatch;
@@ -133,19 +167,16 @@ Check:
   sidecars; capacity pools decide co-residency.
 - **A category is a model pick, not a workload claim.** `emb`/`rnk` name the
   model that fills the embeddings/rerank role. Workloads are `tasks:`.
-- **`capacities` are emitted, not authored.** If you need a model to run
-  alone, leave it unmeasured or give it the whole pool; do not hand-write
-  capacities in `profiles.yaml`.
-- **Role pools enforce exclusivity.** One live serving per role; requesting
-  another model of the same role evicts the current one regardless of
-  `evict_cost`.
+- **`capacities` are derived, not authored.** They come from the measured
+  serving; if you need a model to run alone, leave it unmeasured or give it
+  the whole pool. Do not hand-write capacities in `profiles.yaml`.
+- **Role pools enforce exclusivity.** `pools.<role> = 1`, so one serving per
+  role: requesting another model of the same role evicts the current one
+  regardless of `evict_cost`.
 - **CPU is not "never evicted".** It charges `ram` and is evicted when the
   host pool is full; `ttl` is the separate idle timer.
-- **A full pool is the design.** `capacities.default` is meant to approach
-  `pools.default`; headroom lives in `reserve + spare`, not in unallocated
-  pool space.
 - **Aliases are not model ids.** Category vars and `+ref` names resolve to
-  emitted entry ids; use a real model id/selector.
+  entry ids in the config; use a real model id/selector.
 
 ## After a llama-packer update
 
@@ -160,7 +191,7 @@ Retired spellings:
 
 | old | new |
 |---|---|
-| `matrix.sets:` / `matrix.evict_costs:` | removed; routing is capacity, `capacities`/`evict_cost` are emitted |
+| `matrix.sets:` / `matrix.evict_costs:` | removed; routing is capacity, `capacities`/`evict_cost` are derived |
 | sidecar `role:` / `usage:` | sidecar `tasks: [...]` from `profiles.yaml tasks:` |
 | sidecar `backend:` | sidecar `engines: [...]` |
 | `pinned` persistence | explicit `ttl:` (sidecar or task) |
