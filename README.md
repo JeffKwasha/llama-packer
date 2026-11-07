@@ -266,6 +266,18 @@ relative paths resolve from the active working directory:
 }
 ```
 
+**Installed deployments.** Put the guide beside the `profiles.yaml` it
+describes, then start the agent in that run directory (e.g. `/opt/llama`):
+
+```sh
+mkdir -p /opt/llama/.opencode/skills/profiles-authoring
+cp docs/profiles-authoring.md \
+   /opt/llama/.opencode/skills/profiles-authoring/SKILL.md
+```
+
+Unlike the repo path, this copy travels with the installation and is visible
+to any agent started there.
+
 OpenCode reloads skills on save; no restart is needed. Load it with
 `@profiles-authoring` or let the model pick it from the description.
 

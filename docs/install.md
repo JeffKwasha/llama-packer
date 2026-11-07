@@ -284,6 +284,25 @@ installer warns when it is not. A tree that cannot be written is not fatal
 during the re-pack is discarded, which shows up later as unexplained context
 loss.
 
+## Agent guide in the run directory
+
+`docs/profiles-authoring.md` is a guide for agents editing
+`<dir>/profiles.yaml`. To let an OpenCode agent started in `<dir>` discover
+it, place it at `<dir>/.opencode/skills/profiles-authoring/SKILL.md`:
+
+```sh
+mkdir -p /opt/llama/.opencode/skills/profiles-authoring
+cp docs/profiles-authoring.md \
+   /opt/llama/.opencode/skills/profiles-authoring/SKILL.md
+```
+
+OpenCode checks `<cwd>/.opencode/skills` and walks up to the project root, so
+the agent must be started in `/opt/llama` (or below it). For a global
+install that works from any directory, use
+`~/.config/opencode/skills/profiles-authoring.md` instead.
+
+This is optional: llama-swap itself does not read `.opencode/`.
+
 ## Two things the unit discovers rather than hardcodes
 
 **GPU nodes.** `DeviceAllow` names the nodes that exist on this host. A
