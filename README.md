@@ -231,27 +231,33 @@ probe itself refuses to start beside a resident process.
 
 ## Agent skill: authoring `profiles.yaml`
 
-The repo ships an OpenCode skill at
-[`.opencode/skills/profiles-authoring/SKILL.md`](.opencode/skills/profiles-authoring/SKILL.md).
-It walks an agent through discovery, `tasks:`, sampling profiles, CPU/GPU
-placement, matrix sizing, capacity routing, pools, TTL, and validation.
+[`docs/profiles-authoring.md`](docs/profiles-authoring.md) is a self-contained
+guide (with OpenCode skill frontmatter) covering discovery, `tasks:`,
+sampling profiles, CPU/GPU placement, matrix sizing, capacity routing, pools,
+TTL, and the dry-run/validate loop.
 
-**Use it in this repo (automatic).** OpenCode discovers `.opencode/skills/`
-from the working directory up to the project root. Load it with
-`@profiles-authoring`, or let the model pick it from its description.
-
-**Install it globally.** Copy or symlink the directory under
-`~/.config/opencode/skills/`:
+The repo does not install anything into `.opencode/`; the file is a normal
+document. To expose it to OpenCode, copy or symlink it into the global skills
+directory under the ID you want:
 
 ```sh
 mkdir -p ~/.config/opencode/skills
-cp -r .opencode/skills/profiles-authoring ~/.config/opencode/skills/
-# or: ln -s "$PWD/.opencode/skills/profiles-authoring" \
-#           ~/.config/opencode/skills/profiles-authoring
+ln -s "$PWD/docs/profiles-authoring.md" \
+      ~/.config/opencode/skills/profiles-authoring.md
+# or: cp docs/profiles-authoring.md ~/.config/opencode/skills/profiles-authoring.md
 ```
 
-**Add another source.** List it in `opencode.json(c)`; relative paths resolve
-from the active working directory:
+A flat `~/.config/opencode/skills/<id>.md` is a skill whose ID is the file
+name. For a project-local install, symlink it into that project's
+`.opencode/skills/` instead:
+
+```sh
+mkdir -p .opencode/skills
+ln -s "$PWD/docs/profiles-authoring.md" .opencode/skills/profiles-authoring.md
+```
+
+For a whole directory of skills, add it to `skills` in `opencode.json(c)`;
+relative paths resolve from the active working directory:
 
 ```jsonc
 {
@@ -260,8 +266,8 @@ from the active working directory:
 }
 ```
 
-The skill ID is the directory name (`profiles-authoring`), not the display
-name. OpenCode reloads skills on save; no restart is needed.
+OpenCode reloads skills on save; no restart is needed. Load it with
+`@profiles-authoring` or let the model pick it from the description.
 
 ## See also
 
@@ -271,7 +277,7 @@ name. OpenCode reloads skills on save; no restart is needed.
 - [docs/install.md](docs/install.md) — systemd deployment from a run directory ([extras/install.py](extras/install.py))
 - [docs/backends/](docs/backends/) — per-engine notes: llama-server, vLLM, sd-server, whisper-server, audio-cpp
 - [profiles.yaml.example](profiles.yaml.example) — commented starter for `profiles.yaml`; [llama_packer/profiles.yaml](llama_packer/profiles.yaml) is the bundled fallback
-- [.opencode/skills/profiles-authoring/SKILL.md](.opencode/skills/profiles-authoring/SKILL.md) — agent skill for authoring and validating `profiles.yaml`
+- [docs/profiles-authoring.md](docs/profiles-authoring.md) — agent-facing guide for authoring and validating `profiles.yaml`
 
 ## Limitations
 

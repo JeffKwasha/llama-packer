@@ -7,8 +7,8 @@ description: Build or migrate a llama-packer profiles.yaml — discovery roots, 
 
 `profiles.yaml` is the packer's input. It declares the fleet; the packer
 emits `config.yaml` for llama-swap. Start from the annotated
-[`profiles.yaml.example`](../../../profiles.yaml.example) and the contract in
-[`SPEC.md`](../../../SPEC.md); do not invent keys.
+[`profiles.yaml.example`](../profiles.yaml.example) and the contract in
+[`SPEC.md`](../SPEC.md); do not invent keys.
 
 ## Workflow
 
