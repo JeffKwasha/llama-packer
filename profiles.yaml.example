@@ -15,9 +15,11 @@ defaults:
   # Do not set `parallel` here unless you intend to pin every model and
   # disable auto-parallel; leaving it unset lets the value function choose.
   #
-  # Headroom for the desktop, browser, or other tenants. This is what
-  # `pools.default` subtracts after the fixed reserve; measure it with
-  # `python -m llama_packer.vram_log --once` / `--report`.
+  # Headroom for the desktop, browser, or other tenants. This is additional
+  # to the fixed reserve: reserve = 1024 + max(1024, baseline_mb), and
+  # pools.default = VRAM - reserve - spare. Pick it from vram_log --report
+  # over days; --once is a snapshot that includes loaded models. The solve
+  # fills the pool by design, so spare + reserve is the whole headroom.
   spare: 1G
   temperature: 1.0
   top_p: 0.95
@@ -390,9 +392,11 @@ profiles:
 #
 # ── Capacity routing knobs (optional) ──────────────────
 # The packer emits `routing.router.use: capacity` with:
+#   reserve       = 1024 + max(1024, baseline_mb)
 #   pools.default = detected VRAM - reserve - spare
 #   pools.ram     = detected host pool
 #   pools.<role>  = 1 (one live serving per role)
+# The solve fills pools.default on purpose; reserve + spare is the headroom.
 # plus per-model `capacities` and `evict_cost`. evict_cost is a
 # capacity-router field: reload time plus lost prefill (chat only).
 # `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar

@@ -27,22 +27,30 @@ the run directory can load it.
 ## Decide the budget
 
 ```
-reserve     = 1024 + max(1024, baseline_mb)
+reserve       = 1024 + max(1024, baseline_mb)
 pools.default = total VRAM - reserve - spare
 ```
+
+`spare` is headroom **on top of** the reserve, not the whole headroom. The
+reserve already covers the driver, compositor and scanout; `spare` covers
+the tenants that come and go. The capacity solve then fills
+`pools.default` by design — a small gap between the pool and the largest
+`capacities.default` is normal and is not the headroom.
 
 - Use `defaults.spare` for ordinary headroom: the desktop, a browser, or
   other tenants that appear later. It is subtracted after the fixed reserve.
 - `hardware.baseline_mb` is an advanced override for a **known fixed**
   pre-existing VRAM load. It only matters above the fixed 1 GiB video
   reserve; for normal headroom prefer `spare`.
-- Estimate the footprint with `python -m llama_packer.vram_log --once` (one
-  sample) or `--report` (after logging). `llama-packer --probe-memory`
-  measures a model family's serve-shaped VRAM law — it is not a headroom
-  measurement.
-- Check `pools.default` against each entry's `capacities.default`. Live
-  `used_vram` is deliberately not auto-detected, so the operator's headroom
-  has to be declared.
+- Choose `spare` from `python -m llama_packer.vram_log --report` over days,
+  not from `--once`. A single sample includes whatever models are loaded at
+  that moment, so it cannot separate the resident base from the variable
+  tenant envelope; the report's floor is the base and the gap to the tenant
+  medians is the spare. `llama-packer --probe-memory` measures a model
+  family's serve-shaped VRAM law — it is not a headroom measurement.
+- Check each entry's `capacities.default` is ≤ `pools.default`. The pool
+  already has the headroom deducted, so do not add slack on top by
+  shrinking contexts.
 
 ## Workflow
 
@@ -108,8 +116,8 @@ log lines — that is where dropped models and retired keys appear.
 
 Check:
 
-- `pools.default` leaves the headroom you decided, and every entry's
-  `capacities.default` is ≤ the pool;
+- `pools.default` equals detected VRAM − reserve − spare, and every
+  entry's `capacities.default` is ≤ the pool;
 - no `matrix.sets:`/`matrix.evict_costs:` warning;
 - each emitted `parallel` meets the task's `min_parallel`, and each
   `ctx_size` meets `min_context` (a floor that cannot be met emits nothing);
@@ -133,6 +141,9 @@ Check:
   `evict_cost`.
 - **CPU is not "never evicted".** It charges `ram` and is evicted when the
   host pool is full; `ttl` is the separate idle timer.
+- **A full pool is the design.** `capacities.default` is meant to approach
+  `pools.default`; headroom lives in `reserve + spare`, not in unallocated
+  pool space.
 - **Aliases are not model ids.** Category vars and `+ref` names resolve to
   emitted entry ids; use a real model id/selector.
 
