@@ -520,7 +520,7 @@ def test_emitted_config_plain_is_a_plain_dict():
     from llama_packer.writer import EmittedConfig
 
     ec = EmittedConfig({"models": {"m": {"cmd": "x"}}},
-                       entry_ids_by_stem={"m": ["m"]}, coload_stems=["e"])
+                       entry_ids_by_stem={"m": ["m"]})
     plain = ec.plain()
     assert type(plain) is dict
     assert plain == {"models": {"m": {"cmd": "x"}}}

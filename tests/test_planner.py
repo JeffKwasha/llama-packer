@@ -613,23 +613,6 @@ def test_solve_matrix_skips_coloads_when_no_set_references_them(profiles):
     assert with_ref.coloads == (("s2t", 640),)
 
 
-def test_prune_leaves_removes_refused_members():
-    # category disappears from the emitted sets without leaving a dangling
-    # var; sizes keep their members and empty groups collapse.
-    from llama_packer.writer import _prune_leaves as prune_leaves
-    drops = frozenset({"b"})
-    assert prune_leaves("(CHAT) & (b & c)", drops) == "CHAT & c"
-    assert prune_leaves("(a | b | c) & d", drops) == "(a | c) & d"
-    assert prune_leaves("(CHAT) & (b)", drops) == "CHAT"
-    assert prune_leaves("(CHAT) & (b & c)",
-                        frozenset({"b", "c"})) == "CHAT"
-    assert prune_leaves("a | b", drops) == "a"
-    assert prune_leaves("rnk2 & x", drops) == "rnk2 & x"
-    assert prune_leaves("b", drops) == ""
-    assert prune_leaves("(CHAT) & +combo", drops,
-                        {"combo": "b | d"}) == "CHAT & d"
-
-
 def test_category_ctx_caps_at_one_seam(profiles):
     # Validates: docs/plans/requirement-trace.md, requirement #92
     # ctx is a cap honoured by the served context and never a floor.
@@ -644,68 +627,33 @@ def test_category_ctx_caps_at_one_seam(profiles):
     assert resident_ctx(emb, MatrixKnobs(), 999999) == 4096
 
 
-def test_host_unit_refusals_drop_the_unit(profiles, monkeypatch):
-    # composition that cannot fit is refused as a unit: each category in
-    # the unit gets no id, nothing commits, and the emitted set loses
-    # both leaves.
+def test_host_unit_refusal_drops_a_category_that_cannot_fit_alone(
+        profiles, monkeypatch):
+    # Validates: docs/plans/requirement-trace.md, requirement #70
+    # Each fixed CPU category is judged on its own quad against what is
+    # free after the committed pair: the one that fits still emits an id
+    # and commits to the ledger, the one that does not is refused outright.
     from llama_packer import writer
     chat = make("chat", role="chat")
     emb = make("e", role="embeddings", context_length=32768)
     rnk = make("r", role="rerank", context_length=32768)
     tts = make("t", role="t2s", context_length=32768, device="cpu")
-    music = make("muz", role="t2s", context_length=32768, device="cpu")
+    music = make("muz", role="s2t", context_length=32768, device="cpu")
     _fake_vram(chat, (1000, 0.5, 100))
     for m in (emb, rnk):
         _fake_vram(m, (100, 0.01, 0))
-    _fake_vram(tts, (4000, 0.01, 0))
-    _fake_vram(music, (3000, 0.01, 0))
+    _fake_vram(tts, (1000, 0.0, 0))
+    _fake_vram(music, (9000, 0.0, 0))
     monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
     planner = writer.Planner(
         [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
-        vram_total=64 * 1024, matrix_cfg={
-            "sets": {"voice": "__CHAT_VARS__ & tts & music"}},
+        vram_total=64 * 1024, matrix_cfg={"sets": {}},
         embed_model=emb, rerank_model=rnk,
-        fixed_categories=[("tts", tts), ("music", music)],
+        fixed_categories=[("tts", tts), ("stt", music)],
         host_pool_mb=5000)
     plan = planner.plan()
-    assert planner.host_unit_refused_vars == frozenset({"tts", "music"})
-    assert not planner.host_ledger.residents
-    assert "t" not in plan and "muz" not in plan
-    assert dict(plan)[writer.HOST_REFUSED_KEY] == ["music", "tts"]
-
-
-def test_host_unit_refusals_survive_one_fitting_set(profiles, monkeypatch,
-                                                   caplog):
-    # any fitting composition admits survives (it is an alternative of the
-    # failing one, not co-resident); the failing composition warns.
-    import logging
-    from llama_packer import writer
-    chat = make("chat", role="chat")
-    emb = make("e", role="embeddings", context_length=32768)
-    rnk = make("r", role="rerank", context_length=32768)
-    tts = make("t", role="t2s", context_length=32768, device="cpu")
-    music = make("muz", role="t2s", context_length=32768, device="cpu")
-    _fake_vram(chat, (1000, 0.5, 100))
-    for m in (emb, rnk):
-        _fake_vram(m, (100, 0.01, 0))
-    _fake_vram(tts, (4000, 0.01, 0))
-    _fake_vram(music, (3000, 0.01, 0))
-    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
-    planner = writer.Planner(
-        [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
-        vram_total=64 * 1024, matrix_cfg={
-            "sets": {"both": "__CHAT_VARS__ & tts & music",
-                     "solo": "__CHAT_VARS__ & tts"},
-        },
-        embed_model=emb, rerank_model=rnk,
-        fixed_categories=[("tts", tts), ("music", music)],
-        host_pool_mb=5000)
-    plan = planner.plan()
-    assert planner.host_unit_refused_vars == frozenset({"music"})
+    assert planner.host_unit_refused_vars == frozenset({"stt"})
     assert "t" in plan and "muz" not in plan
-    with caplog.at_level(logging.WARNING):
-        planner._host_unit_refusals()
-    assert "cannot fit as a unit" in caplog.text
 
 
 def test_resident_options_branch_alternatives_not_co_resident():
@@ -1005,8 +953,7 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
                       vram_total=64 * 1024,
                       matrix_cfg={"min_chat_ctx": 8192,
                                   "embed_context": 32768,
-                                  "rerank_context": 32768,
-                                  "sets": COLOAD_SETS},
+                                  "rerank_context": 32768},
                       embed_model=embed, rerank_model=rerank)
     plan = planner.plan()
 
@@ -1017,15 +964,12 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
     assert plan["r"][0].ctx_size == 20480
     # chat solved below tools_min_ctx (131072) -> demoted.
     assert plan["chat"][0].tools_demoted is True
-    # included co-load flagged.
-    assert [v.coload for v in plan["s2t"]] == [True]
 
     config = emit_config([chat, embed, rerank, s2t], plan, profiles, TVARS)
     chat_entry = entry_for(config, "chat")
     assert chat_entry["capabilities"]["tools"] is False
     assert chat_entry["metadata"]["tools_demoted"] is True
     assert entry_for(config, "s2t")["metadata"]["ctx_size"] == 8192
-    assert config.coload_stems == ["s2t"]
 
 
 def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
@@ -1233,97 +1177,6 @@ def _quiet_logger():
     log = logging.getLogger("test-vars")
     log.addHandler(logging.NullHandler())
     return log
-
-
-# ── set admission across profile groups ──────────────────────────────────
-
-
-def test_set_admission_is_per_entry_not_per_stem(make_model):
-    """One model's `.coding` and `.aux` entries are different servings.
-
-    Keyed by stem, whichever entry was solved first spoke for both -- and
-    they are sized from opposite priorities, so an entry sized for 204800
-    could ride on a verdict reached for one sized for 81920.
-
-    Validates: SPEC.md, 'VRAM Allocation': each entry resolves its own
-    serving against the same budget.
-    """
-    from llama_packer.endpoints import CHAT
-    from llama_packer.tasks import Task
-    from llama_packer.writer import FALLBACK, Planner
-    model = make_model("a")
-    planner = _planner_for_sets(model)
-    planner.set_overheads = {"rag": 1751, "voice": 1898}
-    coding = Task("coding", CHAT, "chat", min_context=131072, min_parallel=1)
-    aux = Task("aux", CHAT, "chat", min_context=81920, min_parallel=2)
-
-    def probe_ctx(model, parallel, cache_type, spare_mb, **kw):
-        return planner.probes[spare_mb]
-
-    planner._bounded_ctx = probe_ctx
-    planner._probe_at_overhead = lambda m, oh: (planner.probes[oh], 1)
-
-    planner.probes = {1751: 200000, 1898: 200000}
-    planner.record_admission(model, coding, 204800, 1)
-    assert planner.set_admission[("a", "coding")] == {"rag", "voice"}
-
-    # The same model under a resident that squeezes it: the cheap set still
-    # holds it, the expensive one no longer can.
-    planner.probes = {1751: 200000, 1898: 40000}
-    planner.record_admission(model, coding, 204800, 1)
-    assert planner.set_admission[("a", "coding")] == {"rag"}, \
-        "admission must not be shared with the other category"
-
-    planner.probes = {1751: 200000, 1898: 200000}
-    planner.record_admission(model, aux, 81920, 2)
-    assert planner.set_admission[("a", "aux")] == {"rag", "voice"}
-
-
-def test_the_fallback_entry_joins_no_set(make_model):
-    """Routing is what categories are for; the fallback has no name to
-    route on, so it never joins a set and serves standalone.
-
-    Validates: docs/plans/requirement-trace.md, requirement #42.
-    """
-    from llama_packer.writer import FALLBACK
-    model = make_model("a")
-    planner = _planner_for_sets(model)
-    planner.set_overheads = {"rag": 1751}
-    planner.record_admission(model, FALLBACK, 81920, 1)
-    assert planner.set_admission[("a", None)] == frozenset()
-
-
-def _planner_for_sets(model):
-    """A Planner stub with just enough state for set admission."""
-    from types import SimpleNamespace
-
-    from llama_packer.writer import Planner
-    p = SimpleNamespace()
-    p.profiles = SimpleNamespace(default_cache_type="q8_0",
-                                 shed_order=("vision", "draft"))
-    p.set_overheads = {}
-    p.set_admission = {}
-    p.ledger = SimpleNamespace(extra_reserve_mb=lambda _pool: 0)
-    p.knobs = SimpleNamespace()
-    p.vram_total = 48 * 1024
-    p.fit_bin = "unused"
-    p.baseline_mb = 0
-    p.memory_margin = 0.0
-    p.llama_args = ""
-    p.max_context = None
-    p.min_context = 65536
-    p.min_context_explicit = False
-    p._charge_sets = {}
-    p._bounded_ctx = lambda *a, **k: 65536
-    p._probe_at_overhead = lambda m, oh: (65536, 1)
-    # The real methods, bound to the stub: the behaviour under test is the
-    # planner's, not a reimplementation of it.
-    p.record_admission = lambda m, d, c, par: Planner.record_admission(
-        p, m, d, c, par)
-    p._serves_beside = (lambda m, d, oh, par: Planner._serves_beside(
-        p, m, d, oh, par))
-    p._probe_at_overhead = lambda m, oh: (p.probes[oh], 1)
-    return p
 
 
 # ── solve_rung: most context that fits, vision kept only when free ───────

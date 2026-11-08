@@ -151,7 +151,7 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 70 | Host pool floor: an infeasible read clamps the pool to 0 and an over-pool `device: cpu` model emits no id | `test_host_pool_clamps_to_zero`, `test_cpu_variant_refused_on_small_pool` |
+| 70 | Host pool floor: an infeasible read clamps the pool to 0, and an over-pool `device: cpu` serving — a variant or a declared fixed category — emits no id | `test_host_pool_clamps_to_zero`, `test_cpu_variant_refused_on_small_pool`, `test_host_unit_refusal_drops_a_category_that_cannot_fit_alone` |
 | 71 | Pressure zone: sysctl `(zone high sum, min_free_kbytes floor)` primary; missing/zeroed zoneinfo falls back to 25% of total, called out in the log | `test_pressure_zone_from_zoneinfo`, `test_pressure_zone_fallback_is_logged`, `test_pressure_zone_override_asserted` |
 | 72 | `host_pool = min(sys_free, cgroup_free)` with every override arm (`system_ram`, `host_pool` abs/frac) honored | `test_host_pool_mixed_terms`, `test_host_pool_overrides_arm` |
 | 73 | Service cgroup caps the pool; no llama-swap cgroup skips the term with a warning | `test_host_pool_mixed_terms`, `test_cgroup_missing_service_skips_term` |
@@ -203,7 +203,7 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 99 | A task id is declared data: an arbitrary id declared in `profiles.yaml tasks:` serves, and the same id undeclared is not a task and produces no task entry | `test_a_declared_task_id_is_arbitrary`, `test_an_undeclared_task_id_fails` |
 
-## Composition validation (SPEC.md §VRAM Allocation)
+## Per-category context cap (SPEC.md §VRAM Allocation)
 
 | # | Requirement | Test |
 |---|---|---|

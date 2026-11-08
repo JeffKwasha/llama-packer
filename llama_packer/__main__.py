@@ -1136,8 +1136,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.dry_run:
         payload = config.plain() if isinstance(config, EmittedConfig) else config
-        sys.stdout.write(dump_yaml(
-            payload, getattr(config, "set_overheads", None)))
+        sys.stdout.write(dump_yaml(payload))
         for _name in sorted(var_to_value):
             logger.info("env %s=%s", _name, var_to_value[_name])
         utils.note_fs_op("write", output_path)

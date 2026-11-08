@@ -6,6 +6,10 @@ superseded by capacity routing. Recorded 2026-10-23.
 rule is retired. CPU models charge the capacity `ram` pool and are evicted
 under pressure like any other resident; a non-chat helper defaults to
 `ttl: 3600`. See `SPEC.md` §Host pool / §Capacity routing.
+`matrix.sets` is retired with it (SPEC §Capacity routing), so the set
+composition section and the host-ledger unit judgement below are history:
+each fixed CPU category is judged on its own quad against what is free
+after the committed pair (requirement #70).
 Related: the retired memory-tag plan (§3 measured host RAM — this plan is
 its minimal form), `docs/plans/opportunistic-coload.md`
 (CPU-resident coload at 0 GPU cost, today's rule),

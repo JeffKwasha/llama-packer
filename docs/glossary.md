@@ -105,7 +105,7 @@ is the model pick a capacity-charged entry is emitted for (`emb`, `rnk`).
 | **backend** | Retired spelling of **engine**; survives only as a code identifier (`backends/`, `BoundBackend`). A sidecar declaring `backend:` warns as an alien key. | `backends/` |
 | **transport** | *How* a backend runs: host, podman, docker. An independent axis from the engine. | `backends/transport.py` |
 | **engine resolution** | The sidecar `engines:` list names the engines that can load the model (order, allow list, format, endpoint, availability); refusal by name when none applies. Required on an authored sidecar; only an orphan is inferred. | SPEC "Backend Selection" |
-| **coload** | A second entry placed in a slot that is otherwise idle — opportunistic, not reserved. Legacy matrix vocabulary; capacity pools now govern co-residency. | `coload_stems` |
+| **coload** | A second entry placed in a slot that is otherwise idle — opportunistic, not reserved. Legacy matrix vocabulary; capacity pools now govern co-residency. | `MatrixSolve.coloads` |
 
 ## Deploy
 

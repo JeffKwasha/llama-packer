@@ -548,23 +548,6 @@ def test_unusable_category_name_falls_back_to_a_bare_id(make_model):
     assert list(config["models"]) == ["m"]
 
 
-def test_dump_yaml_annotates_set_memory():
-    # The config documents its own memory split: a comment above each set.
-    # Only direct children of `sets:` are annotated, so a var that happens to
-    # share a set's name is left alone.
-    # Validates: SPEC.md, 'Output Format': the emitted YAML carries the memory set it was built with.
-    from llama_packer.writer import dump_yaml
-    text = dump_yaml(
-        {"routing": {"router": {"settings": {"matrix": {
-            "vars": {"rag": "m", "c1": "m2"},
-            "sets": {"rag": "c1 & emb", "voice": "c1 & stt"},
-        }}}}},
-        {"rag": 1751, "voice": 1898})
-    assert "# rag: 1751 MiB allocated to its co-resident models (1.71 GiB)" in text
-    assert "# voice: 1898 MiB allocated to its co-resident models (1.85 GiB)" in text
-    assert text.count("# rag:") == 1  # the `vars: rag` key is not annotated
-
-
 def test_require_gates_existence(make_model, tmp_path):
     """A model lacking a required capability does not satisfy the category.
 

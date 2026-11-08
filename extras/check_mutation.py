@@ -99,22 +99,14 @@ MUTATIONS = {
         "llama_packer/writer.py",
         '                elif op == "&":',
         "                elif False:"),
-    "test_prune_leaves_removes_refused_members": (
-        "llama_packer/writer.py",
-        'kept.append(pruned if other not in pruned',
-        "                                    kept.append(pruned if other in pruned"),
     "test_category_ctx_caps_at_one_seam": (
         "llama_packer/writer.py",
         "    ctx = (model.design_context if model.role not in (",
         "    ctx = (model.design_context if True not in ("),
-    "test_host_unit_refusals_drop_the_unit": (
+    "test_host_unit_refusal_drops_a_category_that_cannot_fit_alone": (
         "llama_packer/writer.py",
-        "            if available < total:",
-        "            if False:"),
-    "test_host_unit_refusals_survive_one_fitting_set": (
-        "llama_packer/writer.py",
-        "                if all(s in fails for s in named):",
-        "                if True:"),
+        "        refused = {n for n, mb in cats.items() if mb > available}",
+        "        refused = set()"),
     "test_warn_unhandled_names_the_sidecar": (
         "llama_packer/backends/base.py",
         '        who = f"{stem}: " if stem else ""',
