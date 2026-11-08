@@ -87,10 +87,9 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 39 | Residents serve a fixed small context and are charged for it | `test_resident_rag_is_reserved_at_its_fixed_context` |
 | 40 | Resident parallelism is ignored — never buys context from chat | `test_resident_parallelism_is_ignored` |
-| 41 | Admission is per entry, on the resolved serving | `test_set_admission_is_per_entry_not_per_stem` |
-| 42 | The fallback joins no set | `test_the_fallback_entry_joins_no_set` |
 | 43 | The fallback runs the slot solve at exponent 0 | `test_fallback_slot_exponent_is_zero` |
 | 44 | Ties in the slot score go to more slots | `test_ties_go_to_more_slots` |
+| 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
 
 ## Deploy
 
@@ -165,11 +164,10 @@ and every one of them carries a `Validates:` citation.
 | 80 | TTL resolves sidecar > task > placement default: `0` disables idle unload, the smallest declared lifetime wins, an undeclared CPU-resident serving gets 3600 s (chat is not special), and an undeclared device entry carries none | `test_ttl_sidecar_wins_when_tighter`, `test_ttl_task_wins_when_tighter`, `test_ttl_zero_means_never_unload_and_wins`, `test_ttl_cpu_helper_defaults_to_host_lifetime`, `test_ttl_cpu_serving_gets_cpu_default`, `test_cpu_chat_entry_gets_cpu_default_ttl`, `test_gpu_entry_has_no_ttl` |
 | 81 | A category selector defines the RAG pair too — solve, charge, `emb`/`rnk` vars and resident entry name one model | `test_detect_matrix_category_selector_defines_the_pair` |
 
-## Set composition (SPEC.md §VRAM Allocation)
+## Alien keys
 
 | # | Requirement | Test |
 |---|---|---|
-| 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
 | 88 | An alien sidecar key warns at discovery: `role:`/`usage:` are not keys (the warning points at `tasks:`), and `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
 

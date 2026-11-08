@@ -506,7 +506,7 @@ ways); only the recurrent-state cache scales with p:
   it drops layers fit-params doesn't count (Dirk has `nextn_predict_layers = 1`,
   a baked-in MTP layer).
 - **Correction is calibrated far below design context.** `_MEASURE_CTX_CAP =
-  65536` (consts.py:83); `_probe_grid` measures the witness at ≤65536/32768/
+  65536`; `_probe_grid` measures the witness at ≤65536/32768/
   16384, but the model serves at design 262144. Any serve-vs-fit gap that
   scales with C (draft KV, allocator rounding) is fitted at 65k and applied
   at 262k — the correction cannot represent it.

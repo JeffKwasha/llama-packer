@@ -1,8 +1,7 @@
 """VRAM budget calculation: affine memory measurement, context sizing, and
 matrix solving.
 
-The VRAM law (validated across families; see llama_packer.memory_probe
-and docs/plans/auto-parallel.md):
+The VRAM law (validated across families; see llama_packer.memory_probe):
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 

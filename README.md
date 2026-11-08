@@ -48,8 +48,8 @@ you get a warning saying so. Copy `profiles.yaml.example` to `profiles.yaml`
 next (see [Profiles](#profiles-profilesyaml)) to start tuning.
 
 For development, `uv pip install -e .`. To pin an older tree, clone with
-`--branch v0.3.0`, or install without cloning via
-`uv pip install git+https://github.com/JeffKwasha/llama-packer.git@v0.3.0`.
+`--branch <release tag>`, or install without cloning via
+`uv pip install git+https://github.com/JeffKwasha/llama-packer.git@<release tag>`.
 There is no PyPI package — `uvx llama-packer` will not resolve; use the
 clone-and-`uv run` path above.
 

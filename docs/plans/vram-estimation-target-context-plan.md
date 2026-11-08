@@ -10,7 +10,7 @@ The estimator fits the affine law
 
 with `c`, `D`, `model`, `compute` from `llama-fit-params`, plus a per-arch
 correction fitted by `--probe-memory` on a grid capped at
-`_MEASURE_CTX_CAP = 65536` (`consts.py:83`). The model is then planned at
+`_MEASURE_CTX_CAP = 65536`. The model is then planned at
 contexts up to `design_context` (262144 for Dirk). **The correction is fitted
 at ≤64k and applied at ~200k.** The gap it prices is context-independent *if*
 it is constant — and the code never checks that.
@@ -42,7 +42,7 @@ GiB observed) — a significant error factor.
   Proposed grid: `(design,1)`, `(design//2,1)`, `(c_small,2)`,
   `(c_small,1)`, `(c_small//2,1)` where
   `c_small = min(design, _MEASURE_CTX_CAP)`.
-- `llama_packer/memory_probe.py::affine_report` (lines 212-213): `d` is
+- `llama_packer/memory_probe.py::affine_report`: `d` is
   currently `pool((big,2)) - pool((big,1))`. Change it to the small-context
   pair, because `(262144,2)` cannot fit (Dirk needs ~39 GB at p=2). `D` is
   context-independent, so this is exact.
@@ -95,7 +95,7 @@ GiB observed) — a significant error factor.
 
 ### C6 — Do not persist a correction whose grid fit failed
 
-- `memory_probe.py::affine_report` (lines 238-246): call
+- `memory_probe.py::affine_report`: call
   `save_serve_correction` only when the report is `ok`. Today a FAIL is saved.
 - **Why:** a failed fit produces a correction that is confidently wrong.
 
@@ -116,9 +116,9 @@ GiB observed) — a significant error factor.
 
 ### C9 — Docs and dead code
 
-- `vram.py` module header (lines 21-25) still says measurements come from real
+- `vram.py`'s module header still says measurements come from real
   `llama-server` runs; normal runs use fit-params + corrections. Fix.
-- `affine_from_pair` (`vram.py:186`) has no callers — remove.
+- `affine_from_pair` has no callers — remove.
 
 ## What NOT to change
 

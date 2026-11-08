@@ -1,8 +1,7 @@
 """VRAM probe: serve-shaped measurement and affine-law validation.
 
 The VRAM law (validated 2026-09-07 across qwen35/gemma4 — dense, MoE and
-SWA architectures, q8_0/f16/bf16/q4_0, p ∈ {1,2,4,8}, C ∈ {64k,128k,256k};
-see docs/plans/auto-parallel.md):
+SWA architectures, q8_0/f16/bf16/q4_0, p ∈ {1,2,4,8}, C ∈ {64k,128k,256k}):
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 

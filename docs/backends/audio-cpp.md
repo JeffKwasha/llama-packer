@@ -238,8 +238,7 @@ maturity; use `audio-cpp` for breadth or a unified TTS+ASR service.
 
 ## History / sources
 
-The research brief this landed from is preserved in git history
-(`docs/plans/audio-cpp.md`, removed after migration): upstream
+The research brief this landed from is preserved in git history: upstream
 `app/server/README.md`, `docs/gguf.md`, `docs/build/linux.md`, and the working
 config in llama-swap issue #36 (`@dkruyt`, 2026-07-03).
 

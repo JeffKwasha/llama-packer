@@ -24,7 +24,10 @@ TRACE = ROOT / "docs/plans/requirement-trace.md"
 # should break the tests
 MUTATIONS = {
     "test_every_category_gets_an_entry": ("llama_packer/writer.py", "for demand in (*self.demands_for(model), FALLBACK):"),
-    "test_untagged_gets_a_bare_id": ("llama_packer/writer.py", "if demand is FALLBACK:\n            self.set_admission"),
+    "test_untagged_gets_a_bare_id": (
+        "llama_packer/writer.py",
+        'cat_id = utils.slugify(cat) if cat is not None else ""',
+        'cat_id = utils.slugify(cat) if cat is not None else "x"'),
     "test_rung_drops_vision_when_it_buys_context": ("llama_packer/writer.py", "                best = rung\n"),
     "test_fallback_keeps_capability_until_the_minimum_forces_it": ("llama_packer/writer.py", "                return best\n"),
     "test_require_gates_existence": ("llama_packer/writer.py", "def can_meet(self, model, demand"),
@@ -37,7 +40,6 @@ MUTATIONS = {
     "test_min_image_megapixels_keeps_vision": ("llama_packer/writer.py", 'demands = tuple(replace(d, keep=d.keep | {"vision"}) for d in demands)\n'),
     "test_serving_pin_ignores_the_design_max": ("llama_packer/writer.py", "        return min(pins) if pins else None\n"),
     "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
-    "test_set_admission_is_per_entry_not_per_stem": ("llama_packer/writer.py", "def record_admission(self, model, demand"),
     "test_fallback_slot_exponent_is_zero": ("llama_packer/writer.py", "power=0.0 if is_null else demand.parallel_power,"),
     "test_capabilities_context_is_served_window": (
         "llama_packer/writer.py", '"context": ctx_size,',

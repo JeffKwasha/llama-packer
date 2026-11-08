@@ -262,8 +262,7 @@ def test_infer_backend_respects_allowed_list(make_model):
 def test_vllm_recipe_keys_settable_by_override_rule(make_model):
     # The vLLM recipe keys are *serving choices*: they must be settable by an
     # override rule (not just a sidecar), and must not be rejected as unknown
-    # keys by compile_rule_list.  Regression for the "override-rule capable"
-    # claim in docs/plans/gb10-support-plan.md.
+    # keys by compile_rule_list.
     # Validates: SPEC.md, 'Override Rules': the vLLM recipe keys are ordinary frontmatter and can be set by a rule.
     from llama_packer.backends.base import SETTING_KEYS
     recipe_keys = {"vllm_quantization", "moe_backend", "mamba",

@@ -34,8 +34,8 @@ when the plan that produced them is pruned.
   `llama_packer/vram.py`), not the planner.
   **Evidence, 2026-11-02:** reproduced on `llama-b11988` for all four named
   models; the artifacts record `error: invalid argument: --fit-print`.
-  Cause: `_detect_matrix` is called with `fit_bin=llama_bin`
-  (`__main__.py:1175`), so `vram.fit_params` launches `llama-server`, which
+  Cause: `_detect_matrix` was called with `fit_bin=llama_bin`, so
+  `vram.fit_params` launches `llama-server`, which
   has `--fit` but not `--fit-print`. The flag belongs to the sibling
   `llama-fit-params` binary, which accepts the same argv and exits 0. The fix
   is the call site (pass `fit_bin`, not `llama_bin`) plus a regression test.

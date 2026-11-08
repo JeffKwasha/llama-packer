@@ -39,7 +39,7 @@ either way it should not be used in a commit message until it is.
 | **shared solve** (`matrix:`) | The pack-time context solve: one budget across the servings the operator wants co-resident, so a helper is paid for out of the chat context. The name `matrix` survives in the config key and the solver, not in routing (capacity pools replaced matrix sets). | `solve_matrix_ctx`, SPEC §Capacity routing |
 | **co-resident** | Allowed to be loaded at the same time because their capacities fit every pool. Chat models take turns; embed/rerank are resident at a small context. | SPEC §Capacity routing |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
-| **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | writer, SPEC 305 |
+| **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | SPEC §VRAM gating and reservation notes |
 | **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same context, the least shed wins for the null category and the first qualifier stands. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
 
 ## Capacity, eviction and lifetime
@@ -95,7 +95,7 @@ is the model pick a capacity-charged entry is emitted for (`emb`, `rnk`).
 | **entry id** | The stable identifier of an emitted llama-swap entry, `<template_id>.<category|ctx>.<flags>`. Names the task, not the solve. | `emit_config`, `entry_ids_by_stem` |
 | **template_id** | The model identity a variant descends from. | `profiles.py` variant grouping |
 | **squeezed** | An entry whose context was reduced below what it asked for, to make room. Says so in its description. | SPEC "Context Management" |
-| **auto-parallel** | Choosing slots automatically when not declared. May not trade below a declared demand. | `auto_parallel_max`, SPEC 151 |
+| **auto-parallel** | Choosing slots automatically when not declared. May not trade below a declared demand. | `auto_parallel_max`, SPEC §Knobs (matrix section keys) |
 | **demotion** | Lowering a tool to a smaller model so a bigger one fits. | `writer.py` |
 
 ## Backends and transports
