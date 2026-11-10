@@ -51,3 +51,6 @@ build/
 # Sweep output (extras/find_decorated_tests.py)
 extras/decorated-tests.json
 node_modules
+
+# verification evidence and scratch
+.verify/
