@@ -21,13 +21,14 @@ import yaml
 from llama_packer import Model, __version__, find_bin_dir, utils
 from llama_packer import model as _modelmod
 from llama_packer.hardware import GpuProfile, HostProfile, detect_gpu_vendor
-from llama_packer.profiles import Profiles, validate_profiles_keys
+from llama_packer.profiles import (Profiles, check_profiles,
+                                   validate_profiles_keys)
 from llama_packer.tasks import TaskCatalogue
 from llama_packer.scope import ScopeStack
-from llama_packer.discover import discover
+from llama_packer.discover import DiscoveryError, discover
 from llama_packer.utils import (
     compute_env_prefixes, make_subst, make_fast_storage_predicate,
-    _detect_drive_speed, validate_dir_roles, NON_CHAT_ROLES,
+    _detect_drive_speed,
 )
 from llama_packer import roles
 from llama_packer.consts import (
@@ -105,12 +106,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog=textwrap.dedent("""\
             Examples:
               llama-packer                              # defaults
+              llama-packer --check                      # validate profiles.yaml
               llama-packer --dry-run                    # preview
               llama-packer --llama-version 8929         # specific llama-server version
               llama-packer --llama-server /opt/lsrv     # explicit binary path
               llama-packer --output /etc/ls/config.yaml
         """),
     )
+    parser.add_argument("--check", action="store_true",
+                        help="Validate profiles.yaml and exit: report every "
+                             "syntax, key and type error it can name, without "
+                             "discovering models or starting a server")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print config to stdout and touch nothing on disk: "
                              "no config.yaml, no config.env, no stub sidecars, "
@@ -150,7 +156,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--agents", action="store_true",
                         help="Write the AGENTS.md model guide to the models directory if missing "
                              "(never overwrites an existing file; bundled template)")
-    parser.add_argument("--extra-dirs", nargs="*", default=["embed", "rerank"], help="Extra subdirectories of --models-dir to scan for orphan GGUFs (default: embed rerank)")
+    parser.add_argument("--extra-dirs", nargs="*", default=None, help="Retired; a role owns its trees with roles.<name>.dir")
     parser.add_argument("--spare", help="Extra VRAM to reserve on top of the fixed 2048 MiB base "
                                          "(1024 OS/driver + 1024 compositor). This is the operator's slack for "
                                          "other VRAM tenants (immich, browsers, games): suffixed (2G, 512m, 64k) or bare number "
@@ -328,55 +334,6 @@ def _selection_reason(model, measured_mb: int | None = None,
     return f"smallest footprint {model.vram_mb} MiB"
 
 
-def apply_device_roles(models: list, roles_cfg, logger) -> None:
-    """Place every model of the declared roles on the host (decision 11).
-
-    ``profiles.yaml device_roles:`` names serving roles (a list, or a
-    mapping role → device — ``{embeddings: cpu}``); each becomes
-    ``device: cpu`` for every model of that role, indistinguishable from the
-    sidecar tag.  Nothing here infers placement: an absent key changes
-    nothing, and each role applied is logged with the number of models it
-    matched.
-    """
-    if not roles_cfg:
-        return
-    if isinstance(roles_cfg, dict):
-        declared: set[str] = set()
-        for k, v in roles_cfg.items():
-            if str(v).strip().lower() == "cpu":
-                declared.add(str(k))
-            else:
-                logger.warning(
-                    "device_roles: %r: %r is not a device; only 'cpu' can "
-                    "be declared here (the key is a role, the value is a "
-                    "device) — ignored", k, v)
-    elif isinstance(roles_cfg, (list, tuple)):
-        declared = {str(r) for r in roles_cfg}
-    else:
-        logger.warning(
-            "device_roles: expected a list of roles or a role→device "
-            "mapping, got %r; ignored", roles_cfg)
-        return
-    for role in sorted(declared):
-        if role not in roles.DEVICE_ROLES:
-            logger.warning("device_roles: %r is not a placeable role %s; "
-                           "the key is a role and the value is a device — "
-                           "ignored", role, sorted(roles.DEVICE_ROLES))
-            continue
-        hits = [m for m in models if m.role == role]
-        if not hits:
-            logger.warning("device_roles: role %r matched no model", role)
-            continue
-        placed = 0
-        for m in hits:
-            if m.on_cpu:
-                continue
-            m.frontmatter["device"] = "cpu"
-            placed += 1
-        logger.info("device_roles: %s → cpu (%d model(s)%s)", role, len(hits),
-                    f", {placed} newly placed" if placed else ", all already")
-
-
 def _resolve_matrix(profiles_cfg: dict, models: list, args, logger, *,
                     llama_bin: str, fit_bin: str,
                     llama_args: str = "") -> tuple:
@@ -411,6 +368,7 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
     """
     matrix_cfg = profiles_cfg.get("matrix")
     prof_cfg = Profiles(profiles_cfg)
+    tasks = TaskCatalogue.from_cfg(profiles_cfg.get("tasks"))
     knobs = MatrixKnobs.from_cfg(matrix_cfg)
     measured: dict[str, int | None] = {}
     breakdown: dict[str, str] = {}
@@ -423,7 +381,7 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
         """
         def cost(m):
             try:
-                ctx = resident_ctx(m, knobs)
+                ctx = resident_ctx(m, tasks)
                 detail = resident_cost_detail(
                     m, fit_bin=fit_bin,
                     cache_type=prof_cfg.default_cache_type, profiles=prof_cfg,
@@ -515,16 +473,12 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
         rerank_model = categories["rnk"]
         rnk_by_selector = True
 
-    if matrix_cfg.get("sets"):
-        logger.warning(
-            "matrix: sets: is retired — routing is capacity; the key is "
-            "ignored (remove it and declare pools/capacities instead)")
     if matrix_cfg.get("evict_costs"):
         logger.warning(
             "matrix: evict_costs: is retired — evict_cost is derived per "
             "entry from load and prefill time; the key is ignored")
     matrix_cfg = {k: v for k, v in matrix_cfg.items()
-                  if k not in ("sets", "evict_costs")}
+                  if k != "evict_costs"}
 
     fixed = [(n, m) for n, m in categories.items()
              if m is not embed_model and m is not rerank_model]
@@ -543,8 +497,70 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
             ctx_by_var)
 
 
-# Var-name prefix per co-load role, used in set expressions
-# (e.g. ``__CHAT_VARS__ & emb & rnk & __COLOAD_VARS__``).
+def validate_matrix_sets(profiles_cfg: dict) -> str | None:
+    """Why ``matrix.sets`` is unusable, or None when it is sound."""
+    declared = (profiles_cfg.get("matrix") or {}).get("sets")
+    if declared is None:
+        return None
+    if not isinstance(declared, dict):
+        return "matrix.sets: must be a mapping of name to expression"
+    for name, expr in declared.items():
+        if "__CHAT_VARS__" in str(expr) or "__COLOAD_VARS__" in str(expr):
+            return (f"matrix.sets.{name}: __CHAT_VARS__/__COLOAD_VARS__ are "
+                    "retired; name the roles")
+    return None
+
+
+def _expand_matrix_sets(sets: dict, role_by_stem: dict,
+                        entry_ids_by_stem: dict) -> dict[str, str]:
+    """Replace role-label leaves in a set expression with the entries serving
+    them.  Only whole leaves are replaced: model ids and ``+set`` names are
+    left alone even when they contain a role label."""
+    if not sets:
+        return {}
+    by_role: dict[str, list[str]] = {}
+    for stem, ids in entry_ids_by_stem.items():
+        by_role.setdefault(role_by_stem.get(stem), []).extend(ids)
+    from llama_packer.writer import _split_top, _strip_parens
+
+    role_repl = {role: (ids[0] if len(ids) == 1
+                        else "(" + " | ".join(ids) + ")")
+                 for role, ids in by_role.items() if role and ids}
+
+    def _wrap(text: str, need: bool) -> str:
+        if not need or (text.startswith("(") and text.endswith(")")):
+            return text
+        return f"({text})"
+
+    def render(expr: str) -> str:
+        expr = _strip_parens(expr)
+        alts = _split_top(expr, "|")
+        if len(alts) > 1:
+            kept = [p for p in (render(a) for a in alts) if p]
+            return " | ".join(_wrap(p, "&" in p or "|" in p) for p in kept)
+        terms = _split_top(expr, "&")
+        if len(terms) > 1:
+            kept = [p for p in (render(t) for t in terms) if p]
+            return " & ".join(_wrap(p, "|" in p) for p in kept)
+        atom = expr.strip()
+        if atom.startswith("+"):
+            return atom
+        if atom in role_repl:
+            return role_repl[atom]
+        if roles.get(atom) is not None:
+            logger.warning("matrix.sets: role %r has no entries; dropped",
+                           atom)
+            return ""
+        return atom
+
+    expanded = {}
+    for name, expr in sets.items():
+        text = render(str(expr))
+        if not text:
+            logger.warning("matrix.sets.%s: no entries left; set dropped", name)
+            continue
+        expanded[name] = text
+    return expanded
 
 
 def _drive_speed(models, args) -> int:
@@ -669,9 +685,9 @@ def main(argv: list[str] | None = None) -> None:
     written back into every sidecar it measures.
     """
     args = parse_args(argv)
-    # The floor belongs to the dry run alone (SPEC.md, 'Log Levels').
+    # The floor belongs to the preview modes (SPEC.md, 'Log Levels').
     setup_logging(args.verbose,
-                  floor=logging.INFO if args.dry_run else None)
+                  floor=logging.INFO if (args.dry_run or args.check) else None)
 
     # One pack per process, so this is the whole lifetime of the setting.
     # Must happen before discovery and measurement, both of which write.
@@ -695,9 +711,24 @@ def main(argv: list[str] | None = None) -> None:
             fatal("profiles file not found: %s (see profiles.yaml.example)",
                   profiles_path)
 
-    with open(profiles_path) as f:
-        profiles_cfg = yaml.safe_load(f) or {}
+    try:
+        with open(profiles_path) as f:
+            profiles_cfg = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        fatal("profiles.yaml: invalid YAML: %s", e)
+    if not isinstance(profiles_cfg, dict):
+        fatal("profiles.yaml: top level must be a mapping, got %s",
+              type(profiles_cfg).__name__)
 
+    if args.check:
+        problems = check_profiles(profiles_cfg)
+        for problem in problems:
+            logger.error("profiles.yaml: %s", problem)
+        if problems:
+            sys.exit(1)
+        logger.info("profiles.yaml: OK (%s)", profiles_path)
+        return
+    roles.configure(profiles_cfg)
     validate_profiles_keys(profiles_cfg)
     if not Profiles(profiles_cfg).profile_list:
         fatal("no profiles defined in profiles.yaml")
@@ -720,11 +751,13 @@ def main(argv: list[str] | None = None) -> None:
     # resolution and ${HF_HOME} path grouping).
     hf_home = args.hf_home or profiles_cfg.get("hf_home")
 
-    # Directory-name → role map extension from profiles.yaml `dirs:`.
-    dir_roles = profiles_cfg.get("dirs") or {}
-    if not isinstance(dir_roles, dict):
-        fatal("profiles.yaml dirs: must be a mapping of directory name to role")
-    err = validate_dir_roles(dir_roles)
+    if profiles_cfg.get("dirs") is not None:
+        fatal("profiles.yaml dirs: retired; a role owns its trees with "
+              "roles.<name>.dir")
+    if args.extra_dirs is not None:
+        logger.warning("--extra-dirs is retired and ignored; a role owns its "
+                       "trees with roles.<name>.dir")
+    err = validate_matrix_sets(profiles_cfg)
     if err:
         fatal("profiles.yaml %s", err)
 
@@ -848,16 +881,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     stack.push({"overrides": profiles_cfg.get("overrides")},
                origin=str(profiles_path))
-    models = discover(models_dirs, stack=stack,
-                      generate_stubs=args.create_stubs,
-                      extra_dirs=args.extra_dirs, dir_roles=dir_roles,
-                      hf_home=hf_home)
+    try:
+        models = discover(models_dirs, stack=stack,
+                          generate_stubs=args.create_stubs,
+                          hf_home=hf_home)
+    except DiscoveryError as e:
+        fatal("%s", e)
     if not models:
         fatal("no models found (create a .md sidecar file)")
     logger.info("models: %d found", len(models))
-
-    # Role-wide host placement, declared in profiles.yaml (design decision 11).
-    apply_device_roles(models, profiles_cfg.get("device_roles"), logger)
 
     if args.remeasure:
         for m in models:
@@ -1111,11 +1143,18 @@ def main(argv: list[str] | None = None) -> None:
         merged_macros[k] = v
     config["macros"] = merged_macros
 
-    # ── Swap matrix: build matrix vars if configured ──
-    # Capacity routing: the pool limits are the packer's own budget (GPU),
-    # the detected host pool, and one size-1 pool per scheduling role.
-    # Per-entry capacities/evict_cost were attached by the emitter.
-    if config.capacity_pools:
+    # ── Routing section ──
+    # The input selects the router: declared sets mean matrix, nothing means
+    # capacity. llama-swap's matrix is a permission list, not a preload.
+    sets = (profiles_cfg.get("matrix") or {}).get("sets") or {}
+    role_by_stem = {m.stem: m.role for m in models}
+    expanded = _expand_matrix_sets(sets, role_by_stem,
+                                   config.entry_ids_by_stem)
+    if expanded:
+        config["routing"] = {"router": {
+            "use": "matrix",
+            "settings": {"matrix": {"sets": expanded}}}}
+    elif config.capacity_pools:
         config["routing"] = {
             "router": {
                 "use": "capacity",

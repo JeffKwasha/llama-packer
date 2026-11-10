@@ -168,8 +168,13 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 88 | An alien sidecar key warns at discovery: `role:`/`usage:` are not keys (the warning points at `tasks:`), and `device:` is `cpu` or a non-negative GPU index | `test_unknown_role_value_warns_with_a_hint`, `test_unknown_device_value_warns` |
+| 88 | `role:` is a valid sidecar key; `usage:` warns as alien (the warning points at `tasks:`), and `device:` is `cpu` or a non-negative GPU index | `test_role_is_a_valid_sidecar_key`, `test_usage_is_an_alien_sidecar_key`, `test_unknown_device_value_warns` |
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
+| 106 | `--check` validates profiles.yaml without discovery or a server and names every known error: unknown top-level and nested keys with a near-miss hint, required sections, retired keys, bad types, non-roles and a missing `when:` | `test_check_profiles_names_every_nested_error`, `test_check_profiles_accepts_the_example` |
+| 107 | A role is operator data: a label, a `kind`, and an allocation policy. It gets its own capacity pool, `dirs:`/`role:` may target it, and tasks declare `device`/`max_context` instead of a role | `test_custom_role_is_data_and_gets_its_own_pool`, `test_custom_role_parse_reports_every_problem`, `test_custom_role_gets_its_own_size_one_pool`, `test_custom_role_entry_charges_its_own_pool`, `test_task_declares_device_and_max_context` |
+| 108 | `pools.ram.spare` keeps that much host RAM out of both the generated `ram` pool and the host ledger | `test_pools_ram_spare_shrinks_the_host_pool` |
+| 109 | `matrix.sets` is a mapping of name to expression string; its presence selects the matrix router, its absence capacity; `routing` is retired | `test_check_profiles_validates_sets_and_retired_routing`, `test_matrix_sets_are_accepted_and_select_the_router`, `test_matrix_sets_expand_roles_to_entry_ids` |
+| 110 | A role's `share` is a percentage of slack; `share` and `fill` are mutually exclusive, at most one role fills, and shares sum to at most 100% | `test_share_is_a_percentage_of_slack`, `test_share_and_fill_are_validated` |
 
 ## Roles (docs/architecture.md §Models, tasks, engines and endpoints)
 
@@ -195,7 +200,7 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 98 | The catalogue is the only task vocabulary: `tasks:` ids come from it, `role:`/`usage:` are alien keys, and an `audio_cpp.task` cannot contradict the model's task | `test_task_ids_resolve_to_declared_demands`, `test_resolve_tasks_ignores_unblessed_tag_with_warning`, `test_unknown_role_value_warns_with_a_hint`, `test_audio_cpp_task_must_match_the_model_task` |
+| 98 | The catalogue is the only task vocabulary: `tasks:` ids come from it, a task's `role:` is retired (the model declares its role), and an `audio_cpp.task` cannot contradict the model's task | `test_task_ids_resolve_to_declared_demands`, `test_resolve_tasks_ignores_unblessed_tag_with_warning`, `test_usage_is_an_alien_sidecar_key`, `test_audio_cpp_task_must_match_the_model_task` |
 
 ## Declared task vocabulary (SPEC.md §Tasks)
 
@@ -218,3 +223,4 @@ and every one of them carries a `Validates:` citation.
 | 102 | A `device: cpu` serving charges `ram` only, never a GPU pool | `test_capacity_fields_cpu_helper_charges_host_only` |
 | 103 | `evict_cost` prices reload time plus lost prefill for chat only; a sidecar `pp_tps:` overrides the fleet rate | `test_capacity_evict_cost_ignores_prefill_for_stateless_roles`, `test_capacity_evict_cost_uses_sidecar_prompt_rate` |
 | 104 | Matrix measurement runs the sibling `llama-fit-params` binary; `llama-server` rejects `--fit-print` | `test_matrix_resolution_measures_with_fit_binary` |
+| 105 | A declared GPU fixed category is charged to the VRAM ledger at the emission margin, so the per-model chat solve leaves it room instead of filling the pool | `test_gpu_fixed_category_charges_vram_ledger` |

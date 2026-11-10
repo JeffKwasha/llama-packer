@@ -38,6 +38,18 @@ def test_parse_ctx_size_rejects_junk(raw):
     assert _parse_ctx_size(raw) is None
 
 
+def test_task_declares_device_and_max_context():
+    # Validates: docs/plans/requirement-trace.md, requirement #107
+    cat = TaskCatalogue.from_cfg({
+        "spot": {"endpoint": CHAT, "device": 1,
+                 "max_context": "8k", "min_context": "2k"},
+    })
+    task = cat.get("spot")
+    assert task.device == 1
+    assert task.max_context == 8192
+    assert task.min_context == 2048
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 
@@ -192,9 +204,7 @@ from llama_packer.writer import (  # noqa: E402
 )
 
 _MB = {"emb": 749, "rnk": 1002, "rnk2": 5766, "stt": 1898, "tts": 1204,
-       "s2t": 2814, "s2t2": 1914}
-_CH = frozenset(f"c{i}" for i in range(1, 39))
-_CO = frozenset({"s2t", "s2t2"})
+       "s2t": 2814, "s2t2": 1914, "chat": 0}
 
 
 def test_split_top_respects_parentheses():
@@ -210,74 +220,64 @@ def test_split_top_respects_parentheses():
 
 
 @pytest.mark.parametrize("expr,expected", [
-    ("__CHAT_VARS__ & emb & rnk", 749 + 1002),
-    ("__CHAT_VARS__ & emb & rnk2", 749 + 5766),
-    ("__CHAT_VARS__ & stt", 1898),
-    ("__CHAT_VARS__ & tts", 1204),
-    ("__CHAT_VARS__", 0),
+    ("chat & emb & rnk", 749 + 1002),
+    ("chat & emb & rnk2", 749 + 5766),
+    ("chat & stt", 1898),
+    ("chat & tts", 1204),
+    ("chat", 0),
 ])
 def test_set_overhead_sums_coresidents(expr, expected):
     # Validates: SPEC.md, 'VRAM Allocation': a co-resident set is charged the sum of its members
-    assert set_overhead_mb(expr, _MB, _CH, _CO) == expected
+    assert set_overhead_mb(expr, _MB) == expected
 
 
 def test_set_overhead_charges_priciest_or_branch_only():
     # emb and rnk2 are alternatives -- only one is ever resident, and the
     # entry must survive the heavier one.
-    assert set_overhead_mb("__CHAT_VARS__ & (emb | rnk2)", _MB, _CH, _CO) == 5766
-    assert set_overhead_mb("((c1 | c2)) & emb & (rnk | rnk2)",
-                           _MB, _CH, _CO) == 749 + 5766
+    assert set_overhead_mb("chat & (emb | rnk2)", _MB) == 5766
+    assert set_overhead_mb("(chat | chat) & emb & (rnk | rnk2)",
+                           _MB) == 749 + 5766
 
 
-def test_set_overhead_sums_coloads():
-    # co-loads genuinely stack with each other, unlike OR branches
-    assert set_overhead_mb("__CHAT_VARS__ & __COLOAD_VARS__",
-                           _MB, _CH, _CO) == 2814 + 1914
+def test_set_overhead_prices_every_leaf_in_a_conjunction():
+    # Role labels stack: a set that permits both audio roles pays for both.
+    assert set_overhead_mb("chat & s2t & s2t2", _MB) == 2814 + 1914
 
 
-def test_set_overhead_ignores_explicit_chat_vars():
-    # Validates: SPEC.md, 'VRAM Allocation': an explicit chat var is not charged as a co-resident
-    assert set_overhead_mb("(c1 | c2) & emb", _MB, _CH, _CO) == 749
-    assert set_overhead_mb("c1 & emb & stt", _MB, _CH, _CO) == 749 + 1898
-
-
-def test_set_overhead_ignores_unknown_vars():
-    # an unresolvable var charges nothing rather than exploding the solve
-    assert set_overhead_mb("__CHAT_VARS__ & mystery", _MB, _CH, _CO) == 0
+def test_set_overhead_charges_zero_for_an_unknown_leaf():
+    # A leaf the caller cannot price (a role with no GPU model, or a typo)
+    # charges nothing rather than exploding the solve.
+    assert set_overhead_mb("chat & mystery", _MB) == 0
+    assert set_overhead_mb("chat & s2t", {"chat": 0}) == 0
 
 
 def test_set_overhead_prices_nested_branches():
     # a boolean tree: `&` sums, `|` maxes, and a nested group is never
     # mistaken for an unknown var worth 0.
-    buckets = {"one": 1000, "two": 2000, "three": 4000}
-    ch = frozenset({"c1"})
+    buckets = {"one": 1000, "two": 2000, "three": 4000, "chat": 0}
     # (two & three) is a branch, so this is max(1000, 6000) -- the old
     # depth-0 split saw an unknown var and returned 1000.
-    assert set_overhead_mb("(c1) & (one | (two & three))", buckets,
-                           ch, frozenset()) == 6000
-    assert set_overhead_mb("(c1) & (three | (two & one))", buckets,
-                           ch, frozenset()) == 4000
+    assert set_overhead_mb("chat & (one | (two & three))", buckets) == 6000
+    assert set_overhead_mb("chat & (three | (two & one))", buckets) == 4000
 
 
 def test_set_overhead_expands_named_sets():
     # referenced expression, and a cycle terminates instead of recursing.
-    buckets = {"one": 1000, "two": 2000, "three": 4000}
+    buckets = {"one": 1000, "two": 2000, "three": 4000, "chat": 0}
     cfgs = {"combo": "three | (two & one)"}
-    assert set_overhead_mb("(c1) & +combo", buckets, frozenset({"c1"}),
-                           frozenset(), sets_cfg=cfgs) == 4000
+    assert set_overhead_mb("chat & +combo", buckets, sets_cfg=cfgs) == 4000
     cyc = {"a": "+b", "b": "+a"}
-    assert set_overhead_mb("(c1) & +a", buckets, frozenset({"c1"}),
-                           frozenset(), sets_cfg=cyc) == 0
+    assert set_overhead_mb("chat & +a", buckets, sets_cfg=cyc) == 0
 
 
 def test_expr_leaves_walks_nested_branches():
     # real leaves of a nested branch, not a variable called "two & three", and
     # expands `+set` references.
-    assert _expr_leaves("(c1) & (three | (two & one))") == \
-        {"c1", "one", "two", "three"}
-    assert _expr_leaves("(c1) & +combo",
+    assert _expr_leaves("chat & (three | (two & one))") == \
+        {"chat", "one", "two", "three"}
+    assert _expr_leaves("chat & +combo",
                         {"combo": "three | (two & one)"}) == \
-        {"c1", "one", "two", "three"}
+        {"chat", "one", "two", "three"}
 
 
 # ── the id label ────────────────────────────────────────────────────────────

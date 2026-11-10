@@ -35,6 +35,39 @@ def test_capacity_pools_are_gpu_budget_host_pool_and_role_singletons():
         assert p.capacity_pools[role] == 1
 
 
+def test_pools_ram_spare_shrinks_the_host_pool():
+    # Validates: docs/plans/requirement-trace.md, requirement #108
+    p = Planner([], Profiles({"pools": {"ram": {"spare": "2G"}}}), "fit",
+                32768, baseline_mb=4096, host_pool_mb=50000)
+    assert p.capacity_pools["ram"] == 50000 - 2048
+    assert p.host_ledger.pool_mb == 50000 - 2048
+
+
+def test_custom_role_gets_its_own_size_one_pool():
+    # Validates: docs/plans/requirement-trace.md, requirement #107
+    from llama_packer import roles
+
+    try:
+        roles.configure({"roles": {"cat": {"kind": "chat"},
+                                   "dog": {"kind": "rerank"}}})
+        p = Planner([], Profiles({}), "fit", 32768, baseline_mb=4096,
+                    host_pool_mb=50000)
+        assert p.capacity_pools["cat"] == 1
+        assert p.capacity_pools["dog"] == 1
+    finally:
+        roles.configure(None)
+
+
+def test_custom_role_entry_charges_its_own_pool():
+    # Validates: docs/plans/requirement-trace.md, requirement #107
+    caps = _capacity_fields(
+        _model(role="cat"),
+        _variant(task_demands=(SimpleNamespace(role="cat"),)),
+        {"default": 30000, "ram": 50000, "cat": 1},
+        100, 1000, 0.04)
+    assert caps["capacities"]["cat"] == 1
+
+
 def test_capacity_fields_charge_gpu_ram_and_role():
     # Validates: SPEC.md, "Capacity routing": every entry declares the pools
     # it consumes; chat entries also take their role's singleton slot.
@@ -87,3 +120,9 @@ def test_capacity_unestimated_serving_reserves_the_whole_pool():
         _variant(mem_vram_mib=None),
         {"default": 30000, "chat": 1}, 100, 1000, 0.04)
     assert caps["capacities"]["default"] == 30000
+
+
+def test_int_spare_is_mib_not_gigabytes():
+    # Regression: a resolved spare passed as an int was re-parsed as GB.
+    p = Planner([], Profiles({}), "fit", 24576, spare=64)
+    assert p.capacity_pools["default"] == 24576 - 2048 - 64

@@ -91,48 +91,70 @@ vllm:
 #                 floor wins, since the id advertises the context
 #   require       capabilities this category will not give up
 #   sacrifice     preference order for what to shed first, not a cost order
+roles:
+  chat:
+    dir: [chat, t2t, vision, doc, ocr]
+    kind: chat
+    fill: true
+    live: 1
+  embeddings:
+    dir: embed
+    kind: embeddings
+    share: 5%
+    live: 1
+  rerank:
+    dir: rerank
+    kind: rerank
+    share: 5%
+    live: 1
+  image:
+    dir: img
+    kind: image
+    share: 20%
+    live: 1
+  s2t:
+    dir: s2t
+    kind: s2t
+    share: 5%
+    live: per-device
+  t2s:
+    dir: t2s
+    kind: t2s
+    share: 5%
+    live: per-device
+
 tasks:
-  # Chat-endpoint tasks: one serving covers all of them; they evict each
-  # other by request. endpoint + role are required; the demand keys are the
-  # floors the planner must meet.
   chat:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 64k
     min_parallel: 2
     sacrifice: [draft, vision]
   coding:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 130k
     min_parallel: 1
     sacrifice: [vision]
     keep: [draft]
   qa:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 32k
     min_parallel: 2
   aux:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
-  # Capability tasks: endpoint and role only; they are sized by their role.
   embeddings:
     endpoint: openai.embeddings
-    role: embeddings
+    max_context: 4096
   rerank:
     endpoint: openai.rerank
-    role: rerank
+    max_context: 4096
   image:
     endpoint: openai.images.generations
-    role: image
   s2t:
     endpoint: openai.audio.transcriptions
-    role: s2t
+    device: cpu
   t2s:
     endpoint: openai.audio.speech
-    role: t2s
 

@@ -15,7 +15,7 @@ import pytest
 
 from llama_packer.model import Model
 from llama_packer.scope import ScopeStack
-from llama_packer.utils import load_dir_config, validate_dir_roles
+from llama_packer.utils import load_dir_config
 
 from conftest import make_model  # noqa: F401  (fixture via pytest, direct import for emit test)
 
@@ -168,15 +168,6 @@ def test_defaults_and_rules_both_support_mmproj_false(tmp_path):
     by_stem = {m.stem: m for m in _discover(root)}
     assert by_stem["d"].mmproj is None
     assert by_stem["r"].mmproj is None
-
-
-# ── validate_dir_roles ─────────────────────────────────────────────────────
-
-def test_validate_dir_roles():
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a directory role must be a known one.
-    assert validate_dir_roles({"ocr": "chat"}) is None
-    err = validate_dir_roles({"ocr": "vision"})
-    assert err and "unknown role" in err
 
 
 # ── Entry-id collision detection ───────────────────────────────────────────

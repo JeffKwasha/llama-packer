@@ -1556,8 +1556,10 @@ class VramBudget:
                 f"weights + {parallel} slot(s) leave {int(remaining)} MiB, "
                 f"which buys {max_ctx} context tokens — below the "
                 f"{_MIN_CTX_SIZE} minimum")
-            logger.warning("%s: cannot serve — %s", self.model.stem,
-                           self.over_budget_reason)
+            # One rejected slot count, not a verdict on the model: the
+            # planner may still find a feasible one. The caller reports the
+            # model only when no candidate fits.
+            logger.info("%s: %s", self.model.stem, self.over_budget_reason)
             return 0
         ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)

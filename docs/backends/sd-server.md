@@ -8,7 +8,9 @@ Image (and video) generation via stable-diffusion.cpp's `sd-server`.
 - **Proxied:** yes — `proxy` + `checkEndpoint: "/"`.
 - **Binary:** `--sd-server` > `profiles.yaml sd.bin` > `$SD_BIN_DIR` >
   the run directory > `sd-server` on `PATH`.
-- **Opt-in:** `dirs: {img: image}` (the `img/` directory is otherwise ignored).
+- **Opt-in:** enable `sd-server` in `backends:`; the default `image` role
+  owns `img/` (`image: {dir: img}`), and a role that does not own it leaves
+  the tree unserved.
 
 ## Build / install
 

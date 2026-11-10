@@ -112,7 +112,7 @@ See [SPEC.md](SPEC.md) for the full schema and [docs/architecture.md](docs/archi
 ## Directional modalities
 
 Each entry advertises `capabilities.in` / `capabilities.out` (llama-swap derives
-UI badges from these), driven by the task's scheduling role plus declared
+UI badges from these), driven by the task's endpoint plus declared
 capabilities:
 
 | Role | Directory | in → out | Backend | Endpoint |
@@ -173,7 +173,7 @@ Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](p
 | Category | Brief example |
 |---|---|
 | `defaults` / `profiles` | `temperature`, `top_p`, `cache_type`, `parallel`, `spare` (+ `base * N` expressions, `description` docs-only) |
-| `models_dirs` / `dirs` / `hf_home` | discovery roots & dir→role map (`it2t: chat`) |
+| `models_dirs` / `roles.<name>.dir` / `hf_home` | discovery roots & tree→role ownership |
 | `backends` / `vllm` | enable list (`llama-server`, `vllm-podman`, `vllm-docker`), `image`/`bin`/`container_args` (legacy `docker_args`) |
 | `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
@@ -234,7 +234,7 @@ probe itself refuses to start beside a resident process.
 [`docs/profiles-authoring.md`](docs/profiles-authoring.md) is a self-contained
 guide (with OpenCode skill frontmatter) covering discovery, `tasks:`,
 sampling profiles, CPU/GPU placement, matrix sizing, capacity routing, pools,
-TTL, updates, and the dry-run/validate loop.
+TTL, updates, and the `--check`/dry-run/validate loop.
 
 The repo itself does not contain an `.opencode/` tree; the file is a normal
 document. To expose it to OpenCode on your machine, copy or symlink it into
@@ -295,6 +295,8 @@ OpenCode reloads skills on save; no restart is needed. Load it with
 - [docs/backends/](docs/backends/) — per-engine notes: llama-server, vLLM, sd-server, whisper-server, audio-cpp
 - [profiles.yaml.example](profiles.yaml.example) — commented starter for `profiles.yaml`; [llama_packer/profiles.yaml](llama_packer/profiles.yaml) is the bundled fallback
 - [docs/profiles-authoring.md](docs/profiles-authoring.md) — agent-facing guide for authoring and validating `profiles.yaml`
+- [docs/memory-and-eviction.md](docs/memory-and-eviction.md) — VRAM/RAM budgets, co-residency reservations, eviction cost, TTL
+- [docs/llama-swap.md](docs/llama-swap.md) — llama-swap capabilities mapped to the `profiles.yaml`/sidecar input that provides each
 
 ## Limitations
 
@@ -310,8 +312,8 @@ OpenCode reloads skills on save; no restart is needed. Load it with
 - Support multi-image/tensor-parallel vLLM provisioning
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
-- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [docs/backends/sd-server.md](docs/backends/sd-server.md) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
-- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
-- Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as `role: t2s` / `role: s2t` with `dirs: {t2s: t2s, s2t: s2t}` and `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
+- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as a role owning `img/` (`role: image`, `dir: img`) with `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [docs/backends/sd-server.md](docs/backends/sd-server.md) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as a role owning `s2t/` (`role: s2t`, `dir: s2t`) with `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
+- Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as roles owning `t2s/` and `s2t/` with `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
-- Capacity routing — **available**: the packer emits llama-swap pools (VRAM, host RAM, one per role), per-model `capacities`, and derived `evict_cost`; `matrix.sets:` is retired. See [SPEC → Capacity routing](SPEC.md#capacity-routing)
+- Capacity routing — **available**: the packer emits llama-swap pools (VRAM, host RAM, one per role), per-model `capacities`, and derived `evict_cost`. `matrix.sets:` switches to the matrix engine. See [SPEC → Capacity routing](SPEC.md#capacity-routing)

@@ -76,8 +76,13 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
 | `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
-| `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF_HOME root (the dir containing `hub/`) for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
+| `tasks` | Named kinds of work, their endpoint/role and demand floors | [Tasks](#tasks-tasks) |
+| `roles` | Operator-defined purposes, owned trees, placement and allocation policy | [Roles](#roles-roles) |
+| `pools` | Per-pool solve spare, unmodelled reservations, pins | [Capacity routing](#capacity-routing) |
+| `capacity` | `pp_tps` / `drive_mbps` inputs to eviction cost | [Capacity routing](#capacity-routing) |
+| `macros` | Named flag chunks for `cmd` | [Path Macros](#path-macros-macros-block-and-configenv) |
+| `shed` | Default capability-shedding order | [Tasks](#tasks-tasks) |
 
 `profiles.yaml.example` provides a commented starter with one brief example per category — copy to `profiles.yaml` (gitignored) and uncomment what you need. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present.
 
@@ -103,6 +108,14 @@ pass-through `metadata` for agents (see [Model Metadata](#model-metadata)).
 Within `profiles`, sampling deltas become `filters.setParamsByID` and
 `parallel`/`cache_type`/`spare` differences split a model into separate
 variants/entries; `description` is the only inert key.
+
+`llama-packer --check` loads only the profile and reports every problem it
+can name — unknown top-level and nested keys with a near-miss hint, a
+missing `profiles:` section, a task without `endpoint:`, retired
+`matrix.evict_costs:`, `routing:`, wrong container types, retired
+`device_roles:`, and an override without `when:` — then exits
+`0` or `1`. It performs no model discovery, measurement, or server start,
+so a profile can be checked before the model tree exists.
 
 ## Hardware Detection
 
@@ -341,7 +354,7 @@ When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` 
 
 ### Tasks (`tasks:`)
 
-The global `min_context` is one floor for the whole fleet, which cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, the scheduling role it implies, and the demand that work needs. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids and the scheduling roles. A task whose endpoint or role is not in those sets is warned about and dropped:
+The global `min_context` is one floor for the whole fleet, which cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, and the demand that work needs. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids. A task whose endpoint is not in that set is warned about and dropped:
 
 ```yaml
 tasks:
@@ -374,11 +387,10 @@ Two tiers, and only two.
 
 ### Residents
 
-Embeddings and rerank serve a fixed small context (`embed_context` /
-`rerank_context`, default 4096): clients chunk to one size, and a fixed
-footprint makes the chat budget computable. A `device: cpu` sidecar charges
-host RAM instead of VRAM. Residents serve single-slot; a declared
-`parallel:` on an embeddings/rerank model is ignored.
+A resident serves the context its task declares (`max_context`); clients
+chunk to fit, and a declared footprint makes the chat budget computable. A
+`device: cpu` sidecar charges host RAM instead of VRAM. Residents serve
+single-slot; a declared `parallel:` on an embeddings/rerank model is ignored.
 
 The RAG pair is a budgeting convention, not a runtime guarantee: a model is
 charged because it is an emitted serving with a capacity, and llama-swap
@@ -386,7 +398,8 @@ decides whether it stays resident.
 
 ### Capacity routing
 
-llama-swap's capacity engine replaces matrix sets. The packer emits:
+llama-swap's capacity engine is the default: it runs when `matrix.sets:` is
+absent. The packer emits:
 
 ```yaml
 routing:
@@ -402,8 +415,8 @@ models:
 ```
 
 - Any combination whose summed capacities fit every pool may coexist.
-- One size-1 pool per scheduling role means one live serving per role:
-  requesting another chat model evicts the current one, whatever its
+- One size-1 counting pool per `live: 1` role means one live serving per
+  role: requesting another chat model evicts the current one, whatever its
   `evict_cost`.
 - `capacities` carry the same measurement margin as the solve. A pool set
   to the whole card admits an overcommit; the packer emits `available`
@@ -413,12 +426,60 @@ models:
   the `capacity:` fleet default. Long context makes a dense chat serving
   expensive to evict.
 - Nothing is preloaded; only the requested model starts.
-- `matrix.sets:` and `matrix.evict_costs:` are retired: they warn and are
-  ignored. `matrix:` keeps the sizing knobs (context caps, auto_parallel,
-  parallel_power, the shared-solve floors).
+- `matrix.sets:` selects llama-swap's matrix engine instead: each set is its
+  own budget, so a role may exceed its global share when no set holds it
+  together. Only a set can forbid a combination that fits. It never
+  preloads.
+- `matrix.evict_costs:` and `routing:` are retired: they error. `matrix:`
+  keeps the sizing knobs (context caps, auto_parallel, parallel_power, the
+  shared-solve floors).
+
+Profile `pools:` keys (optional; per pool id — `default`, `ram`, `gpu0`,
+a role name, …):
+
+- `spare:` — per-pool solve spare overriding the global spare for models
+  mapped to that pool. It sizes the context/slot solve; it does not change
+  the emitted `default` pool. On `ram:` it reduces both the emitted host
+  pool and the host ledger.
+- `reserve_extra:` — MB (or `N G`) added to the **chat** solve's spare for
+  an unmodelled resident (VM, another tenant, a sidecar the packer does not
+  charge). Leaves the emitted pools intact while sizing chat smaller — the
+  lever for co-residency.
+- `pins:` — map a claimant name to an explicit reservation or `"auto"`
+  (`"auto"` keeps the derived math authoritative); accumulates into
+  `reserve_extra`.
+- `vram:` — the nominal size used to resolve bare-number memory values and
+  `pins:` for that pool. It does not change the emitted `default` pool,
+  which is the detected total minus reserve and global spare.
+
+The emitted `default` pool is controlled by `--vram` / `hardware.vram` and
+`defaults.spare` / `--spare`. Everything in `pools:` sizes the solve around
+that pool.
 
 Every emitted entry declares its pools. A model that declares none can only
 run alone.
+
+### Device (`device:`)
+
+One vocabulary, one parser (`utils.parse_device`): `auto` (the default —
+llama-packer decides), `cpu`, or a non-negative GPU index (`1`, `"1"`).
+Omit the key for `auto`. There is no `gpu` or `any` spelling.
+
+It can be declared in three places, most specific first:
+
+| where | applies to |
+|---|---|
+| sidecar `device:` | this model only |
+| task `device:` | a default for every model serving that task |
+| role `device:` | a default for every model of that role |
+
+The sidecar wins. When it omits the key, the task's declaration applies, then
+the role's. A sidecar that contradicts a task or role logs a warning.
+Conflicting task devices warn and leave placement unset.
+
+`cpu` makes the serving host-resident: `-ngl 0`, charged to the `ram` pool,
+never VRAM. An index pins the GPU (`ROCR_VISIBLE_DEVICES` /
+`CUDA_VISIBLE_DEVICES`).
 
 ### Host pool (`device: cpu`)
 
@@ -440,13 +501,75 @@ decision quality (`docs/plans/cpu-residency-budget.md`):
   TTL defaults a CPU-resident serving to 3600 s; set `ttl: 0` to keep it.
 
 **Moving a whole usecase off VRAM** takes one declaration —
-`profiles.yaml device_roles: [embeddings, rerank]` (or the mapping
-`{embeddings: cpu, rerank: cpu}`) places every model of those roles on the
-host, exactly as if each sidecar carried `device: cpu`.
+`roles.<name>.device: cpu` places every model of that role on the host,
+exactly as if each sidecar carried `device: cpu` (see [Device](#device-device)).
 
 `metadata.packing` names the placement (`device: cpu|gpu`) and the decided
 byte facts (`ram_mib`/`vram_mib`, `kv_per_token`) so clients can filter
 without parsing ids.
+
+### Roles (`roles:`)
+
+A role is an operator-defined purpose. Models are assigned to a role by the
+tree it owns (or a sidecar `role:`); models in the same role share memory and
+evict each other on request. The code ships no role names; the default roles
+live in `llama_packer/profiles.yaml` as data.
+
+```yaml
+roles:
+  cat:
+    dir: cats              # the tree this role owns
+    kind: chat
+    fill: true             # take the slack no other share claims
+    live: 1
+  dog:
+    dir: dogs
+    kind: rerank
+    share: 10%             # fraction of slack
+    live: 1
+    device: cpu            # every model of this role runs from system RAM
+```
+
+- `dir` is the models-root-relative directory or directories this role owns;
+  `.` is the root. A tree belongs to exactly one role; overlapping trees are
+  an error. Optional: a role without one is reachable only by an explicit
+  sidecar `role:`.
+- `kind` selects the behaviour implementation (`chat`, `embeddings`,
+  `rerank`, `image`, `s2t`, `t2s`); the role name is arbitrary.
+- `share` is a percentage of slack — the pool after reserve, spare,
+  residents, and every serving's floor. `40%` and `40` are 40%; a bare number
+  at or below 1 is a fraction (`0.4` is 40%, `1` is 100%). Shares in a pool
+  sum to at most 100%.
+- `fill` takes the remainder; at most one role per pool may fill.
+- `live` is `1`, `per-device`, or `capacity`.
+- `device` is `auto`, `cpu`, or a GPU index, exactly the sidecar vocabulary;
+  leaves placement to the sidecar/task. A sidecar `device:` overrides it per
+  model, and a task `device:` is the work's requirement.
+
+`share`, `fill` and `live` are parsed and validated; the allocation they
+describe is not applied yet — the solver still uses the global spare (see
+`docs/roles-tasks-routing.md` §Implementation status).
+
+There is no `min`, `preferred`, `cap`, `weight`, `exclusive`, or
+`persistent`. A floor is derived per model from its task's `min_context` and
+`min_parallel`; a share is already a cap; `share: 100%` is what `exclusive`
+meant.
+
+A model belongs to the role that owns its directory, or to the role named by
+its sidecar `role:`. A model that resolves to no role, or to an undefined
+role, is an error. A task does not name a role. `tasks.<id>.role` is retired
+and warns.
+
+The router follows from the input, not from a key:
+
+- `matrix.sets:` present → matrix. Each set is its own memory budget, so a
+  role may exceed its global share when no set holds it together. Only a set
+  can forbid a combination that fits.
+- absent → capacity. One global budget: every combination that fits may be
+  resident, so shares sum to 100%.
+
+`group` is not emitted. See `docs/roles-tasks-routing.md` for the full schema,
+the allocation algebra, and the fidelity table.
 
 ### Remainder
 
@@ -466,8 +589,6 @@ fallback entry is the floor on that.
 
 | key | default | meaning |
 | --- | --- | --- |
-| `embed_context` | 4096 | Context an embeddings serving is capped at |
-| `rerank_context` | 4096 | Context a rerank serving is capped at |
 | `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: a value-function `(ctx, slots)` solve, best feasible pair wins. `false` disables it fleet-wide; a sidecar `parallel:` pin opts one model out |
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
 | `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score |
@@ -967,7 +1088,7 @@ a ~60 GB NVFP4 model gets ≥ 600 s.
 
 ## Image Backend (sd-server)
 
-A model with `role: image` (selected via `dirs: {img: image}` and/or `type: image`) is served with
+A model with `role: image` (selected by a role owning `img/` or a sidecar `role: image`) is served with
 `sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`engines: [sd-server]`).
 The emitted entry runs `sd-server --diffusion-model …` plus `cli_args` verbatim, proxied via llama-swap's `${PORT}`.
 
@@ -987,7 +1108,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 # name: flux-4b
 # # llm: qwen-4b.gguf
 # ---
-# With dirs: {img: image} and backends: [llama-server, sd-server] the entry emits:
+# With a role owning img/ and backends: [llama-server, sd-server] the entry emits:
 # cmd: sd-server --listen-port ${PORT} --listen-ip 0.0.0.0 --diffusion-model ${MODELS_DIR}/img/flux-4b.gguf  # add --vae etc. via cli_args:
 # proxy: http://127.0.0.1:${PORT}
 # checkEndpoint: /          # sd-server returns 200 on / only (not /health — Discussion #866)
@@ -1020,8 +1141,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ## Audio Backend (whisper-server)
 
-A model with `role: s2t` (opt-in: an `s2t/` directory plus `dirs: {s2t: s2t}` in
-`profiles.yaml`) is served with **whisper-server** from
+A model with `role: s2t` (the default `s2t` role owns `s2t/`; `backends:` enables whisper-server) is served with **whisper-server** from
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`engines: [whisper-server]`) —
 the long-lived HTTP server from `examples/server` (the analog of `llama-server`;
 `whisper-cli` is oneshot and cannot be proxied by llama-swap). Exposes
@@ -1029,7 +1149,7 @@ OpenAI-compatible `POST /v1/audio/transcriptions`.
 
 ```yaml
 # profiles.yaml
-dirs: {s2t: s2t}
+roles: {s2t: {dir: s2t}}
 backends: [llama-server, whisper-server]
 
 # sidecar: s2t/ggml-large-v3.md (authored — .bin orphans are never stubbed)
@@ -1094,7 +1214,7 @@ profiles.yaml keys (`audio_cpp: {bin, backend, device, …}`), the emitted
 
 ```yaml
 # profiles.yaml
-dirs: {t2s: t2s, s2t: s2t}
+roles: {t2s: {dir: t2s}, s2t: {dir: s2t}}
 backends: [llama-server, audio-cpp]
 ```
 
@@ -1321,7 +1441,7 @@ backends:
   - llama-server    # tried first for everything it can serve
   - vllm            # vLLM host binary
   - vllm-podman     # container pair
-  - sd-server       # image generation (opt-in; needs dirs: img: image)
+  - sd-server       # image generation (the default image role owns img/)
   # vllm-docker     # absent = disabled, even with resources configured
 ```
 
@@ -1455,33 +1575,30 @@ kv_per_token_mib [MiB/token] = kv_bytes_per_token / 2²⁰
 ## Model Discovery and Stub Sidecars
 
 Every `--models-dir` directory is scanned independently via a depth-first
-walk (`discover.discover` → `scope.ScopeStack`; role mapping via
-`utils.dir_role_map`). At each level the directory's `models.yaml` scope is
+walk (`discover.discover` → `scope.ScopeStack`; role mapping from each
+role's `dir:`). At each level the directory's `models.yaml` scope is
 pushed, its models are built, then children are visited:
 
 - `.md` sidecar files are the entry points; each binds to the model file whose
   stem matches its own, or the file named by `model:`.
-- Within a models dir the **first relative path component** selects the role
-  via `dirs:` in profiles.yaml (case-insensitive). Defaults:
+- Within a models dir a role owns one or more trees with `dir:` in
+  profiles.yaml (case-insensitive, relative to the models root; `.` is the
+  root). The default roles in `llama_packer/profiles.yaml` supply the usual mapping as data:
 
-  | Prefix | Role | Meaning |
+  | Directory | Role | Meaning |
   |--------|------|---------|
-  | `chat` | `chat` | Chat — and its mmproj/MTP companions living next to it |
-  | `t2t` | `chat` | Legacy name for the chat dir |
-  | `vision` | `chat` | VLMs + mmproj (same role as chat, colocated) |
-  | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
-| `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
-| `rerank` | `rerank` | Reranker models |
-| `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
-| `t2s` | `t2s` | Text-to-speech (audio.cpp via audio-cpp; opt-in via `dirs: {t2s: t2s}`) |
-| `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
+  | `chat`, `t2t`, `vision`, `doc`, `ocr` | `chat` | Chat and its mmproj/MTP companions; the extra names are organizational splits |
+  | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
+  | `rerank` | `rerank` | Reranker models |
+  | `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`) |
+  | `t2s` | `t2s` | Text-to-speech (audio.cpp via audio-cpp) |
+  | `img` | `image` | Diffusion / image generation (sd-server) |
 
-  Files at the root itself default to `chat`; files under any other
-  subdirectory (`img/` when not opted in, `misc/`, `tmp/`,
-  `hf_hub/`, … — and `s2t/`, `t2s/`, `img/` when not opted in) are **skipped** — one summary line per run names the
-  skipped directories so nothing disappears silently. The whitelist is
-  extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
-  via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).
+  The names are not special: a tree belongs to the role whose `dir:` lists
+  it. A model under no role's tree and with no sidecar `role:` is an error,
+  as is a `role:` that names an undefined role. Directories no role owns are
+  **skipped** — one summary line per run names them so nothing disappears
+  silently. `--extra-dirs` is retired and warns.
 
   A `<models-root>/.modelignore` file excludes individual files/subtrees in
   place (no moving or deleting): one glob per line, `#` comments; a pattern

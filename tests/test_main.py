@@ -192,11 +192,10 @@ def test_detect_matrix_selects_when_section_present(caplog):
         cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({"matrix": matrix_cfg},
                                                     models, args,
                                                     logging.getLogger("test"))
-    assert cfg == {}
+    assert cfg == matrix_cfg
     assert emb.stem == "emb1" and rnk.stem == "rnk1"
     assert cats == {"emb": emb, "rnk": rnk}
     assert fixed == []
-    assert "sets: is retired" in caplog.text
     assert "matrix: disabled" not in caplog.text
 
 
@@ -221,12 +220,11 @@ def test_detect_matrix_custom_categories(caplog):
     with caplog.at_level(logging.WARNING):
         cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix(
             {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
-    assert "sets" not in cfg and "evict_costs" not in cfg
+    assert "sets" in cfg and "evict_costs" not in cfg
     assert set(cats) == {"emb", "rnk", "tts", "stt"}
     assert cats["tts"].stem == "tts1" and cats["stt"].stem == "stt1"
     # Non-RAG categories are fixed-overhead residents, in declaration order.
     assert [n for n, _ in fixed] == ["tts", "stt"]
-    assert "sets: is retired" in caplog.text
     assert "evict_costs: is retired" in caplog.text
 
 
@@ -425,73 +423,46 @@ def test_selection_reason_names_the_cost_terms():
         f"selector, 1050 MiB resident = {detail}"
 
 
-# ── role-wide placement + CPU-helper pinning ─────────────────────────────
+# ── role-wide placement ──────────────────────────────────────────────────
 
 
-def test_device_roles_place_every_role_model(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #79
-    # roles whose every model is CPU-placed, logged with the count.
-    import logging
-    from llama_packer.__main__ import apply_device_roles
-    a = make_model("embed-a", role="embeddings")
-    b = make_model("embed-b", role="embeddings")
-    chat = make_model("chat", role="chat")
-    with caplog.at_level(logging.INFO):
-        apply_device_roles([a, b, chat], ["embeddings"], logging.getLogger("t"))
-    assert a.on_cpu and b.on_cpu
-    assert not chat.on_cpu
-    assert any("device_roles: embeddings" in r.message for r in caplog.records)
+def test_role_device_places_every_model_of_the_role(tmp_path):
+    # Validates: SPEC.md, 'Roles': a role's device: places every model it
+    # owns, indistinguishable from a sidecar device: cpu.
+    from llama_packer import roles
+    from llama_packer.discover import discover
+    root = tmp_path / "models"
+    for sub, stem in (("s2t", "asr"), ("t2s", "tts")):
+        (root / sub).mkdir(parents=True)
+        (root / sub / f"{stem}.gguf").write_bytes(b"x")
+    try:
+        roles.configure({"roles": {
+            "s2t": {"dir": "s2t", "kind": "s2t", "device": "cpu"},
+            "t2s": {"dir": "t2s", "kind": "t2s", "device": 1},
+        }})
+        models = discover(root, generate_stubs=False)
+    finally:
+        roles.configure(None)
+    by_stem = {m.stem: m for m in models}
+    assert by_stem["asr"].on_cpu
+    assert by_stem["tts"].device == 1
 
 
-def test_device_roles_absent_and_unmatched(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #79
-    # nothing; a role matching no model warns.
-    import logging
-    from llama_packer.__main__ import apply_device_roles
-    a = make_model("chat", role="chat")
-    apply_device_roles([a], None, logging.getLogger("t"))
-    assert not a.on_cpu
-    with caplog.at_level(logging.WARNING):
-        apply_device_roles([a], {"s2t": "cpu"}, logging.getLogger("t"))
-    assert any("matched no model" in r.message for r in caplog.records)
-
-
-def test_device_roles_rejects_unknown_role(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #79
-    # warn and are ignored (placement stays an explicit, known-role act).
-    import logging
-    from llama_packer.__main__ import apply_device_roles
-    a = make_model("chat", role="chat")
-    with caplog.at_level(logging.WARNING):
-        apply_device_roles([a], {"everything": "cpu"}, logging.getLogger("t"))
-    assert not a.on_cpu
-    assert any("not a placeable role" in r.message for r in caplog.records)
-
-
-def test_device_roles_rejects_a_non_cpu_value(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #79
-    # role -> device: a value that is not `cpu` places nothing and says so.
-    # A silent no-op is how `role: cpu` thinking survives a repack.
-    import logging
-    from llama_packer.__main__ import apply_device_roles
-    a = make_model("embed-a", role="embeddings")
-    with caplog.at_level(logging.WARNING):
-        apply_device_roles([a], {"embeddings": "gpu"}, logging.getLogger("t"))
-    assert not a.on_cpu
-    assert any("is not a device" in r.message for r in caplog.records)
-
-
-def test_device_roles_rejects_a_scalar(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #79
-    # list of roles or a role->device mapping; a bare scalar is a typo, not a
-    # shorthand, and must warn instead of crashing on iteration.
-    import logging
-    from llama_packer.__main__ import apply_device_roles
-    a = make_model("embed-a", role="embeddings")
-    with caplog.at_level(logging.WARNING):
-        apply_device_roles([a], 3, logging.getLogger("t"))
-    assert not a.on_cpu
-    assert any("expected a list" in r.message for r in caplog.records)
+def test_role_device_does_not_override_a_sidecar(tmp_path):
+    # Validates: SPEC.md, 'Roles': the sidecar is the more specific source.
+    from llama_packer import roles
+    from llama_packer.discover import discover
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "m.gguf").write_bytes(b"x")
+    (root / "s2t" / "m.md").write_text("---\nrole: s2t\ndevice: 1\n---\n")
+    try:
+        roles.configure({"roles": {
+            "s2t": {"dir": "s2t", "kind": "s2t", "device": "cpu"}}})
+        (model,) = discover(root, generate_stubs=False)
+    finally:
+        roles.configure(None)
+    assert not model.on_cpu
 
 
 def test_select_model_picks_measured_cheapest_over_file_size():
@@ -571,3 +542,43 @@ def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatc
         cfg, [voyage, jina, rnk], args, logging.getLogger("t"))
     assert emb is voyage and cats["emb"] is voyage
     assert all(name != "emb" for name, _ in fixed)
+
+
+def test_matrix_sets_validation():
+    from llama_packer.__main__ import validate_matrix_sets
+    assert validate_matrix_sets({}) is None
+    assert "must be a mapping" in validate_matrix_sets(
+        {"matrix": {"sets": ["rag"]}})
+    assert "__CHAT_VARS__" in validate_matrix_sets(
+        {"matrix": {"sets": {"rag": "__CHAT_VARS__ & embeddings"}}})
+    assert validate_matrix_sets(
+        {"matrix": {"sets": {"rag": "chat & embeddings"}}}) is None
+
+
+def test_expand_matrix_sets_replaces_only_role_leaves():
+    from llama_packer.__main__ import _expand_matrix_sets
+    out = _expand_matrix_sets(
+        {"rag": "chat & jina-embeddings-v3", "voice": "+chat & qwen"},
+        {"jina-embeddings-v3": "embeddings", "qwen": "chat"},
+        {"jina-embeddings-v3": ["jina-embeddings-v3"],
+         "qwen": ["qwen", "qwen.aux"]})
+    assert out["rag"] == "(qwen | qwen.aux) & jina-embeddings-v3"
+    assert out["voice"] == "+chat & qwen"
+
+
+def test_parse_device_auto():
+    from llama_packer.utils import parse_device
+    assert parse_device("auto") == (None, None)
+    assert parse_device("cpu") == ("cpu", None)
+    assert parse_device("gpu")[1] is not None
+
+
+def test_empty_role_is_pruned_from_a_set(caplog):
+    import logging
+    from llama_packer.__main__ import _expand_matrix_sets
+    with caplog.at_level(logging.WARNING):
+        out = _expand_matrix_sets(
+            {"voice": "chat & t2s", "talk": "chat & (t2s | s2t)"},
+            {"c": "chat"}, {"c": ["c"]})
+    assert out == {"voice": "c", "talk": "c"}
+    assert "has no entries" in caplog.text

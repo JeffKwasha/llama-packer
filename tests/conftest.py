@@ -137,16 +137,9 @@ TASK_ENDPOINT = {
     "image": "openai.images.generations",
     "s2t": "openai.audio.transcriptions", "t2s": "openai.audio.speech",
 }
-TASK_ROLE = {
-    "chat": "chat", "coding": "chat", "qa": "chat", "aux": "chat",
-    "embeddings": "embeddings", "rerank": "rerank", "image": "image",
-    "s2t": "s2t", "t2s": "t2s",
-}
-
-
 def task_cfg(name: str, **demand) -> dict:
-    """One declared task: the standard endpoint/role for that id + demand."""
-    return {"endpoint": TASK_ENDPOINT[name], "role": TASK_ROLE[name], **demand}
+    """One declared task: the standard endpoint for that id + demand."""
+    return {"endpoint": TASK_ENDPOINT[name], **demand}
 
 
 def tasks_cfg(**demands) -> dict:

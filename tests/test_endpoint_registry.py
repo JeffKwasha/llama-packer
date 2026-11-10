@@ -18,7 +18,7 @@ def test_registry_invariants_hold():
 
 def test_registry_task_mapping_is_total():
     # Validates: docs/plans/requirement-trace.md, requirement #97
-    assert set(endpoints.TASK_ENDPOINTS) == set(roles.SERVED_ROLES)
+    assert set(endpoints.TASK_ENDPOINTS) == set(roles.names())
     assert set(endpoints.TASK_ENDPOINTS.values()) <= endpoints.ENDPOINTS
 
 

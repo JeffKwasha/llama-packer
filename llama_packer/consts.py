@@ -206,20 +206,6 @@ _DIFFUSION_ARCH_RES = tuple(
 )
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-# Default directory roles
-# of a model file (relative to a models-dir root) selects the role;
-# files at the root itself are chat.  Subdirectories absent from this
-# map are not served at all.  Extend or override via the
-# profiles.yaml dirs: mapping.  Keys are matched case-insensitively.
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-_DEFAULT_DIR_ROLES = {
-    "chat": "chat", "t2t": "chat", "vision": "chat",
-    "doc": "chat", "ocr": "chat",
-    "embed": "embeddings", "rerank": "rerank",
-}
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # Weight-file suffixes
 # The only files that can be models. Snapshot listings and companion
 # scans filter to these so config/asset subdirs (tokenizer/,

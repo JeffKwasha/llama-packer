@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import yaml
 
-from llama_packer import ggufmeta, utils
+from llama_packer import ggufmeta, roles, utils
 from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DEFAULT_IMAGE_OUTPUT_RESERVE,
@@ -799,7 +799,7 @@ class Model:
             # mmproj_stripped (stem without 'mmproj.*' + quant/version) must be
             # prefix of model stem.
             # Rerank/embeddings (and image/s2t/t2s) never auto-attach vision.
-            if self.hf_repo and self.role not in utils.NON_CHAT_ROLES:
+            if self.hf_repo and self.role not in roles.non_chat():
                 snap, _ = self._finder.snapshot_files(
                     self.hf_repo, self._hf_home)
                 # Auto only when model is inside its snapshot directory
@@ -966,8 +966,6 @@ class Model:
         models_dirs,
         *,
         generate_stubs: bool = True,
-        extra_dirs: list[str] | None = None,
-        dir_roles: dict | None = None,
         hf_home=None,
         stack=None,
     ) -> list[Model]:
@@ -982,8 +980,7 @@ class Model:
         """
         from llama_packer.discover import discover
         return discover(models_dirs, stack=stack,
-                        generate_stubs=generate_stubs, extra_dirs=extra_dirs,
-                        dir_roles=dir_roles, hf_home=hf_home)
+                        generate_stubs=generate_stubs, hf_home=hf_home)
 
     @property
     def vram(self) -> VramBudget:
@@ -1028,7 +1025,7 @@ class Model:
             ctx = int(self.frontmatter.get(
                 "context_length", _DEFAULT_CONTEXT_LENGTH
             ))
-        if ctx < _MIN_CTX_SIZE and self.role == "chat" \
+        if ctx < _MIN_CTX_SIZE and roles.base_of(self.role) == "chat" \
                 and self.stem not in _warned_sub4k:
             _warned_sub4k.add(self.stem)
             logger.warning(
@@ -1516,12 +1513,7 @@ class Model:
 
     @property
     def role(self) -> str:
-        """The scheduling role this model's tasks imply.
-
-        Falls back to the role discovery injected from the directory (or a
-        legacy ``role:`` key) for a model that declares no tasks. Defaults to
-        ``chat``.
-        """
+        """The role discovery assigned: its owning tree, or a sidecar ``role:``."""
         return str(self.frontmatter.get("role") or "chat")
 
     @property
@@ -1620,7 +1612,7 @@ class Model:
     @property
     def on_cpu(self) -> bool:
         """True when the model is CPU-resident (`device: cpu` in frontmatter)."""
-        return str(self.frontmatter.get("device", "")).strip().lower() == "cpu"
+        return utils.parse_device(self.frontmatter.get("device"))[0] == "cpu"
 
     @property
     def device(self) -> int | None:
@@ -1628,15 +1620,8 @@ class Model:
 
         Returns None for CPU-resident models (`device: cpu`).
         """
-        if self.on_cpu:
-            return None
-        v = self.frontmatter.get("device")
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
+        value = utils.parse_device(self.frontmatter.get("device"))[0]
+        return value if isinstance(value, int) else None
 
     @property
     def concurrency(self) -> int | None:

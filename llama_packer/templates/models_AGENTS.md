@@ -16,29 +16,31 @@ names), point at the file with `model:`.
 ### Directory layout
 
 A sidecar is YAML frontmatter (between `---` lines) in a `.md` file whose stem
-matches the model file next to it. The directory sets the task:
+matches the model file next to it. A role owns a directory with `dir:`; the
+table below shows the default roles, not a code table.
 
 | Directory | Task | Notes |
 |-----------|------|-------|
-| root, `chat/` (`t2t/`) | chat | text-output model |
+| `chat/` (`t2t/`) | chat | text-output model |
 | `vision/` | chat | + colocated `*mmproj*.gguf` companion |
 | `doc/` (`ocr/`) | chat | OCR/extraction |
 | `embed/` | embeddings | nested dirs keep the role |
 | `rerank/` | rerank | |
-| `img/` | image | sd-server; opt-in via profiles.yaml `dirs:` |
+| `img/` | image | sd-server; opt-in with a role that has `dir: img` |
 | `s2t/` | s2t | whisper.cpp `.bin` (whisper-server) or audio.cpp GGUFs (audio-cpp); opt-in; `.bin` needs an authored sidecar |
 | `t2s/` | t2s | audio-cpp; opt-in; sidecar declares `audio_cpp: {family, task}` |
 | (any) `<name>.safetensors` | by dir or `tasks:` | vLLM |
 | (any) `<name>.md` | — | sidecar for the model file above |
 
 Orphan files under `embed/`/`rerank`/`doc/` are served with built-in defaults
-(the role comes from the directory, not any stub). Pass `--create-stubs` to
+(the role comes from the tree its `dir:` owns, not any stub). Pass `--create-stubs` to
 `llama-packer` if you want an empty stub written beside each one to fill in. Whisper `.bin` models are
 never stubbed — write the sidecar yourself. Other subdirs (`misc/`, `tmp/`,
-`hf_hub/`, … — and `img/`, `s2t/`, `t2s/` when not opted in) are not served —
-extend via profiles.yaml `dirs:` (skipped dirs are listed in the run log). A
-`.modelignore` at a models root excludes files/subtrees in place (one glob per
-line, `#` comments).
+`hf_hub/`, … — and `img/`, `s2t/`, `t2s/` when no role owns them) are not
+served — give a role that `dir:` (skipped dirs are listed in the run log). A
+file directly at the models root belongs to a role only if one owns `.` or the
+sidecar sets `role:`; otherwise the run stops. A `.modelignore` at a models
+root excludes files/subtrees in place (one glob per line, `#` comments).
 
 ### Companions
 
@@ -92,7 +94,7 @@ How to check:
 
 Diffusion/image-generation weights placed under a served text role are excluded
 from the config with an error in the pack log — move them to the image tree
-(`img/` with `dirs: {img: image}` and `backends: [sd-server]`) or set
+(`img/` with a role that has `dir: img` and `backends: [sd-server]`) or set
 `ignore: true`. Filenames prove nothing: classify by headers.
 
 ## Engines (required)
@@ -259,9 +261,8 @@ Convention: brand + major version; minor only when it changed the architecture
 `profiles.yaml tasks:`. The ids are a closed catalog: an id the catalogue does
 not declare is warned about and ignored, so a claim only counts when the
 operator declared that id. Capability ids are inferred from the directory
-(table above) or from `type:` containing `embedding`/`rerank`/`image`, and
-only need writing to override that inference; chat-endpoint ids are never
-inferred and must be claimed explicitly.
+(table above); `type:` is descriptive metadata and chooses no role. Chat
+endpoint ids are never inferred and must be claimed explicitly.
 
 Choosing them:
 
@@ -282,13 +283,14 @@ Choosing them:
 - Examples: a coding model that also answers chat → `tasks: [coding, chat]`;
   the vision model for captioning → `tasks: [describe]`; an embedder →
   `[embeddings]`, never `[chat]`.
-- `role:` and `usage:` are not sidecar keys. They are warned about and ignored.
+- `usage:` is not a sidecar key. `role:` is valid and overrides the role that
+  owns the model's directory.
 
-`image`/`s2t`/`t2s` engines are opt-in via profiles.yaml (`dirs:` +
-`backends:`). Floors (`min_context`, `min_parallel`, `require`, `keep`,
-`sacrifice`) and `parallel_power` live in the `profiles.yaml` task
-declaration, not in the sidecar. See the `llama-packer` project's `SPEC.md`
-for the full map.
+`image`/`s2t`/`t2s` engines are opt-in via profiles.yaml (a role with the
+matching `dir:` + `backends:`). Floors (`min_context`, `min_parallel`,
+`require`, `keep`, `sacrifice`) and `parallel_power` live in the
+`profiles.yaml` task declaration, not in the sidecar. See the `llama-packer`
+project's `SPEC.md` for the full map.
 
 ## HuggingFace resolution
 

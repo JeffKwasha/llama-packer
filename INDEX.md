@@ -4,7 +4,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 ## Entry points
 
-- [`llama_packer/__main__.py`](llama_packer/__main__.py) — CLI entry point (`llama-packer`), VRAM/env resolution, matrix wiring
+- [`llama_packer/__main__.py`](llama_packer/__main__.py) — CLI entry point (`llama-packer`), VRAM/env resolution, matrix wiring; `--check` validates profiles.yaml without discovery or a server
 - [`llama_packer/profiles.yaml`](llama_packer/profiles.yaml) — sampling profiles + `vllm:` backend defaults (bundled)
 - [`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md) — bundled `models/AGENTS.md` guide (written with `--agents`)
 
@@ -12,10 +12,10 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 - [`llama_packer/model.py`](llama_packer/model.py) — `Model` sidecar parsing, field accessors (`backend`, `hf_repo`, `vllm_image`, `modes`, `role`, `chat_template`, `image_min/max_tokens`, ...), companion resolution; file identity (`from_file`/`from_ref`/`Model[…]` registry, `GGUFModel`/`SafetensorsModel` subclasses, `WeightFinder`), `derived:` block persist/sync
 - [`llama_packer/endpoints.py`](llama_packer/endpoints.py) — the closed endpoint id set and the one task→endpoint map; `serves()` is the compatibility check, so engines declare surfaces and tasks map to one
-- [`llama_packer/roles.py`](llama_packer/roles.py) — the scheduling table: one `Role` row per purpose (chat pass, context knob, `device_roles:` eligibility); the closed role vocabulary, not a routing composition
+- [`llama_packer/roles.py`](llama_packer/roles.py) — the scheduling table: one `Role` row per purpose (owned trees, placement, allocation policy); roles are data, not a closed list
 - [`llama_packer/profiles.py`](llama_packer/profiles.py) — `Profiles` value object: defaults, spare precedence, `allow_profiles` filtering, per-model variant grouping
 - [`llama_packer/progress.py`](llama_packer/progress.py) — optional `rich` progress bar (models completed/total); every method no-ops without `rich`/non-TTY/under pytest
-- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + gain-gated vision-less variant, auto-dropped main, context solve: squeeze + opportunistic s2t/image co-loads + tools demotion, bounded ctx, capacity pools/capacities/evict_cost) → `emit_config` (llama-swap entries with stable `<template_id>.<category|ctx>.<flags>` ids; exposes `entry_ids_by_stem`), `_filter_supported` (validation boundary incl. capability/companion cross-check), `write_yaml`
+- [`llama_packer/writer.py`](llama_packer/writer.py) — `build_config` = filter → `Planner` (variants, mmproj keep/drop + gain-gated vision-less variant, auto-dropped main, context solve: squeeze + tools demotion, bounded ctx, capacity pools/capacities/evict_cost) → `emit_config` (llama-swap entries with stable `<template_id>.<category|ctx>.<flags>` ids; exposes `entry_ids_by_stem`), `_filter_supported` (validation boundary incl. capability/companion cross-check), `write_yaml`
 - [`llama_packer/memory_probe.py`](llama_packer/memory_probe.py) — importable VRAM probe: raw `llama-fit-params` sweeps, the affine `(c, D)` pair derivation, and the `--probe-memory [ARCH...]` per-family law validator
 - [`llama_packer/vram_log.py`](llama_packer/vram_log.py) — long-horizon VRAM baseline logger (`python -m llama_packer.vram_log`): 5-min samples of `used/gtt` MiB + tenant fingerprint (models/audio/image/immich/browsers), run-length counted within `--threshold` (default 128 MiB) and held in RAM while used ≤ `--low-mib` (default 2048, no disk writes when idle); `--once`/`--report` (floor = base, tenant deltas = `--spare` slack); see [docs/plans/phase0-vram-baseline.md](docs/plans/phase0-vram-baseline.md)
 - [`llama_packer/gpu_state.py`](llama_packer/gpu_state.py) — measurement-window guardrails: resident-llama pre-flight, process-group kill, single-flight `measurement_lock`, append-only run `journal`, cache dir
@@ -26,7 +26,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 - [`llama_packer/hardware.py`](llama_packer/hardware.py) — VRAM detection, `GpuProfile`, family handlers
 - [`llama_packer/scope.py`](llama_packer/scope.py) — `ScopeStack`: the one select-and-set engine for sidecar data (defaults fold + rule application + backend/path finalization)
 - [`llama_packer/discover.py`](llama_packer/discover.py) — depth-first model discovery, empty stub sidecars, HF-blobs guard
-- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, dir-role map (`_DEFAULT_DIR_ROLES`, `dir_role_map`), HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_dir`, `snapshot_weight_paths`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`), header-only model-kind classification (`classify_file`, `gguf_header_probe`, `sniff_safetensors`, `hf_readme_kind`)
+- [`llama_packer/utils.py`](llama_packer/utils.py) — `VLLM_DEFAULT_*`, sampling keys, `_KV_CACHE_BYTES`, slugify, HF hub snapshot resolution (`hf_hub_cache`, `hf_snapshot_dir`, `snapshot_weight_paths`, `hf_snapshot_file`), path-macro grouping (`compute_env_prefixes`, `hf_cache_root`), header-only model-kind classification (`classify_file`, `gguf_header_probe`, `sniff_safetensors`, `hf_readme_kind`)
 
 ## Backends
 
@@ -52,8 +52,11 @@ Engines and transports are independent axes: each engine declares the transports
 - [docs/transports/](docs/transports/) — host / docker / podman: launch wrapping, path translation, mounts, lifecycle
 - [SPEC.md](SPEC.md) — behavioral contract: discovery, fit-params estimate, measurement shape, capacity routing, auto-parallel, batch/ubatch keys; deleting `derived:` costs seconds, never a probe
 - [docs/gguf_model_analysis.md](docs/gguf_model_analysis.md) — GGUF sizing notes
-- [docs/llama-swap.md](docs/llama-swap.md) — llama-swap features the emitted config relies on, official doc links, unused features
-- [docs/profiles-authoring.md](docs/profiles-authoring.md) — agent-facing guide: build/validate `profiles.yaml` (tasks, categories, placement, capacity, TTL, dry-run); OpenCode install notes in [README](README.md#agent-skill-authoring-profilesyaml)
+- [docs/llama-swap.md](docs/llama-swap.md) — llama-swap capabilities mapped to the `profiles.yaml`/sidecar input that provides each, with composition examples and official doc links
+- [docs/memory-and-eviction.md](docs/memory-and-eviction.md) — the two budgets, context/slot solve, co-resident reservations, emitted capacities/eviction cost, TTL, and worked hardware examples
+- [docs/roles-tasks-routing.md](docs/roles-tasks-routing.md) — contract for roles, tasks, sets, pools, and the three llama-swap routers; includes implementation status
+- [docs/plans/roles-refactor-handoff.md](docs/plans/roles-refactor-handoff.md) — what landed in the roles refactor, what did not, and how to validate it
+- [docs/profiles-authoring.md](docs/profiles-authoring.md) — agent-facing skill: `profiles.yaml` syntax and every key, examples, validation (`--check`, `--dry-run`), retired keys, deeper links; OpenCode install notes in [README](README.md#agent-skill-authoring-profilesyaml)
 - [docs/plans/](docs/plans/) — design records and unscheduled proposals; not normative. The current contract is [SPEC.md](SPEC.md) and [docs/architecture.md](docs/architecture.md).
 - [docs/plans/roadmap.md](docs/plans/roadmap.md) — followers designed but unscheduled, and open defects, so a shipped plan can be pruned without losing them
 - [docs/glossary.md](docs/glossary.md) — **one name per concept**: sidecar, spare, derived:, rung, demand, blessed, coload, entry id, and the rest, each tied to the identifier that implements it
@@ -62,9 +65,11 @@ Engines and transports are independent axes: each engine declares the transports
 
 ## Data dirs
 
-- `models/` — GGUF + `.md` sidecars (`chat/` `vision/` `doc/` `embed/` `rerank/` by use-case; `img/` etc. ignored; optional per-directory `models.yaml`; see SPEC.md "Model Discovery"); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
-- configured model roots (`models_dirs:`) — same layout (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored); `dirs:` maps directories to roles, `hf_home:` sets the HF cache root
+- `models/` — GGUF + `.md` sidecars (`chat/` `vision/` `doc/` `embed/` `rerank/` by use-case; `img/` served only when a role owns it; optional per-directory `models.yaml`; see SPEC.md "Model Discovery"); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
+- configured model roots (`models_dirs:`) — same layout (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored unless a role owns them); each role owns one or more trees with `dir:`, `hf_home:` sets the HF cache root
 - `profiles.yaml.example` — tracked template; the live `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
 - [`extras/update.py`](extras/update.py) — prebuilt server binaries, each engine updated **in the directory it is already installed in** (resolved, not taken from the cwd; `--print-paths` shows the resolution, `--dir engine=path` pins one, optional [`extras/engines.ini`](extras/engines.ini) configures the root); positional target selectors (`llama`/`ll`, `cpp`, `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, `all`) + backends; default = llama.cpp + llama-swap, `all` adds the three with no upstream checksums; stdlib-only Python
 - [`extras/install.py`](extras/install.py) — systemd deployer: service account, binaries, config, hardened unit from [`extras/llama-swap.service.in`](extras/llama-swap.service.in) ([docs/install.md](docs/install.md))
+- [`extras/check_sidecar_budget.py`](extras/check_sidecar_budget.py) — judge one emitted capacity-routing config: applies the router's own rule (summed `capacities` fit every pool, one serving per role pool) and reports which sidecars can be resident beside each chat (`--require t2s,embeddings,...`); exit 1 when a required set cannot fit
+- [`extras/sidecar_eval.py`](extras/sidecar_eval.py) — run llama-packer once per sidecar-residency strategy (`host`, `voice`, `rag-hot`, `rag-voice`, `all-hot`) over a base `profiles.yaml` and tabulate largest chat charge, headroom, entries and median ctx; exit 1 when a strategy cannot host its required set ([docs/plans/sidecar-residency-eval.md](docs/plans/sidecar-residency-eval.md))

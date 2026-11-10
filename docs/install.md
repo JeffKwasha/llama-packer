@@ -44,7 +44,7 @@ different source for that first copy.
 
 Edit `<dir>/profiles.yaml` for this host, not the repo copy:
 
-- `models_dirs`, `dirs`, `hf_home` — where the models are;
+- `models_dirs`, `roles.<name>.dir`, `hf_home` — where the models are;
 - `backends` — which engines this host enables;
 - `defaults.spare` — the headroom for the desktop/other tenants; measure it
   with `python -m llama_packer.vram_log --once` (or `--report` after
@@ -53,11 +53,14 @@ Edit `<dir>/profiles.yaml` for this host, not the repo copy:
   1 GiB video floor;
 - `defaults.parallel` — leave it unset; a value here is a pin and disables
   auto-parallel for every model;
-- `device_roles` / `device: cpu` — what runs from host RAM;
+- `roles.<name>.device: cpu` / `device: cpu` — what runs from host RAM (SPEC §Device);
+- `roles` — the purposes the fleet uses, with their allocation policy;
 - `tasks` — the task ids the fleet uses; `min_context` and `min_parallel`
-  are floors (leave a key undefined for no floor), and `ttl` sets the idle
+  are floors (leave a key undefined for no floor), `max_context` is a
+  ceiling, `device` is a placement requirement, and `ttl` sets the idle
   lifetime;
-- `matrix.categories` — which model fills each role, and its context cap;
+- `matrix.sets` — writing it switches the config to matrix mode; leaving it
+  out keeps capacity;
 - `capacity` — `pp_tps` / `drive_mbps` for derived eviction cost;
 - `pools` — per-pool VRAM/spare overrides.
 
@@ -81,12 +84,12 @@ an agent started in `<dir>` can load it; `--no-agent-guide` skips that.
 ## After a llama-packer update, re-check the profiles syntax
 
 `extras/update.py` updates **binaries**, not `profiles.yaml`. A new
-llama-packer can retire a key (for example `matrix.sets:` was replaced by
-capacity pools) and the packer warns about alien keys during a run. After
-updating:
+llama-packer can retire a key (for example `dirs:` or `device_roles:`) and
+the packer warns about alien keys during a run. After updating:
 
 ```sh
 cd <dir>
+sudo -u <service-user> llama-packer --profiles profiles.yaml --check
 sudo -u <service-user> llama-packer --profiles profiles.yaml \
   --output /tmp/config.yaml --spare <same-as-install> -v
 ```

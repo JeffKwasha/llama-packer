@@ -54,9 +54,9 @@ runtime: we choose the fields, llama-swap acts on them.
 **The packer decides numbers; llama-swap enforces them.** `capacities` are
 declarations, so the packer emits the same measurement margin it solved
 with. `evict_cost` only orders evictions under pressure; it does not
-reserve or preload. A size-1 pool per scheduling role turns "one live
-serving per role" into a capacity constraint, so a same-role request evicts
-its sibling without any set vocabulary.
+reserve or preload. A role with `live: 1` emits a size-1 counting pool,
+which turns "one live serving per role" into a capacity constraint, so a
+same-role request evicts its sibling without any set vocabulary.
 
 Nothing is preloaded: llama-swap starts the requested model and evicts
 whatever the pools require. `ttl` is independent — it yields time, not
@@ -105,19 +105,17 @@ are alternatives, never co-resident.
 
 ### A task is a catalog entry
 
-A task is a closed id and carries everything the packer needs to schedule
-it: the endpoint it is served at, the scheduling role it implies, its load
-semantics (request-time parameter vs one task per process), and the negative
-examples that keep near neighbours apart. Adding a task is a contract change
-— endpoint + role + policy — never an agent's passing invention; an unknown
-id warns and is ignored, and "we don't know" is an empty `tasks:`, not an
-invented name.
+A task is a closed id and carries everything the packer needs to size it:
+the endpoint it is served at, its demand, and its placement requirement.
+Adding a task is a contract change — endpoint + policy — never an agent's
+passing invention; an unknown id warns and is ignored, and "we don't know"
+is an empty `tasks:`, not an invented name.
 
-The task vocabulary is declared in `profiles.yaml tasks:`; the code owns only
-the contract it is checked against (the endpoint ids and the scheduling
-roles). A sidecar claims its work with `tasks:`; `role:` and `usage:` are
-alien keys that warn and are ignored. The six scheduling roles (`chat`,
-`embeddings`, `rerank`, `image`, `s2t`, `t2s`) remain the fixed contract.
+The task vocabulary is declared in `profiles.yaml tasks:`; the code owns
+only the contract it is checked against (the endpoint ids). A sidecar claims
+its work with `tasks:` and belongs to a role by its directory or an explicit
+`role:`; `usage:` is an alien key that warns and is ignored. Roles are
+operator data, not a fixed list.
 
 ### An endpoint is standardized
 
@@ -125,36 +123,39 @@ Endpoints are concrete serving surfaces, engine-owned and hardcoded in one
 place: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`,
 `openai.audio.transcriptions`, `openai.audio.speech`, plus `native.*` for
 engine-specific surfaces. Servers and clients choose endpoints; a model
-never does. A role's required endpoints are the union of its tasks'
-endpoints, and one live serving covers every task sharing an endpoint —
+never does. A role's required endpoints are the union of the endpoints of the tasks its
+models declare, and one live serving covers every task sharing an endpoint —
 those tasks are aliases of one serving, never one load each.
 
-### A role is a purpose; a category is a model pick
+### A role is a purpose; a task is an endpoint contract
 
 The levels are not interchangeable:
 
 | level | answers | example |
 |---|---|---|
-| **role** | what a model is *for*; the substitutable slot — one live serving per role | `chat`, `embeddings`, `rerank`, `s2t`, `t2s` |
-| **task** | the endpoint contract that implements a role | `openai.chat.completions`, `/v1/embeddings` |
-| **category** | a model chosen to fill a role (a matrix var) | `emb`→embeddings, `rnk`/`rnk2`→rerank |
-| **capacity pool** | what may be co-resident | `default` VRAM, `ram`, one size-1 pool per role |
+| **role** | what a model is *for*, the tree it owns, plus its allocation policy | `chat` owns `chat/`, `embeddings` owns `embed/` |
+| **task** | the endpoint contract a model can serve | `openai.chat.completions`, `/v1/embeddings` |
+| **share** | how much of the slack a role may claim | `40%`, or `fill: true` |
+| **capacity pool** | what may be co-resident | `default` VRAM, `ram`, a size-1 counting pool per `live: 1` role |
+| **set** | matrix mode: which combinations may stay resident | `chat & embeddings & rerank` |
 
 A role is not a composition and does not "host" anything. Co-residency is
 what the emitted capacities allow: any combination that fits every pool may
-coexist, and a size-1 role pool keeps one model per role live. This replaces
-matrix sets entirely; there is no `roles:` table and no hand-authored
-`sets:`.
+coexist, and a size-1 counting pool keeps one model per `live: 1` role live.
+That is capacity mode. An operator who must forbid a combination that fits
+writes `matrix.sets:` instead; each set is its own budget, so roles may
+exceed their global share when no set holds them together.
 
 `ttl` is the temporal knob: sidecar > task > placement default, `0` = never,
 CPU-resident servings default to 3600 s (chat is not special).
 
 ### Where the registries live
 
-`roles.py` is the scheduling table: one row per scheduling role with the
-chat-pass flag, context knob and `device_roles:` eligibility. Every derived role collection (`SERVED_ROLES`, `NON_CHAT_ROLES`,
-`DEVICE_ROLES`) is read off it. The task vocabulary itself comes from
-`profiles.yaml tasks:`; each declaration names one of these roles.
+`roles.py` is the role data: one row per operator-declared purpose with the
+tree it owns (`dir`), a behaviour `kind`, and an allocation policy. The task
+vocabulary itself comes from `profiles.yaml tasks:`; a model belongs to the
+role that owns its directory or to the one its sidecar names, and a task
+declares only its endpoint, demand, and device.
 
 `endpoints.py` is the other half: the closed set of endpoint ids and the one
 mapping from a task to the endpoint it is served at. An engine declares
@@ -164,7 +165,7 @@ API and the doc/code agreement test live here (`docs_agree`,
 `test_registry_docs_agree`).
 
 Validation follows the same split: an alien sidecar key warns at discovery
-(`role:`/`usage:` are not keys — the warning points at `tasks:`), an
+(`usage:` is not a key — the warning points at `tasks:`), an
 unsupported `device:` warns (`cpu`/non-negative index), and format/endpoint
 compatibility is checked once in `_filter_supported` before any budgeting.
 

@@ -3,8 +3,8 @@
 # sidecar (the `<model>.md` beside the weights):
 #   engines: [llama-server]    # engine names that can load the weights;
 #                              # required — a single-engine claim is a list
-#   tasks: [embeddings]        # closed catalog ids; unset/empty = unverified
-#                              # (never an invented name)
+#   role: chat                 # operator-defined purpose (see roles: below)
+#   tasks: [embeddings]        # declared task ids; unset/empty = unverified
 # `backend:` (compatibility) and `usage:` (workload tags) are the old
 # spellings: they warn as alien keys, and there is no tolerated dual
 # vocabulary.
@@ -54,74 +54,126 @@ defaults:
 # shed: the default order for capabilities a task does not name.
 # shed: [vision, draft]
 tasks:
-  # Chat-endpoint tasks: one serving covers all of them; they evict each
-  # other by request. endpoint + role are required; the demand keys are the
-  # floors the planner must meet.
+  # A task is an endpoint contract plus demand. It does not name a role:
+  # the model's role is the model's. `device` is `auto`, `cpu`, or a GPU
+  # index; a sidecar `device:` wins. `parallel_power` overrides
+  # matrix.parallel_power for that task: low keeps context, high buys slots.
+  # `max_context` is the served ceiling; for embeddings/rerank it is the RAG
+  # window.
+  #
+  # A model's tasks must share one endpoint: `--embeddings` and chat are
+  # different commands, so they cannot be one serving. Chat tasks are
+  # aliases of one serving; each gets its own entry.
   chat:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 64k
     min_parallel: 2
     sacrifice: [draft, vision]
   coding:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 130k
     min_parallel: 1
     sacrifice: [vision]
     keep: [draft]
   qa:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 32k
     min_parallel: 2
   aux:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
-  # A task may also set parallel_power to override matrix.parallel_power for
-  # that task: low keeps context, high buys slots.
-  # Capability tasks: endpoint and role only; they are sized by their role.
   embeddings:
     endpoint: openai.embeddings
-    role: embeddings
+    max_context: 4096      # the served RAG window; clients chunk to fit
     ttl: 0                 # keep the RAG pair warm
   rerank:
     endpoint: openai.rerank
-    role: rerank
+    max_context: 4096
     ttl: 0
   image:
     endpoint: openai.images.generations
-    role: image
   s2t:
     endpoint: openai.audio.transcriptions
-    role: s2t
+    device: cpu
     # CPU default is 3600 s; set ttl: 0 to keep it warm.
   t2s:
     endpoint: openai.audio.speech
-    role: t2s
 
-# Model roots (CLI --models-dir overrides this). Role is selected by the
-# first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →
-# embeddings, rerank/ → rerank; other subdirs (img/, misc/, tmp/…) are
-# ignored, and files at a root are chat.  Any subdirectory may also carry a
-# models.yaml with subtree-scoped `defaults:` and `overrides:`.
+# ── Roles (required) ───────────────────────────────────
+# A role is an operator-defined purpose and allocation policy. The code ships
+# no role names; these are data. A role owns one or more trees with `dir:`;
+# every model under them belongs to it. A sidecar `role:` overrides the tree.
+# There is no default role: a model under no role's tree and with no `role:`
+# is an error, as is a `role:` naming a role not defined here.
+#
+# Every serving's floor (weights + the memory its task's min_context and
+# min_parallel need) is taken out first. `share` divides only what is left:
+#   share    percentage of slack this role may claim
+#   fill     take whatever no other share claims (one role per pool)
+#   live     1 (one serving, evicts) | per-device | capacity
+#   device   cpu | GPU index — where every model of the role runs. Same
+#            vocabulary as a sidecar `device:`; omit it to leave placement
+#            to the sidecar (and the task). `cpu` means no VRAM charge,
+#            -ngl 0, and a charge against the `ram` pool.
+# Shares in a pool must sum to at most 100%; the rest is headroom. A role with
+# `share: 100%` runs alone. There is no min/preferred/cap/weight: floors are
+# derived, a share is already a cap, and one fill role takes the rest.
+# There is no `persistent:` — residency is a TTL, set with `ttl: 0` on the
+# task (or the sidecar), not a role flag.
+roles:
+  chat:
+    dir: [chat, t2t, vision, doc, ocr]
+    kind: chat
+    fill: true
+    live: 1
+  embeddings:
+    dir: embed
+    kind: embeddings
+    share: 5%
+    live: 1
+    # device: cpu          # run the whole role from system RAM
+  rerank:
+    dir: rerank
+    kind: rerank
+    share: 5%
+    live: 1
+  image:
+    dir: img
+    kind: image
+    share: 20%
+    live: 1
+  s2t:
+    dir: s2t
+    kind: s2t
+    share: 5%
+    live: per-device
+  t2s:
+    dir: t2s
+    kind: t2s
+    share: 5%
+    live: per-device
+
+# ── Routing ────────────────────────────────────────────
+# There is no `routing.use`. The mode follows from the input: `matrix.sets:`
+# present → matrix; absent → capacity. `group` is not emitted; `exclusive` is
+# `share: 100%`; residency is `ttl: 0`.
+#
+# capacity  one global budget: every combination that fits may be resident,
+#           so shares must sum to 100%.
+# matrix    each set is its own budget, so roles may exceed their global
+#           share when no set holds them together. Only a set can forbid a
+#           combination that fits. It never preloads.
+
+# Model roots (CLI --models-dir overrides this). A model belongs to the role
+# whose `dir:` owns its directory (case-insensitive, relative to the root);
+# a subtree no role owns is skipped and named in the run log.  Any
+# subdirectory may also carry a models.yaml with subtree-scoped `defaults:`
+# and `overrides:`.
 models_dirs:
   - models
   # - /mnt/ai/models  # multiple roots allowed
-
-# Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank | image | s2t | t2s. CLI
-# --extra-dirs adds directories to scan; they are chat unless named here.
-# Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
-# Speech-to-text (whisper.cpp) is opt-in: add `s2t: s2t` to serve .bin weights
-# via whisper-server (requires an authored same-stem sidecar per model).
-# dirs:
-#   it2t: chat
-#   img: image
-#   s2t: s2t
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -312,17 +364,11 @@ profiles:
 #   #                          # vm.min_free_kbytes) | 25% | <abs>
 #   # cgroup_dir: /sys/fs/cgroup/system.slice/llama-swap.service
 
-# ── Role-wide host placement (optional) ─────────────────
-# Every model of a named role runs from RAM — identical to tagging each
-# sidecar `device: cpu`: no VRAM charge, same host budget, -ngl 0. It still
-# charges the `ram` capacity pool and is evicted under RAM pressure; an
-# undeclared CPU serving defaults to ttl 3600 s (override with ttl: 0 or a
-# number). Only the four resident roles can be named here (embeddings,
-# rerank, s2t, t2s); a chat model is placed per sidecar.
-# The key is a role, the value is a device — there is no `role: cpu`.
-# Unset = per-sidecar tags only.
-# device_roles: [embeddings, rerank]
-# device_roles: {embeddings: cpu, s2t: cpu}
+# ── Roles are defined above ────────────────────────────
+# Every role is declared in `roles:` with its trees (`dir`), placement
+# (`device`) and allocation policy. Sidecars may set `role:` to override the
+# tree's role. Placement lives on the role:
+#   embeddings: {dir: embed, device: cpu, ...}
 
 # ── Override rules (optional) ────────────────────────────
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.
@@ -350,43 +396,39 @@ profiles:
 #   - when: {name: 'tiny-.*'}
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
-# ── Context limits (optional) ──────────────────────────
-# The config uses llama-swap's capacity router: memory pools plus a
-# per-model allowance, and no named sets. `matrix:` keeps the context
-# limits, and `categories` chooses which model fills each role.
-#
-# `embed_context` / `rerank_context` cap the resident helpers at a fixed
-# small context: clients chunk to one RAG size, and a fixed footprint makes
-# the chat budget computable. Select the helpers with a category `selector:`;
-# they always serve single-slot.
+# ── Context and routing knobs (optional) ───────────────
+# A task's `min_context` is a floor and `max_context` is a ceiling. The old
+# `embed_context` / `rerank_context` knobs are gone: put `max_context: 4096`
+# on the embeddings/rerank tasks instead.
 #
 # Limits and guards for shared context:
-#   tools_min_ctx     below this chat context, the RAG pair is squeezed to
-#                     buy context back (default 128k)
-#   coload_min_ctx    how far the RAG pair may be squeezed (default 20k)
+#   tools_min_ctx     below this chat context, helpers are squeezed to buy
+#                     context back (default 128k)
+#   coload_min_ctx    how far helpers may be squeezed (default 20k)
 #   ctx_gain_min      the minimum chat gain that makes the squeeze worth it
 #   min_chat_ctx      the floor kept for a co-load (default 64k)
 #   estimate_headroom pads an estimated, not measured, overhead (1.25)
 #
-# `sets:` and `evict_costs:` are retired: they warn and are ignored.
+# `sets:` switches the emitted config to matrix mode. Each set is its own
+# memory budget: [A&B] [A&C] [A&D] constrains only the pairs, so all four can
+# take half the pool, where capacity would force each to a quarter. Only a set
+# can forbid a combination that fits. Expressions use llama-swap syntax:
+# & (together), | (alternative), +set, +auto:orphans. A model in no set runs
+# alone. Matrix never preloads: it evicts to the cheapest set containing the
+# requested model and starts only that model.
 #
 # matrix:
-#   embed_context: 4096
-#   rerank_context: 4096
-#   # tools_min_ctx: 131072
-#   # coload_min_ctx: 20480
-#   # ctx_gain_min: 4096
-#   # min_chat_ctx: 65536
-#   # estimate_headroom: 1.25
+#   tools_min_ctx: 131072
+#   coload_min_ctx: 20480
+#   ctx_gain_min: 4096
+#   min_chat_ctx: 65536
+#   estimate_headroom: 1.25
 #   auto_parallel: false        # on by default: the packer chooses context and slots
 #   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
 #   parallel_power: 0.75        # slot exponent; a task's own overrides it
-#   categories:                 # var -> model pick; each is a role
-#     emb: { role: embeddings }
-#     rnk: { role: rerank }
-#     rnk2: { role: rerank, selector: zerank }   # alternative, not additive
-#     stt: { role: s2t }
-#     tts: { role: t2s }
+#   sets:                       # presence switches to matrix mode
+#     rag: "chat & embeddings & rerank"
+#     voice: "chat & t2s"
 #
 # ── Capacity routing knobs (optional) ──────────────────
 # The generated config uses capacity routing:
@@ -404,16 +446,20 @@ profiles:
 #   pp_tps: 1000
 #   # drive_mbps: 1000
 
-# ── VRAM pools (optional) ───────────────────────────────────
-# One shared allowance per pool: per-pool spare override, unmodelled
-# residents, and explicit reservations. "auto" keeps the calculated limits.
+# ── VRAM and RAM pools (optional) ───────────────────────────
+# The emitted `default` pool is detected VRAM - reserve - spare. `pools:`
+# sizes the solve around that pool; it does not change the emitted default
+# pool. `ram.spare` is the exception: it keeps that much host RAM out of the
+# emitted ram pool.
 # pools:
 #   default:
-#     spare: 2G
-#     reserve_extra: 8G          # VM, game, other tenant
+#     spare: 2G                  # per-pool solve spare (not the emitted pool)
+#     reserve_extra: 8G          # VM, game, other tenant: chat is sized around it
 #     pins:
 #       image: 40G
 #       embeddings: auto
+#   ram:
+#     spare: 2G                  # keep 2G of host RAM free
 
 # ── Flag macros (optional) ──────────────────────────────────
 # Named flag chunks for cmd readability (llama-swap macros). Auto-derived

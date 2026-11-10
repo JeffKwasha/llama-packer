@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 
-from llama_packer import utils
+from llama_packer import roles, utils
 from llama_packer.consts import DEFAULT_SACRIFICE_ORDER
 
 logger = logging.getLogger(__name__)
@@ -22,11 +22,15 @@ logger = logging.getLogger(__name__)
 #: Every top-level ``profiles.yaml`` key something reads.  Unknown keys warn
 #: (a typo such as ``device_role`` must not silently do nothing).
 PROFILES_KEYS: frozenset[str] = frozenset({
-    "defaults", "tasks", "models_dirs", "dirs", "hf_home", "backends",
+    "defaults", "tasks", "models_dirs", "hf_home", "backends",
     "profiles", "llama_server", "vllm", "sd", "whisper", "audio_cpp",
-    "hardware", "device_roles", "overrides", "matrix", "pools", "macros",
-    "shed", "capacity",
+    "hardware", "overrides", "matrix", "pools", "macros",
+    "shed", "capacity", "roles",
 })
+
+
+#: Retired top-level keys: reported by name, not as unknown typos.
+RETIRED_TOP_KEYS = frozenset({"routing", "device_roles"})
 
 
 def validate_profiles_keys(cfg: dict, log=logger) -> None:
@@ -41,6 +45,217 @@ def validate_profiles_keys(cfg: dict, log=logger) -> None:
                                           n=1, cutoff=0.7)
         hint = f" (did you mean {close[0]!r}?)" if close else ""
         log.warning("profiles.yaml: unknown key %r%s; ignored", key, hint)
+
+
+_PROFILE_KEYS = utils.SAMPLING_KEYS | {
+    "cache_type", "parallel", "spare", "batch", "ubatch",
+}
+_TASK_KEYS = {
+    "endpoint", "intent", "device", "min_context", "max_context",
+    "min_parallel", "parallel_power", "ttl", "require", "keep", "sacrifice",
+    "role",  # retired; accepted with a warning for old files
+}
+_MATRIX_KEYS = {
+    "min_chat_ctx", "tools_min_ctx", "coload_min_ctx", "ctx_gain_min",
+    "auto_parallel_max",
+    "vllm_auto_parallel_max", "estimate_headroom", "auto_parallel",
+    "parallel_power", "categories",
+}
+_CATEGORY_KEYS = {"role", "selector", "ctx"}
+_POOL_KEYS = {"vram", "spare", "reserve_extra", "pins"}
+_CAPACITY_KEYS = {"pp_tps", "drive_mbps"}
+_HARDWARE_KEYS = {
+    "vram", "baseline_mb", "unified_system_mb", "gpu_family",
+    "memory_margin", "fast_storage", "host_pool", "system_ram",
+    "host_pressure", "cgroup_dir",
+}
+_BACKEND_KEYS = {
+    "llama_server": {"args", "batch", "ubatch"},
+    "vllm": {"image", "bin", "docker_args", "podman_args", "container_args",
+             "container_port", "container_vendor", "gpu_mem_util", "hf_cache",
+             "args"},
+    "sd": {"bin", "args"},
+    "whisper": {"bin", "args"},
+    "audio_cpp": {"bin", "backend", "device", "threads", "tmpdir",
+                  "max_loaded_models", "idle_unload_ms", "busy_timeout_ms",
+                  "min_free_memory_mb", "voice_dir", "model_spec_override",
+                  "args"},
+}
+
+
+def _did_you_mean(name: str, known) -> str:
+    import difflib
+    close = difflib.get_close_matches(str(name), sorted(known), n=1,
+                                      cutoff=0.7)
+    return f" (did you mean {close[0]!r}?)" if close else ""
+
+
+def _check_mapping(problems: list[str], label: str, value, *,
+                   known: set[str] | frozenset[str] | None = None) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        problems.append(f"{label}: must be a mapping, got "
+                        f"{type(value).__name__}")
+        return {}
+    if known is not None:
+        for key in value:
+            if key not in known:
+                problems.append(f"{label}: unknown key {key!r}"
+                                f"{_did_you_mean(key, known)}")
+    return value
+
+
+def check_profiles(cfg: dict) -> list[str]:
+    """Return every profiles.yaml problem this validator can name.
+
+    Collects instead of stopping at the first, so a single run explains the
+    whole file.  Loading is ``--check``: no model discovery, no server.
+    """
+    problems: list[str] = []
+    if not isinstance(cfg, dict):
+        return [f"top level: must be a mapping, got {type(cfg).__name__}"]
+
+    for key in cfg:
+        if key in RETIRED_TOP_KEYS:
+            continue
+        if key not in PROFILES_KEYS:
+            problems.append(f"unknown top-level key {key!r}"
+                            f"{_did_you_mean(key, PROFILES_KEYS)}")
+
+    profiles = cfg.get("profiles")
+    if profiles is None:
+        problems.append("profiles: missing; at least one profile is required")
+    elif not isinstance(profiles, dict):
+        problems.append("profiles: must be a mapping of name to values")
+    elif not profiles:
+        problems.append("profiles: empty; at least one profile is required")
+    else:
+        for name, body in profiles.items():
+            _check_mapping(problems, f"profiles.{name}", body,
+                           known=_PROFILE_KEYS | {"description"})
+
+    _check_mapping(problems, "defaults", cfg.get("defaults"),
+                   known=_PROFILE_KEYS)
+
+    role_table, role_problems = roles.parse_roles(cfg)
+    problems.extend(role_problems)
+    served = tuple(role_table)
+
+    tasks = _check_mapping(problems, "tasks", cfg.get("tasks"))
+    for name, body in tasks.items():
+        spec = _check_mapping(problems, f"tasks.{name}", body,
+                              known=_TASK_KEYS)
+        if name and "endpoint" not in spec:
+            problems.append(f"tasks.{name}: endpoint is required")
+        _device, device_problem = utils.parse_device(spec.get("device"))
+        if device_problem:
+            problems.append(f"tasks.{name}.device: {spec.get('device')!r} "
+                            f"is {device_problem}")
+
+    if cfg.get("models_dirs") is not None:
+        roots = cfg["models_dirs"]
+        if not isinstance(roots, (list, tuple)):
+            problems.append("models_dirs: must be a list of directories")
+
+    if cfg.get("dirs") is not None:
+        problems.append("dirs: retired; a role owns its trees with "
+                        "roles.<name>.dir")
+
+    backends = cfg.get("backends")
+    if backends is not None:
+        if not isinstance(backends, (list, tuple)):
+            problems.append("backends: must be a list of backend names")
+        else:
+            from llama_packer.backends import validate_backend_names
+            err = validate_backend_names(backends)
+            if err:
+                problems.append(f"backends: {err}")
+
+    matrix = _check_mapping(problems, "matrix", cfg.get("matrix"),
+                            known=_MATRIX_KEYS | {
+                                "sets", "evict_costs",
+                                "embed_context", "rerank_context"})
+    sets = matrix.get("sets")
+    if sets is not None:
+        if not isinstance(sets, dict):
+            problems.append("matrix.sets: must be a mapping of name to "
+                            "expression")
+        else:
+            for name, expr in sets.items():
+                if not isinstance(expr, str) or not expr.strip():
+                    problems.append(f"matrix.sets.{name}: must be an "
+                                    "expression string")
+                elif ("__CHAT_VARS__" in expr
+                      or "__COLOAD_VARS__" in expr):
+                    problems.append(
+                        f"matrix.sets.{name}: __CHAT_VARS__/"
+                        "__COLOAD_VARS__ are retired; name the roles "
+                        "(e.g. 'chat & s2t')")
+    if matrix.get("evict_costs"):
+        problems.append("matrix.evict_costs: retired; remove it (eviction "
+                        "cost is derived)")
+    for key in ("embed_context", "rerank_context"):
+        if matrix.get(key) is not None:
+            problems.append(f"matrix.{key}: retired; set max_context on the "
+                            "embeddings/rerank task")
+    categories = _check_mapping(problems, "matrix.categories",
+                                matrix.get("categories"))
+    for name, spec in categories.items():
+        body = _check_mapping(problems, f"matrix.categories.{name}", spec,
+                              known=_CATEGORY_KEYS)
+        if not body.get("role"):
+            problems.append(f"matrix.categories.{name}: role is required")
+        elif body.get("role") not in served:
+            problems.append(f"matrix.categories.{name}: role "
+                            f"{body.get('role')!r} is not a role "
+                            f"({', '.join(served)})")
+
+    routing = _check_mapping(problems, "routing", cfg.get("routing"))
+    if routing:
+        problems.append("routing: retired; remove it (matrix.sets selects "
+                        "the router)")
+
+    pools = _check_mapping(problems, "pools", cfg.get("pools"))
+    for name, spec in pools.items():
+        body = _check_mapping(problems, f"pools.{name}", spec,
+                              known=_POOL_KEYS)
+        if "pins" in body:
+            _check_mapping(problems, f"pools.{name}.pins", body["pins"])
+
+    _check_mapping(problems, "capacity", cfg.get("capacity"),
+                   known=_CAPACITY_KEYS)
+    _check_mapping(problems, "hardware", cfg.get("hardware"),
+                   known=_HARDWARE_KEYS)
+
+    if cfg.get("device_roles") is not None:
+        problems.append("device_roles: retired; put device: on the role "
+                        "(roles.<name>.device: cpu)")
+
+    overrides = cfg.get("overrides")
+    if overrides is not None:
+        if not isinstance(overrides, (list, tuple)):
+            problems.append("overrides: must be a list of rules")
+        else:
+            for i, rule in enumerate(overrides):
+                if not isinstance(rule, dict):
+                    problems.append(f"overrides[{i}]: must be a mapping")
+                elif "when" not in rule:
+                    problems.append(f"overrides[{i}]: when is required")
+
+    for section, known in _BACKEND_KEYS.items():
+        _check_mapping(problems, section, cfg.get(section), known=known)
+
+    macros = _check_mapping(problems, "macros", cfg.get("macros"))
+    for name, value in macros.items():
+        if not isinstance(value, str):
+            problems.append(f"macros.{name}: must be a string of flags")
+
+    shed = cfg.get("shed")
+    if shed is not None and not isinstance(shed, (list, tuple)):
+        problems.append("shed: must be a list of capabilities")
+
+    return problems
 
 
 def parse_spare_mb(spare_str: str | None, vram_total: int) -> int:
@@ -190,10 +405,11 @@ class Profiles:
         """
         try:
             from llama_packer.backends import get_backend
-            role_defaults = get_backend(model.backend).default_batch_ubatch(model.role)
+            role_defaults = get_backend(model.backend).default_batch_ubatch(
+                roles.base_of(model.role))
         except Exception:
             role_defaults = (None, None)
-        rag_role = model.role in ("embeddings", "rerank")
+        rag_role = roles.base_of(model.role) in ("embeddings", "rerank")
         groups: dict[tuple, list] = {}
         for pname, resolved in self.matched_for(model):
             parallel = model.parallel_for(resolved.get("parallel", 1))

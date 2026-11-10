@@ -293,9 +293,16 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
                                                           monkeypatch):
     from llama_packer import writer
 
+    from llama_packer.endpoints import EMBEDDINGS, RERANK
+    from llama_packer.tasks import TaskCatalogue
+    tasks = TaskCatalogue.from_cfg({
+        "embeddings": {"endpoint": EMBEDDINGS, "max_context": 32768},
+        "rerank": {"endpoint": RERANK, "max_context": 16384}})
     chat = make_model("chat", context_length=32768)
-    embed = make_model("e", role="embeddings", context_length=32768)
-    rerank = make_model("r", role="rerank", context_length=16384)
+    embed = make_model("e", role="embeddings", context_length=32768,
+                       tasks=["embeddings"])
+    rerank = make_model("r", role="rerank", context_length=16384,
+                        tasks=["rerank"])
 
     def fake_effective_static(fit_bin, cache_type="q8_0", **kw):
         return (1000.0, 0.05, 0.0, 50.0)
@@ -314,8 +321,7 @@ def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
                         lambda **kw: calls.append(dict(kw)) or 8192)
     profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
     result = writer._solve_matrix_context(
-        [chat], embed, rerank, "unused", 48000, None, profiles,
-        knobs=MatrixKnobs(embed_context=32768, rerank_context=16384))
+        [chat], embed, rerank, "unused", 48000, None, profiles, tasks=tasks)
     assert result is not None
     assert calls[0]["embed_ctx"] == 32768   # configured, not hardcoded 8192
     assert calls[0]["rerank_ctx"] == 16384
@@ -330,9 +336,16 @@ def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
     # the solver sees fixed_overhead_mb > 0 for it.
     from llama_packer import writer
 
+    from llama_packer.endpoints import EMBEDDINGS, RERANK
+    from llama_packer.tasks import TaskCatalogue
+    tasks = TaskCatalogue.from_cfg({
+        "embeddings": {"endpoint": EMBEDDINGS, "max_context": 32768},
+        "rerank": {"endpoint": RERANK, "max_context": 16384}})
     chat = make_model("chat", context_length=32768)
-    embed = make_model("e", role="embeddings", context_length=32768)
-    rerank = make_model("r", role="rerank", context_length=16384)
+    embed = make_model("e", role="embeddings", context_length=32768,
+                       tasks=["embeddings"])
+    rerank = make_model("r", role="rerank", context_length=16384,
+                        tasks=["rerank"])
     tts = make_model("t", role="t2s", context_length=4096)
 
     def fake_fp(fit_bin, cache_type="q8_0", **kw):
@@ -350,12 +363,9 @@ def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
     profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
     result = writer._solve_matrix_context(
         [chat], embed, rerank, "unused", 100000, None, profiles,
-        knobs=MatrixKnobs(embed_context=32768, rerank_context=16384),
-        fixed_categories=[("tts", tts)])
+        tasks=tasks, fixed_categories=[("tts", tts)])
     assert result is not None
     assert any(c.get("fixed_overhead_mb", 0) > 0 for c in calls)
-    # Declared categories are not opportunistic co-loads.
-    assert result.coloads == ()
 
 
 

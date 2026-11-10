@@ -57,11 +57,21 @@ def test_solve_matrix_no_chat_participants_returns_none(make_model):
         [], embed, rerank, "unused", 100000, None, profiles) is None
 
 
+def _task_caps():
+    from llama_packer.endpoints import EMBEDDINGS, RERANK
+    from llama_packer.tasks import TaskCatalogue
+    return TaskCatalogue.from_cfg({
+        "embeddings": {"endpoint": EMBEDDINGS, "max_context": 32768},
+        "rerank": {"endpoint": RERANK, "max_context": 16384}})
+
+
 def _matrix_fixture(make_model, monkeypatch, chat_backend, chat_parallel):
     chat = _stub_vram(make_model("c", backend=chat_backend,
                                  parallel=chat_parallel, context_length=32768))
-    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
-    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
+    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768,
+                                  tasks=["embeddings"]))
+    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384,
+                                   tasks=["rerank"]))
     captured: dict = {}
 
     def fake_solve(**kw):
@@ -73,7 +83,7 @@ def _matrix_fixture(make_model, monkeypatch, chat_backend, chat_parallel):
                          "profiles": {"default": {}}})
     result = writer._solve_matrix_context(
         [chat], embed, rerank, "unused", 100000, None, profiles,
-        knobs=writer.MatrixKnobs(embed_context=32768, rerank_context=16384))
+        tasks=_task_caps())
     return result, captured
 
 
@@ -96,8 +106,10 @@ def test_matrix_category_unsizable_is_skipped(make_model, caplog, monkeypatch):
     # Validates: SPEC.md, 'VRAM Allocation': a category that cannot be
     # sized is skipped, never reserved.
     chat = _stub_vram(make_model("c", context_length=32768))
-    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
-    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
+    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768,
+                                  tasks=["embeddings"]))
+    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384,
+                                   tasks=["rerank"]))
     tts = make_model("t", role="t2s")
     tts.vram.effective_static = lambda *a, **k: None   # cannot be sized
     tts.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
@@ -108,10 +120,8 @@ def test_matrix_category_unsizable_is_skipped(make_model, caplog, monkeypatch):
     with caplog.at_level("WARNING"):
         result = writer._solve_matrix_context(
             [chat], embed, rerank, "unused", 100000, None, profiles,
-            knobs=writer.MatrixKnobs(embed_context=32768, rerank_context=16384),
-            fixed_categories=[("tts", tts)])
+            tasks=_task_caps(), fixed_categories=[("tts", tts)])
     assert result is not None
-    assert result.coloads == ()
     assert "cannot size" in caplog.text
 
 
@@ -120,8 +130,10 @@ def test_matrix_category_that_does_not_fit_is_not_reserved(make_model, caplog,
     # Validates: SPEC.md, 'VRAM Allocation': a category that does not fit
     # is not charged against the chat context.
     chat = _stub_vram(make_model("c", context_length=32768))
-    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
-    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
+    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768,
+                                  tasks=["embeddings"]))
+    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384,
+                                   tasks=["rerank"]))
     tts = _stub_vram(make_model("t", role="t2s", context_length=4096))
 
     def fake_solve(**kw):
@@ -133,8 +145,7 @@ def test_matrix_category_that_does_not_fit_is_not_reserved(make_model, caplog,
     with caplog.at_level("WARNING"):
         result = writer._solve_matrix_context(
             [chat], embed, rerank, "unused", 100000, None, profiles,
-            knobs=writer.MatrixKnobs(embed_context=32768, rerank_context=16384),
-            fixed_categories=[("tts", tts)])
+            tasks=_task_caps(), fixed_categories=[("tts", tts)])
     assert result is not None
     assert result.chat_ctx == 100000          # category not charged
     assert "does not fit" in caplog.text

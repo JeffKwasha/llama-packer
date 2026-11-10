@@ -193,10 +193,12 @@ def test_sidecar_capability_removal_warns(tmp_path, caplog):
     from llama_packer.scope import ScopeStack
     (tmp_path / "m.gguf").write_bytes(b"dummy")
     out = []
+    problems = []
     with caplog.at_level(logging.WARNING, logger="llama_packer.discover"):
         discover._build(tmp_path / "m.md",
-                        {"name": "m", "capabilities": ["-tools"]},
-                        None, ScopeStack(), None, out)
+                        {"name": "m", "capabilities": ["-tools"],
+                         "role": "chat"},
+                        None, ScopeStack(), None, out, problems)
     assert any("add capabilities" in r.message for r in caplog.records)
 
 

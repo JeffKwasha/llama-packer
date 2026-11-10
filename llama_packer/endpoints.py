@@ -54,8 +54,17 @@ ENGINE_ENDPOINTS: dict[str, frozenset[str]] = {
 
 
 def for_task(task: object) -> str | None:
-    """The endpoint *task* is served at, or None when it is not a task."""
-    return TASK_ENDPOINTS.get(task) if isinstance(task, str) else None
+    """The endpoint *task* is served at, or None when it is not a task.
+
+    A custom role is served at its base role's endpoint.
+    """
+    if not isinstance(task, str):
+        return None
+    endpoint = TASK_ENDPOINTS.get(task)
+    if endpoint is not None:
+        return endpoint
+    from llama_packer import roles
+    return TASK_ENDPOINTS.get(roles.base_of(task))
 
 
 def serves(endpoints: frozenset[str] | set[str], task: object) -> bool:

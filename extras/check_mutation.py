@@ -173,26 +173,6 @@ MUTATIONS = {
         "llama_packer/__main__.py",
         '        return "device: cpu — explicit placement"',
         '        return "explicit placement"'),
-    "test_device_roles_place_every_role_model": (
-        "llama_packer/__main__.py",
-        '            m.frontmatter["device"] = "cpu"',
-        '            m.frontmatter["device"] = "gpu"'),
-    "test_device_roles_absent_and_unmatched": (
-        "llama_packer/__main__.py",
-        '            logger.warning("device_roles: role %r matched no model", role)',
-        '            pass'),
-    "test_device_roles_rejects_unknown_role": (
-        "llama_packer/__main__.py",
-        '        if role not in roles.DEVICE_ROLES:',
-        '        if False:'),
-    "test_device_roles_rejects_a_non_cpu_value": (
-        "llama_packer/__main__.py",
-        '            if str(v).strip().lower() == "cpu":',
-        "            if True:"),
-    "test_device_roles_rejects_a_scalar": (
-        "llama_packer/__main__.py",
-        "    elif isinstance(roles_cfg, (list, tuple)):",
-        "    elif True:"),
     "test_cpu_chat_entry_gets_cpu_default_ttl": (
         "llama_packer/writer.py",
         "    if model.on_cpu:\n        return CPU_HELPER_TTL",
@@ -223,12 +203,12 @@ MUTATIONS = {
         "        embed_model = embed_model"),
     "test_cpu_fixed_category_resident_charged_host": (
         "llama_packer/writer.py",
-        "                if model is None or not model.on_cpu:\n"
-        "                    continue\n"
-        "                if name in self.host_unit_refused_vars:",
-        "                if True:\n"
-        "                    continue\n"
-        "                if name in self.host_unit_refused_vars:"),
+        "                if model.on_cpu:\n"
+        "                    mb = self._host_resident_mb(model, ctx)\n"
+        "                    self.host_ledger.add_resident(f\"{name}:{model.stem}\",",
+        "                if False:\n"
+        "                    mb = self._host_resident_mb(model, ctx)\n"
+        "                    self.host_ledger.add_resident(f\"{name}:{model.stem}\","),
     "test_host_measurement_does_not_leak_into_vram_pricing": (
         "llama_packer/vram.py",
         '        if getattr(self.model, "on_cpu", False) and not allow_cpu:',
@@ -258,16 +238,13 @@ MUTATIONS = {
         "        return set(parts)"),
     "test_solve_matrix_reserves_worst_set_not_category_union": (
         "llama_packer/writer.py",
-        "        return max(_set_costs(embed_ctx_, rerank_ctx_, extra_mb).values(),\n"
-        "                   default=0)",
-        "        return sum(_set_costs(embed_ctx_, rerank_ctx_, extra_mb).values())"),
+        "        return max(_set_costs(embed_ctx_, rerank_ctx_).values(), default=0)",
+        "        return sum(_set_costs(embed_ctx_, rerank_ctx_).values())"),
     "test_solve_matrix_unreferenced_category_reserves_nothing": (
         "llama_packer/writer.py",
-        "        return {name: set_overhead_mb(expr, var_mb, frozenset(), frozenset(),\n"
-        "                                      sets_cfg=raw_sets, coload_mb=coload_mb)\n"
+        "        return {name: set_overhead_mb(expr, var_mb, sets_cfg=raw_sets)\n"
         "                for name, expr in chat_sets.items()}",
-        "        return {name: set_overhead_mb(expr, var_mb, frozenset(), frozenset(),\n"
-        "                                      sets_cfg=raw_sets, coload_mb=coload_mb)\n"
+        "        return {name: set_overhead_mb(expr, var_mb, sets_cfg=raw_sets)\n"
         "                       + sum(v for n, v in fixed_mb.items()\n"
         "                             if n not in _expr_leaves(expr, raw_sets))\n"
         "                for name, expr in chat_sets.items()}"),

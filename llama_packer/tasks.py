@@ -22,8 +22,7 @@ from typing import Mapping
 
 from llama_packer.consts import KNOWN_CAPABILITIES
 from llama_packer.endpoints import ENDPOINTS
-from llama_packer.roles import SERVED_ROLES
-from llama_packer.utils import parse_ctx_size
+from llama_packer.utils import parse_ctx_size, parse_device
 
 log = logging.getLogger(__name__)
 
@@ -36,10 +35,13 @@ class Task:
 
     id: str
     endpoint: str
-    role: str
     intent: str = ""
+    #: Placement requirement: ``cpu``, a GPU index, or None.
+    device: str | int | None = None
     #: Minimum serving an entry must afford to satisfy this task.
     min_context: int = 0
+    #: Ceiling on the served context for this task, in tokens.
+    max_context: int | None = None
     min_parallel: int = 1
     require: frozenset[str] = frozenset()
     keep: frozenset[str] = frozenset()
@@ -68,15 +70,15 @@ class TaskCatalogue:
     def get(self, name: str) -> Task | None:
         return self.by_id.get(name)
 
+    def max_context_for(self, task_ids) -> int | None:
+        """Tightest declared ``max_context`` among *task_ids*, or None."""
+        caps = [t.max_context for t in (self.get(i) for i in task_ids)
+                if t is not None and t.max_context is not None]
+        return min(caps) if caps else None
+
     @property
     def order(self) -> tuple[str, ...]:
         return tuple(self.by_id)
-
-    def role_of(self, ids: tuple[str, ...] | list[str]) -> str | None:
-        """The scheduling role a task list implies, or None when it is mixed."""
-        roles = {t.role for t in (self.get(name) for name in ids)
-                 if t is not None}
-        return roles.pop() if len(roles) == 1 else None
 
     @classmethod
     def from_cfg(cls, cfg: dict | None) -> "TaskCatalogue":
@@ -110,19 +112,27 @@ def _parse(name: object, spec: object) -> Task | None:
                     "ignoring the task", task_id, endpoint,
                     ", ".join(sorted(ENDPOINTS)))
         return None
-    role = spec.get("role")
-    if role not in SERVED_ROLES:
-        log.warning("tasks: %s.role=%r is not a scheduling role (one of %s); "
-                    "ignoring the task", task_id, role,
-                    ", ".join(SERVED_ROLES))
-        return None
-    task = Task(task_id, str(endpoint), str(role))
+    task = Task(task_id, str(endpoint))
     changes: dict = {}
     for key, value in spec.items():
-        if key in ("endpoint", "role"):
+        if key == "endpoint":
             continue
         if key == "intent":
             changes["intent"] = str(value)
+        elif key == "device":
+            dev, problem = parse_device(value)
+            if problem:
+                log.warning("tasks: %s.device=%r is %s; ignoring it",
+                            task_id, value, problem)
+                continue
+            changes["device"] = dev
+        elif key == "max_context":
+            parsed = parse_ctx_size(value)
+            if parsed is None or parsed <= 0:
+                log.warning("tasks: %s.max_context=%r is not a positive size; "
+                            "ignoring it", task_id, value)
+                continue
+            changes["max_context"] = parsed
         elif key == "min_context":
             parsed = parse_ctx_size(value)
             if parsed is None or parsed <= 0:
@@ -169,6 +179,9 @@ def _parse(name: object, spec: object) -> Task | None:
                             "it", task_id, value)
                 continue
             changes[key] = tuple(str(v) for v in value)
+        elif key == "role":
+            log.warning("tasks: %s.role is retired; the model declares its "
+                        "role (sidecar role: or dirs:)", task_id)
         else:
             log.warning("tasks: %s.%s is not a task key; ignoring it",
                         task_id, key)

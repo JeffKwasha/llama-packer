@@ -24,7 +24,6 @@ from pathlib import Path
 import yaml
 
 from llama_packer import ggufmeta
-from llama_packer import roles
 from llama_packer.consts import (
     _SAFETENSORS_DTYPE_BYTES,
     _KV_CACHE_BYTES,
@@ -32,7 +31,6 @@ from llama_packer.consts import (
     _SSD_READ_MBPS,
     _HDD_READ_MBPS,
     _UNKNOWN_READ_MBPS,
-    _DEFAULT_DIR_ROLES,
     _DIFFUSION_ARCH_RES,
     _WEIGHT_SUFFIXES,
 )
@@ -488,19 +486,30 @@ def _is_ignored(rel_parts: tuple[str, ...], rel_path: str,
             return True
     return False
 
-# Roles and their derived sets live in `roles.py`; these names are the
-# module-level aliases older imports use, never a second definition.
-SERVED_ROLES = roles.SERVED_ROLES
-NON_CHAT_ROLES = roles.NON_CHAT_ROLES
+def parse_device(value: object) -> tuple[str | int | None, str | None]:
+    """Canonical ``device:`` value: ``"cpu"``, a GPU index, or None.
 
-
-def validate_dir_roles(dir_roles: dict) -> str | None:
-    """Validate a profiles.yaml ``dirs:`` mapping; return an error message or None."""
-    for d, r in dir_roles.items():
-        if r not in SERVED_ROLES:
-            return (f"dirs: {d!r}: unknown role {r!r} "
-                    f"(allowed: {', '.join(SERVED_ROLES)})")
-    return None
+    The one parser for every place a device is declared (sidecar, task,
+    role).  ``auto`` (and an omitted key) means the packer decides; there is
+    no ``gpu`` or ``any`` spelling.  Returns ``(device, problem)``.
+    """
+    if value is None or value == "":
+        return None, None
+    if isinstance(value, bool):
+        return None, "not a GPU index"
+    if isinstance(value, int):
+        return ((value, None) if value >= 0
+                else (None, "not a non-negative GPU index"))
+    text = str(value).strip().lower()
+    if text == "auto":
+        return None, None
+    if text == "cpu":
+        return "cpu", None
+    if text.lstrip("+-").isdigit():
+        index = int(text)
+        return ((index, None) if index >= 0
+                else (None, "not a non-negative GPU index"))
+    return None, "neither 'cpu' nor a GPU index"
 
 
 def companion_kind(stem: str) -> str | None:
@@ -680,17 +689,6 @@ def hf_readme_kind(repo_id: str, hf_home=None) -> str | None:
         if hit:
             return hit
     return None
-
-
-def dir_role_map(extra_dirs: list[str] | None = None,
-                 dir_roles: dict | None = None) -> dict[str, str]:
-    """Effective directory-name → role map: defaults + extra dirs + profiles.yaml ``dirs:``."""
-    role_map = dict(_DEFAULT_DIR_ROLES)
-    for d in (extra_dirs or []):
-        role_map.setdefault(str(d).lower(), _DEFAULT_DIR_ROLES.get(str(d).lower()) or "chat")
-    for d, r in (dir_roles or {}).items():
-        role_map[str(d).lower()] = str(r)
-    return role_map
 
 
 # ── Directory-scoped models.yaml ──────────────────────────────────────

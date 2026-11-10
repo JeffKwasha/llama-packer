@@ -28,9 +28,9 @@ audio.cpp `task` values map onto llama-packer roles:
 | `vc`, `s2s` | `vc` (later) | audio → audio |
 | `sep` | (later) | audio → audio × tracks |
 
-Shipped now: `t2s` + `s2t`. Additional roles are not part of the closed
-role vocabulary; `capabilities.in/out` are freeform lists, so a future role
-is a contract change, not a schema change.
+Shipped now: `t2s` + `s2t` (the default roles). Role labels are
+operator data, so another label is free; a new audio behaviour is a contract
+change, not a schema change.
 
 ## Sidecar
 
@@ -129,9 +129,9 @@ engine resolves the path and rejects extensionless targets with
 Two layers keep audio GGUFs off the chat path and whisper models out of
 audio.cpp:
 
-1. **Directory authority** — audio models live under audio-mapped dirs
-   (`t2s/`, `s2t/`, …; opt-in via `dirs:`). A `.gguf` in `chat/` is never an
-   audio model.
+1. **Directory authority** — audio models live under the directories their
+   roles own (`t2s/`, `s2t/`, …; the default roles own them, and `backends:`
+   enables the engine). A `.gguf` in `chat/` is never an audio model.
 2. **Role + formats** — audio.cpp serves only `t2s`/`s2t` for
    `.gguf`/`.safetensors`/`hf_repo`, so llama.cpp's `.gguf` chat selection
    cannot claim them. whisper `.bin` models are not in its formats, so they
@@ -151,15 +151,17 @@ Declare audio as co-load categories ([`matrix:`](../../profiles.yaml.example)):
 ```yaml
 matrix:
   categories: {tts: {role: t2s}, stt: {role: s2t}}
-  evict_costs: {tts: 50, stt: 50}     # brief use: evict before chat context
   sets:
-    rag:   "__CHAT_VARS__ & emb & rnk"
-    voice: "__CHAT_VARS__ & (tts | stt)"
+    rag:   "chat & embeddings & rerank"
+    voice: "chat & s2t"
+    talk:  "chat & t2s"
 ```
 
-`tts` and `stt` are separate categories because switching between them forces
-a resident reload. Declared categories are reserved as fixed-overhead residents
-alongside chat and RAG while the chat context stays at/above the co-load floor.
+A set names roles (or literal entry ids); the chat solve reserves the most
+expensive model each named role can contribute. `tts` and `stt` are separate
+categories because switching between them forces a resident reload. A task
+with `device: cpu` (the audio-cpp default here) places its models on the host,
+so they cost RAM rather than VRAM.
 
 ## Build / install
 

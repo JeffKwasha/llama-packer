@@ -41,7 +41,7 @@ import logging
 import os
 from pathlib import Path
 
-from llama_packer import tasks, utils
+from llama_packer import roles, tasks, utils
 from llama_packer.endpoints import validate_engines_value
 from llama_packer.model import Model
 from llama_packer.scope import ScopeStack
@@ -49,13 +49,15 @@ from llama_packer.scope import ScopeStack
 logger = logging.getLogger(__name__)
 
 
+class DiscoveryError(Exception):
+    """Models that resolve to no role, or to a role no file defines."""
+
+
 def discover(
     models_dirs,
     *,
     stack: ScopeStack | None = None,
     generate_stubs: bool = False,
-    extra_dirs: list[str] | None = None,
-    dir_roles: dict | None = None,
     hf_home=None,
 ) -> list[Model]:
     """Walk *models_dirs* depth-first and return deduplicated Models.
@@ -70,7 +72,6 @@ def discover(
         models_dirs = [Path(d) for d in models_dirs]
 
     stack = stack or ScopeStack()
-    role_map = utils.dir_role_map(extra_dirs, dir_roles)
 
     # Global registry: sidecar → weight claims. Cleared per discover() so
     # orphan detection can ask Model.is_claimed(path) after the walk.
@@ -79,13 +80,14 @@ def discover(
     models: list[Model] = []
     orphan_candidates: list[tuple[Path, Path, str | None, ScopeStack]] = []
     skipped: set[str] = set()
+    problems: list[str] = []
     for root in models_dirs:
         if not root.is_dir():
             continue
         logger.info("scanning models dir: %s", root)
         ignore = utils.load_model_ignore(root)
-        _walk(root, root, None, role_map, ignore, stack,
-              hf_home, models, orphan_candidates, skipped)
+        _walk(root, root, ignore, stack, hf_home, models,
+              orphan_candidates, skipped, problems)
 
     # Deferred orphan handling: the walk above created sidecars and *remembered*
     # candidate weight files; only now, with all sidecars validated and registered,
@@ -99,14 +101,18 @@ def discover(
         # Defensive: companions should never have been collected, but re-check.
         if utils.companion_kind(gguf.stem):
             continue
-        if role == "image" and gguf.suffix.lower() == ".safetensors":
+        if role and roles.base_of(role) == "image" \
+                and gguf.suffix.lower() == ".safetensors":
             continue
         _model_from_orphan(gguf, root, role, stack_snapshot, generate_stubs,
-                           hf_home, models)
+                           hf_home, models, problems)
 
     if skipped:
-        logger.info("skipping %s (not in dirs map; extend via profiles.yaml dirs:)",
+        logger.info("skipping %s (no role owns them; give a role that dir:)",
                     ", ".join(f"{d}/" for d in sorted(skipped)))
+
+    if problems:
+        raise DiscoveryError("\n".join(problems))
 
     # Deduplicate links to the same model file (first wins): symlinks via
     # realpath, hardlinks via (st_dev, st_ino).
@@ -164,20 +170,18 @@ def discover(
     return filtered
 
 
-def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
-          ignore: list[str], stack: ScopeStack,
+def _walk(d: Path, root: Path, ignore: list[str], stack: ScopeStack,
           hf_home, out: list[Model],
           orphan_candidates: list[tuple[Path, Path, str | None, ScopeStack]],
-          skipped: set[str]) -> None:
+          skipped: set[str], problems: list[str]) -> None:
     """Preorder DFS: this directory's scope and models first, then children.
 
-    *role* is the inherited directory role (None at a models-dir root and for
-    unmapped depth-1 directories, whose subtrees are not served at all).
-
-    This walk *creates sidecars and remembers weight files*; orphan stub
-    creation is deferred until all sidecars are validated and registered so
-    Model.is_claimed can answer canonically.
+    The role is the one whose ``dir:`` owns this directory; a subtree no role
+    owns is not descended at all.  This walk *creates sidecars and remembers
+    weight files*; orphan stub creation is deferred until all sidecars are
+    validated and registered so Model.is_claimed can answer canonically.
     """
+    role = roles.owner(d.relative_to(root).parts)
     stack.push(utils.load_dir_config(d), origin=str(d / utils.DIR_CONFIG_NAME))
     try:
         for p in sorted(d.iterdir()):
@@ -188,12 +192,14 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
                 continue
             suffix = p.suffix.lower()
             if suffix == ".md":
-                _model_from_sidecar(p, root, role, stack, hf_home, out)
+                _model_from_sidecar(p, root, role, stack, hf_home, out,
+                                    problems)
             elif suffix == ".bin":
                 # Whisper GGML weights: served only via an authored same-stem
                 # sidecar inside an s2t-mapped directory — never walked as
                 # orphans, never stubbed (few models, low churn).
-                if role == "s2t" and not p.with_suffix(".md").is_file():
+                if role and roles.base_of(role) == "s2t" \
+                        and not p.with_suffix(".md").is_file():
                     logger.info("skipping %s: .bin model without a same-stem "
                                 ".md sidecar (write one to serve it)", p.name)
             elif suffix in (".gguf", ".safetensors"):
@@ -204,21 +210,20 @@ def _walk(d: Path, root: Path, role: str | None, role_map: dict[str, str],
                 # Image role: safetensors orphans are typically companions, not
                 # standalone diffusion models. Require a sidecar to serve a safetensors
                 # image model (gguf diffusion orphans still auto-stub).
-                if role == "image" and suffix == ".safetensors":
+                if role and roles.base_of(role) == "image" \
+                        and suffix == ".safetensors":
                     continue
                 # Remember candidate; Model.is_claimed (global registry) decides later.
                 orphan_candidates.append((p, root, role, copy.deepcopy(stack)))
         for child in sorted(d.iterdir()):
             if not child.is_dir():
                 continue
-            rel_first = child.relative_to(root).parts[0].lower()
-            child_role = role or role_map.get(rel_first)
-            if role is None and child_role is None:
-                # Depth-1 directory outside the role whitelist: not served.
-                skipped.add(rel_first)
+            rel = child.relative_to(root)
+            if not roles.covers(rel.parts):
+                skipped.add(rel.parts[0].lower())
                 continue
-            _walk(child, root, child_role, role_map, ignore, stack,
-                  hf_home, out, orphan_candidates, skipped)
+            _walk(child, root, ignore, stack, hf_home, out,
+                  orphan_candidates, skipped, problems)
     finally:
         stack.pop()
 
@@ -231,10 +236,9 @@ def _warn_unsupported_values(model: Model, label: str, catalogue=None) -> None:
     later as "no backend supports", and ``device: gpu`` silently placed the
     model on the device exactly as if the key were absent.
     """
-    for alien in ("role", "usage"):
-        if alien in model.sidecar_keys:
-            logger.warning("%s: %s: is not a sidecar key; declare tasks:",
-                           label, alien)
+    if "usage" in model.sidecar_keys:
+        logger.warning("%s: usage: is not a sidecar key; declare tasks:",
+                       label)
     if catalogue is not None:
         for problem in tasks.validate_task_ids(
                 model.frontmatter.get("tasks"), catalogue):
@@ -263,19 +267,12 @@ def _warn_unsupported_values(model: Model, label: str, catalogue=None) -> None:
 
 def _device_problem(dev) -> str | None:
     """Why *dev* is not a usable `device:` value, or None when it is."""
-    if isinstance(dev, bool):
-        return "not a GPU index"
-    if isinstance(dev, int):
-        return None if dev >= 0 else "not a non-negative GPU index"
-    if isinstance(dev, str):
-        s = dev.strip()
-        if s.lstrip("+-").isdigit():
-            return None if int(s) >= 0 else "not a non-negative GPU index"
-    return "neither 'cpu' nor a GPU index"
+    return utils.parse_device(dev)[1]
 
 
 def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
-           hf_home, out: list[Model], stub: bool = False) -> None:
+           hf_home, out: list[Model], problems: list[str],
+           stub: bool = False) -> None:
     """The single model pipeline: merge → construct → rules → companions → finalize.
 
     *stub* marks freshly materialized orphan sidecars: their measured-file
@@ -290,17 +287,38 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
             "add capabilities; conditional serving belongs in an mmproj "
             "block", path.name)
     merged = stack.merge_defaults(frontmatter)
-    # A model in embed//rerank/image/s2t/t2s inherits its role from the
-    # location when its own data (sidecar or defaults) does not declare one.
-    if role in ("embeddings", "rerank", "image", "s2t", "t2s") \
-            and "role" not in merged and "tasks" not in merged:
+    # A model inherits its role from the tree that owns it; a sidecar or
+    # directory default may override it.  Anything else is an operator error:
+    # there is no default role.
+    if role and "role" not in merged:
         merged["role"] = role
+    declared = merged.get("role")
+    if not isinstance(declared, str) or not declared.strip():
+        problems.append(f"{path}: no role owns this model; give a role a "
+                        "dir: that covers it or set role: in the sidecar")
+        return
+    declared = declared.strip()
+    if roles.get(declared) is None:
+        problems.append(f"{path}: role {declared!r} is not defined in "
+                        f"profiles.yaml roles: "
+                        f"({', '.join(roles.names()) or 'none'})")
+        return
+    merged["role"] = declared
     try:
         model = Model(path, merged, hf_home=hf_home)
     except Exception as e:
         logger.error("failed to load model from %s: %s", path.name, e)
         return
     model.stub = stub
+    catalogue = stack.tasks
+    spans = {t.endpoint for t in ((catalogue.get(tid) if catalogue else None)
+                                  for tid in model.task_ids)
+             if t is not None}
+    if len(spans) > 1:
+        problems.append(
+            f"{path}: tasks span endpoints ({', '.join(sorted(spans))}); "
+            "one serving cannot serve different endpoints")
+        return
     # Authored keys only: the directory-derived role and the role finalize
     # derives from tasks: are builder values, not sidecar typos.
     model.sidecar_keys = frozenset(frontmatter)
@@ -314,19 +332,20 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     # cached HF model card) and never blocks the run — one error log per
     # offending file, then the model is excluded from the config.
     # The `image` role is exempt — diffusion weights are expected there.
-    if model.role in utils.SERVED_ROLES and model.role != "image" and model.gguf_path:
+    if model.role in roles.names() \
+            and roles.base_of(model.role) != "image" and model.gguf_path:
         kind = model.file_kind
         if kind == "image":
             logger.error(
                 "%s: diffusion/image weights classified in a served %s role "
-                "(header check); excluded. Move under an image dir, set "
-                "`ignore: true`, or extend dirs: in profiles.yaml",
+                "(header check); excluded. Move under a role that owns the "
+                "image tree, set `ignore: true`, or set role: in the sidecar",
                 path.name, model.role)
             return
     # Guard: image role should only serve diffusion/image weights — skip
     # textual-inversion embeddings, loras, and other assets that live under
     # img/ but are not diffusion models themselves (they are companions).
-    if model.role == "image" and model.gguf_path:
+    if roles.base_of(model.role) == "image" and model.gguf_path:
         kind = model.file_kind
         if kind != "image":
             logger.info("skipping %s: not diffusion/image weights in image role (kind=%s)",
@@ -335,23 +354,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     out.append(model)
 
 
-def _effective_role(fm: dict, role: str | None) -> str | None:
-    """Role for a sidecar: its declared tasks, then an embeddings/rerank/image/
-    s2t/t2s *directory*, then a ``type:`` field containing embed/rerank/image."""
-    if role in ("embeddings", "rerank", "image", "s2t", "t2s"):
-        return role
-    typ = str(fm.get("type") or "").lower()
-    if "rerank" in typ:
-        return "rerank"
-    if "embed" in typ:
-        return "embeddings"
-    if "image" in typ:
-        return "image"
-    return role
-
-
 def _model_from_sidecar(md_path: Path, root: Path, role: str | None,
-                         stack: ScopeStack, hf_home, out: list[Model]) -> None:
+                         stack: ScopeStack, hf_home, out: list[Model],
+                         problems: list[str]) -> None:
     # Never serve sidecars that live inside the HF hub cache hierarchy
     # (snapshots contain README.md plus any stray .md a user may have dropped).
     try:
@@ -373,12 +378,13 @@ def _model_from_sidecar(md_path: Path, root: Path, role: str | None,
     if fm.get("ignore"):
         logger.info("ignore: skipping %s", md_path.name)
         return
-    _build(md_path, fm, _effective_role(fm, role), stack, hf_home, out)
+    _build(md_path, fm, role, stack, hf_home, out, problems)
 
 
 def _model_from_orphan(gguf: Path, root: Path, role: str | None,
                        stack: ScopeStack, generate_stubs: bool,
-                       hf_home, out: list[Model]) -> None:
+                       hf_home, out: list[Model],
+                       problems: list[str]) -> None:
     """Serve an orphan model file; materialize its empty editable sidecar.
 
     Stubs carry no data — identity falls back to the stem, context to the
@@ -386,7 +392,7 @@ def _model_from_orphan(gguf: Path, root: Path, role: str | None,
     sidecar behave identically through the pipeline.
     """
     md_path = _materialize_sidecar(gguf, root, generate_stubs)
-    _build(md_path, {}, role, stack, hf_home, out, stub=True)
+    _build(md_path, {}, role, stack, hf_home, out, problems, stub=True)
 
 
 def _write_stub(md_path: Path) -> None:

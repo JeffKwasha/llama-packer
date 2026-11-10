@@ -26,7 +26,7 @@ hf_repo: AtomicChat/Ornith-1.5-9B-GGUF   # resolved offline from $HF_HOME/hub
 `chat/`; the next run auto-writes a stub sidecar beside it (dedup by realpath
 prevents double-serving).
 
-**Not recommended:** mapping the cache itself via `dirs: {hf_hub: chat}` — one
+**Not recommended:** pointing a role's `dir:` at the cache tree — one
 uniform role for mixed content, and stubs get written inside the cache tree.
 
 Never-servable formats regardless of sidecar: CTranslate2 (faster-whisper),
@@ -47,8 +47,8 @@ Three separate causes — check in order:
    serves 40960 no matter how much VRAM is free — small weights buy *slots*,
    never more context than the file allows.
 2. **`parallel: 1` means the solve skipped the model.** Auto-parallel only
-   runs for `role: chat` on llama-server/vLLM with no `parallel:` pin in the
-   sidecar/block or any profile. It is on by default; `matrix:
+   runs for a role whose `kind` is `chat`, on llama-server/vLLM, with no
+   `parallel:` pin in the sidecar/block or any profile. It is on by default; `matrix:
    auto_parallel: false` turns it off fleet-wide.
 3. **The floor-ceiling trap.** A tool-calling model defaults to a 131072
    floor; if its max context is below that *and* it has no `context_length:`
