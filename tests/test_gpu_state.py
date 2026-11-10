@@ -79,7 +79,11 @@ def test_kill_process_group_kills_descendants(tmp_path):
     grandchild = int(pidfile.read_text())
     gpu_state.kill_process_group(proc)
     assert proc.poll() is not None
+    deadline = time.monotonic() + 2
     state = _proc_state(grandchild)
+    while state not in (None, "Z") and time.monotonic() < deadline:
+        time.sleep(0.02)
+        state = _proc_state(grandchild)
     assert state in (None, "Z"), f"the grandchild is still {state}"
 
 
