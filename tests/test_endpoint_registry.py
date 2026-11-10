@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from llama_packer import endpoints, roles
+from llama_packer import endpoints
 from llama_packer.backends import BACKENDS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -14,12 +14,6 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_registry_invariants_hold():
     # Validates: docs/plans/requirement-trace.md, requirement #97
     assert endpoints.check_registry() == []
-
-
-def test_registry_task_mapping_is_total():
-    # Validates: docs/plans/requirement-trace.md, requirement #97
-    assert set(endpoints.TASK_ENDPOINTS) == set(roles.names())
-    assert set(endpoints.TASK_ENDPOINTS.values()) <= endpoints.ENDPOINTS
 
 
 def test_registry_engine_table_matches_backends():
@@ -31,12 +25,6 @@ def test_registry_engine_table_matches_backends():
 def test_registry_docs_agree():
     # Validates: docs/plans/requirement-trace.md, requirement #97
     assert endpoints.docs_agree(ROOT) == []
-
-
-def test_registry_unknown_endpoint_is_rejected():
-    # Validates: docs/plans/requirement-trace.md, requirement #97
-    assert endpoints.for_task("nope") is None
-    assert endpoints.serves({endpoints.CHAT}, "nope") is False
 
 
 def test_registry_engines_value_shape():

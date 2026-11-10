@@ -38,7 +38,7 @@ def test_filter_supported_rejects_audio_image_roles_on_llama_server(
     with caplog.at_level("ERROR"):
         out = writer._filter_supported([m], "q8_0")
     assert out == []
-    assert "not supported" in caplog.text
+    assert "needs " in caplog.text
 
 
 def test_filter_supported_allows_role_on_matching_backend(make_model):

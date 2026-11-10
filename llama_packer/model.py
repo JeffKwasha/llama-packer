@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 import yaml
 
-from llama_packer import ggufmeta, roles, utils
+from llama_packer import ggufmeta, utils
+from llama_packer.endpoints import CHAT
 from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DEFAULT_IMAGE_OUTPUT_RESERVE,
@@ -321,6 +322,8 @@ class Model:
     _stat_sig: tuple[int, int] | None = None  # (size, mtime_ns) at registration
     _file: Model | None = None  # canonical file delegate (self when sidecar-less)
     _header: object = None  # lazy parsed header (subclass fills on demand)
+    #: Tasks the sidecar declares, resolved by discovery before companions.
+    tasks_resolved: tuple = ()
 
     # Global registry: claimed weight files → owning Model. The key is the
     # weight's realpath (and dev:ino for hardlinks) so a sidecar with an
@@ -799,7 +802,7 @@ class Model:
             # mmproj_stripped (stem without 'mmproj.*' + quant/version) must be
             # prefix of model stem.
             # Rerank/embeddings (and image/s2t/t2s) never auto-attach vision.
-            if self.hf_repo and self.role not in roles.non_chat():
+            if self.hf_repo and not self.serves_endpoint(CHAT):
                 snap, _ = self._finder.snapshot_files(
                     self.hf_repo, self._hf_home)
                 # Auto only when model is inside its snapshot directory
@@ -1025,7 +1028,7 @@ class Model:
             ctx = int(self.frontmatter.get(
                 "context_length", _DEFAULT_CONTEXT_LENGTH
             ))
-        if ctx < _MIN_CTX_SIZE and roles.base_of(self.role) == "chat" \
+        if ctx < _MIN_CTX_SIZE and self.serves_endpoint(CHAT) \
                 and self.stem not in _warned_sub4k:
             _warned_sub4k.add(self.stem)
             logger.warning(
@@ -1400,11 +1403,10 @@ class Model:
         self,
         profile: dict | None,
         fleet: dict | None,
-        role_defaults: tuple[int | None, int | None],
     ) -> tuple[int | None, int | None]:
         """Resolved ``(batch, ubatch)`` for the serve command and the VRAM
         measurement shape — sidecar ``batch:``/``ubatch:`` > profile keys >
-        fleet ``llama_server: batch:/ubatch:`` > role defaults.  Each half
+        fleet ``llama_server: batch:/ubatch:``.  Each half
         resolves independently.  ``None`` means "nothing configured": the
         backend renders no flag and the engine's own builtin applies.  A
         malformed value is warned about and falls through to the next tier
@@ -1434,12 +1436,12 @@ class Model:
         fleet = fleet or {}
         batch = tier(fm.get("batch"),
                      tier(profile.get("batch"),
-                          tier(fleet.get("batch"), role_defaults[0], "batch"),
+                          tier(fleet.get("batch"), None, "batch"),
                           "batch"),
                      "batch")
         ubatch = tier(fm.get("ubatch"),
                       tier(profile.get("ubatch"),
-                           tier(fleet.get("ubatch"), role_defaults[1], "ubatch"),
+                           tier(fleet.get("ubatch"), None, "ubatch"),
                            "ubatch"),
                       "ubatch")
         return batch, ubatch
@@ -1510,6 +1512,11 @@ class Model:
         if dm:
             return dm
         return next(iter(modes))
+
+    def serves_endpoint(self, endpoint: str) -> bool:
+        """True when any declared task is served at *endpoint*."""
+        return any(getattr(t, "endpoint", None) == endpoint
+                   for t in self.tasks_resolved)
 
     @property
     def role(self) -> str:

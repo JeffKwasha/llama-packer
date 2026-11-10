@@ -9,10 +9,15 @@ from llama_packer.writer import Planner, _capacity_fields
 
 
 def _model(**kw):
+    from conftest import fake_tasks
     base = dict(on_cpu=False, size_mb=20000, role="chat",
                 sidecar_keys=frozenset(), frontmatter={})
     base.update(kw)
-    return SimpleNamespace(**base)
+    m = SimpleNamespace(**base)
+    m.tasks_resolved = fake_tasks({"role": m.role})
+    m.serves_endpoint = lambda ep: any(t.endpoint == ep
+                                       for t in m.tasks_resolved)
+    return m
 
 
 def _variant(**kw):

@@ -7,7 +7,30 @@ from pathlib import Path
 
 import pytest
 
+from llama_packer.endpoints import (CHAT, EMBEDDINGS, IMAGES, RERANK,
+                                    SPEECH, TRANSCRIPTIONS)
 from llama_packer.model import Model
+from llama_packer.tasks import Task
+
+_ENDPOINT_BY_TASK = {
+    "chat": CHAT, "coding": CHAT, "qa": CHAT, "aux": CHAT,
+    "describe": CHAT, "max": CHAT,
+    "embeddings": EMBEDDINGS, "rerank": RERANK, "image": IMAGES,
+    "s2t": TRANSCRIPTIONS, "t2s": SPEECH,
+}
+
+
+def fake_tasks(fm: dict) -> tuple:
+    """Resolved tasks for a test model: declared ids, else its role."""
+    ids = fm.get("tasks")
+    if isinstance(ids, str):
+        ids = [ids]
+    if ids:
+        return tuple(Task(str(i), _ENDPOINT_BY_TASK.get(str(i), CHAT))
+                     for i in ids)
+    role = str(fm.get("role") or "chat")
+    task = role if role in _ENDPOINT_BY_TASK else "chat"
+    return (Task(task, _ENDPOINT_BY_TASK[task]),)
 
 
 @pytest.fixture
@@ -26,6 +49,7 @@ def make_model(tmp_path):
         fm: dict = {"name": stem, "context_length": 32768}
         fm.update(frontmatter)
         model = Model(md_path, fm)
+        model.tasks_resolved = fake_tasks(fm)
         # Synthetic fixture: no authored sidecar, so it keeps orphan
         # semantics (engine inference) unless a test says otherwise.
         model.stub = True

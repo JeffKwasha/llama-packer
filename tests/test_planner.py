@@ -10,7 +10,7 @@ import pytest
 
 from llama_packer.consts import _RESERVE_VIDEO
 from llama_packer.profiles import Profiles
-from conftest import entry_for, only_entry, entry_id, tasks_section
+from conftest import entry_for, fake_tasks, only_entry, entry_id, tasks_section
 from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context, _has_chat_slot
 
 TVARS = {"llama_bin": "/opt/llama-server"}
@@ -960,8 +960,9 @@ def make(stem, **fm):
     import tempfile
     d = tempfile.mkdtemp()
     (Path(d) / f"{stem}.gguf").write_bytes(b"x")
-    m = Model(Path(d) / f"{stem}.md", {"name": stem, "context_length": 32768,
-                                       **fm})
+    fm = {"name": stem, "context_length": 32768, **fm}
+    m = Model(Path(d) / f"{stem}.md", fm)
+    m.tasks_resolved = fake_tasks(fm)
     return m
 
 
@@ -1899,20 +1900,6 @@ def test_task_max_context_caps_a_non_chat_entry(make_model):
     planner._bounded_ctx = lambda *a, **kw: kw.get("context_length") or 32768
     variants = planner.plan()["e"]
     assert [v.ctx_size for v in variants] == [4096]
-
-
-def test_groups_for_uses_backend_batch_defaults(profiles, monkeypatch):
-    # Regression: a function-local `roles` import made this raise and the
-    # except swallowed it, so the backend default was never consulted.
-    import llama_packer.backends as backends
-
-    class B:
-        def default_batch_ubatch(self, role):
-            return (123, 45)
-
-    monkeypatch.setattr(backends, "get_backend", lambda name: B())
-    groups = profiles.groups_for(make("m", role="chat"), 48 * 1024, None)
-    assert any(key[-2:] == (123, 45) for key in groups)
 
 
 def test_task_max_context_is_per_entry(make_model):

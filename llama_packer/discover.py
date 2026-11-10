@@ -42,6 +42,7 @@ import os
 from pathlib import Path
 
 from llama_packer import roles, tasks, utils
+from llama_packer.endpoints import IMAGES
 from llama_packer.endpoints import validate_engines_value
 from llama_packer.model import Model
 from llama_packer.scope import ScopeStack
@@ -100,9 +101,6 @@ def discover(
             continue
         # Defensive: companions should never have been collected, but re-check.
         if utils.companion_kind(gguf.stem):
-            continue
-        if role and roles.base_of(role) == "image" \
-                and gguf.suffix.lower() == ".safetensors":
             continue
         _model_from_orphan(gguf, root, role, stack_snapshot, generate_stubs,
                            hf_home, models, problems)
@@ -196,10 +194,8 @@ def _walk(d: Path, root: Path, ignore: list[str], stack: ScopeStack,
                                     problems)
             elif suffix == ".bin":
                 # Whisper GGML weights: served only via an authored same-stem
-                # sidecar inside an s2t-mapped directory — never walked as
-                # orphans, never stubbed (few models, low churn).
-                if role and roles.base_of(role) == "s2t" \
-                        and not p.with_suffix(".md").is_file():
+                # sidecar — never walked as orphans, never stubbed.
+                if not p.with_suffix(".md").is_file():
                     logger.info("skipping %s: .bin model without a same-stem "
                                 ".md sidecar (write one to serve it)", p.name)
             elif suffix in (".gguf", ".safetensors"):
@@ -207,11 +203,10 @@ def _walk(d: Path, root: Path, ignore: list[str], stack: ScopeStack,
                     continue  # companions join via fuzzy resolution, never walked
                 if p.with_suffix(".md").is_file():
                     continue  # exact-stem sidecar owns this file
-                # Image role: safetensors orphans are typically companions, not
-                # standalone diffusion models. Require a sidecar to serve a safetensors
-                # image model (gguf diffusion orphans still auto-stub).
-                if role and roles.base_of(role) == "image" \
-                        and suffix == ".safetensors":
+                # A safetensors weight declares its engine and tasks in a
+                # sidecar; guessing from the filename is exactly what this
+                # project refuses to do. GGUF orphans still auto-stub.
+                if suffix == ".safetensors":
                     continue
                 # Remember candidate; Model.is_claimed (global registry) decides later.
                 orphan_candidates.append((p, root, role, copy.deepcopy(stack)))
@@ -323,6 +318,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     # derives from tasks: are builder values, not sidecar typos.
     model.sidecar_keys = frozenset(frontmatter)
     stack.apply_rules(model)
+    stack.annotate_tasks(model)
     model.resolve_companions()
     model.sync_measured_file(write=not stub)
     stack.finalize(model)
@@ -331,26 +327,20 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
     # classification is header-only (GGUF metadata / safetensors names /
     # cached HF model card) and never blocks the run — one error log per
     # offending file, then the model is excluded from the config.
-    # The `image` role is exempt — diffusion weights are expected there.
-    if model.role in roles.names() \
-            and roles.base_of(model.role) != "image" and model.gguf_path:
-        kind = model.file_kind
-        if kind == "image":
-            logger.error(
-                "%s: diffusion/image weights classified in a served %s role "
-                "(header check); excluded. Move under a role that owns the "
-                "image tree, set `ignore: true`, or set role: in the sidecar",
-                path.name, model.role)
-            return
-    # Guard: image role should only serve diffusion/image weights — skip
-    # textual-inversion embeddings, loras, and other assets that live under
-    # img/ but are not diffusion models themselves (they are companions).
-    if roles.base_of(model.role) == "image" and model.gguf_path:
-        kind = model.file_kind
-        if kind != "image":
-            logger.info("skipping %s: not diffusion/image weights in image role (kind=%s)",
-                        path.name, kind)
-            return
+    # The image endpoint is exempt — diffusion weights are expected there.
+    if model.file_kind == "image" and not model.serves_endpoint(IMAGES):
+        logger.error(
+            "%s: diffusion/image weights classified in a role without an "
+            "image task (header check); excluded. Move under a role whose "
+            "models serve image, set `ignore: true`, or set role: in the "
+            "sidecar", path.name)
+        return
+    # A model serving the image endpoint should carry diffusion/image
+    # weights — skip textual-inversion embeddings, loras and other assets.
+    if model.serves_endpoint(IMAGES) and model.file_kind != "image":
+        logger.info("skipping %s: not diffusion/image weights in an image "
+                    "role (kind=%s)", path.name, model.file_kind)
+        return
     out.append(model)
 
 

@@ -65,7 +65,7 @@ def test_engines_refusal_names_every_engine(make_model):
     resolved, reasons = resolve_engines(m, ("llama-server",),
                                         {"llama_bin": "/opt/llama-server"})
     assert resolved is None
-    assert "does not serve role 'image'" in reasons["llama-server"]
+    assert "does not serve openai.images.generations" in reasons["llama-server"]
 
 
 def test_engines_finalize_sets_the_backend(make_model):

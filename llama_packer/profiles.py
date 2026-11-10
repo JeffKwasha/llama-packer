@@ -15,6 +15,7 @@ import logging
 import re
 
 from llama_packer import roles, utils
+from llama_packer.endpoints import EMBEDDINGS, RERANK
 from llama_packer.consts import DEFAULT_SACRIFICE_ORDER
 
 logger = logging.getLogger(__name__)
@@ -403,13 +404,8 @@ class Profiles:
         (declared values are ignored with a note) — a resident's parallelism
         must never buy context away from the main chat it serves.
         """
-        try:
-            from llama_packer.backends import get_backend
-            role_defaults = get_backend(model.backend).default_batch_ubatch(
-                roles.base_of(model.role))
-        except Exception:
-            role_defaults = (None, None)
-        rag_role = roles.base_of(model.role) in ("embeddings", "rerank")
+        rag_role = model.serves_endpoint(EMBEDDINGS) or \
+            model.serves_endpoint(RERANK)
         groups: dict[tuple, list] = {}
         for pname, resolved in self.matched_for(model):
             parallel = model.parallel_for(resolved.get("parallel", 1))
@@ -419,14 +415,14 @@ class Profiles:
                 str(resolved.get("cache_type", self.default_cache_type)))
             spare = self.spare_mb(resolved.get("spare"), spare_override, vram_total)
             batch, ubatch = model.batch_ubatch_for(
-                resolved, self.llama_server_cfg, role_defaults)
+                resolved, self.llama_server_cfg)
             groups.setdefault(
                 (int(parallel), cache_type, spare, batch, ubatch), []
             ).append((pname, resolved))
 
         if not groups:
             batch, ubatch = model.batch_ubatch_for(
-                None, self.llama_server_cfg, role_defaults)
+                None, self.llama_server_cfg)
             groups = {
                 (1 if rag_role else model.parallel_for(1),
                  model.cache_type_for(self.default_cache_type),

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from llama_packer import utils
 from llama_packer.backends.base import BaseBackend
+from llama_packer import endpoints as eps
 from llama_packer.endpoints import ENGINE_ENDPOINTS
 
 if TYPE_CHECKING:
@@ -127,7 +128,8 @@ class AudioCppBackend(BaseBackend):
         """Task: sidecar > family default > role default, with warnings for
         sidecar/role inconsistency and clone-only families."""
         task = str(cfg.get("task") or _FAMILY_TASK_DEFAULTS.get(family)
-                   or ("asr" if model.role == "s2t" else "tts"))
+                   or ("asr" if model.serves_endpoint(eps.TRANSCRIPTIONS)
+                       else "tts"))
         expected = _FAMILY_TASK_DEFAULTS.get(family)
         if family == "chatterbox" and task == "tts":
             logger.warning("audio-cpp: %s: base chatterbox has no zero-shot "
@@ -137,11 +139,11 @@ class AudioCppBackend(BaseBackend):
             logger.warning("audio-cpp: %s: family %r normally runs task "
                            "%r (sidecar says %r)", model.stem, family,
                            expected, task)
-        if model.role == "t2s" and task in _S2T_TASKS:
+        if model.serves_endpoint(eps.SPEECH) and task in _S2T_TASKS:
             logger.warning("audio-cpp: %s: task %r is audio→text but the "
                            "role is t2s (text→audio); capabilities will "
                            "mismatch the model", model.stem, task)
-        if model.role == "s2t" and task in _T2S_TASKS:
+        if model.serves_endpoint(eps.TRANSCRIPTIONS) and task in _T2S_TASKS:
             logger.warning("audio-cpp: %s: task %r is text→audio but the "
                            "role is s2t (audio→text); capabilities will "
                            "mismatch the model", model.stem, task)

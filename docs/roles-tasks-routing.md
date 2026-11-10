@@ -10,7 +10,7 @@ the code is wrong and gets fixed next.
 | **model** | weights plus sidecar. Declares engines, role, tasks, context ceiling, capabilities, `pp_tps`. |
 | **task** | one endpoint contract plus demand. The only thing bound to server API capabilities. |
 | **endpoint** | fixed server API surface (chat, embeddings, rerank, images, transcriptions, speech). |
-| **role** | operator-defined purpose and allocation policy: a label, the directory it owns, a `kind`, a `share`, and a residency rule. No built-in names. |
+| **role** | operator-defined purpose and allocation policy: a label, the directory it owns, a `share`, and a residency rule. No built-in names. |
 | **set** | a named combination of models/roles that llama-swap may keep resident together. Only used in matrix mode. |
 | **pool** | a memory limit. `default` is the GPU budget, `ram` is the host budget, and a multi-GPU host has one per card. |
 | **share** | the fraction of *slack* a role may claim, as a percentage. |
@@ -29,17 +29,14 @@ on request.
 roles:
   dog:
     dir: qwen3           # the tree this role owns
-    kind: chat           # behaviour implementation
     fill: true           # take the slack no other share claims
     live: 1              # 1 | per-device | capacity
   cat:
     dir: misc
-    kind: chat
     share: 20%           # fraction of slack
     live: 1
   always-on:
     dir: embed
-    kind: embeddings
     share: 5%
     live: 1
     device: cpu          # every model of this role runs from system RAM
@@ -53,8 +50,9 @@ The schema:
   so. A tree belongs to exactly one role; overlapping trees are an error.
   `dir` is optional; a role without one is reachable only by an explicit
   sidecar `role:`.
-- `kind` — the behaviour implementation: `chat`, `embeddings`, `rerank`,
-  `image`, `s2t`, `t2s`. It is data; rename the role freely.
+- A role has no behaviour. The models under it declare their `tasks:`, and
+  each task names the endpoint it is served at. A role is ownership and
+  allocation, nothing else.
 - `share` — percentage of slack the role may claim. Shares in one pool must
   sum to at most 100%; the remainder is unallocated headroom.
 - `fill` — `true` means "take whatever no other share claims". At most one
@@ -269,12 +267,10 @@ prefill. A resident role can raise the result so it is evicted last.
 roles:
   dog:
     dir: qwen3
-    kind: chat
     fill: true
     live: 1
   cat:
     dir: misc
-    kind: chat
     share: 20%
     live: 1
 
@@ -311,7 +307,7 @@ Implemented:
 
 - `roles:` is data. The code loads the default roles and replaces them from
   `profiles.yaml`. Role names are not hardcoded.
-- `dir`, `kind`, `share`, `fill`, `live`, and `device` are parsed and
+- `dir`, `share`, `fill`, `live`, and `device` are parsed and
   validated: `share` is a percentage in (0, 100], one role may
   fill, shares sum to at most 100%, and two roles may not own overlapping
   trees.
@@ -327,7 +323,9 @@ Implemented:
   `role:` inside a
   task warns and is ignored for old files.
 - Sidecar `role:` is valid and overrides the tree's role.
-- Retired role keys (`min`, `preferred`, `cap`, `weight`, `exclusive`,
+- A role has no behaviour: a model's declared tasks name the endpoint, and
+  the endpoint selects engine flags, discovery guards and solve paths.
+- Retired role keys (`kind`, `min`, `preferred`, `cap`, `weight`, `exclusive`,
   `persistent`) warn and are ignored.
 - The router follows the input: `matrix.sets:` present → matrix, absent →
   capacity. `routing.use` is retired and errors; the group router is gone.

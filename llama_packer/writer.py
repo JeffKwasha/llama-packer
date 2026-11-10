@@ -25,7 +25,8 @@ from llama_packer.model import Model
 from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
-from llama_packer.endpoints import CHAT
+from llama_packer.endpoints import (CHAT, EMBEDDINGS, IMAGES, RERANK,
+                                   SPEECH, TRANSCRIPTIONS)
 from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
 from llama_packer.consts import (
     DEFAULT_SACRIFICE_ORDER,
@@ -58,7 +59,7 @@ _REASONING_FLAG_KEYS = ("reasoning-format", "reasoning-preserve")
 
 def _model_can_reason(model: Model) -> bool:
     """True when the model is a chat model that advertises reasoning support."""
-    if roles.base_of(model.role) != "chat":
+    if not model.serves_endpoint(CHAT):
         return False
     return "reasoning" in [c.lower() for c in model.capabilities]
 
@@ -158,7 +159,7 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
         if model.gguf_path and model.gguf_path.is_file():
             arch = model.arch
             if arch and any(rx.search(arch) for rx in _DIFFUSION_ARCH_RES):
-                if roles.base_of(model.role) != "image":
+                if not model.serves_endpoint(IMAGES):
                     logger.error("skipping %s: diffusion arch %r requires role: image (sd-server); "
                                  "move to img/ with dirs:{img:image} or set ignore:true (found role=%r)",
                                  model.stem, arch, model.role)
@@ -471,18 +472,17 @@ def _build_entry(
     caps_l = [c.lower() for c in model.capabilities]
     arch = str(model.frontmatter.get("architecture") or "").lower()
     is_video_arch = "video" in arch or arch in {"wan", "hunyuan-video", "h3", "mochi", "cosmos"}
-    base = roles.base_of(model.role)
-    if base == "image":
+    if model.serves_endpoint(IMAGES):
         in_mods = ["text", "image"]
         # architecture or explicit video token decides output modality
         if "video" in caps_l or is_video_arch:
             out_mods = ["video"]
         else:
             out_mods = ["image"]
-    elif base == "s2t":
+    elif model.serves_endpoint(TRANSCRIPTIONS):
         in_mods = ["audio"]
         out_mods = ["text"]
-    elif base == "t2s":
+    elif model.serves_endpoint(SPEECH):
         in_mods = ["text"]
         out_mods = ["audio"]
     else:
@@ -507,7 +507,7 @@ def _build_entry(
     # companion block, ``model`` is already the base (off) view so block
     # capabilities are absent; this stays as a safety net for unconditional
     # top-level image/video claims.
-    if (not include_mmproj and roles.base_of(model.role) != "image"
+    if (not include_mmproj and not model.serves_endpoint(IMAGES)
             and model.mmproj and model.mmproj.gguf_path):
         caps = [c for c in model.capabilities if str(c).lower() not in ("image", "video")]
         if "image" in caps_l and "image" in in_mods:
@@ -584,7 +584,7 @@ def _build_entry(
     # number, kept for clients that read it. context_max preserves the
     # trained maximum when the entry is folded below it.
     metadata["ctx_size"] = ctx_size
-    if roles.base_of(model.role) == "chat":
+    if model.serves_endpoint(CHAT):
         # The served window is the true generation ceiling: llama-server
         # allows a reply up to n_ctx minus the prompt, and clients clamp to
         # the room a prompt leaves. A sidecar may lower it for a model whose
@@ -639,7 +639,7 @@ def _build_entry(
         "out": out_mods,
         "tools": "tools" in [c.lower() for c in caps],
         "reranker": "reranker" in caps_l
-                    or roles.base_of(model.role) == "rerank",
+                    or model.serves_endpoint(RERANK),
         "context": ctx_size,
     }
 
@@ -1085,7 +1085,7 @@ def served_flags(model: "Model", include_mmproj: bool,
     ``model.capabilities`` vocabulary.
     """
     caps = [str(c).lower() for c in model.capabilities]
-    if (not include_mmproj and roles.base_of(model.role) != "image"
+    if (not include_mmproj and not model.serves_endpoint(IMAGES)
             and model.mmproj and model.mmproj.gguf_path):
         caps = [c for c in caps if c not in ("image", "video")]
     if tools_demoted:
@@ -1183,16 +1183,17 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
 # model type.  Tiny residents (speech, RAG) ride along beside chat for pocket
 # change; huge residents (diffusion) are chat-scale and tracked as exclusive
 # candidates; chat models evict each other.
-BUCKET_TINY_ROLES = frozenset({"s2t", "t2s", "embeddings", "rerank"})
+BUCKET_TINY_ENDPOINTS = frozenset({EMBEDDINGS, RERANK,
+                                   TRANSCRIPTIONS, SPEECH})
 BUCKET_HUGE_BACKENDS = frozenset({"sd-server"})
 
 
 def footprint_bucket(model) -> str:
     """Size bucket of a model for ledger accounting: tiny/huge/chat."""
-    role = roles.base_of(model.role)
-    if role in BUCKET_TINY_ROLES:
+    needed = {t.endpoint for t in model.tasks_resolved}
+    if needed and needed <= BUCKET_TINY_ENDPOINTS:
         return "tiny"
-    if role == "image" or model.backend in BUCKET_HUGE_BACKENDS:
+    if model.serves_endpoint(IMAGES) or model.backend in BUCKET_HUGE_BACKENDS:
         return "huge"
     return "chat"
 
@@ -1390,18 +1391,13 @@ def resolve_batch_ubatch(
     profiles: Profiles, model: Model, profile: dict | None = None,
 ) -> tuple[int | None, int | None]:
     """Resolved ``(batch, ubatch)`` for *model* — sidecar keys > profile
-    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults.
-    ``None`` means "nothing configured": the backend renders no flag and the
-    engine's builtin applies.  One resolution site: the rendered command
-    and the VRAM measurement shape both consume these values, so the serve
-    and the estimate can never drift apart on batch flags."""
-    try:
-        backend = get_backend(model.backend)
-        role_defaults = backend.default_batch_ubatch(model.role)
-    except KeyError:
-        role_defaults = (None, None)
+    keys > fleet ``llama_server: batch:/ubatch:``.  ``None`` means "nothing
+    configured": the backend renders no flag and the engine's builtin
+    applies.  One resolution site: the rendered command and the VRAM
+    measurement shape both consume these values, so the serve and the
+    estimate can never drift apart on batch flags."""
     return model.batch_ubatch_for(
-        profile, profiles.llama_server_cfg if profiles else {}, role_defaults)
+        profile, profiles.llama_server_cfg if profiles else {})
 
 
 def measurement_args(
@@ -1590,10 +1586,9 @@ class Planner:
         serves its task's ``max_context`` (capped by the trained design
         context and ``--max-context``).
         """
-        base = roles.base_of(view.role)
-        if base in ("embeddings", "rerank"):
+        if view.serves_endpoint(EMBEDDINGS) or view.serves_endpoint(RERANK):
             ctx = resident_ctx(view, self.tasks)
-        elif base == "chat" and self.chat_ctx is not None:
+        elif view.serves_endpoint(CHAT) and self.chat_ctx is not None:
             ctx = self.chat_ctx
         else:
             ctx = resolve_min_ctx(
@@ -1715,7 +1710,7 @@ class Planner:
         because each entry of a model serves its own context -- a `.coding`
         entry and a `.aux` entry of the same model rarely match.
         """
-        return (roles.base_of(view.role) == "chat"
+        return (view.serves_endpoint(CHAT)
                 and ctx < self.knobs.tools_min_ctx
                 and "tools" in [c.lower() for c in view.capabilities])
 
@@ -1873,12 +1868,11 @@ class Planner:
         never floors it.
         """
         res = self.matrix_result
-        base = roles.base_of(model.role)
         if res is None:
             ctx = model.design_context
-        elif base == "embeddings":
+        elif model.serves_endpoint(EMBEDDINGS):
             ctx = min(model.design_context, res.embed_ctx)
-        elif base == "rerank":
+        elif model.serves_endpoint(RERANK):
             ctx = min(model.design_context, res.rerank_ctx)
         else:
             ctx = model.design_context
@@ -2194,11 +2188,10 @@ class Planner:
                 or getattr(view.vram, "unestimated_reason", None)
             # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
             # RAG entry's served context (the emit is what frees the VRAM).
-            base = roles.base_of(view.role)
-            if base == "embeddings" and self.matrix_result:
+            if view.serves_endpoint(EMBEDDINGS) and self.matrix_result:
                 context_length = min(context_length,
                                      self.matrix_result.embed_ctx)
-            elif base == "rerank" and self.matrix_result:
+            elif view.serves_endpoint(RERANK) and self.matrix_result:
                 context_length = min(context_length,
                                      self.matrix_result.rerank_ctx)
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
@@ -2209,11 +2202,10 @@ class Planner:
                 include_mmproj = True   # per-category now; see solve_rung
                 view = model.view_for(include_mmproj)
                 context_length = view.design_context
-                base = roles.base_of(view.role)
-                if base == "embeddings" and self.matrix_result:
+                if view.serves_endpoint(EMBEDDINGS) and self.matrix_result:
                     context_length = min(context_length,
                                          self.matrix_result.embed_ctx)
-                elif base == "rerank" and self.matrix_result:
+                elif view.serves_endpoint(RERANK) and self.matrix_result:
                     context_length = min(context_length,
                                          self.matrix_result.rerank_ctx)
                 cap = self._category_ctx_cap(model)
@@ -2226,7 +2218,7 @@ class Planner:
                 pool_id = self.ledger.pool_id_for(view)
                 spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                 spare_eff = spare_mb
-                if roles.base_of(view.role) == "chat":
+                if view.serves_endpoint(CHAT):
                     spare_eff += self.ledger.extra_reserve_mb(pool_id)
                 # Auto-parallel: unpinned chat models on slot-based backends
                 # get a value-function (parallel, ctx) solve instead of the
@@ -2234,7 +2226,7 @@ class Planner:
                 # profile in the group declaring `parallel`.
                 auto = (
                     self.knobs.auto_parallel
-                    and roles.base_of(view.role) == "chat"
+                    and view.serves_endpoint(CHAT)
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
                     # A CPU-resident model's KV pool lives in host RAM, which
                     # no VRAM ledger sees or budgets, and calc_ctx returns
@@ -2608,7 +2600,7 @@ def _solve_matrix_context(
         # Embed/rerank/image/s2t models are handled outside the shared chat
         # budget (fixed overhead / separate pool). Including a 40 GB
         # diffusion model would collapse the chat budget, so exclude it.
-        if m.role in roles.non_chat() or m.on_cpu:
+        if not m.serves_endpoint(CHAT) or m.on_cpu:
             continue
         # Overlay keys (cache_type/parallel/context_length/image_max_tokens)
         # live in the block and are only visible on the companion-on view.
@@ -2712,7 +2704,7 @@ def _solve_matrix_context(
     raw_sets = {str(n): str(e) for n, e in (routing_sets or {}).items()}
     chat_roles = frozenset(
         m.role for m in chat_models
-        if m.role not in roles.non_chat() and not m.on_cpu)
+        if m.serves_endpoint(CHAT) and not m.on_cpu)
     chat_ids = frozenset(
         x for m in chat_models if m.role in chat_roles
         for x in (m.stem, m.template_id))
@@ -2972,7 +2964,7 @@ def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
     size_mb = float(model.size_mb or 0)
     if size_mb > 0 and drive_mbps > 0:
         cost += size_mb / drive_mbps
-    if roles.base_of(role) == "chat":
+    if model.serves_endpoint(CHAT):
         pp = None
         if "pp_tps" in getattr(model, "sidecar_keys", ()):
             try:

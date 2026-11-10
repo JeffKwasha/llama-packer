@@ -81,6 +81,21 @@ class TaskCatalogue:
         return tuple(self.by_id)
 
     @classmethod
+    def default(cls) -> "TaskCatalogue":
+        """The packaged task catalogue, used when no profiles file is given."""
+        try:
+            import importlib.resources
+
+            import yaml
+
+            path = importlib.resources.files("llama_packer").joinpath(
+                "profiles.yaml")
+            cfg = yaml.safe_load(path.read_text()) or {}
+            return cls.from_cfg(cfg.get("tasks"))
+        except Exception:
+            return cls()
+
+    @classmethod
     def from_cfg(cls, cfg: dict | None) -> "TaskCatalogue":
         """Parse ``tasks:`` from profiles.yaml.
 

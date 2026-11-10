@@ -9,9 +9,9 @@ from llama_packer.backends import BACKENDS
 def test_share_is_a_percentage_of_slack():
     # Validates: docs/plans/requirement-trace.md, requirement #110
     table, problems = roles.parse_roles({"roles": {
-        "chat": {"kind": "chat", "fill": True},
-        "dog": {"kind": "chat", "share": "40%"},
-        "cat": {"kind": "chat", "share": 0.2},
+        "chat": {"fill": True},
+        "dog": {"share": "40%"},
+        "cat": {"share": 0.2},
     }})
     assert problems == []
     assert table["dog"].share == 0.4
@@ -22,12 +22,12 @@ def test_share_is_a_percentage_of_slack():
 def test_share_and_fill_are_validated():
     # Validates: docs/plans/requirement-trace.md, requirement #110
     _table, problems = roles.parse_roles({"roles": {
-        "a": {"kind": "chat", "share": "80%"},
-        "b": {"kind": "chat", "share": "40%"},
-        "c": {"kind": "chat", "fill": True},
-        "d": {"kind": "chat", "fill": True},
-        "e": {"kind": "chat", "share": "120%"},
-        "f": {"kind": "chat", "share": "10%", "fill": True},
+        "a": {"share": "80%"},
+        "b": {"share": "40%"},
+        "c": {"fill": True},
+        "d": {"fill": True},
+        "e": {"share": "120%"},
+        "f": {"share": "10%", "fill": True},
     }})
     text = "\n".join(problems)
     assert "shares sum to" in text
@@ -40,11 +40,7 @@ def test_role_registry_derives_its_sets():
     # Validates: docs/plans/requirement-trace.md, requirement #90
     assert roles.names() == ("chat", "embeddings", "rerank",
                              "image", "s2t", "t2s")
-    assert roles.non_chat() == frozenset(
-        {"embeddings", "rerank", "image", "s2t", "t2s"})
     assert all(r.device is None for r in roles.ROLES.values())
-    assert roles.get("embeddings").kind == "embeddings"
-    assert roles.get("rerank").kind == "rerank"
     assert roles.get("embedder") is None
 
 
@@ -52,13 +48,11 @@ def test_custom_role_is_data_and_gets_its_own_pool():
     # Validates: docs/plans/requirement-trace.md, requirement #107
     try:
         roles.configure({"roles": {
-            "cat": {"kind": "chat"},
-            "dog": {"kind": "rerank", "device": 1},
-            "hamster": {"kind": "t2s", "live": "per-device",
-                        "device": "cpu"},
+            "cat": {},
+            "dog": {"device": 1},
+            "hamster": {"live": "per-device", "device": "cpu"},
         }})
         assert roles.names() == ("cat", "dog", "hamster")
-        assert roles.base_of("cat") == "chat"
         assert roles.get("hamster").live == "per-device"
         assert roles.get("dog").device == 1
         assert roles.get("hamster").device == "cpu"
@@ -69,8 +63,8 @@ def test_custom_role_is_data_and_gets_its_own_pool():
 def test_dir_is_one_path_or_a_list_and_is_normalised():
     # Validates: SPEC.md, Roles: dir is the tree a role owns.
     table, problems = roles.parse_roles({"roles": {
-        "chat": {"dir": ["./chat/", "T2T"], "kind": "chat"},
-        "pics": {"dir": "img", "kind": "image"},
+        "chat": {"dir": ["./chat/", "T2T"]},
+        "pics": {"dir": "img"},
     }})
     assert problems == []
     assert table["chat"].dir == ("chat", "t2t")
@@ -107,21 +101,18 @@ def test_custom_role_parse_reports_every_problem():
         "dog": {"unknown": 1},
     }})
     text = "\n".join(problems)
-    assert "kind='unicorn' is not one of" in text
+    assert "'kind' is retired" in text
     assert "'weight' is retired" in text
     assert "unknown key 'unknown'" in text
 
 
-def test_every_task_maps_to_a_served_endpoint():
+def test_every_engine_endpoint_is_closed_and_served():
     # Validates: docs/plans/requirement-trace.md, requirement #90
     from llama_packer import endpoints
 
-    assert set(endpoints.TASK_ENDPOINTS) == set(roles.names())
-    assert set(endpoints.TASK_ENDPOINTS.values()) <= endpoints.ENDPOINTS
-    for task, endpoint in endpoints.TASK_ENDPOINTS.items():
-        assert any(endpoint in b.endpoints for b in BACKENDS.values()), task
     served = {e for b in BACKENDS.values() for e in b.endpoints}
-    assert served <= set(endpoints.TASK_ENDPOINTS.values())
+    assert served <= endpoints.ENDPOINTS
+    assert all(b.endpoints for b in BACKENDS.values())
 
 
 def test_ctx_cap_is_retired():
@@ -165,7 +156,7 @@ def test_reserved_pool_names_are_rejected():
 def test_one_role_may_list_overlapping_trees():
     # A role listing x and x/y is redundant, not two roles owning a tree.
     _table, problems = roles.parse_roles({"roles": {
-        "a": {"dir": ["x", "x/y"], "kind": "chat"}}})
+        "a": {"dir": ["x", "x/y"]}}})
     assert problems == []
 
 

@@ -412,15 +412,20 @@ def test_pools_cfg_garbage_tolerated(caplog):
 
 
 def test_buckets():
+    from conftest import fake_tasks
     from llama_packer.writer import PoolLedger, footprint_bucket
-    tiny = SimpleNamespace(role="s2t", backend="whisper-server")
-    assert footprint_bucket(tiny) == "tiny"
-    assert footprint_bucket(SimpleNamespace(role="rerank",
-                                            backend="llama-server")) == "tiny"
-    assert footprint_bucket(SimpleNamespace(role="image",
-                                            backend="sd-server")) == "huge"
-    assert footprint_bucket(SimpleNamespace(role="chat",
-                                            backend="llama-server")) == "chat"
+
+    def bucket(role, backend):
+        m = SimpleNamespace(role=role, backend=backend,
+                            tasks_resolved=fake_tasks({"role": role}))
+        m.serves_endpoint = lambda ep: any(t.endpoint == ep
+                                           for t in m.tasks_resolved)
+        return footprint_bucket(m)
+
+    assert bucket("s2t", "whisper-server") == "tiny"
+    assert bucket("rerank", "llama-server") == "tiny"
+    assert bucket("image", "sd-server") == "huge"
+    assert bucket("chat", "llama-server") == "chat"
     assert PoolLedger(48000).extra_reserve_mb() == 0
 
 

@@ -154,8 +154,8 @@ when requested; the router still sees the full 21G pool.
 
 ```yaml
 roles:
-  cat: {dir: cats, kind: chat, share: 40%, live: 1}
-  dog: {dir: dogs, kind: chat, share: 40%, live: 1}
+  cat: {dir: cats, share: 40%, live: 1}
+  dog: {dir: dogs, share: 40%, live: 1}
 tasks:
   cat: {endpoint: openai.chat.completions}
   dog: {endpoint: openai.chat.completions}

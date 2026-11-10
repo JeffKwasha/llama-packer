@@ -228,12 +228,10 @@ the role that owns its directory, or to the role named by its sidecar
 roles:
   chat:
     dir: qwen3             # the tree this role owns
-    kind: chat             # behaviour implementation
     fill: true             # take the slack no other share claims
     live: 1                # 1 | per-device | capacity
   embeddings:
     dir: embed
-    kind: embeddings
     share: 5%              # fraction of slack
     live: 1
     device: cpu            # every model of this role runs from system RAM
@@ -243,8 +241,9 @@ roles:
   `.` is the root. A tree belongs to exactly one role; overlapping trees are
   an error. Optional: a role without one is reachable only by a sidecar
   `role:`.
-- `kind` — the behaviour: `chat`, `embeddings`, `rerank`, `image`, `s2t`,
-  `t2s`. It is data; rename the role freely.
+- A role has no behaviour. The models under it declare `tasks:`, and each
+  task names the endpoint it is served at. A role is ownership and
+  allocation, nothing else.
 - `share` — percentage of slack. Slack is the pool after reserve, spare,
   residents, and every serving's floor. `40%` and `40` are 40%; a bare number
   at or below 1 is a fraction (`0.4` is 40%, `1` is 100%). Shares in a pool

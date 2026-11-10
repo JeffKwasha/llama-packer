@@ -91,10 +91,10 @@ class BaseBackend(ABC):
 
     def unsupported_reason(self, model: "Model") -> str | None:
         """Return why this backend cannot serve *model*, or None if it can."""
-        if not endpoints.serves(self.endpoints, model.role):
-            supported = endpoints.tasks_for(self.endpoints)
-            return (f"role {model.role!r} not supported "
-                    f"(serves: {', '.join(sorted(supported))})")
+        needed = {t.endpoint for t in model.tasks_resolved}
+        if not needed <= self.endpoints:
+            return (f"needs {', '.join(sorted(needed))} "
+                    f"(serves: {', '.join(sorted(self.endpoints))})")
         if "hf_repo" in self.formats and model.hf_repo:
             return None
         suffix = model.gguf_path.suffix.lower() if model.gguf_path else None
@@ -122,14 +122,6 @@ class BaseBackend(ABC):
         required = (self.container_requires if transport.container
                     else self.host_requires)
         return all(avail.get(key) for key in required)
-
-    def default_batch_ubatch(self, role: str) -> tuple[int | None, int | None]:
-        """``(batch, ubatch)`` defaults for *role* when nothing is
-        configured.  ``None`` means **"emit nothing"** — the engine's own
-        builtin applies — which is why the default here is ``(None, None)``
-        rather than a hardcoded copy of it.  A backend overrides per role
-        only when upstream really has a different depth."""
-        return (None, None)
 
     @abstractmethod
     def build_cmd(

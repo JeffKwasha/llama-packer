@@ -625,14 +625,6 @@ def test_llama_server_batch_ubatch_render_and_defaults(make_model):
     assert "-b 2048 -ub 512" in cmd
     assert "-b 512" not in cmd and "-ub 512" in cmd
     assert "--flash-attn on" in cmd
-    # Role defaults: nothing configured means nothing rendered. embed/rerank
-    # used to declare `-b 4096`, but llama-server forces n_batch = n_ubatch
-    # when embeddings are on ("setting n_batch = n_ubatch = 512 to avoid
-    # assertion failure"), so that number never took effect. Throughput there
-    # is the ubatch, pinned fleet-wide.
-    assert be.default_batch_ubatch("embeddings") == (None, None)
-    assert be.default_batch_ubatch("rerank") == (None, None)
-    assert be.default_batch_ubatch("chat") == (None, None)
     # cli_args -b/-ub warn once (shadowed + invisible to measurement).
     cmd2, _ = be.build_cmd(make_model("w", cli_args="-b 4096"), 32768, 1,
                            "q8_0", tv, batch=2048, ubatch=512)
@@ -998,8 +990,10 @@ def _safetensors_model(tmp_path, stem="st", **fm):
     from llama_packer.model import Model
     f = tmp_path / f"{stem}.safetensors"
     f.write_bytes(b"w")
+    from conftest import fake_tasks
     model = Model(tmp_path / f"{stem}.md", {"name": stem, **fm})
     model.gguf_path = f
+    model.tasks_resolved = fake_tasks(fm)
     return model
 
 

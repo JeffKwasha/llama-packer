@@ -96,7 +96,7 @@ def test_no_context_max_or_token_limits_when_nothing_is_folded(make_model):
     # At full design context there is no fold to report, and non-chat roles
     # have no token-generation limits to advertise.
     # Validates: SPEC.md, 'Output Format': Build a single llama-swap config entry for a model+profile group.
-    model = make_model("m", backend="llama-server", role="embedding")
+    model = make_model("m", backend="llama-server", role="embeddings")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
         profiles_group=[("default", {})], profiles_defaults={},

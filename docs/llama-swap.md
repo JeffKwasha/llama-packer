@@ -49,9 +49,9 @@ their shares fit.
 
 ```yaml
 roles:
-  chat:       {dir: chat, kind: chat, fill: true, live: 1}
-  embeddings: {dir: embed, kind: embeddings, share: 5%, live: 1, device: cpu}
-  rerank:     {dir: rerank, kind: rerank, share: 5%, live: 1, device: cpu}
+  chat:       {dir: chat, fill: true, live: 1}
+  embeddings: {dir: embed, share: 5%, live: 1, device: cpu}
+  rerank:     {dir: rerank, share: 5%, live: 1, device: cpu}
 pools:
   default:
     reserve_extra: 3G      # the voice sidecar the packer does not charge
@@ -62,13 +62,13 @@ fills, so it takes whatever the helpers do not claim.
 
 ### Your own roles
 
-Declare a role with a behaviour `kind` and its own share.
+Declare a role with its own trees and share.
 
 ```yaml
 roles:
-  cat:     {dir: cats, kind: chat, share: 40%, live: 1}
-  dog:     {dir: dogs, kind: chat, share: 40%, live: 1}
-  hamster: {dir: voices, kind: t2s, share: 10%, live: per-device}
+  cat:     {dir: cats, share: 40%, live: 1}
+  dog:     {dir: dogs, share: 40%, live: 1}
+  hamster: {dir: voices, share: 10%, live: per-device}
 
 tasks:
   cat:   {endpoint: openai.chat.completions}

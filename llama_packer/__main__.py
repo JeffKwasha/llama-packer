@@ -31,6 +31,7 @@ from llama_packer.utils import (
     _detect_drive_speed,
 )
 from llama_packer import roles
+from llama_packer.endpoints import EMBEDDINGS, RERANK
 from llama_packer.consts import (
     _MIN_AGENTIC_CTX, _MEMORY_MARGIN, _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
@@ -261,8 +262,8 @@ def _apply_env_subst(config: EmittedConfig, sub, raw_paths: list[str]) -> Emitte
 
 
 def _select_model(models: list, type_name: str, selector: str | None, logger,
-                  *, cost=None) -> "Model | None":
-    """Pick a model of `type_name` (role).
+                  *, cost=None, endpoint: str | None = None) -> "Model | None":
+    """Pick a model of *type_name*: an endpoint, or (without *endpoint*) a role label.
 
     With no selector, a `device: cpu` candidate wins — the tag is the
     operator's explicit "this one stays warm in host RAM" choice, and it
@@ -273,7 +274,8 @@ def _select_model(models: list, type_name: str, selector: str | None, logger,
     substring overrides both: returns the single model whose id/name/stem
     contains it; errors if the match is not exactly one.
     """
-    cands = [m for m in models if m.role == type_name]
+    cands = [m for m in models
+             if (m.serves_endpoint(endpoint) if endpoint else m.role == type_name)]
     if not cands:
         return None
     if selector:
@@ -398,8 +400,10 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
         return cost
 
     if not matrix_cfg:
-        emb = _select_model(models, "embeddings", args.embed, logger)
-        rnk = _select_model(models, "rerank", args.rerank, logger)
+        emb = _select_model(models, "embeddings", args.embed, logger,
+                            endpoint=EMBEDDINGS)
+        rnk = _select_model(models, "rerank", args.rerank, logger,
+                            endpoint=RERANK)
         if emb is not None or rnk is not None:
             logger.warning(
                 "matrix: disabled — profiles.yaml has no matrix: section; "
@@ -407,9 +411,9 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
                 emb.stem if emb else "none", rnk.stem if rnk else "none")
         return None, None, None, {}, (), {}
     embed_model = _select_model(models, "embeddings", args.embed, logger,
-                                cost=resident_cost())
+                                cost=resident_cost(), endpoint=EMBEDDINGS)
     rerank_model = _select_model(models, "rerank", args.rerank, logger,
-                                 cost=resident_cost())
+                                 cost=resident_cost(), endpoint=RERANK)
     if embed_model is None:
         logger.warning("no embeddings model found; skipping matrix")
         return None, None, None, {}, (), {}
@@ -417,10 +421,9 @@ def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
         logger.warning("no rerank model found; skipping matrix")
         return None, None, None, {}, (), {}
 
-    # Declared categories (defaults bind the RAG pair).  Category names are
-    # the matrix var names; roles may repeat (e.g. tts/stt on t2s/s2t).
-    cat_specs = matrix_cfg.get("categories") or {
-        "emb": {"role": "embeddings"}, "rnk": {"role": "rerank"}}
+    # Declared categories.  Category names are the matrix var names; roles
+    # may repeat.  The RAG pair is already selected by endpoint above.
+    cat_specs = matrix_cfg.get("categories") or {}
     categories: dict[str, "Model"] = {}
     ctx_by_var: dict[str, int] = {}
     for name, spec in cat_specs.items():

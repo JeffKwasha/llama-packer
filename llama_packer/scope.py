@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import logging
 
-from llama_packer import endpoints, roles, utils
+from llama_packer import roles, utils
+from llama_packer.tasks import TaskCatalogue, resolve_tasks
 from llama_packer.backends import BACKENDS, infer_backend, resolve_engines
 from llama_packer.overrides import (
     compile_rule_list,
@@ -65,7 +66,7 @@ class ScopeStack:
         self.allowed = allowed
         #: Declared tasks (profiles.yaml ``tasks:``); finalize() reads the
         #: scheduling role a sidecar's task list implies.
-        self.tasks = tasks
+        self.tasks = tasks if tasks is not None else TaskCatalogue.default()
 
     # ── scoping ──
 
@@ -142,6 +143,12 @@ class ScopeStack:
 
     # ── post-merge finalization ──
 
+    def annotate_tasks(self, model) -> None:
+        """Resolve the model's declared tasks before companions are built."""
+        model.tasks_resolved = (
+            resolve_tasks(model.task_ids, self.tasks, logger, stem=model.stem)
+            if self.tasks else ())
+
     def _apply_placement(self, model) -> None:
         """Place a model from its role and the tasks it serves.
 
@@ -165,10 +172,8 @@ class ScopeStack:
                         model.stem, side if side is not None else "auto",
                         wanted)
             return
-        catalogue = self.tasks
-        devices = {t.device for t in ((catalogue.get(tid) if catalogue else None)
-                                      for tid in model.task_ids)
-                   if t is not None and t.device is not None}
+        devices = {t.device for t in model.tasks_resolved
+                   if t.device is not None}
         if len(devices) > 1:
             logger.warning("%s: tasks disagree on placement (%s); leaving "
                            "the device unset", model.stem,
@@ -230,9 +235,9 @@ class ScopeStack:
                 fmt = (model.gguf_path.suffix.lower() if model.gguf_path
                        else "hf_repo" if model.hf_repo else "none")
                 reason = f"No backend supports {model_file} in {model.md_path} (role {model.role}, format {fmt!r})"
+                needed = {t.endpoint for t in model.tasks_resolved}
                 covered = [b for b in BACKENDS.values()
-                           if fmt in b.formats
-                           and endpoints.serves(b.endpoints, model.role)]
+                           if fmt in b.formats and needed <= b.endpoints]
                 if covered and not any(b.is_available(self.avail or {}) for b in covered):
                     logger.warning("%s — install the binary or pass "
                                    "--llama-server <path>", reason)

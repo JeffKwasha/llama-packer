@@ -62,6 +62,9 @@ def test_role_trees_and_companions(tmp_path):
         for f in files:
             if sub == "img":
                 write_gguf(d / f, arch="flux1")
+                (d / f"{f[:-5]}.md").write_text(
+                    "---\nname: SD\ntasks: [image]\n"
+                    "engines: [sd-server]\n---\n")
             else:
                 (d / f).write_bytes(b"x")
 
@@ -86,11 +89,13 @@ def test_role_trees_are_operator_data(tmp_path):
     (root / "ocr" / "o1.gguf").write_bytes(b"x")
     (root / "img").mkdir()
     write_gguf(root / "img" / "sd.gguf", arch="flux1")
+    (root / "img" / "sd.md").write_text(
+        "---\nname: SD\ntasks: [image]\nengines: [sd-server]\n---\n")
 
     try:
         roles.configure({"roles": {
-            "text": {"dir": ["ocr"], "kind": "chat"},
-            "pics": {"dir": "img", "kind": "image"},
+            "text": {"dir": ["ocr"]},
+            "pics": {"dir": "img"},
         }})
         models = discover([root], generate_stubs=False)
     finally:
@@ -446,23 +451,20 @@ def test_s2t_is_skipped_when_no_role_owns_it(tmp_path):
     assert models == []
 
 
-def test_bin_outside_s2t_never_served(tmp_path, caplog):
-    # A .bin next to a sidecar in a non-s2t role resolves by stem (ordered
-    # last), but no backend supports .bin outside whisper-server's s2t role —
-    # finalize flags it (info: expected in ordinary fleets, not an
-    # operator error) and _filter_supported drops it from the config.
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
+def test_bin_model_is_classified_by_its_task(tmp_path):
+    # The tree allocates; the task decides. A .bin under chat/ with an s2t
+    # task is an ASR model, not a chat model.
+    from llama_packer.endpoints import TRANSCRIPTIONS
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "mysterious.bin").write_bytes(b"x")
     (root / "chat" / "mysterious.md").write_text(
-        "---\nname: Mystery\nengines: [whisper-server]\n---\n")
+        "---\nname: Mystery\ntasks: [s2t]\n"
+        "engines: [whisper-server]\n---\n")
 
-    with caplog.at_level(logging.INFO):
-        models = Model.from_dir(root, generate_stubs=False)
+    models = Model.from_dir(root, generate_stubs=False)
     assert len(models) == 1
-    error = getattr(models[0], "_override_error", None)
-    assert error is not None and "does not serve role 'chat'" in error
+    assert models[0].serves_endpoint(TRANSCRIPTIONS)
 
 
 # ── audio (t2s) discovery is exercised by the audio-cpp backend tests ─────

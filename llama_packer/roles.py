@@ -1,12 +1,11 @@
 """Roles: operator-defined purposes and allocation policies.
 
-A role is a label, a behaviour kind, and a memory policy. The code ships no
+A role is a label, the trees it owns, and a memory policy. The code ships no
 role names: the packaged ``profiles.yaml`` provides the default set as data,
 and ``configure()`` replaces it from the operator's file.
 
-``kind`` selects the behaviour implementation (chat solve, helper context,
-media placement, audio). It is data, so a role may rename or duplicate a kind
-without changing the code. Everything else is allocation.
+A role has no behaviour. A model declares ``tasks:``; each task names the
+endpoint it is served at, and that endpoint selects the implementation.
 """
 
 from __future__ import annotations
@@ -21,10 +20,9 @@ log = logging.getLogger(__name__)
 
 _ROLE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 LIVE_VALUES = frozenset({"1", "per-device", "capacity"})
-KINDS = frozenset({"chat", "embeddings", "rerank", "image", "s2t", "t2s"})
 #: Old role keys. A file that still sets them is told they do nothing.
 RETIRED_KEYS = frozenset({"min", "preferred", "cap", "weight", "exclusive",
-                          "persistent", "ctx_cap"})
+                          "persistent", "ctx_cap", "kind"})
 
 
 @dataclass(frozen=True)
@@ -34,7 +32,6 @@ class Role:
     name: str
     #: Models-root-relative trees this role owns; ``"."`` is the root.
     dir: tuple[str, ...] = ()
-    kind: str = "chat"
     #: Fraction of slack this role may claim; None when it fills instead.
     share: float | None = None
     fill: bool = False
@@ -111,7 +108,7 @@ def _parse_one(name: object, spec: object,
         return None, [f"roles.{name}: reserved pool name"]
     if not isinstance(spec, dict):
         return None, [f"roles.{name}: must be a mapping"]
-    known = {"dir", "kind", "share", "fill", "live",
+    known = {"dir", "share", "fill", "live",
              "device"} | RETIRED_KEYS
     problems = [f"roles.{name}: unknown key {key!r}"
                 for key in sorted(set(spec) - known)]
@@ -119,11 +116,6 @@ def _parse_one(name: object, spec: object,
                     for key in sorted(set(spec) & RETIRED_KEYS))
     dirs, dir_problems = _parse_dirs(name, spec.get("dir"))
     problems.extend(dir_problems)
-    kind = str(spec.get("kind", "chat")).strip().lower()
-    if kind not in KINDS:
-        problems.append(f"roles.{name}: kind={kind!r} is not one of "
-                        f"{', '.join(sorted(KINDS))}")
-        kind = "chat"
     live = str(spec.get("live", "1")).strip().lower()
     if live not in LIVE_VALUES:
         problems.append(f"roles.{name}: live={spec.get('live')!r} is not one "
@@ -146,7 +138,6 @@ def _parse_one(name: object, spec: object,
     return Role(
         name=name,
         dir=dirs,
-        kind=kind,
         share=share,
         fill=bool(spec.get("fill", False)),
         live=live,
@@ -207,18 +198,8 @@ def names() -> tuple[str, ...]:
     return tuple(ROLES)
 
 
-def non_chat() -> frozenset[str]:
-    return frozenset(n for n, r in ROLES.items() if r.kind != "chat")
-
-
 def get(name: object) -> Role | None:
     return ROLES.get(name) if isinstance(name, str) else None
-
-
-def base_of(name: str) -> str:
-    """Behaviour kind for *name* (itself when unknown)."""
-    role = ROLES.get(name)
-    return role.kind if role is not None else name
 
 
 def _key(rel_parts) -> str:

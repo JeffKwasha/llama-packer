@@ -142,8 +142,13 @@ def test_backend_args_validation(caplog):
 
 def _stub_model(stem, role):
     from types import SimpleNamespace
-    return SimpleNamespace(stem=stem, role=role, frontmatter={},
-                           name=stem, template_id=stem, vram_mb=100)
+    from conftest import fake_tasks
+    m = SimpleNamespace(stem=stem, role=role, frontmatter={},
+                        name=stem, template_id=stem, vram_mb=100)
+    m.tasks_resolved = fake_tasks({"role": role})
+    m.serves_endpoint = lambda ep: any(t.endpoint == ep
+                                       for t in m.tasks_resolved)
+    return m
 
 
 def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):

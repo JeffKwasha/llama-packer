@@ -152,7 +152,7 @@ CPU-resident servings default to 3600 s (chat is not special).
 ### Where the registries live
 
 `roles.py` is the role data: one row per operator-declared purpose with the
-tree it owns (`dir`), a behaviour `kind`, and an allocation policy. The task
+tree it owns (`dir`) and an allocation policy. The task
 vocabulary itself comes from `profiles.yaml tasks:`; a model belongs to the
 role that owns its directory or to the one its sidecar names, and a task
 declares only its endpoint, demand, and device.

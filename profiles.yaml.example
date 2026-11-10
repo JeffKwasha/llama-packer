@@ -125,33 +125,27 @@ tasks:
 roles:
   chat:
     dir: [chat, t2t, vision, doc, ocr]
-    kind: chat
     fill: true
     live: 1
   embeddings:
     dir: embed
-    kind: embeddings
     share: 5%
     live: 1
     # device: cpu          # run the whole role from system RAM
   rerank:
     dir: rerank
-    kind: rerank
     share: 5%
     live: 1
   image:
     dir: img
-    kind: image
     share: 20%
     live: 1
   s2t:
     dir: s2t
-    kind: s2t
     share: 5%
     live: per-device
   t2s:
     dir: t2s
-    kind: t2s
     share: 5%
     live: per-device
 

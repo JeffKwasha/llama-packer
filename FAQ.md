@@ -47,7 +47,7 @@ Three separate causes — check in order:
    serves 40960 no matter how much VRAM is free — small weights buy *slots*,
    never more context than the file allows.
 2. **`parallel: 1` means the solve skipped the model.** Auto-parallel only
-   runs for a role whose `kind` is `chat`, on llama-server/vLLM, with no
+   runs for a model whose task endpoint is chat, on llama-server/vLLM, with no
    `parallel:` pin in the sidecar/block or any profile. It is on by default; `matrix:
    auto_parallel: false` turns it off fleet-wide.
 3. **The floor-ceiling trap.** A tool-calling model defaults to a 131072
