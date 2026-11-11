@@ -94,28 +94,22 @@ vllm:
 roles:
   chat:
     dir: [chat, t2t, vision, doc, ocr]
-    fill: true
-    live: 1
+    share: fill
   embeddings:
     dir: embed
     share: 5%
-    live: 1
   rerank:
     dir: rerank
     share: 5%
-    live: 1
   image:
     dir: img
     share: 20%
-    live: 1
   s2t:
     dir: s2t
     share: 5%
-    live: per-device
   t2s:
     dir: t2s
     share: 5%
-    live: per-device
 
 tasks:
   chat:

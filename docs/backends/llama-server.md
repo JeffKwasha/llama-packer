@@ -20,7 +20,7 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
 <llama_bin> --port ${PORT} -m <model.gguf>
   --kv-unified-per-slot <ctx> --parallel <N>
   --cache-type-k <ct> --cache-type-v <ct>
-  --n-gpu-layers 0                  # only when the model is CPU-resident;
+  --n-gpu-layers 0                  # only when the model is CPU-placed;
                                     # otherwise omitted (llama-server "auto"
                                     # offloads all layers on a GPU build)
   [-b <batch> -ub <ubatch>]         # role-aware defaults
@@ -30,7 +30,7 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
   [--reasoning-format <f>] [--reasoning-preserve]   # chat only
 ```
 
-CPU-resident entries (`--n-gpu-layers 0`) are budgeted off **host RAM** at
+CPU-placed entries (`--n-gpu-layers 0`) are budgeted off **host RAM** at
 pack time, not freed of budgeting: the pool is `MemAvailable − sysctl
 pressure zone`, capped by the llama-swap service cgroup headroom, and the
 same `over_budget` refusal applies — an entry whose measured quad will not

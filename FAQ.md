@@ -69,7 +69,7 @@ What you probably saw was the per-arch note
 
 which is informational: uncalibrated arches estimate uncorrected (the
 estimate errs slightly optimistic about allocator overhead). The
-corrections live in the durable machine-local `serve-corrections.yaml`
+corrections are in the durable machine-local `serve-corrections.yaml`
 beside `profiles.yaml` — rows carry the witness `shape` and `ts`. Also:
 `llama-packer --remeasure` ignores saved blocks for one run without
 touching any files.
@@ -96,7 +96,7 @@ measurement (a warning points this out).
 
 ## Can I run embed/rerank with `parallel: > 1`?
 
-No — by design. RAG residents always serve single-slot: a declared
+No — by design. Embeddings and rerank models always serve single-slot: a declared
 `parallel:` on an embeddings/rerank model is ignored with a once-per-model
-note. The main chat context those residents serve must never shrink by even
-4k to buy resident parallelism ("main chat slightly better" wins).
+note. The context those servings use must never shrink by even
+4k to buy helper parallelism ("main chat slightly better" wins).

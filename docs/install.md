@@ -64,7 +64,8 @@ Edit `<dir>/profiles.yaml` for this host, not the repo copy:
 - `capacity` — `pp_tps` / `drive_mbps` for derived eviction cost;
 - `pools` — per-pool VRAM/spare overrides.
 
-A CPU-resident serving defaults to `ttl: 3600`; use `ttl: 0` to keep it
+A CPU-placed serving follows the same TTL rules; the top-level default is
+3600 s. Use `ttl: 0` to keep it
 warm or an explicit number. A task floor the budget cannot meet emits no
 entry rather than a serving below it.
 
@@ -246,7 +247,7 @@ produce the same result, and running it from the wrong place no longer
 installs a second copy of an engine you already have. Where two directories
 in one root both hold the same engine, it says so and refuses to guess.
 
-Each engine keeps its history beside the live one and is reached through a
+Each engine keeps its history beside the current one and is reached through a
 stable name, so moving forward or rolling back is a single symlink:
 
 ```

@@ -4,36 +4,45 @@ from __future__ import annotations
 
 from llama_packer import roles
 from llama_packer.backends import BACKENDS
+from llama_packer.roles import Share
 
 
-def test_share_is_a_percentage_of_slack():
-    # Validates: docs/plans/requirement-trace.md, requirement #110
+def test_share_is_a_request_weight():
+    # Validates: docs/allocation.md, 'The auction': a role's share is its
+    # request weight in each set, not a fraction of the fleet.
     table, problems = roles.parse_roles({"roles": {
-        "chat": {"fill": True},
+        "chat": {"share": "fill"},
         "dog": {"share": "40%"},
         "cat": {"share": 0.2},
     }})
     assert problems == []
-    assert table["dog"].share == 0.4
-    assert table["cat"].share == 0.2
-    assert table["chat"].fill is True
+    assert table["dog"].share == Share("weight", 40.0)
+    assert table["cat"].share == Share("weight", 0.2)
+    assert table["chat"].share == Share("fill", 100.0)
 
 
-def test_share_and_fill_are_validated():
-    # Validates: docs/plans/requirement-trace.md, requirement #110
-    _table, problems = roles.parse_roles({"roles": {
+def test_share_values_are_uncapped():
+    # Validates: docs/allocation.md, 'The auction': weights are relative and
+    # may exceed 100; they are normalised per set.
+    table, problems = roles.parse_roles({"roles": {
         "a": {"share": "80%"},
         "b": {"share": "40%"},
-        "c": {"fill": True},
-        "d": {"fill": True},
-        "e": {"share": "120%"},
-        "f": {"share": "10%", "fill": True},
+        "c": {"share": "123"},
+        "d": {"share": "min"},
+        "e": {"share": 0},
     }})
-    text = "\n".join(problems)
-    assert "shares sum to" in text
-    assert "all fill" in text
-    assert "is not a percentage" in text
-    assert "mutually exclusive" in text
+    assert problems == []
+    assert table["c"].share == Share("weight", 123.0)
+    assert table["d"].share == Share("min", 0.0)
+    assert table["e"].share == Share("zero", 0.0)
+
+
+def test_bad_share_is_reported():
+    _table, problems = roles.parse_roles({"roles": {
+        "a": {"share": "banana"},
+        "b": {"share": -1},
+    }})
+    assert sum("is not a weight" in p for p in problems) == 2
 
 
 def test_role_registry_derives_its_sets():
@@ -50,10 +59,9 @@ def test_custom_role_is_data_and_gets_its_own_pool():
         roles.configure({"roles": {
             "cat": {},
             "dog": {"device": 1},
-            "hamster": {"live": "per-device", "device": "cpu"},
+            "hamster": {"device": "cpu"},
         }})
         assert roles.names() == ("cat", "dog", "hamster")
-        assert roles.get("hamster").live == "per-device"
         assert roles.get("dog").device == 1
         assert roles.get("hamster").device == "cpu"
     finally:
@@ -161,12 +169,29 @@ def test_one_role_may_list_overlapping_trees():
 
 
 def test_share_forms():
-    # A percent with a suffix, a bare percent, a fraction, and 1 = 100%.
+    # Validates: docs/allocation.md, 'The auction': a number is a weight,
+    # `fill` is 100, `min` is 0 with no accept, and `0` accepts leftovers.
     def share(value):
         table, problems = roles.parse_roles(
             {"roles": {"a": {"share": value}}})
         assert problems == []
         return table["a"].share
 
-    assert [share("40%"), share(40), share(0.4), share(1)] == [
-        0.4, 0.4, 0.4, 1.0]
+    assert share("40%") == Share("weight", 40.0)
+    assert share(40) == Share("weight", 40.0)
+    assert share(0.4) == Share("weight", 0.4)
+    assert share("fill") == Share("fill", 100.0)
+    assert share("min") == Share("min", 0.0)
+    assert share(0) == Share("zero", 0.0)
+
+
+def test_fill_and_live_are_not_keys():
+    # Validates: docs/roles-tasks-routing.md, Role: `share` carries the
+    # request; there is no fill or per-role count key.
+    _table, problems = roles.parse_roles({"roles": {
+        "a": {"fill": True},
+        "b": {"live": 1},
+    }})
+    text = "\n".join(problems)
+    assert "unknown key 'fill'" in text
+    assert "unknown key 'live'" in text

@@ -20,12 +20,12 @@ either way it should not be used in a commit message until it is.
 | **endpoint** | A standardized serving surface: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`, `openai.images.generations`, `openai.audio.transcriptions`, `openai.audio.speech`, `native.*`. Engine-owned; servers and clients choose it, a model never does. | `endpoints.py` |
 | **family** | The interchangeability unit: serving one member taught you how to serve the other (same launch options, template, quantization conventions). Agent-assigned with evidence; the arch string is a confirm-only hint. Not the audio.cpp loader `family`, which is `audio_cpp.family`. | sidecar `family:` |
 | **device** | Where a serving runs: `cpu` or a non-negative GPU index; unset means no explicit placement. Sidecar, task and role all use `utils.parse_device`. See SPEC §Device for precedence. | `Model.on_cpu`, `utils.parse_device` |
-| **host-resident** | A `device: cpu` model: charged to the `ram` capacity pool, 0 VRAM. Do not call it "a CPU task" — placement is not identity. A CPU-resident serving defaults to `ttl: 3600`; set `ttl: 0` to keep it. | `HostLedger` |
+| **host-placed** | A `device: cpu` model: charged to the `ram` capacity pool, 0 VRAM. Do not call it "a CPU task"; placement is not identity. Its `ttl` follows the same rule as any serving. | `HostLedger` |
 | **role `device`** | Where every model of a role runs: `auto`, `cpu`, or a GPU index, the sidecar vocabulary; the sidecar wins. | `roles.py`, `utils.parse_device` |
 | **profiles.yaml** | Fleet-wide sampling defaults, spare values, backend defaults, the `tasks:` demand overrides, and the optional `matrix:` section. | `profiles.py` |
 | **override** | A rule that beats the profiles default, scoped to a glob or a directory. Per-directory `models.yaml` is the directory-scoped form. | `overrides.py` |
 | **derived:** | The frontmatter block holding measured, machine-specific values (fingerprints, `model_mib`, KV coefficients). Deleting it costs a re-measure, never a probe. | `model.py:persist_measured` |
-| **`spare`** | VRAM deliberately left free, so another tenant (ComfyUI, a game) can have it. Re-pack with the same `--spare` to reproduce a config. | profiles `spare`, CLI `--spare` |
+| **`spare`** | Memory deliberately left free, so another tenant (ComfyUI, a game) can have it. It adds to the measured reserve, per pool. Re-pack with the same spare to reproduce a config. | profiles `pools.<id>.spare`, `defaults.spare` |
 
 ## VRAM
 
@@ -36,28 +36,27 @@ either way it should not be used in a commit message until it is.
 | **`D`** (`slot_mib`) | Fixed cost per parallel slot: SWA ring buffers plus slot overhead. | `vram.py` |
 | **slot** | One concurrent conversation. `parallel` is how many a model serves at once. | `parallel:` |
 | **budget** (`VramBudget`) | The object that answers "what fits", from either measured coefficients or a pin. | `vram.py` |
-| **shared solve** (`matrix:`) | The pack-time context solve: one budget across the servings the operator wants co-resident, so a helper is paid for out of the chat context. The name `matrix` survives in the config key and the solver; routing is capacity unless `matrix.sets:` is present. | `solve_matrix_ctx`, SPEC §Capacity routing |
-| **co-resident** | Allowed to be loaded at the same time because their capacities fit every pool. Chat models take turns; embed/rerank are resident at a small context. | SPEC §Capacity routing |
+| **set solve** | The pack-time context solve inside one set: one budget, floors first, then the auction. Authored sets drive matrix mode; generated sets size capacity mode. | `solve_matrix_ctx`, SPEC §Capacity routing |
+| **loaded together** | Allowed at the same time because the capacities fit every pool. A role still runs one serving at a time. | SPEC §Capacity routing |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
-| **`globalTTL`** | Emitted only with `--idle-unload N`: llama-swap unloads anything idle for N seconds. | SPEC §VRAM gating and reservation notes |
+| **`ttl`** | Idle lifetime: top-level default 3600 s, overridden by a role, task, or sidecar `ttl:`. `0` disables idle unload. | SPEC §TTL |
 | **gain-gating** | A rung is kept only if it actually *buys* context; among rungs buying the same context, the least shed wins for the null category and the first qualifier stands. A model already at its design cap therefore keeps its projector rather than getting a pointless text-only twin. | `writer.py:solve_rung` |
 
 ## Capacity, eviction and lifetime
 
 | Term | Means | Code |
 |---|---|---|
-| **capacity pool** | An independent integer limit in the emitted `routing.router.settings.capacity.pools`. `default` is the packer's usable VRAM, `ram` the host pool, and a role with `live: 1` has a size-1 pool so only one serving of that role is live. | `Planner.capacity_pools`, SPEC §Capacity routing |
-| **capacity** | What one entry claims from a pool, in that pool's units (MiB). Emitted per model; the sum of resident capacities must fit every pool. | `_capacity_fields`, `capacities:` |
-| **evict_cost** | Relative cost of losing a resident, used only to choose *which* model leaves under pool pressure. Derived from reload time plus lost prefill for chat; never a reservation. | `_capacity_fields`, `evict_cost` |
-| **TTL** | The temporal complement of `spare`: eventually the serving is freed for duties this tool cannot see. Sidecar > task > placement default; `0` disables idle unload, otherwise the smallest lifetime wins. | `resolve_entry_ttl`, SPEC §TTL |
+| **capacity pool** | An independent integer limit in the emitted `routing.router.settings.capacity.pools`. `default` is the packer's usable VRAM, `ram` the host pool, and every role has a size-1 pool so only one serving of that role is loaded. | `Planner.capacity_pools`, SPEC §Capacity routing |
+| **capacity** | What one entry claims from a pool, in that pool's units (MiB). Emitted per model; the sum of the loaded capacities must fit every pool. | `_capacity_fields`, `capacities:` |
+| **evict_cost** | Relative cost of losing a serving, used only to choose *which* model leaves under pool pressure. Derived from reload time plus lost prefill for KV-cached endpoints; never a reservation. | `_capacity_fields`, `evict_cost` |
+| **TTL** | The temporal complement of `spare`: eventually the serving is freed for duties this tool cannot see. Sidecar > task > role > top-level `ttl`; `0` disables idle unload; the top-level default is 3600 s. | `resolve_entry_ttl`, SPEC §TTL |
 
 ## Host RAM
 
 | Term | Means | Code |
 |---|---|---|
-| **resident** | A model of a resident role (embeddings/rerank) served at a fixed small context. It is charged a capacity, not pinned by name; llama-swap may still evict it under pool pressure. | SPEC §Residents |
 | **host pool** | The host RAM the ledger may spend: `min(sys_free, cgroup_free)`, each term logged with the arm (`declared`/`sysctl`/`fallback-25%`/`skipped-cgroup`) that chose it. | `hardware.py:HostProfile` |
-| **host ledger** | Sibling of `PoolLedger` that charges host-resident quads. Go/no-go, never a solve-down. | `HostLedger` |
+| **host ledger** | Sibling of `PoolLedger` that charges host-placed quads. Go/no-go, never a solve-down. | `HostLedger` |
 
 ## The capability ladder
 
@@ -78,16 +77,16 @@ either way it should not be used in a commit message until it is.
 Two different things. Say which one: a **role** is what a model is for
 (`chat`, `embeddings`, `rerank`, …) with an allocation policy, and a **task**
 is the endpoint contract a model can serve (`coding`, `embeddings`). A
-**set** is a matrix-mode permission for models to stay resident together.
+**set** is a permission for models to be loaded together.
 
 | Term | Means | Code |
 |---|---|---|
 | **task catalogue** | The declared set of task ids: endpoint, intent, demand. An id outside it is not a task. | `profiles.yaml tasks:`, validated by `tasks.py` |
-| **share** | A role's percentage of slack, where slack is the pool after reserve, spare, residents, and every serving's floor. Parsed and validated; not applied by the solver yet. | `roles.py`, `docs/roles-tasks-routing.md` |
-| **floor** | The memory a serving needs at its task's `min_context` and `min_parallel`. Derived per model, never configured. | `solve`, `docs/roles-tasks-routing.md` |
+| **share** | A role's request weight in each set's auction: `N%` (relative, may exceed 100), `fill` (100), `min` (0, accept nothing), or `0` (0, accept what remains). Parsed and validated; the auction is not applied yet. | `roles.py`, `docs/roles-tasks-routing.md` |
+| **floor** | The memory a serving needs at its task's `min_context` and `min_parallel`. A role's floor is the maximum floor of its models. Derived, never configured. | `solve`, `docs/roles-tasks-routing.md` |
 | **demand** | One task's minimum serving (`min_context`, `min_parallel`, `require`, `keep`, `sacrifice`). | `tasks.Task` |
 | **`min_context`** | The context a task requires. A model that cannot serve it at any rung emits nothing for that task. | profiles `tasks:` |
-| **set** | A matrix-mode expression naming models/roles that may stay resident together. Each set is its own memory budget, so roles may exceed their global share. Never preloads. | `matrix.sets` |
+| **set** | An expression naming roles or model ids that may be loaded together. Each set is its own budget, sized by the auction. Authored sets drive matrix mode; generated sets size capacity mode. Never preloads. | `matrix.sets` |
 
 ## Emission
 
@@ -116,5 +115,5 @@ is the endpoint contract a model can serve (`coding`, `embeddings`). A
 | **promote** | The rename that makes a staged build its final name. | `update.py:promote` |
 | **versioned entry** | `llama-bNNNNN`, `llama-swap-vNNN`, `<engine>-vX.Y.Z`. Kept newest-N; never pruned while a symlink points at it. | `update.py` |
 | **stable primary** | The unversioned name beside a versioned entry — `llama-server` -> `./llama-b12345/llama-server`. What a config names; updating and rolling back both move this one link. | `update.py:_ensure_stable_primary` |
-| **tools dir** | `<run dir>/tools`: where a deployment's engines live, so the run directory holds only generated config. Searched before the run directory itself. | `llama_packer/utils.py:binary_search_dirs` |
+| **tools dir** | `<run dir>/tools`: where a deployment's engines are installed, so the run directory holds only generated config. Searched before the run directory itself. | `llama_packer/utils.py:binary_search_dirs` |
 | **the fleet tag table** | Which upstream release is installed, per engine. | `extras/update.py`, `config.env` |

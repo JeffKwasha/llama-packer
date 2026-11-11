@@ -26,7 +26,7 @@ PROFILES_KEYS: frozenset[str] = frozenset({
     "defaults", "tasks", "models_dirs", "hf_home", "backends",
     "profiles", "llama_server", "vllm", "sd", "whisper", "audio_cpp",
     "hardware", "overrides", "matrix", "pools", "macros",
-    "shed", "capacity", "roles",
+    "shed", "capacity", "roles", "ttl", "min_context",
 })
 
 

@@ -1,6 +1,6 @@
 ---
 name: Authoring profiles.yaml
-description: Build or migrate a llama-packer profiles.yaml — where models live, what work they do, how much memory they get, how they are placed, and how idle models are unloaded. Use when writing, editing, or debugging a profiles.yaml for llama-packer.
+description: Build or migrate a llama-packer profiles.yaml — where models are, what work they do, how much memory they get, how they are placed, and how idle models are unloaded. Use when writing, editing, or debugging a profiles.yaml for llama-packer.
 ---
 
 # Authoring `profiles.yaml`
@@ -31,15 +31,12 @@ the run directory can load it.
 - **Serving** — one loaded model answering requests.
 - **Context** — tokens one request may use.
 - **Slots** — requests one serving handles at once (`parallel`).
-- **Role** — an operator-defined purpose. Models are assigned to a role by
-  the tree it owns; models in the same role share memory and evict each
-  other on request. The default roles are chat, embeddings, rerank, image,
-  speech-to-text (`s2t`), text-to-speech (`t2s`), but the names are data.
-- **Task** — a named kind of work (for example `coding`) - bound to an API endpoint.
-- **Pool** — a memory allowance. Models sharing the GPU must fit inside it;
-  the router unloads one to make room.
-- **Category** — a *model pick* for a role (`emb`, `rnk`, `tts`, …). Not a
-  kind of work; that is a task.
+- **Role** — an operator-defined label. Models are assigned to a role by
+  the tree it owns; models in the same role evict each other on request.
+  The packaged defaults are data; rename or replace them.
+- **Task** — a named kind of work bound to an API endpoint.
+- **Pool** — a memory allowance with a measured reserve and an operator
+  spare. Models sharing it must fit; the router unloads one to make room.
 
 ## Minimal file
 
@@ -76,7 +73,7 @@ tasks:
     keep: [draft]
   embeddings:
     endpoint: openai.embeddings
-    ttl: 0                  # keep the RAG pair resident
+    ttl: 0                  # keep it loaded
 
 models_dirs:
   - models
@@ -94,17 +91,13 @@ profiles:
 
 matrix:
   parallel_power: 0.75      # low favours context, high favours slots
-  categories:
-    emb: {role: embeddings}
-    rnk: {role: rerank}
-    tts: {role: t2s}
 
 capacity:
   pp_tps: 1000              # prompt speed, for eviction cost
 
 pools:
   default:
-    reserve_extra: 2G       # unmodelled resident (a game, a VM)
+    spare: 2G               # added to the measured reserve
 
 hardware:
   vram: 32G
@@ -126,7 +119,7 @@ set it.
 | `backends` | Ordered enable/prefer list | [SPEC §Backend Selection](../SPEC.md#backend-selection) |
 | `roles` | Operator-defined purposes, owned trees, placement, allocation | [roles-tasks-routing](roles-tasks-routing.md) |
 | `matrix` | Sizing knobs and matrix `sets:` | [SPEC §VRAM Allocation](../SPEC.md#vram-allocation) |
-| `pools` | Pool sizes, spare, reservations, pins | [SPEC §Capacity routing](../SPEC.md#capacity-routing) |
+| `pools` | Per-pool spare and nominal size | [SPEC §Capacity routing](../SPEC.md#capacity-routing) |
 | `capacity` | Eviction-cost inputs (`pp_tps`, `drive_mbps`) | [SPEC §Capacity routing](../SPEC.md#capacity-routing) |
 | `hardware` | Physical overrides | [SPEC §Hardware Detection](../SPEC.md#hardware-detection) |
 | `overrides` | Pattern-scoped serving rules | [SPEC §Override Rules](../SPEC.md#override-rules) |
@@ -219,21 +212,18 @@ A model with no owning role and no sidecar `role:` is an error: the run quits.
 
 ### `roles`
 
-A role is an operator-defined purpose and allocation policy. The code ships
-no role names; the example below defines the usual set. A model belongs to
-the role that owns its directory, or to the role named by its sidecar
-`role:`.
+A role is ownership and allocation. The code ships no role names; the
+example below defines the usual set. A model belongs to the role that owns
+its directory, or to the role named by its sidecar `role:`.
 
 ```yaml
 roles:
   chat:
     dir: qwen3             # the tree this role owns
-    fill: true             # take the slack no other share claims
-    live: 1                # 1 | per-device | capacity
+    share: fill            # request 100 in each set
   embeddings:
     dir: embed
-    share: 5%              # fraction of slack
-    live: 1
+    share: 5%              # request weight
     device: cpu            # every model of this role runs from system RAM
 ```
 
@@ -244,25 +234,22 @@ roles:
 - A role has no behaviour. The models under it declare `tasks:`, and each
   task names the endpoint it is served at. A role is ownership and
   allocation, nothing else.
-- `share` — percentage of slack. Slack is the pool after reserve, spare,
-  residents, and every serving's floor. `40%` and `40` are 40%; a bare number
-  at or below 1 is a fraction (`0.4` is 40%, `1` is 100%). Shares in a pool
-  sum to at most 100%; the rest is headroom.
-- `fill` — take whatever no share claims. At most one role per pool; mutually
-  exclusive with `share`.
-- `live` — `1` (one serving, evicts), `per-device`, or `capacity`.
+- `share` — the role's request in each set: a number (`40`, `40%`, and values
+  above 100 are relative weights), `fill` (100), `min` (0, accept nothing), or
+  `0` (0, accept what remains). Weights are normalised per set; they do not
+  sum to a cap.
 - `device` — `auto`, `cpu`, or a GPU index, the same vocabulary as a sidecar.
   Unset leaves placement to the sidecar/task. See
   [SPEC §Device](../SPEC.md#device-device) for the precedence and the
   `ram`/`-ngl 0` effect.
 
-`share`, `fill` and `live` are parsed and validated; the allocation they
-describe is not applied yet — the solver still uses the global spare (see
+`share` is parsed and validated; the auction it describes is not applied yet —
+the solver still uses the global spare (see
 [roles-tasks-routing](roles-tasks-routing.md) §Implementation status).
 
-There is no `min`, `preferred`, `cap`, `weight`, `exclusive`, or
-`persistent`. A floor is derived per model from its task's `min_context` and
-`min_parallel`; a share is already a cap; `share: 100%` runs alone.
+There is no `min`, `preferred`, `cap`, `weight`, `exclusive`, `persistent`,
+`fill`, or per-role count key. A floor is derived per model from its task's
+`min_context` and `min_parallel`. A single-leaf set is how a role runs alone.
 
 A task does not name a role. The model's role is the model's.
 
@@ -283,20 +270,23 @@ matrix:
     voice: "chat & t2s"
 ```
 
-- `tools_min_ctx`, `coload_min_ctx`, `min_chat_ctx`,
-  `ctx_gain_min` — guards for squeezing helpers to buy chat context.
+- `tools_min_ctx`, `min_chat_ctx` — guards for squeezing helpers to buy
+  context.
 - `auto_parallel`, `auto_parallel_max`, `parallel_power` — how leftover
   memory becomes slots vs context.
-- `sets` — llama-swap expressions (`&`, `|`, `()`, `+set`, `+auto:orphans`)
-  over role labels and model ids. A model in no set runs alone.
+- `sets` — llama-swap expressions (`&`, `|`, `()`, `+set`) over role labels
+  and model ids. A single leaf is a valid set and confines that role to
+  running alone. A model in no set runs alone.
 - `embed_context` / `rerank_context` are retired; use a task `max_context`.
-- `categories` is retired; the matrix picks by role and/or model id.
+- The old set-category selector is retired; name the model id directly in
+  a set.
 
 `sets:` is not a separate router switch. Writing it makes the config matrix;
-leaving it out makes it capacity. Each set is its own memory budget, so
-`[A&B] [A&C] [A&D]` lets all four take half the pool where capacity would
-force each to a quarter. Matrix never preloads: it evicts to the cheapest set
-containing the requested model and starts only that model.
+leaving it out makes it capacity. Each set is its own budget, sized by the
+auction in [allocation.md](allocation.md). Capacity uses generated sets with
+the same algebra and emits pools plus capacities. Matrix never preloads: it
+evicts to the cheapest set containing the requested model and starts only
+that model.
 
 ### `pools`
 
@@ -308,33 +298,19 @@ for something llama-packer does not model. Keys per pool id (`default`,
 ```yaml
 pools:
   default:
-    spare: 2G               # per-pool solve spare
-    reserve_extra: 4G      # unmodelled resident; chat is sized around it
-    pins:
-      image: 6G
-      embeddings: auto
+    spare: 2G               # added to the measured reserve
   ram:
     spare: 2G               # keep 2G of host RAM free
 ```
 
-- `spare:` — per-pool solve spare, overriding the global spare for models
-  whose `device:` maps to that pool. It sizes chat/context; it does **not**
-  change the emitted `default` pool. On `ram:` it does reduce the emitted
-  host pool (and the host ledger).
-- `reserve_extra:` — memory added to the chat solve's spare for something
-  the packer does not charge (a VM, a game, another tenant, a sidecar).
-  **Leaves the emitted pools intact while sizing chat smaller** — the lever
-  for co-residency.
-- `pins:` — map a claimant name to an explicit reservation or `"auto"`
-  (`"auto"` keeps the derived math authoritative). Accumulates into
-  `reserve_extra`.
-- `vram:` — the nominal size used to resolve bare-number memory values and
-  `pins:` for that pool. It does not change the emitted `default` pool,
-  which is the detected total minus reserve and global spare.
+- `spare:` — added to the measured reserve for that pool. It overrides the
+  fleet `defaults.spare` for that pool and reduces the emitted pool.
+- `vram:` — the nominal size used to resolve bare-number memory values. It
+  does not change the emitted `default` pool.
+- `reserve_extra:` and `pins:` are retired and error.
 
-The pool the router sees is therefore controlled by `--vram` (or
-`hardware.vram`) and `defaults.spare` (or `--spare`). Everything in
-`pools:` sizes the solve around that pool.
+The pool the router sees is `--vram` (or `hardware.vram`) minus the measured
+reserve and that pool's spare.
 
 ### `capacity`
 
@@ -475,7 +451,7 @@ slot count.
 
 - **One model per role.** A size-1 role pool means requesting another model
   of the same role unloads the current one, whatever its eviction cost.
-  Chat and each helper role behave this way.
+  Every role behaves this way.
 - **RAM models can be unloaded too.** A `device: cpu` model charges the
   `ram` pool and can be evicted under RAM pressure. TTL is a separate idle
   timer.
@@ -484,7 +460,7 @@ slot count.
 
   ```
   eviction cost = weight size / disk read speed
-                + context * slots / prompt speed        (chat only)
+                + context * slots / prompt speed        (KV-cached endpoints)
   ```
 
   First term: time to read the model file from disk. Second: chat prefill
@@ -492,15 +468,17 @@ slot count.
   tokens/s. A 20 GiB model on a 1 GiB/s disk costs about 20 s to reload; its
   32k context at 2 slots and 1000 prompt tokens/s adds about 66 s of lost
   prefill.
-- **TTL** — declare `ttl:` per task or per model:
+- **TTL** — declare `ttl:` at the top level, on a role, on a task, or on a
+  model:
 
   ```
   0                     never unload
-  shortest declared     otherwise
-  1 hour                CPU-resident model, nothing declared
+  most specific value   otherwise
+  3600 seconds          top-level default
   ```
 
-  A GPU model with no TTL of its own follows the global idle setting.
+  A task or sidecar value overrides the role, and the role overrides the
+  top-level `ttl`. TTL never reserves memory.
 
 ## Validate before handing back
 
@@ -532,7 +510,7 @@ your intent.
 Then check the plan itself:
 
 - no model gets more memory than the pool allows;
-- no warning about `matrix.sets:` or `matrix.evict_costs:`;
+- no warning about a set expression or `matrix.evict_costs:`;
 - every model offered for a task meets its minimum context and slot count;
 - idle timeouts are what you intend for keep-warm roles;
 - eviction cost is high for long-context chat and low for small helpers;
@@ -546,7 +524,7 @@ Then check the plan itself:
 | `llama-packer --check --profiles P` | Is the profile valid, and where exactly is the typo? |
 | `llama-packer --dry-run` | Does the file parse, and what did the packer decide? |
 | `llama-swap -config FILE -validate` | Is the emitted YAML a valid llama-swap config? |
-| `extras/check_sidecar_budget.py FILE --require t2s,embeddings` | Can the required sidecars be resident beside each chat? [plan](plans/sidecar-residency-eval.md) |
+| `extras/check_sidecar_budget.py FILE --require t2s,embeddings` | Can the required sidecars be loaded beside each chat? [plan](plans/sidecar-residency-eval.md) |
 | `extras/sidecar_eval.py --profiles P` | What does each co-residency strategy cost in chat context? [plan](plans/sidecar-residency-eval.md) |
 | `python -m llama_packer.vram_log --report` | What is the real fixed baseline and peak tenant usage? |
 | `llama-packer --probe-memory` | How much VRAM does a model family take at a context/slot grid? |
@@ -564,10 +542,12 @@ Retired spellings, and what replaces them:
 
 | old | new |
 |---|---|
-| `matrix.sets:` / `matrix.evict_costs:` | removed; memory decides co-residency, allocations and eviction cost are measured |
+| `matrix.categories:` / `matrix.evict_costs:` | removed; name the model id in a set, or let the role label expand |
 | sidecar `usage:` | sidecar `tasks: [...]`, built from `profiles.yaml tasks:` (`role:` is valid again, as a tree override) |
 | sidecar `backend:` | sidecar `engines: [...]` |
 | role `persistent:` | explicit `ttl:` (sidecar or task) |
+| the old per-role count key, `fill:`, and `kind:` | one serving per role; `share: fill`; behaviour comes from the task endpoint |
+| `pools.<id>.reserve_extra:` / `pins:` | `pools.<id>.spare:` |
 
 Warnings are the migration list. Do not assume an old file is valid because
 the binaries updated cleanly.
@@ -582,7 +562,7 @@ the binaries updated cleanly.
   co-residency, capacities, eviction, and worked hardware examples.
 - [`docs/llama-swap.md`](llama-swap.md) — what llama-swap can do and the
   `profiles.yaml`/sidecar input that provides it.
-- [`docs/architecture.md`](architecture.md) — the four levels (role, task,
-  category, pool) and how they fit.
+- [`docs/architecture.md`](architecture.md) — the levels (role, task, pool)
+  and how they fit.
 - [`docs/glossary.md`](glossary.md) — one name per concept.
 - [`docs/install.md`](install.md) — install and update workflow.

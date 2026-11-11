@@ -10,10 +10,10 @@ the code is wrong and gets fixed next.
 | **model** | weights plus sidecar. Declares engines, role, tasks, context ceiling, capabilities, `pp_tps`. |
 | **task** | one endpoint contract plus demand. The only thing bound to server API capabilities. |
 | **endpoint** | fixed server API surface (chat, embeddings, rerank, images, transcriptions, speech). |
-| **role** | operator-defined purpose and allocation policy: a label, the directory it owns, a `share`, and a residency rule. No built-in names. |
-| **set** | a named combination of models/roles that llama-swap may keep resident together. Only used in matrix mode. |
-| **pool** | a memory limit. `default` is the GPU budget, `ram` is the host budget, and a multi-GPU host has one per card. |
-| **share** | the fraction of *slack* a role may claim, as a percentage. |
+| **role** | operator-defined ownership and allocation policy: a label, the directory it owns, and a `share`. No built-in names. |
+| **set** | a named combination of roles or model ids with one budget. Authored sets drive matrix mode; generated sets size capacity mode. |
+| **pool** | a memory limit with a measured reserve and an operator spare. `default` is the GPU pool, `ram` is the host pool. |
+| **share** | a role's request weight in a set's auction, or `min`, `0`, or `fill`. |
 | **floor** | the memory a serving needs at its task's minimum context and slots. Derived per model, never configured. |
 
 A role is not an endpoint, a task, a device, or a slot count. Two models with
@@ -21,24 +21,20 @@ different tasks and endpoints can share a role.
 
 ## Role
 
-A role is a purpose. Models are assigned to it by the tree it owns (or a
-sidecar `role:`); models in the same role share memory and evict each other
-on request.
+A role is ownership and allocation. Models are assigned by the tree it owns
+(or a sidecar `role:`); models in the same role evict each other on request.
 
 ```yaml
 roles:
   dog:
     dir: qwen3           # the tree this role owns
-    fill: true           # take the slack no other share claims
-    live: 1              # 1 | per-device | capacity
+    share: fill          # take the auction the other weights leave
   cat:
     dir: misc
-    share: 20%           # fraction of slack
-    live: 1
+    share: 20%           # request weight in each set
   always-on:
     dir: embed
-    share: 5%
-    live: 1
+    share: min           # floor only
     device: cpu          # every model of this role runs from system RAM
 ```
 
@@ -53,24 +49,23 @@ The schema:
 - A role has no behaviour. The models under it declare their `tasks:`, and
   each task names the endpoint it is served at. A role is ownership and
   allocation, nothing else.
-- `share` — percentage of slack the role may claim. Shares in one pool must
-  sum to at most 100%; the remainder is unallocated headroom.
-- `fill` — `true` means "take whatever no other share claims". At most one
-  role per pool may fill. `share` and `fill` are mutually exclusive.
-- `live` — how many servings of the role may be resident:
-  - `1` (default): one; requesting another evicts.
-  - `per-device`: one per pool-bin (`gpu0`, `gpu1`, `ram`).
-  - `capacity`: no role-level limit; the role's share is the only bound.
+- `share` — the role's request in each set it belongs to:
+  - `N%` (or `N`) — request weight `N`. Weights are relative and may exceed
+    100.
+  - `fill` — request weight 100.
+  - `min` — request 0, accept nothing; the role stays at its floor.
+  - `0` — request 0, accept whatever remains unclaimed.
+  A role with no `share` accepts but does not request.
 - `device` — `auto`, `cpu`, or a GPU index, exactly the sidecar vocabulary;
   leaves placement to the sidecar/task. See SPEC §Device for the three
   places and their precedence.
 
-There is no `min`, `preferred`, `cap`, `weight`, `exclusive`, or
-`persistent`. Floors are derived (see *Allocation*), a share is already a
-cap, and `share: 100%` is what `exclusive` used to mean.
+There is no `min`, `preferred`, `cap`, `weight`, `exclusive`, or `persistent`
+key. `share` carries both the request and the fill. Floors are derived. A role
+runs one serving at a time, so exclusivity is a single-leaf set.
 
 Roles are data. The code ships no role names and no directory table. The
-default roles live in `llama_packer/profiles.yaml`; your `profiles.yaml`
+default roles are defined in `llama_packer/profiles.yaml`; your `profiles.yaml`
 replaces them entirely. `dirs:` is retired: the tree-to-role mapping lives in
 the role.
 
@@ -80,8 +75,8 @@ the role.
 tasks:
   spot:
     endpoint: openai.chat.completions
-    device: 0                # cpu | GPU index
-    min_context: 32k
+    device: 0                # auto | cpu | GPU index
+    min_context: 32k         # optional; top-level min_context is the default
     max_context: 64k         # optional ceiling
     min_parallel: 2
     require: [vision]
@@ -93,13 +88,15 @@ tasks:
 - `endpoint` (required) — from the fixed endpoint set.
 - `device` — `auto`, `cpu`, or a GPU index (SPEC §Device). A task's value is
   a default; a sidecar `device:` wins.
-- `min_context`, `min_parallel` — hard floors. These produce the serving's
-  memory floor.
-- `max_context` — ceiling on the served context. For embeddings/rerank it
-  is the RAG window; clients chunk to fit.
+- `min_context` — the serving's context floor. A task value overrides the
+  top-level `min_context`. `min_context > max_context` is an error and no
+  config is written.
+- `min_parallel` — the serving's slot floor. These two produce the memory
+  floor.
+- `max_context` — ceiling on the served context. Clients chunk to fit.
 - `require` / `keep` / `sacrifice` — capability policy.
 - `parallel_power` — per-task slot exponent.
-- `ttl` — idle lifetime.
+- `ttl` — idle lifetime. `0` disables idle unload.
 
 A task does not name a role. The model's role is the model's.
 
@@ -126,78 +123,60 @@ pp_tps: 1200
 
 ## Memory is a tuple
 
-Every serving has a cost in every pool, including zero:
+Every serving has a cost in every pool, including zero, and `cpu` is the
+first field:
+
+```python
+Memory = namedtuple("Memory", ["cpu", "gpu0", "gpu1"])
+```
 
 | placement | cost tuple |
 |---|---|
-| GPU model | `{gpu0: n, ram: 0}` |
-| CPU model | `{ram: n}` |
-| tensor split across two cards | `{gpu0: a, gpu1: b, ram: c}` |
-| projector on the host | `{gpu0: a, ram: b}` |
+| GPU model | `{gpu0: n, cpu: 0}` |
+| CPU model | `{cpu: n}` |
+| projector on the host | `{gpu0: a, cpu: b}` |
 
-Placement is therefore not a special case: it is which vectors are feasible.
-The planner is total over pools; the emitted `capacities:` stays sparse,
-because llama-swap treats an absent pool as zero.
+Placement is not a special case: it is which fields are non-zero. The planner
+is total over pools; the emitted `capacities:` stays sparse, because
+llama-swap treats an absent pool as zero. Tensor splits across cards are
+future work; the tuple already expresses them.
 
 ## Allocation
 
-A serving's **floor** is the memory it needs at its task's `min_context`,
-`min_parallel`, and any capability it must keep. It is derived through the
-model's measured memory law, so two models in one role have different floors.
+The full algebra lives in [allocation.md](allocation.md). In short:
 
-Floors come out first; shares divide only what is left:
+- A serving's floor comes from its task's `min_context` and `min_parallel`,
+  through the measured memory law.
+- A role's floor is the maximum floor of all models in the role.
+- A set's floor follows its expression: `&` sums floors, `|` takes the
+  maximum, `+set` inlines a set.
+- `auction(set) = available − floor(set)`. Members request it by `share`
+  weight; a role accepts the minimum offer across the sets it belongs to;
+  squeezed sets renormalise their remainder.
 
-```
-slack[pool]            = pool − reserve − spare − Σ residents[pool] − Σ floors[pool]
-allocation[role][pool] = Σ floors of its servings + share × slack[pool]
-```
-
-Residents are the RAG pair, roles placed on the host, `reserve_extra`, pins,
-and unmodelled sidecars. A role's floor is not counted twice: a resident that is
-also a role contributes its floor to the resident sum and nothing to slack.
-
-A serving is solved inside `floor + role share of slack`, because it may be
-alone. What is emitted depends on `live`:
-
-- `live: 1` — the entry charges its actual size to the pool and a size-1
-  counting pool enforces one serving. No role memory pool is needed.
-- `live: capacity` — the role gets a memory pool equal to its allocation, so
-  the runtime enforces the sum when several servings are live.
-- `live: per-device` — one counting pool per role and bin.
-
-### Infeasible floors
-
-A model whose floor does not fit its role's allocation in any placement gets
-no entry. It is logged with the pool, the need, and the shortfall. Removing it
-lowers `Σ floors`, which raises slack, so the process repeats until stable. It
-is monotone and terminates.
-
-A role that loses every model keeps its name with a zero floor tuple. It
-emits nothing and warns once. That is a legal state: the operator removed the
-models, not the policy.
+A role runs one serving at a time in both routers. In capacity mode every
+role is a pool of value 1 and every entry charges 1. In matrix mode a role
+label expands to one of its entries.
 
 ## Routing
 
 There is no `routing.use`. The mode follows from the input:
 
 - `matrix.sets:` present → matrix.
-- absent → capacity.
+- absent or empty → capacity.
 
-`group` is not emitted. `exclusive` is `share: 100%`; residency is `ttl: 0`.
+`group` is not emitted.
 
 ### Capacity
 
 The packer emits pools and per-entry `capacities`. llama-swap loads the
 requested model if it fits every pool, evicting by `evict_cost` when it does
-not. Any combination that fits is allowed, so the budget is global:
+not. Any combination that fits is allowed.
 
-```
-Σ over all models ≤ pool, per pool
-```
-
-Shares must sum to at most 100%, because every role may be resident with every
-other. That is the honest constraint when every fitting combination is
-acceptable.
+Sizes come from **generated sets**: the packer builds ephemeral sets from the
+role floors and runs the same auction. The generated sets are reported in a
+comment. Once generated they are identical to authored sets; only their
+origin differs. The generation rule is not recorded yet.
 
 ### Matrix
 
@@ -206,47 +185,36 @@ Sets are the only way to forbid a combination that fits:
 ```yaml
 matrix:
   sets:
-    rag: "chat & embeddings & rerank"
-    voice: "chat & t2s"
+    pair: "foo & bar"
+    alone: "baz"
 ```
 
-Expressions use llama-swap syntax: `&`, `|`, `()`, `+set`, `+auto:orphans`.
-Leaves are role labels or model ids. A model in no set runs alone.
+Expressions use llama-swap syntax: `&`, `|`, `()`, `+set`. Leaves are role
+labels or model ids. A single leaf is a valid set and confines that role to
+running alone. A model in no set runs alone.
 
-Matrix has no global budget. Each set is its own:
-
-```
-Σ over each declared set ≤ pool, per pool
-```
-
-So `[A&B] [A&C] [A&D]` constrains only the pairs, and all four can take half
-the pool. Capacity would demand `A+B+C+D ≤ pool` and force each to a quarter.
-Excluding combinations is what lets the remaining ones be larger.
-
-The packer's matrix job: for each set, solve its members to fit, maximising
-context; an entry takes the tightest bound among the sets it appears in. No
-global sum, no search — the operator's set list *is* the constraint.
+Each set is its own budget. The packer sizes each member by the auction and
+gives an entry the tightest allocation among the sets it appears in. There is
+no sum over all models.
 
 Matrix does not preload. On a request for X, llama-swap picks the cheapest set
-containing X, evicts models outside it, and starts only X. Subsets are
+containing X, evicts what is outside it, and starts only X. Subsets are
 permitted. A set is a permission, not a prescription.
 
 ### Fidelity
 
 | | capacity | matrix |
 |---|---|---|
-| who decides co-residency | arithmetic: anything that fits | the sets |
-| sum range | all models | each declared set |
-| memory enforced at runtime | yes | no |
+| who decides what may load together | arithmetic: any combination whose capacities fit every pool | the authored sets |
+| budget used to size | generated sets | authored sets |
+| memory enforced at runtime | yes, by the pools | no, the set is a permission |
 | preloads | no | no |
-| one live per role | size-1 counting pool | no set contains two of the role |
-| runs alone | `share: 100%` | model in no set |
-| never unload | `ttl: 0` + high `evict_cost` | high `evict_costs` |
+| one serving per role | a role pool of 1 | a role label expands to one entry |
+| runs alone | a generated single-role set | a single-leaf set, or no set |
+| no idle unload | `ttl: 0` | `ttl: 0` |
 
-Matrix buys two things: the right to forbid a combination that fits, and the
-right to size each role against its sets rather than against every other role.
-When the shares already sum to 100% and no set forbids anything, the two modes
-agree and capacity is less to maintain; the packer says so.
+Matrix buys the right to forbid a combination that fits. Capacity always
+admits any combination whose numbers fit.
 
 ## Prefill and eviction cost
 
@@ -254,12 +222,11 @@ Eviction cost is derived, not configured per role:
 
 ```
 evict_cost = model_size / drive_mbps
-           + (context * slots / pp_tps, chat endpoints only)
+           + (context * slots / pp_tps, KV-cached endpoints only)
 ```
 
 `pp_tps` comes from the sidecar, else `capacity.pp_tps`, else an estimate from
-active parameters. Only chat endpoints keep a KV cache, so only they pay
-prefill. A resident role can raise the result so it is evicted last.
+active parameters. Stateless endpoints keep no KV, so they pay no prefill.
 
 ## Worked example
 
@@ -267,12 +234,10 @@ prefill. A resident role can raise the result so it is evicted last.
 roles:
   dog:
     dir: qwen3
-    fill: true
-    live: 1
+    share: fill
   cat:
     dir: misc
     share: 20%
-    live: 1
 
 tasks:
   spot:
@@ -296,10 +261,9 @@ tasks:
 
 One model under `qwen3/`, `tasks: [spot, hunt, tricks]`, produces up to three
 entries. It belongs to `dog` because `dog` owns `qwen3/`; no `role:` line is
-needed. All three are in role `dog`; `live: 1` means one is resident at a
-time. `dog` fills, so it takes the slack after `cat` and the residents. A
-sidecar `role: cat` in the same tree moves it; `role: wolf` errors because
-`wolf` is not defined.
+needed. All three are in role `dog`, so one is loaded at a time. `dog` fills
+and takes what `cat` leaves. A sidecar `role: cat` in the same tree moves it;
+`role: wolf` errors because `wolf` is not defined.
 
 ## Implementation status
 
@@ -307,11 +271,8 @@ Implemented:
 
 - `roles:` is data. The code loads the default roles and replaces them from
   `profiles.yaml`. Role names are not hardcoded.
-- `dir`, `share`, `fill`, `live`, and `device` are parsed and
-  validated: `share` is a percentage in (0, 100], one role may
-  fill, shares sum to at most 100%, and two roles may not own overlapping
+- `dir`, `share`, `device` are parsed. Two roles may not own overlapping
   trees.
-- The default roles and `profiles.yaml.example` use the new schema.
 - A role owns its trees with `dir`; discovery assigns every model from the
   owning tree. `dirs:` is retired and errors, the built-in directory table is
   gone, and `--extra-dirs` warns and is ignored.
@@ -320,8 +281,7 @@ Implemented:
 - `tasks:` no longer takes `role:`. A task's `device:` places every model
   that serves it when the sidecar declares none (conflicting task devices
   warn and leave placement alone); `max_context` is the serving ceiling.
-  `role:` inside a
-  task warns and is ignored for old files.
+  `role:` inside a task warns and is ignored for old files.
 - Sidecar `role:` is valid and overrides the tree's role.
 - A role has no behaviour: a model's declared tasks name the endpoint, and
   the endpoint selects engine flags, discovery guards and solve paths.
@@ -331,18 +291,23 @@ Implemented:
   capacity. `routing.use` is retired and errors; the group router is gone.
 - `matrix.sets:` expands role labels to the entries serving them; a role
   with no entries is removed from the expression and the set keeps the rest.
-- The chat solve prices a set by its worst branch: a role leaf costs the most
-  expensive GPU model of that role, a literal leaf costs the model with that
-  stem or published id, and the roles being solved cost nothing.
+- The chat solve prices a set by its worst branch.
 - `__CHAT_VARS__` / `__COLOAD_VARS__` are retired and rejected; the
   opportunistic co-load pass is gone.
 
 Not implemented yet:
 
-- `share` is parsed but not applied: floors, slack, and the role split are not
-  computed. The solver still uses the global spare.
-- The tuple memory model is two fields (`vram`, `ram`), not one per pool.
-- `live: per-device` is not emitted per pool-bin.
-- `matrix.categories` is still accepted by the packer's shared solve even
-  though the contract retires it.
-- The set-feasibility check and the drop fixpoint are not written.
+- `share` values and the auction. The solver still uses the global spare.
+- Role floor as the maximum model floor; set floor by expression; set
+  feasibility.
+- The tuple memory model: two fields (`vram`, `ram`), not one per pool.
+  `cpu` is not first.
+- Generated sets for capacity mode.
+- A top-level `ttl` and a role `ttl`; only task and sidecar TTL exist.
+- Per-pool `spare` from the CLI; `reserve_extra` and `pins` are still
+  accepted.
+- The retired set-category selector is still accepted by the shared solve.
+- The fallback entry is still priced as a chat task.
+- `min_context` as a required task value with a top-level default.
+- The old `fill:` key and the old per-role count key are still accepted; the
+  parser does not retire them yet.

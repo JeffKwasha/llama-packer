@@ -129,7 +129,7 @@ engine resolves the path and rejects extensionless targets with
 Two layers keep audio GGUFs off the chat path and whisper models out of
 audio.cpp:
 
-1. **Directory authority** — audio models live under the directories their
+1. **Directory authority** — audio models are under the directories their
    roles own (`t2s/`, `s2t/`, …; the default roles own them, and `backends:`
    enables the engine). A `.gguf` in `chat/` is never an audio model.
 2. **Role + formats** — audio.cpp serves only `t2s`/`s2t` for
@@ -159,7 +159,7 @@ matrix:
 
 A set names roles (or literal entry ids); the chat solve reserves the most
 expensive model each named role can contribute. `tts` and `stt` are separate
-categories because switching between them forces a resident reload. A task
+categories because switching between them forces a reload. A task
 with `device: cpu` (the audio-cpp default here) places its models on the host,
 so they cost RAM rather than VRAM.
 
@@ -209,7 +209,7 @@ Vulkan backend requested but registry 'Vulkan' has no device 0
 
 — while llama.cpp offloads normally from the same account, the same `/dev`
 and the same unit (verified: `/sys/class/drm/card1/.../mem_info_vram_used`
-shows a resident model), so it is audio.cpp's device enumeration rather than
+shows a loaded model), so it is audio.cpp's device enumeration rather than
 a permission problem. Measured CPU cost: parakeet ASR RTF 0.076, kokoro
 synthesis comfortably under real time. To settle it properly, watch
 `journalctl -u llama-swap -f` (as a user in `systemd-journal`) while making a
@@ -245,9 +245,9 @@ The research brief this landed from is preserved in git history: upstream
 config in llama-swap issue #36 (`@dkruyt`, 2026-07-03).
 
 **2026-09-16 rework (0.8.0):** all emitted-key claims verified against the
-0.8.0 server README + live binary (AMD R9700 / RADV Vulkan): `hip`/`rocm`
+0.8.0 server README + current binary (AMD R9700 / RADV Vulkan): `hip`/`rocm`
 backend, `lazy_load`, `default_voice_preset`/`voice_presets`,
 `load_options`/`session_options`, `model_spec_override`, embedded package
-specs in standalone GGUFs, symlinked-blob rejection. Live-verified families:
+specs in standalone GGUFs, symlinked-blob rejection. Verified on hardware:
 kokoro `tts`, chatterbox_turbo `tts`, chatterbox `clon`, parakeet_tdt `asr`,
 nemotron_asr `asr`.

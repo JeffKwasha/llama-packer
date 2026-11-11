@@ -21,14 +21,14 @@ The memory model behind routing, capacities and eviction is in
 
 | You want | llama-swap does | Write this |
 |---|---|---|
-| Several models, one live at a time | one process per entry, swapped on request | sidecars in `models_dirs`; one entry per model/variant |
-| Two models resident together | capacity pools; any combination that fits may coexist | `roles:` with `share:` so the sums fit |
-| One model per purpose | a size-1 counting pool per role | `roles:` with `live: 1` |
-| Forbid a combination that fits | matrix sets; only listed combinations may stay resident | `matrix.sets:` |
+| Several models, one loaded at a time | one process per entry, swapped on request | sidecars in `models_dirs`; one entry per model/variant |
+| Two models loaded together | capacity pools; any combination that fits may coexist | `roles:` with `share:`; the auction sizes each member |
+| One model per role | a size-1 counting pool per role | `roles:` (the pool is emitted automatically) |
+| Forbid a combination that fits | matrix sets; only listed combinations may be loaded | `matrix.sets:` |
 | Never unload a model | eviction cost, and `ttl: 0` | sidecar `ttl: 0` |
 | Pin a model to a GPU | `env` device variable | sidecar `device: N` or `roles.<name>.device: N` |
 | Run a model from system RAM | a process with `--n-gpu-layers 0` | sidecar `device: cpu` or `roles.<name>.device: cpu` |
-| Unload idle models | `ttl` / `globalTTL` | sidecar or task `ttl:`; `--idle-unload N` |
+| Unload idle models | `ttl` | top-level, role, task, or sidecar `ttl:` |
 | Change sampling per request | `filters.setParamsByID` | `profiles:` and sidecar `modes:` |
 | Show modes as models | auto-created aliases in `/v1/models` | `includeAliasesInList: true` (emitted) |
 | Advertise context/tools/vision | `capabilities` badges | sidecar `capabilities:`, `context_length`, `tasks:` |
@@ -41,24 +41,24 @@ The memory model behind routing, capacities and eviction is in
 
 ## Composing the capabilities
 
-### One model per role, several roles resident
+### One model per role, several roles loaded
 
-A role with `live: 1` gets a size-1 counting pool, so one serving of that role
-is live and a second request evicts the first. Different roles coexist when
-their shares fit.
+Every role is a pool of value 1, and every entry charges 1 to its role's
+pool. One serving of that role is loaded at a time; a second request evicts
+the first. Different roles coexist when their capacities fit.
 
 ```yaml
 roles:
-  chat:       {dir: chat, fill: true, live: 1}
-  embeddings: {dir: embed, share: 5%, live: 1, device: cpu}
-  rerank:     {dir: rerank, share: 5%, live: 1, device: cpu}
+  chat:       {dir: chat, share: fill}
+  embeddings: {dir: embed, share: 5%, device: cpu}
+  rerank:     {dir: rerank, share: 5%, device: cpu}
 pools:
   default:
-    reserve_extra: 3G      # the voice sidecar the packer does not charge
+    spare: 3G
 ```
 
-Every serving's floor comes out first; `share` divides only the slack. `chat`
-fills, so it takes whatever the helpers do not claim.
+A set's floors come out first; `share` divides the auction. `chat` fills, so
+it takes what the helpers leave.
 
 ### Your own roles
 
@@ -66,9 +66,9 @@ Declare a role with its own trees and share.
 
 ```yaml
 roles:
-  cat:     {dir: cats, share: 40%, live: 1}
-  dog:     {dir: dogs, share: 40%, live: 1}
-  hamster: {dir: voices, share: 10%, live: per-device}
+  cat:     {dir: cats, share: 40%}
+  dog:     {dir: dogs, share: 40%}
+  hamster: {dir: voices, share: 10%}
 
 tasks:
   cat:   {endpoint: openai.chat.completions}
@@ -79,15 +79,14 @@ tasks:
 Models belong to the role that owns their directory; a sidecar `role:`
 overrides it. Tasks do not name a role.
 
-`cat` and `dog` may be resident together; a second `cat` request evicts the
-first. `hamster` is a separate voice role. The shares and `live` values are
-parsed; the solver still uses the global spare and gives every role one live
-serving today (see `roles-tasks-routing.md` §Implementation status).
+`cat` and `dog` may be loaded together; a second `cat` request evicts the
+first. `hamster` is a separate voice role. Shares are weights inside each
+set, not a cap on the fleet.
 
 ### A model that must run alone
 
-Give its role `share: 100%`. Nothing else can be resident with it, and it is
-the same thing `exclusive` meant under the group router.
+Put its role in a single-leaf set (`alone: "foo"`). It gets the whole auction
+of that set, and nothing else may be loaded with it.
 
 ### Forbidding a combination that fits
 
@@ -101,9 +100,11 @@ matrix:
     voice: "chat & t2s"
 ```
 
-Each set is its own budget. `[A&B] [A&C] [A&D]` constrains only the pairs, so
-all four can take half the pool, where capacity would demand
-`A+B+C+D ≤ pool` and force each to a quarter. That is what matrix buys.
+Each set is its own budget, sized by the auction. Capacity uses generated
+sets with the same algebra and still admits any combination that fits.
+Matrix is the one that forbids. `[A&B] [A&C] [A&D]` constrains only the
+pairs, so each pair may use the whole pool; a global sum would force every
+model to a quarter.
 
 It does not preload. On a request for X, llama-swap picks the cheapest set
 containing X, evicts models outside it, and starts only X. Subsets are
@@ -127,9 +128,9 @@ filters what a model may use.
 
 ### Idle vs pressure
 
-TTL yields time; capacity yields memory. Use `ttl: 0` to keep a resident
-warm, `--idle-unload N` for a fleet-wide fallback, and `pools.<pool>.spare`
-/ `reserve_extra` when a pool must stay honest under pressure.
+TTL yields time; capacity yields memory. Use `ttl: 0` on a role, task, or
+sidecar to stop idle unload, and `pools.<pool>.spare` when a pool must stay
+honest under pressure. The top-level `ttl` defaults to 3600 seconds.
 
 ## Sidecar keys that change emitted behaviour
 
@@ -168,10 +169,10 @@ warm, `--idle-unload N` for a fleet-wide fallback, and `pools.<pool>.spare`
 | `proxy` + `checkEndpoint: /` (sd-server, whisper-server) | Proxied HTTP services instead of managed processes; `/` avoids sd-server's 200-on-/health pitfall (upstream Discussion #866) | [writing-cmd](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/model-runtime/writing-cmd.md) |
 | `macros` (`${VAR}` → absolute paths, path + flag macros) | Macro substitution in the config; llama-packer resolves to absolute paths so `-watch-config` reloads pick up new binaries without a service restart, and orders definitions so nested substitution (flag macro referencing a path macro) works | [macros](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/configuration/macros.md) |
 | `includeAliasesInList: true` | Presents the auto-created setParamsByID aliases in `/v1/models`; llama-swap's default is `false`, which would hide them from dynamic-list clients (OpenWebUI, OpenClaw, …) | [config.example.yaml — includeAliasesInList](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
-| `routing.router.use: capacity` + `settings.capacity.pools` (`default`, `ram`, one size-1 counting pool per `live: 1` role), per-model `capacities` and `evict_cost` | Resource-pool routing: any combination that fits every pool may coexist; llama-swap evicts the cheapest resident under pressure. llama-packer solves contexts/capacities in Python | [groups and matrix](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/routing/groups-and-matrix.md) |
-| `routing.router.use: matrix` + `settings.matrix.sets` | Combination routing: only listed combinations may stay resident; each set is its own budget, so roles may exceed their global share. Never preloads — it evicts to the cheapest set containing the requested model and starts only that model | [groups and matrix](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/routing/groups-and-matrix.md) |
+| `routing.router.use: capacity` + `settings.capacity.pools` (`default`, `ram`, one size-1 counting pool per role), per-model `capacities` and `evict_cost` | Resource-pool routing: any combination that fits every pool may coexist; llama-swap evicts the cheapest serving under pressure. llama-packer solves contexts/capacities in Python | [groups and matrix](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/routing/groups-and-matrix.md) |
+| `routing.router.use: matrix` + `settings.matrix.sets` | Combination routing: only listed combinations may be loaded; each set is its own budget. Never preloads — it evicts to the cheapest set containing the requested model and starts only that model | [groups and matrix](https://github.com/mostlygeek/llama-swap/blob/main/docs/kb/guides/routing/groups-and-matrix.md) |
 | `healthCheckTimeout` | Startup health-check budget (auto-calculated from model size or explicit) | [config.example.yaml — healthCheckTimeout](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
-| `globalTTL` (via `--idle-unload SECONDS`) | Top-level default TTL: unload any model after SECONDS of inactivity (`0` = never; key omitted when the flag is absent). Opt-in — for co-residency with ComfyUI/games that need VRAM back without re-packing | [config.example.yaml — globalTTL](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
+| `ttl` (top-level, default 3600) | Top-level default TTL: unload any model after that many seconds of inactivity (`0` = never). A role, task, or sidecar `ttl:` overrides it | [config.example.yaml — ttl](https://github.com/mostlygeek/llama-swap/blob/main/docs/config.example.yaml) |
 
 Not a llama-swap feature: the sibling `config.env` file is llama-packer's own
 artifact (systemd `EnvironmentFile=` / docker `--env-file`) that happens to

@@ -1,7 +1,7 @@
 # Architecture
 
 How llama-packer turns a directory of model sidecars into a llama-swap
-`config.yaml`. Behavioral details live in [SPEC.md](../SPEC.md); this document
+`config.yaml`. Behavioral details are in [SPEC.md](../SPEC.md); this document
 is about *structure* — which component owns what, and why.
 
 ## Data flow
@@ -46,7 +46,7 @@ runtime: we choose the fields, llama-swap acts on them.
 | decision | our output | who acts |
 |---|---|---|
 | which entries exist | `models:` (`cmd`, `metadata`, `capabilities`, `name`) | llama-swap serves them |
-| when an idle entry unloads | `ttl:` per entry, `globalTTL:` top-level (seconds; `0` disables idle unload) | llama-swap's idle timer |
+| when an idle entry unloads | `ttl:` per entry, top-level `ttl:` (seconds; `0` disables idle unload) | llama-swap's idle timer |
 | which entries may be wanted together | `routing.router.settings.capacity` (`pools`, per-entry `capacities`, `evict_cost`) | llama-swap's capacity router |
 | what memory each serving claims | `capacities:` on each model | llama-swap, at request time |
 | what memory the packer budgets | pack-time arithmetic only | nobody at runtime |
@@ -54,9 +54,9 @@ runtime: we choose the fields, llama-swap acts on them.
 **The packer decides numbers; llama-swap enforces them.** `capacities` are
 declarations, so the packer emits the same measurement margin it solved
 with. `evict_cost` only orders evictions under pressure; it does not
-reserve or preload. A role with `live: 1` emits a size-1 counting pool,
-which turns "one live serving per role" into a capacity constraint, so a
-same-role request evicts its sibling without any set vocabulary.
+reserve or preload. Every role emits a size-1 counting pool, which turns
+"one serving per role" into a capacity constraint, so a same-role request
+evicts its sibling without any set vocabulary.
 
 Nothing is preloaded: llama-swap starts the requested model and evicts
 whatever the pools require. `ttl` is independent — it yields time, not
@@ -101,7 +101,7 @@ model --declares--> tasks --served at--> endpoints <--served by--> engine
 
 So one engine serves many models, one task can be served by several engines,
 and a model may perform several tasks. Two models performing the same task
-are alternatives, never co-resident.
+are alternatives, never loaded together.
 
 ### A task is a catalog entry
 
@@ -124,32 +124,31 @@ place: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`,
 `openai.audio.transcriptions`, `openai.audio.speech`, plus `native.*` for
 engine-specific surfaces. Servers and clients choose endpoints; a model
 never does. A role's required endpoints are the union of the endpoints of the tasks its
-models declare, and one live serving covers every task sharing an endpoint —
+models declare, and one serving covers every task sharing an endpoint —
 those tasks are aliases of one serving, never one load each.
 
-### A role is a purpose; a task is an endpoint contract
+### A role is ownership; a task is an endpoint contract
 
 The levels are not interchangeable:
 
 | level | answers | example |
 |---|---|---|
-| **role** | what a model is *for*, the tree it owns, plus its allocation policy | `chat` owns `chat/`, `embeddings` owns `embed/` |
+| **role** | the tree a model's directory belongs to, plus its allocation policy | `chat` owns `chat/`, `embeddings` owns `embed/` |
 | **task** | the endpoint contract a model can serve | `openai.chat.completions`, `/v1/embeddings` |
-| **share** | how much of the slack a role may claim | `40%`, or `fill: true` |
-| **capacity pool** | what may be co-resident | `default` VRAM, `ram`, a size-1 counting pool per `live: 1` role |
-| **set** | matrix mode: which combinations may stay resident | `chat & embeddings & rerank` |
+| **share** | a role's request weight in a set's auction | `40%`, `fill`, `min`, or `0` |
+| **capacity pool** | what may be loaded together | `default` VRAM, `ram`, a size-1 counting pool per role |
+| **set** | which combinations may be loaded together | `foo & bar` |
 
-A role is not a composition and does not "host" anything. Co-residency is
-what the emitted capacities allow: any combination that fits every pool may
-coexist, and a size-1 counting pool keeps one model per `live: 1` role live.
-That is capacity mode. An operator who must forbid a combination that fits
-writes `matrix.sets:` instead; each set is its own budget, so roles may
-exceed their global share when no set holds them together.
+A role is not a composition and does not "host" anything. What may be loaded
+together is what the emitted capacities allow: any combination that fits
+every pool, with a size-1 counting pool keeping one model per role. That is
+capacity mode. An operator who must forbid a combination that fits writes
+`matrix.sets:` instead; each set is its own budget.
 
-`ttl` is the temporal knob: sidecar > task > placement default, `0` = never,
-CPU-resident servings default to 3600 s (chat is not special).
+`ttl` is the temporal knob: sidecar > task > role > top-level `ttl`, `0` =
+never. The top-level default is 3600 s.
 
-### Where the registries live
+### Where the registries are
 
 `roles.py` is the role data: one row per operator-declared purpose with the
 tree it owns (`dir`) and an allocation policy. The task
@@ -161,7 +160,7 @@ declares only its endpoint, demand, and device.
 mapping from a task to the endpoint it is served at. An engine declares
 `endpoints`; compatibility is `endpoints.serves(engine.endpoints, task)`, so
 neither side has to learn the other's vocabulary. The registry's validation
-API and the doc/code agreement test live here (`docs_agree`,
+API and the doc/code agreement test are here (`docs_agree`,
 `test_registry_docs_agree`).
 
 Validation follows the same split: an alien sidecar key warns at discovery
@@ -179,7 +178,7 @@ compatibility is checked once in `_filter_supported` before any budgeting.
 | Validation happens exactly once, before budgeting | `build_config` composes filter → plan → emit in that order |
 | Plans are values; rendering is pure | `Planner.plan()` returns `dict[stem, list[Variant]]`; `emit_config` has no side effects |
 | Precedence rules exist in one place | raw `defaults:`/`profiles:` dicts are only read through `Profiles` |
-| Backends are (engine × transport) bindings, not per-combination classes | `BoundBackend` over `ENGINES` × `TRANSPORTS` (`backends/__init__.py`); container mechanics live only in `transport.py` |
+| Backends are (engine × transport) bindings, not per-combination classes | `BoundBackend` over `ENGINES` × `TRANSPORTS` (`backends/__init__.py`); container mechanics are only in `transport.py` |
 
 The plan/emit split is deliberate: planning depends only on models'
 `VramBudget` interfaces (injectable/fakeable), emission is deterministic over

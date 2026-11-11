@@ -20,9 +20,9 @@ Features:
 - want all Qwen3.5+ models to use the sharp chat template? 3 lines in models.yaml
 - Add low-temperature `coding` aliases to every model? 2 lines in profiles.yaml
 - Want 'text-only' variants that skip mmproj to maximize context or parallel? Automatic.
-- budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the capacity budget charges them to host RAM or a small VRAM slice, so chat keeps its context.
+- budget a couple GB of VRAM so embedding and rerank can stay loaded for RAG? Automatic — the capacity budget charges them to host RAM or a small VRAM slice, so chat keeps its context.
 - pick some models to use `q8_0` KV cache for longer context? YES
-- ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. `--idle-unload SECONDS` additionally emits `globalTTL` so llama-swap releases VRAM after idle.
+- ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. The top-level `ttl` additionally lets llama-swap release VRAM after idle.
 
 
 ## Quickstart ("It's alive")
@@ -91,12 +91,12 @@ Now you have capabilities, context windows, MTP support where available.
 mv profiles.yaml.example profiles.yaml
 
 - **Aliases.** Give one model several names — `instruct`, `coding`, `thinking` — each with its own sampling parameters, switched per-request with no reload. Declared once in the sidecar's `modes:` (or generated from `profiles.yaml`); emitted as `filters.setParamsByID` overrides.
-- **Capacity-budgeted co-residency.** Keep small models (embedders, rerankers, a quick draft model) loaded alongside your main chat model. Every serving declares its VRAM/host-RAM capacity, llama-swap evicts the cheapest one when a pool is full, and a size-1 role pool keeps one model per role live.
+- **Capacity-budgeted co-loading.** Keep small models (embedders, rerankers, a quick draft model) loaded alongside your main chat model. Every serving declares its VRAM/host-RAM capacity, llama-swap evicts the cheapest one when a pool is full, and a size-1 role pool keeps one model per role loaded.
 - **Auto-parallel.** Chat models without a `parallel:` pin automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
 - **Standard discovery.** Model info flows straight off the running server, so you never hand-edit your client config when you add a model. A maintained discovery plugin works against the config unchanged.
 - **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a vision-less variant that drops the projection to reclaim VRAM for a much larger context (plus a vision companion entry keeping image input available at reduced context). The `i`/`v` capability flags on the id tell them apart; the exact context is in the display name and metadata.
-- **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. `--idle-unload SECONDS` emits `globalTTL` so llama-swap unloads idle models.
+- **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. The top-level `ttl` lets llama-swap unload idle models.
 
 
 ## What it does
@@ -168,7 +168,7 @@ Unknown keys pass as `metadata` informing clients with descriptive fields (see [
 
 ### Profiles (`profiles.yaml`)
 
-Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](profiles.yaml.example) to `profiles.yaml` (gitignored) — it has one brief commented example per category. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present. All `profiles.yaml` keys are builder-consumed (unknown keys ignored), in contrast to sidecar frontmatter above.
+Sampling and placement are in `profiles.yaml`. Copy [`profiles.yaml.example`](profiles.yaml.example) to `profiles.yaml` (gitignored) — it has one brief commented example per category. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present. All `profiles.yaml` keys are builder-consumed (unknown keys ignored), in contrast to sidecar frontmatter above.
 
 | Category | Brief example |
 |---|---|
@@ -208,7 +208,7 @@ python -m llama_packer --probe-memory qwen35 gemma4 --models-dir ~/models
 ```
 
 **Requirements:**
-- No resident `llama` processes (the probe refuses otherwise)
+- No running `llama` processes (the probe refuses otherwise)
 - GPU visible as device 0 (run from a normal shell, not under the hardened
   systemd unit)
 - Enough VRAM for `(design, 2)` points at the cap context
@@ -225,9 +225,9 @@ near-instantly is the point of the block: it is invalidated only by a file
 change (size/mtime) or a serve-flag change (the compute term re-measures via
 one `llama-fit-params` run).
 
-For an unattended nightly calibration, wrap it in a script that checks
-`gpu_state.llama_residents()` is empty, then fires `--probe-memory`. The
-probe itself refuses to start beside a resident process.
+For an unattended nightly calibration, wrap it in a script that checks no `llama` process is running, then fires
+`--probe-memory`. The probe itself refuses to start beside a running
+process.
 
 ## Agent skill: authoring `profiles.yaml`
 

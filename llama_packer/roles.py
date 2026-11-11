@@ -19,10 +19,26 @@ from llama_packer.utils import parse_device
 log = logging.getLogger(__name__)
 
 _ROLE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-LIVE_VALUES = frozenset({"1", "per-device", "capacity"})
 #: Old role keys. A file that still sets them is told they do nothing.
 RETIRED_KEYS = frozenset({"min", "preferred", "cap", "weight", "exclusive",
                           "persistent", "ctx_cap", "kind"})
+
+
+@dataclass(frozen=True)
+class Share:
+    """A role's request in a set's auction."""
+
+    #: ``weight``, ``fill``, ``min``, or ``zero``.
+    kind: str = "zero"
+    weight: float = 0.0
+
+    @property
+    def requests(self) -> bool:
+        return self.kind in ("weight", "fill")
+
+    @property
+    def accepts(self) -> bool:
+        return self.kind != "min"
 
 
 @dataclass(frozen=True)
@@ -32,27 +48,33 @@ class Role:
     name: str
     #: Models-root-relative trees this role owns; ``"."`` is the root.
     dir: tuple[str, ...] = ()
-    #: Fraction of slack this role may claim; None when it fills instead.
-    share: float | None = None
-    fill: bool = False
-    live: str = "1"
+    #: Request weight in each set's auction.
+    share: Share = Share()
     #: Where every model of this role runs: ``cpu`` or a GPU index; None
     #: leaves placement to the sidecar/task.  Same vocabulary as sidecars.
     device: str | int | None = None
 
 
-def _parse_share(value: object) -> float | None:
-    """``40%`` / ``40`` / ``0.4`` → 0.4; None when unreadable."""
+def _parse_share(value: object) -> Share | None:
+    """``40``, ``40%``, ``fill``, ``min``, or ``0``; None when unreadable."""
     if value is None:
+        return Share()
+    if isinstance(value, bool):
         return None
-    text = str(value).strip()
+    text = str(value).strip().lower()
+    if text == "fill":
+        return Share("fill", 100.0)
+    if text == "min":
+        return Share("min", 0.0)
     try:
-        if text.endswith("%"):
-            return float(text[:-1]) / 100.0
-        share = float(text)
+        weight = float(text[:-1]) if text.endswith("%") else float(text)
     except ValueError:
         return None
-    return share / 100.0 if share > 1.0 else share
+    if weight < 0:
+        return None
+    if weight == 0.0:
+        return Share("zero", 0.0)
+    return Share("weight", weight)
 
 
 def _default_specs() -> dict:
@@ -108,41 +130,24 @@ def _parse_one(name: object, spec: object,
         return None, [f"roles.{name}: reserved pool name"]
     if not isinstance(spec, dict):
         return None, [f"roles.{name}: must be a mapping"]
-    known = {"dir", "share", "fill", "live",
-             "device"} | RETIRED_KEYS
+    known = {"dir", "share", "device"} | RETIRED_KEYS
     problems = [f"roles.{name}: unknown key {key!r}"
                 for key in sorted(set(spec) - known)]
     problems.extend(f"roles.{name}: {key!r} is retired"
                     for key in sorted(set(spec) & RETIRED_KEYS))
     dirs, dir_problems = _parse_dirs(name, spec.get("dir"))
     problems.extend(dir_problems)
-    live = str(spec.get("live", "1")).strip().lower()
-    if live not in LIVE_VALUES:
-        problems.append(f"roles.{name}: live={spec.get('live')!r} is not one "
-                        f"of {', '.join(sorted(LIVE_VALUES))}")
-        live = "1"
     share = _parse_share(spec.get("share"))
-    if spec.get("share") is not None and (
-            share is None or not 0.0 < share <= 1.0):
+    if share is None:
         problems.append(f"roles.{name}: share={spec.get('share')!r} is not a "
-                        "percentage in (0, 100]")
-        share = None
-    if share is not None and spec.get("fill"):
-        problems.append(f"roles.{name}: share and fill are mutually exclusive")
-        share = None
+                        "weight, 'fill', 'min', or 0")
+        share = Share()
     device, device_problem = parse_device(spec.get("device"))
     if device_problem:
         problems.append(f"roles.{name}: device={spec.get('device')!r} is "
                         f"{device_problem}")
         device = None
-    return Role(
-        name=name,
-        dir=dirs,
-        share=share,
-        fill=bool(spec.get("fill", False)),
-        live=live,
-        device=device,
-    ), problems
+    return Role(name=name, dir=dirs, share=share, device=device), problems
 
 
 def parse_roles(cfg: dict | None) -> tuple[dict[str, Role], list[str]]:
@@ -159,13 +164,6 @@ def parse_roles(cfg: dict | None) -> tuple[dict[str, Role], list[str]]:
         problems.extend(issues)
         if role is not None:
             out[role.name] = role
-    fills = [r.name for r in out.values() if r.fill]
-    if len(fills) > 1:
-        problems.append(f"roles: {', '.join(sorted(fills))} all fill; at most "
-                        "one role may")
-    total = sum(r.share or 0.0 for r in out.values())
-    if total > 1.0 + 1e-9:
-        problems.append(f"roles: shares sum to {total:.0%}; at most 100%")
     owned: dict[str, str] = {}
     for role in out.values():
         for d in role.dir:

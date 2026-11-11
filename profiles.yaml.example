@@ -28,6 +28,10 @@ defaults:
   min_p: 0.01
   pres_pen: 0.0
 
+# Top-level defaults shared by every task and serving.
+# min_context: 64k          # default for tasks that omit it
+ttl: 3600                    # idle unload seconds; 0 disables it
+
 # ── Tasks (optional) ──────────────────────────────────
 # A task is a named kind of work (coding, chat, embeddings...) with the
 # endpoint it is served at and the least context and slots it needs. A
@@ -36,8 +40,9 @@ defaults:
 # unknown name warns and is ignored.
 #
 # This section sets a task's minimums; it cannot invent a task.
-# min_context and min_parallel are both minimums. Leave a key out for no
-# minimum; one entry at context >= 128k and slots >= 2 can satisfy several
+# min_context and min_parallel are both minimums. A task that omits
+# min_context uses the top-level value; min_context > max_context is an
+# error. One entry at context >= 128k and slots >= 2 can satisfy several
 # tasks, so nothing forces four entries per model.
 #
 # require:   capabilities that must survive. A model that cannot keep one is
@@ -108,57 +113,49 @@ tasks:
 # There is no default role: a model under no role's tree and with no `role:`
 # is an error, as is a `role:` naming a role not defined here.
 #
-# Every serving's floor (weights + the memory its task's min_context and
-# min_parallel need) is taken out first. `share` divides only what is left:
-#   share    percentage of slack this role may claim
-#   fill     take whatever no other share claims (one role per pool)
-#   live     1 (one serving, evicts) | per-device | capacity
+# A role's floor is the maximum floor of its models. The set's floors come
+# out first; the rest is the auction. `share` is the role's request in each
+# set:
+#   share    40 or 40% — request weight (relative; may exceed 100)
+#   share    fill — request 100
+#   share    min — request 0, accept nothing
+#   share    0 — request 0, accept what remains
 #   device   cpu | GPU index — where every model of the role runs. Same
 #            vocabulary as a sidecar `device:`; omit it to leave placement
 #            to the sidecar (and the task). `cpu` means no VRAM charge,
 #            -ngl 0, and a charge against the `ram` pool.
-# Shares in a pool must sum to at most 100%; the rest is headroom. A role with
-# `share: 100%` runs alone. There is no min/preferred/cap/weight: floors are
-# derived, a share is already a cap, and one fill role takes the rest.
-# There is no `persistent:` — residency is a TTL, set with `ttl: 0` on the
-# task (or the sidecar), not a role flag.
+# There is no per-role count, fill, or persistent key: one serving per role.
+# Keeping a serving loaded is `ttl: 0` on the task or the sidecar.
 roles:
   chat:
     dir: [chat, t2t, vision, doc, ocr]
-    fill: true
-    live: 1
+    share: fill
   embeddings:
     dir: embed
     share: 5%
-    live: 1
     # device: cpu          # run the whole role from system RAM
   rerank:
     dir: rerank
     share: 5%
-    live: 1
   image:
     dir: img
     share: 20%
-    live: 1
   s2t:
     dir: s2t
     share: 5%
-    live: per-device
   t2s:
     dir: t2s
     share: 5%
-    live: per-device
 
 # ── Routing ────────────────────────────────────────────
 # There is no `routing.use`. The mode follows from the input: `matrix.sets:`
-# present → matrix; absent → capacity. `group` is not emitted; `exclusive` is
-# `share: 100%`; residency is `ttl: 0`.
+# present → matrix; absent → capacity. `group` is not emitted; a single-leaf
+# set confines a role to running alone; keeping a model loaded is `ttl: 0`.
 #
-# capacity  one global budget: every combination that fits may be resident,
-#           so shares must sum to 100%.
-# matrix    each set is its own budget, so roles may exceed their global
-#           share when no set holds them together. Only a set can forbid a
-#           combination that fits. It never preloads.
+# capacity  generated sets size each role; any combination that fits may be
+#           loaded.
+# matrix    each set is its own budget. Only a set can forbid a combination
+#           that fits. It never preloads.
 
 # Model roots (CLI --models-dir overrides this). A model belongs to the role
 # whose `dir:` owns its directory (case-insensitive, relative to the root);
@@ -347,7 +344,7 @@ profiles:
 #   #                          # allocator overhead llama.cpp's own buffers
 #   #                          # don't report, ~4% observed on Vulkan/radv)
 #   # fast_storage: /mnt/@/ssd_ai   # physical branch (or list) that holds
-#   #                          # SSD-resident models — reads ~6x faster than
+#   #                          # SSD-backed models — reads ~6x faster than
 #   #                          # platter branches.  Family representatives and
 #   #                          # measurement prefer models resolved here;
 #   #                          # unset = no tier preference.
@@ -429,11 +426,11 @@ profiles:
 #   reserve       = 1024 + max(1024, baseline_mb)
 #   pools.default = detected VRAM - reserve - spare
 #   pools.ram     = detected host pool
-#   pools.<role>  = 1 (one live serving per role)
+#   pools.<role>  = 1 (one serving per role)
 # Allocations fill pools.default on purpose; reserve + spare is every bit of
 # headroom, so a nearly full pool is normal.
-# Each model also gets an eviction cost: reload time plus lost prefill (chat
-# only). `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
+# Each model also gets an eviction cost: reload time plus lost prefill
+# (KV-cached endpoints only). `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
 # `pp_tps:` overrides the fleet value; estimate it from hardware TOPS x
 # active parameters, or measure it with extras/bench.py / llama-bench.
 # capacity:
@@ -441,17 +438,12 @@ profiles:
 #   # drive_mbps: 1000
 
 # ── VRAM and RAM pools (optional) ───────────────────────────
-# The emitted `default` pool is detected VRAM - reserve - spare. `pools:`
-# sizes the solve around that pool; it does not change the emitted default
-# pool. `ram.spare` is the exception: it keeps that much host RAM out of the
-# emitted ram pool.
+# The emitted `default` pool is detected VRAM minus the measured reserve and
+# `spare`. A per-pool `spare` overrides the fleet value for that pool and
+# reduces its emitted pool.
 # pools:
 #   default:
-#     spare: 2G                  # per-pool solve spare (not the emitted pool)
-#     reserve_extra: 8G          # VM, game, other tenant: chat is sized around it
-#     pins:
-#       image: 40G
-#       embeddings: auto
+#     spare: 2G                  # added to the measured reserve
 #   ram:
 #     spare: 2G                  # keep 2G of host RAM free
 
