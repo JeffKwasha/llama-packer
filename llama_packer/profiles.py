@@ -60,9 +60,8 @@ _MATRIX_KEYS = {
     "min_chat_ctx", "tools_min_ctx", "coload_min_ctx", "ctx_gain_min",
     "auto_parallel_max",
     "vllm_auto_parallel_max", "estimate_headroom", "auto_parallel",
-    "parallel_power", "categories",
+    "parallel_power",
 }
-_CATEGORY_KEYS = {"role", "selector", "ctx"}
 _POOL_KEYS = {"vram", "spare", "reserve_extra", "pins"}
 _CAPACITY_KEYS = {"pp_tps", "drive_mbps"}
 _HARDWARE_KEYS = {
@@ -200,18 +199,6 @@ def check_profiles(cfg: dict) -> list[str]:
         if matrix.get(key) is not None:
             problems.append(f"matrix.{key}: retired; set max_context on the "
                             "embeddings/rerank task")
-    categories = _check_mapping(problems, "matrix.categories",
-                                matrix.get("categories"))
-    for name, spec in categories.items():
-        body = _check_mapping(problems, f"matrix.categories.{name}", spec,
-                              known=_CATEGORY_KEYS)
-        if not body.get("role"):
-            problems.append(f"matrix.categories.{name}: role is required")
-        elif body.get("role") not in served:
-            problems.append(f"matrix.categories.{name}: role "
-                            f"{body.get('role')!r} is not a role "
-                            f"({', '.join(served)})")
-
     routing = _check_mapping(problems, "routing", cfg.get("routing"))
     if routing:
         problems.append("routing: retired; remove it (matrix.sets selects "

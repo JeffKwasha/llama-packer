@@ -183,8 +183,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Slowest drive speed in MB/s for timeout calc (default: auto-detect, else 100)")
     parser.add_argument("--verbose", "-v", "-V", action="count", default=0,
                         help="Increase verbosity, repeatable (-v: INFO, -vv: DEBUG, -vvv: all)")
-    parser.add_argument("--embed", help="Substring selector for the embedder; else smallest embed-type model")
-    parser.add_argument("--rerank", help="Substring selector for the reranker; else smallest rerank-type model")
     parser.add_argument("--vllm-image", help="vLLM docker image for `vllm-docker` backend models "
                          "(overrides profiles.yaml vllm.image)")
     parser.add_argument("--vllm-server", help="vLLM binary for `vllm` backend models "
@@ -352,153 +350,9 @@ def _resolve_matrix(profiles_cfg: dict, models: list, args, logger, *,
 
 def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
                    *, fit_bin: str = "", llama_args: str = "") -> tuple:
-    """Resolve the swap-matrix configuration before build_config.
-
-    Returns ``(matrix_cfg, embed_model, rerank_model, categories, fixed,
-    ctx_by_var)`` — the last naming each category's optional served-context
-    override (requirement 32, ``matrix.categories.<name>.ctx:``).
-
-    ``categories`` maps each declared category name → its selected model
-    (defaults: ``emb``/``rnk`` bound to the embeddings/rerank models).  The
-    RAG pair still drives the shared chat-context solve; every *other*
-    category (e.g. ``tts``/``stt``) is returned in ``fixed`` as a
-    fixed-overhead resident reserved alongside chat and RAG.
-
-    Without a ``matrix:`` section the matrix is disabled — make that state
-    visible when the fleet actually has RAG models, otherwise a silently
-    missing co-loading setup looks exactly like a bug (it has, repeatedly).
-    """
-    matrix_cfg = profiles_cfg.get("matrix")
-    prof_cfg = Profiles(profiles_cfg)
-    tasks = TaskCatalogue.from_cfg(profiles_cfg.get("tasks"))
-    knobs = MatrixKnobs.from_cfg(matrix_cfg)
-    measured: dict[str, int | None] = {}
-    breakdown: dict[str, str] = {}
-
-    def resident_cost():
-        """Cost callable: measured MiB at this model's served ctx.
-
-        The same estimator the planner charges residents with
-        (``resident_cost_mb``), so selection and budget cannot disagree.
-        """
-        def cost(m):
-            try:
-                ctx = resident_ctx(m, tasks)
-                detail = resident_cost_detail(
-                    m, fit_bin=fit_bin,
-                    cache_type=prof_cfg.default_cache_type, profiles=prof_cfg,
-                    llama_args=llama_args, ctx=ctx, allow_cpu=True)
-                if detail is None:
-                    mb = None
-                else:
-                    mb, breakdown[m.stem] = detail
-            except Exception as e:
-                logger.warning("matrix: cannot size %s (%s)", m.stem, e)
-                mb = None
-            measured[m.stem] = mb
-            return mb
-        return cost
-
-    if not matrix_cfg:
-        emb = _select_model(models, "embeddings", args.embed, logger,
-                            endpoint=EMBEDDINGS)
-        rnk = _select_model(models, "rerank", args.rerank, logger,
-                            endpoint=RERANK)
-        if emb is not None or rnk is not None:
-            logger.warning(
-                "matrix: disabled — profiles.yaml has no matrix: section; "
-                "RAG co-loading off (emb: %s, rnk: %s)",
-                emb.stem if emb else "none", rnk.stem if rnk else "none")
-        return None, None, None, {}, (), {}
-    embed_model = _select_model(models, "embeddings", args.embed, logger,
-                                cost=resident_cost(), endpoint=EMBEDDINGS)
-    rerank_model = _select_model(models, "rerank", args.rerank, logger,
-                                 cost=resident_cost(), endpoint=RERANK)
-    if embed_model is None:
-        logger.warning("no embeddings model found; skipping matrix")
-        return None, None, None, {}, (), {}
-    if rerank_model is None:
-        logger.warning("no rerank model found; skipping matrix")
-        return None, None, None, {}, (), {}
-
-    # Declared categories.  Category names are the matrix var names; roles
-    # may repeat.  The RAG pair is already selected by endpoint above.
-    cat_specs = matrix_cfg.get("categories") or {}
-    categories: dict[str, "Model"] = {}
-    ctx_by_var: dict[str, int] = {}
-    for name, spec in cat_specs.items():
-        # The spec schema is strict (D13, clean break): anything but these
-        # keys is an alien spelling and warns instead of being ignored.
-        for key in sorted(set(spec) - {"role", "selector", "ctx"}):
-            logger.warning("matrix: category %r: unhandled key %r "
-                           "(known: role, selector, ctx)", name, key)
-        role = str(spec.get("role") or "")
-        selector = spec.get("selector")
-        if not role:
-            logger.warning("matrix: category %r has no role; omitted", name)
-            continue
-        model = _select_model(models, role, selector, logger,
-                              cost=resident_cost())
-        if model is None:
-            logger.warning("matrix: category %r: no %s model%s; omitted",
-                           name, role,
-                           f" matching {selector!r}" if selector else "")
-            continue
-        categories[str(name)] = model
-        ctx = spec.get("ctx")
-        if ctx is not None:
-            try:
-                iv = int(ctx)
-                assert iv > 0
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("matrix: category %r: ctx=%r is not a "
-                               "positive integer; ignored", name, ctx)
-            else:
-                ctx_by_var[str(name)] = iv
-    # Back-compat: the canonical RAG names always resolve.
-    categories.setdefault("emb", embed_model)
-    categories.setdefault("rnk", rerank_model)
-    # One answer per role: a category selector (the more specific
-    # declaration) defines the RAG pair too, instead of leaving the solve
-    # on a different model than the `emb`/`rnk` vars point at.
-    emb_by_selector = bool(args.embed)
-    rnk_by_selector = bool(args.rerank)
-    if categories.get("emb") is not embed_model:
-        logger.info("matrix embed: category selector overrides the pair "
-                    "pick (%s instead of %s)",
-                    categories["emb"].stem, embed_model.stem)
-        embed_model = categories["emb"]
-        emb_by_selector = True
-    if categories.get("rnk") is not rerank_model:
-        logger.info("matrix rerank: category selector overrides the pair "
-                    "pick (%s instead of %s)",
-                    categories["rnk"].stem, rerank_model.stem)
-        rerank_model = categories["rnk"]
-        rnk_by_selector = True
-
-    if matrix_cfg.get("evict_costs"):
-        logger.warning(
-            "matrix: evict_costs: is retired — evict_cost is derived per "
-            "entry from load and prefill time; the key is ignored")
-    matrix_cfg = {k: v for k, v in matrix_cfg.items()
-                  if k != "evict_costs"}
-
-    fixed = [(n, m) for n, m in categories.items()
-             if m is not embed_model and m is not rerank_model]
-    logger.info("matrix embed: %s (%s)", embed_model.stem,
-                _selection_reason(embed_model, measured.get(embed_model.stem),
-                                  by_selector=emb_by_selector,
-                                  detail=breakdown.get(embed_model.stem)))
-    logger.info("matrix rerank: %s (%s)", rerank_model.stem,
-                _selection_reason(rerank_model, measured.get(rerank_model.stem),
-                                  by_selector=rnk_by_selector,
-                                  detail=breakdown.get(rerank_model.stem)))
-    if fixed:
-        logger.info("matrix categories: %s",
-                    ", ".join(f"{n}={m.stem}" for n, m in fixed))
-    return (matrix_cfg, embed_model, rerank_model, categories, fixed,
-            ctx_by_var)
-
+    """Return the matrix section. Role labels and model ids price it; there
+    is no RAG pair and no category pick."""
+    return profiles_cfg.get("matrix"), None, None, {}, (), {}
 
 def validate_matrix_sets(profiles_cfg: dict) -> str | None:
     """Why ``matrix.sets`` is unusable, or None when it is sound."""

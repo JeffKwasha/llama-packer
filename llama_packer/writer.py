@@ -1961,11 +1961,13 @@ class Planner:
         if not raw:
             return {}
         role_floor: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        role_source: dict[tuple[str, str], tuple[int, str, str]] = {}
         role_pools: dict[str, set[str]] = {}
         model_floor: dict[str, tuple[str, int]] = {}
         leaf_role: dict[str, str] = {}
         for m in self.models:
             pool = "ram" if m.on_cpu else "default"
+            role_pools.setdefault(m.role, set()).add(pool)
             view = m.view_for(True)
             quad = view.vram.effective_static(
                 self.fit_bin, cache_type=self.profiles.default_cache_type,
@@ -1974,10 +1976,15 @@ class Planner:
                                             self.llama_args),
                 allow_cpu=True)
             if quad is None:
+                role_floor[pool].setdefault(m.role, 0)
+                for key in (m.stem, m.template_id):
+                    model_floor[key] = (pool, 0)
+                    leaf_role[key] = m.role
                 continue
             demands = m.tasks_resolved or ()
             pool_mb = self.capacity_pools.get(pool, 0)
-            feasible = []
+            best = 0
+            best_task = None
             for task in demands:
                 need = allocation.floor_mb(
                     quad, task.min_context or self.min_context,
@@ -1988,18 +1995,21 @@ class Planner:
                         "dropped", m.stem, task.id or "fallback", need,
                         pool, pool_mb)
                     continue
-                feasible.append(need)
-            if not feasible:
+                if need > best:
+                    best, best_task = need, task
+            if best == 0:
                 fallback = allocation.floor_mb(
                     quad, self.min_context, 1, self.memory_margin)
                 if fallback > pool_mb:
                     logger.info("matrix: %s floor %d MiB exceeds %s %d; "
                                 "dropped", m.stem, fallback, pool, pool_mb)
                     continue
-                feasible = [fallback]
-            best = max(feasible)
-            role_floor[pool][m.role] = max(
-                role_floor[pool].get(m.role, 0), best)
+                best = fallback
+            previous = role_floor[pool].get(m.role, 0)
+            if best > previous:
+                role_source[(m.role, pool)] = (
+                    best, m.stem, best_task.id if best_task else "")
+            role_floor[pool][m.role] = max(previous, best)
             role_pools.setdefault(m.role, set()).add(pool)
             if not m.on_cpu:
                 files = m.size_mb or 0
@@ -2059,6 +2069,19 @@ class Planner:
                 floors[pool].update(table)
                 leaves_by_pool[pool].update(roles_seen)
 
+        for (role, pool), (mb, stem, task) in sorted(role_source.items()):
+            share = roles.get(role).share if roles.get(role) else None
+            if share is None:
+                continue
+            low = share.kind in ("min", "zero") or (
+                share.kind == "weight" and share.weight < 25)
+            cap = self.capacity_pools.get(pool, 0)
+            if low and cap and mb > cap / 100:
+                logger.warning(
+                    "matrix: role %r floor %d MiB on %s (share %s) is set by "
+                    "%s/%s; that role cannot grow, so split it if the floor "
+                    "is not intended", role, mb, pool, share.kind, stem,
+                    task or "fallback")
         logger.info("matrix: role floors %s",
                     {p: dict(sorted(v.items())) for p, v in role_floor.items()
                      if v})

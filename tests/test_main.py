@@ -151,23 +151,6 @@ def _stub_model(stem, role):
     return m
 
 
-def test_detect_matrix_warns_when_rag_models_but_no_section(caplog):
-    import logging
-    from types import SimpleNamespace
-
-    from llama_packer.__main__ import _detect_matrix
-
-    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
-              _stub_model("c1", "chat")]
-    args = SimpleNamespace(embed=None, rerank=None)
-    with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({}, models, args,
-                                                    logging.getLogger("test"))
-    assert cfg is None and emb is None and rnk is None
-    assert "matrix: disabled" in caplog.text
-    assert "emb1" in caplog.text and "rnk1" in caplog.text
-
-
 def test_detect_matrix_silent_without_rag_models(caplog):
     import logging
     from types import SimpleNamespace
@@ -183,68 +166,35 @@ def test_detect_matrix_silent_without_rag_models(caplog):
     assert "matrix: disabled" not in caplog.text
 
 
-def test_detect_matrix_selects_when_section_present(caplog):
-    import logging
-    from types import SimpleNamespace
-
-    from llama_packer.__main__ import _detect_matrix
-
-    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
-              _stub_model("c1", "chat")]
-    args = SimpleNamespace(embed=None, rerank=None)
-    matrix_cfg = {"sets": {"rag": "__CHAT_VARS__ & emb & rnk"}}
-    with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix({"matrix": matrix_cfg},
-                                                    models, args,
-                                                    logging.getLogger("test"))
-    assert cfg == matrix_cfg
-    assert emb.stem == "emb1" and rnk.stem == "rnk1"
-    assert cats == {"emb": emb, "rnk": rnk}
-    assert fixed == []
-    assert "matrix: disabled" not in caplog.text
-
-
-def test_detect_matrix_custom_categories(caplog):
-    import logging
-    from types import SimpleNamespace
-
-    from llama_packer.__main__ import _detect_matrix
-
-    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank"),
-              _stub_model("tts1", "t2s"), _stub_model("stt1", "s2t"),
-              _stub_model("c1", "chat")]
-    args = SimpleNamespace(embed=None, rerank=None)
-    matrix_cfg = {
-        "categories": {"emb": {"role": "embeddings"},
-                       "rnk": {"role": "rerank"},
-                       "tts": {"role": "t2s"},
-                       "stt": {"role": "s2t"}},
-        "evict_costs": {"emb": 100, "tts": 50},
-        "sets": {"voice": "__CHAT_VARS__ & (tts | stt)"},
-    }
-    with caplog.at_level(logging.WARNING):
-        cfg, emb, rnk, cats, fixed, _ctx = _detect_matrix(
-            {"matrix": matrix_cfg}, models, args, logging.getLogger("test"))
-    assert "sets" in cfg and "evict_costs" not in cfg
-    assert set(cats) == {"emb", "rnk", "tts", "stt"}
-    assert cats["tts"].stem == "tts1" and cats["stt"].stem == "stt1"
-    # Non-RAG categories are fixed-overhead residents, in declaration order.
-    assert [n for n, _ in fixed] == ["tts", "stt"]
-    assert "evict_costs: is retired" in caplog.text
-
-
-def test_detect_matrix_warns_retired_evict_costs(caplog):
+def test_detect_matrix_returns_none_without_a_section():
     import logging
     from types import SimpleNamespace
 
     from llama_packer.__main__ import _detect_matrix
 
     models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank")]
-    args = SimpleNamespace(embed=None, rerank=None)
-    with caplog.at_level(logging.WARNING):
-        _detect_matrix({"matrix": {"evict_costs": {"nope": 5}}}, models, args,
-                       logging.getLogger("test"))
-    assert "evict_costs: is retired" in caplog.text
+    args = SimpleNamespace()
+    cfg, emb, rnk, cats, fixed, ctx = _detect_matrix(
+        {}, models, args, logging.getLogger("test"))
+    assert cfg is None and emb is None and rnk is None
+    assert cats == {} and fixed == () and ctx == {}
+
+
+def test_detect_matrix_returns_the_section_and_no_pair():
+    # Validates: docs/allocation.md, 'Routers': sets are priced by roles and
+    # model ids; there is no RAG pair or category pick.
+    import logging
+    from types import SimpleNamespace
+
+    from llama_packer.__main__ import _detect_matrix
+
+    matrix_cfg = {"sets": {"rag": "chat & embeddings & rerank"}}
+    cfg, emb, rnk, cats, fixed, ctx = _detect_matrix(
+        {"matrix": matrix_cfg}, [], SimpleNamespace(),
+        logging.getLogger("test"))
+    assert cfg == matrix_cfg
+    assert emb is None and rnk is None
+    assert cats == {} and fixed == () and ctx == {}
 
 
 def test_parse_args_idle_unload():
@@ -524,29 +474,6 @@ def test_selection_reason_measured_and_selector_arms():
     assert _selection_reason(m, 1050, by_selector=True) == \
         "selector, 1050 MiB resident"
     assert _selection_reason(m) == "device: cpu — explicit placement"
-
-
-def test_detect_matrix_category_selector_defines_the_pair(make_model, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #81
-    # selector is the RAG pair too: one answer per role, never a solve on one
-    # model while the `emb` var points at another.
-    import logging
-    from llama_packer import __main__ as m
-
-    voyage = make_model("voyage", role="embeddings")
-    jina = make_model("jina", role="embeddings", device="cpu")
-    rnk = make_model("rnk", role="rerank")
-    monkeypatch.setattr(m, "resident_cost_detail",
-                        lambda model, **kw: (900, "900 test"))
-    args = SimpleNamespace(embed=None, rerank=None)
-    # The selector pins the *device* model: the pair pick alone would take
-    # the CPU candidate, so only the pair adoption can make this pass.
-    cfg = {"matrix": {"categories": {
-        "emb": {"role": "embeddings", "selector": "voyage"}}}}
-    _, emb, _, cats, fixed, _ctx = m._detect_matrix(
-        cfg, [voyage, jina, rnk], args, logging.getLogger("t"))
-    assert emb is voyage and cats["emb"] is voyage
-    assert all(name != "emb" for name, _ in fixed)
 
 
 def test_matrix_sets_validation():
