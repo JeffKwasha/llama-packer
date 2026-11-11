@@ -12,7 +12,7 @@ from llama_packer import tasks
 from conftest import TASK_ENDPOINT, catalogue, task_cfg, tasks_section
 from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
 from llama_packer.utils import parse_ctx_size as _parse_ctx_size
-from llama_packer.writer import FALLBACK, KNOWN_CAPABILITIES
+from llama_packer.writer import KNOWN_CAPABILITIES, fallback_task
 
 
 # ── context size parsing ───────────────────────────────────────────────────
@@ -634,10 +634,13 @@ def test_none_sacrifice_means_never_degrade():
 def test_fallback_is_a_bare_minimum_category():
     """Every model emits this; it has no name and never degrades.
     """
-    assert FALLBACK.id == ""
-    assert FALLBACK.min_context == 4096
-    assert FALLBACK.min_parallel == 1
-    assert FALLBACK.sacrifice == ()      # default order, floor-gated
+    from types import SimpleNamespace
+
+    fb = fallback_task(SimpleNamespace(tasks_resolved=()))
+    assert fb.id == ""
+    assert fb.min_context == 4096
+    assert fb.min_parallel == 1
+    assert fb.sacrifice == ()      # default order, floor-gated
 
 
 # ── keep vs require ───────────────────────────────────────────────────────

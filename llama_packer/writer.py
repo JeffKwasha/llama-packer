@@ -849,8 +849,18 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
 #: gated by the minimum, and the first qualifying rung wins rather than the
 #: one buying the most context (a category wants context; this wants
 #: capability).
-FALLBACK: "Task" = Task("", CHAT, min_context=_MIN_CTX_SIZE,
-                        min_parallel=1, require=frozenset(), sacrifice=())
+def fallback_task(model: Model,
+                  empty_min: int = _MIN_CTX_SIZE) -> Task:
+    """The bare ``<stem>`` entry: no endpoint, the cheapest declared task.
+
+    A client may call the model by its bare id. The entry serves it at the
+    smallest floor among the model's tasks, so the alias never claims a
+    larger serving than the model already declares.
+    """
+    mins = [task.min_context for task in (model.tasks_resolved or ())
+            if task.min_context]
+    return Task("", "", min_context=min(mins) if mins else empty_min,
+                min_parallel=1, require=frozenset(), sacrifice=())
 
 
 @dataclass(frozen=True)
@@ -1328,7 +1338,7 @@ class Variant:
     #: express "nothing declared" without a second field. Empty for the
     #: fallback entry, which carries no category name in its id.
     task_demands: tuple[Task, ...] = ()
-    #: The category this variant answers, or :data:`FALLBACK` for the null
+    #: The category this variant answers, or the bare fallback task
     #: category. Singular, because a rung exists to serve one category -- which
     #: is what lets one model emit several entries and stay unambiguous.
     category: Task | None = None
@@ -2418,9 +2428,10 @@ class Planner:
                 # its own (shed, ctx, parallel) against the same budget -- so
                 # a `.coding` entry and a `.aux` entry for one model are
                 # entitled to different sizes, which is the point.
+                fallback = fallback_task(model)
                 if est_error is not None:
                     ctx_size = self._unestimated_ctx(view)
-                    serves = [(FALLBACK, view, parallel, ctx_size)]
+                    serves = [(fallback, view, parallel, ctx_size)]
                 else:
                     serves = []
                     pin_ctx = self._serving_pin(view)
@@ -2428,8 +2439,8 @@ class Planner:
                     if self.max_context is not None:
                         cap_ctx = min(cap_ctx, self.max_context)
                     task_cap = self.tasks.max_context_for(model.task_ids)
-                    for demand in (*self.demands_for(model), FALLBACK):
-                        is_null = demand is FALLBACK
+                    for demand in (*self.demands_for(model), fallback):
+                        is_null = demand is fallback
                         demand_cap = cap_ctx
                         if is_null:
                             if task_cap is not None:
@@ -2517,7 +2528,7 @@ class Planner:
                         # invalidated; rebuild it so the emitted entry does
                         # not carry an estimated context while claiming to be
                         # unestimated.
-                        serves = [(FALLBACK, view, group_parallel, ctx_size)]
+                        serves = [(fallback, view, group_parallel, ctx_size)]
 
                 # Squeeze note: the budget could not afford the design
                 # context and an explicit reservation (--spare/--baseline)
@@ -2545,7 +2556,7 @@ class Planner:
                 for demand, serve_view, serve_par, serve_ctx in serves:
                     shed_vision = serve_view is not view
                     demoted = self._tools_demoted(serve_view, serve_ctx)
-                    task_demands = () if demand is FALLBACK else (demand,)
+                    task_demands = () if demand is fallback else (demand,)
                     if est_error is not None:
                         mem = (None, None, None)
                     else:

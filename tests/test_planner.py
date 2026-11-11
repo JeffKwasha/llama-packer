@@ -1333,17 +1333,18 @@ def test_fallback_keeps_capability_until_the_minimum_forces_it(make_model):
 
     Validates: docs/plans/requirement-trace.md, requirement #11.
     """
-    from llama_packer.writer import FALLBACK
+    from llama_packer.writer import fallback_task
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 4096, False: 262144})
-    rung = p.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
+    fallback = fallback_task(m)
+    rung = p.solve_rung(m, fallback, parallel=1, cache_type="q8_0",
                         spare_mb=0, prefer_capability=True)
     assert rung.shed == frozenset(), "shed while a legal serving existed"
     assert rung.ctx == 4096, "took the minimum, keeping the projector"
 
     # Plentiful: the projector costs nothing, so the cap is served outright.
     generous = _affording(m, {True: 262144, False: 262144})
-    assert generous.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
+    assert generous.solve_rung(m, fallback, parallel=1, cache_type="q8_0",
                                spare_mb=0,
                                prefer_capability=True).ctx == 262144
 
@@ -1353,10 +1354,11 @@ def test_fallback_sheds_when_nothing_else_fits(make_model):
 
     Validates: docs/plans/requirement-trace.md, requirement #12.
     """
-    from llama_packer.writer import FALLBACK
+    from llama_packer.writer import fallback_task
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 0, False: 4096})
-    rung = p.solve_rung(m, FALLBACK, parallel=1, cache_type="q8_0",
+    rung = p.solve_rung(m, fallback_task(m), parallel=1,
+                        cache_type="q8_0",
                         spare_mb=0, prefer_capability=True)
     assert rung is not None, "the fallback must still emit something"
     assert "vision" in rung.shed, "kept a capability it could not afford"
