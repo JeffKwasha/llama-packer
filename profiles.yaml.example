@@ -117,7 +117,7 @@ tasks:
 # out first; the rest is the auction. `share` is the role's request in each
 # set:
 #   share    40 or 40% — request weight (relative; may exceed 100)
-#   share    fill — request 100
+#   share    fill — take what the weighted roles leave
 #   share    min — request 0, accept nothing
 #   share    0 — request 0, accept what remains
 #   device   cpu | GPU index — where every model of the role runs. Same

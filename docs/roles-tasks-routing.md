@@ -52,7 +52,8 @@ The schema:
 - `share` — the role's request in each set it belongs to:
   - `N%` (or `N`) — request weight `N`. Weights are relative and may exceed
     100.
-  - `fill` — request weight 100.
+  - `fill` — the weight the weighted roles leave below 100, split equally;
+    0 when they leave nothing, then accepts a remainder a capped role frees.
   - `min` — request 0, accept nothing; the role stays at its floor.
   - `0` — request 0, accept whatever remains unclaimed.
   A role with no `share` accepts but does not request.

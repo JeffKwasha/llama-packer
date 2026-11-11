@@ -433,8 +433,10 @@ auction(set) = available − floor(set)
 ```
 
 Each member requests a share of it by `share:` weight. `N%` requests N,
-`fill` requests 100, `min` requests 0 and accepts nothing, `0` requests 0
-and accepts what remains. Weights are relative and may exceed 100.
+`fill` takes what the weighted roles leave below 100, split equally; when
+they leave nothing it weighs 0 and accepts a remainder freed by a capped
+role, `min` requests 0 and accepts nothing, `0` requests 0 and accepts what
+remains. Weights are normalised per set.
 
 ```
 request(role, set) = weight / Σ weights in set × auction(set)
@@ -553,7 +555,7 @@ The code ships no role names; the default roles are data in
 roles:
   cat:
     dir: cats              # the tree this role owns
-    share: fill            # request 100 in each set
+    share: fill            # take what the weighted roles leave
   dog:
     dir: dogs
     share: 10%             # request weight
@@ -567,9 +569,9 @@ roles:
 - A role has no behaviour. The models under it declare `tasks:`, and each
   task names the endpoint it is served at; the role name is arbitrary.
 - `share` is the role's request in each set: a number (`40`, `40%`, and
-  values above 100 are relative weights), `fill` (100), `min` (0, accept
-  nothing), or `0` (0, accept what remains). Weights are normalised per set;
-  they do not sum to a cap.
+  values above 100 are relative weights), `fill` (the remainder, or 0 when
+  none), `min` (0, accept nothing), or `0` (0, accept what remains).
+  Weights are normalised per set; they do not sum to a cap.
 - `device` is `auto`, `cpu`, or a GPU index, exactly the sidecar vocabulary.
   A sidecar `device:` overrides it per model, and a task `device:` is the
   work's requirement.

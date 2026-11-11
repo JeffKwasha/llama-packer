@@ -101,12 +101,13 @@ Each role in the set carries a request weight and an accept flag from its
 | `min` | 0 | no |
 | `0` | 0 | yes |
 | `27%` | 27 | yes |
-| `fill` | the remainder after the weighted requests | yes |
+| `fill` | what the weighted roles leave below 100, else 0 | yes |
 
-A weight is a percentage of the auction. Each role takes its literal
-percentage, and fills take the remainder. When the weights in one set add up
-to more than 100, they scale down proportionally: 60 and 90 become 60/150
-and 90/150. A lone 60 leaves 40 for a fill. Any positive value is valid.
+Every claimant is normalised by the sum of its weight. A weighted role
+uses its number. A fill uses what the weighted roles leave below 100, split
+equally among fills; when they leave nothing, the fill weighs 0 and takes
+any remainder a capped role frees. A lone 60 therefore leaves 40 for one
+fill. Any positive value is valid.
 
 Requests are normalised inside each set, never capped at an absolute
 percentage:

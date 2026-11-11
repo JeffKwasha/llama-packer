@@ -220,7 +220,7 @@ its directory, or to the role named by its sidecar `role:`.
 roles:
   chat:
     dir: qwen3             # the tree this role owns
-    share: fill            # request 100 in each set
+    share: fill            # take what the weighted roles leave
   embeddings:
     dir: embed
     share: 5%              # request weight
@@ -235,8 +235,7 @@ roles:
   task names the endpoint it is served at. A role is ownership and
   allocation, nothing else.
 - `share` — the role's request in each set: a number (`40`, `40%`, and values
-  above 100 are relative weights), `fill` (100), `min` (0, accept nothing), or
-  `0` (0, accept what remains). Weights are normalised per set; they do not
+  above 100 are relative weights), `fill` (the remainder, or 0 when none), `min` (0, accept nothing), or `0` (0, accept what remains). Weights are normalised per set; they do not
   sum to a cap.
 - `device` — `auto`, `cpu`, or a GPU index, the same vocabulary as a sidecar.
   Unset leaves placement to the sidecar/task. See

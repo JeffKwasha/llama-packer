@@ -50,8 +50,8 @@ def test_capped_role_renormalises_its_set():
     alloc, _left = auction(m(gpu0=15), sets, floors,
                            {"a": 60, "b": 0, "c": 0},
                            fills=frozenset({"b"}))
-    assert alloc["a"] == m(gpu0=3)
-    assert alloc["b"] == m(gpu0=12)
+    assert alloc["a"] == m(gpu0=5)
+    assert alloc["b"] == m(gpu0=10)
     assert alloc["c"] == m(gpu0=10)
 
 
@@ -103,6 +103,29 @@ def test_two_zero_roles_split_the_leftover():
     assert alloc["b"] == m(gpu0=5)
     assert alloc["c"] == m(gpu0=5)
     assert left["one"] == ZERO
+
+
+def test_overclaimed_fill_weighs_zero():
+    # Validates: docs/allocation.md, 'The auction': a fill gets nothing when
+    # the weighted roles already claim the whole auction.
+    floors = {"a": ZERO, "b": ZERO}
+    alloc, left = auction(m(gpu0=10), {"s": parse("a & b")}, floors,
+                          {"a": 100, "b": 0}, fills=frozenset({"b"}))
+    assert alloc["a"] == m(gpu0=10)
+    assert alloc["b"] == ZERO
+    assert left["s"] == ZERO
+
+
+def test_capped_role_frees_memory_for_a_fill():
+    # Validates: docs/allocation.md, 'The auction': the fill takes the
+    # remainder when another set caps the weighted role.
+    floors = {"a": ZERO, "b": ZERO, "c": m(gpu0=10)}
+    sets = {"one": parse("a & b"), "two": parse("a & c")}
+    alloc, _left = auction(m(gpu0=15), sets, floors,
+                           {"a": 100, "b": 0, "c": 0},
+                           fills=frozenset({"b"}))
+    assert alloc["a"] == m(gpu0=5)
+    assert alloc["b"] == m(gpu0=10)
 
 
 def test_fields_are_independent():

@@ -73,7 +73,7 @@ Each member requests a share of it, by weight:
 | `min` | 0 | no |
 | `0` | 0 | yes |
 | `27%` | 27 | yes |
-| `fill` | the remainder after the weighted requests | yes |
+| `fill` | what the weighted roles leave below 100, else 0 | yes |
 
 ```
 request(role, set) = weight% × auction(set)
@@ -81,9 +81,10 @@ offer(role, set)   = floor + request
 allocation(role)   = min over its sets of offer
 ```
 
-A role takes its literal percentage. Only when the weights in one set add
-up to more than 100 do they scale down, by `100 / Σ weights`. `fill` is not
-a weight; it takes what the weighted roles leave.
+Every claimant is normalised by the sum of its weight. A weighted role uses
+its number. A fill uses what the weighted roles leave below 100, split
+equally; when they leave nothing, the fill weighs 0 and accepts any
+remainder a capped role frees.
 
 When one set offers a role less than another requested, that set has memory
 left: fix the role at its allocation and renormalise the rest among the

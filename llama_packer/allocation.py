@@ -140,10 +140,30 @@ def floor_of(expr: Expr, floors: dict):
     return maximum(floor_of(expr.left, floors), floor_of(expr.right, floors))
 
 
+def effective_weights(members, weights, fills):
+    """The weight each claimant uses in the normalised split.
+
+    A fill weighs what the weighted roles leave below 100, split equally
+    among fills. If the weighted roles already claim 100 or more, the fill
+    weighs 0 and becomes an acceptor of any remainder a capped role frees.
+    """
+    weighted_sum = sum(weights.get(r, 0.0) for r in members
+                       if r not in fills)
+    out = {r: weights.get(r, 0.0) for r in members}
+    free_fill = [r for r in members if r in fills]
+    if free_fill:
+        each = (100.0 - weighted_sum) / len(free_fill) \
+            if weighted_sum < 100.0 else 0.0
+        for role in free_fill:
+            out[role] = each
+    return out
+
+
 def _offer(auction, members, weights, floors, fills, fixed):
-    weighted = [r for r in members
-                if r not in fixed and r not in fills and weights.get(r, 0.0) > 0]
-    total = sum(weights.get(r, 0.0) for r in weighted)
+    free = [r for r in members if r not in fixed]
+    effective = effective_weights(free, weights, fills)
+    total = sum(effective.values())
+
     fixed_used = type(auction)(*([0] * len(auction)))
     for role, amount in fixed.items():
         fixed_used = add(fixed_used, subtract(amount, floors[role]))
@@ -153,22 +173,10 @@ def _offer(auction, members, weights, floors, fills, fixed):
     for role, amount in fixed.items():
         out[role] = amount
     if total > 0:
-        # A weight is a percentage of the auction. Claims are scaled down
-        # only when the set is overclaimed, so a lone 50% role leaves half
-        # for a fill.
-        scale = 100.0 / total if total > 100.0 else 1.0
-        for role in weighted:
-            out[role] = add(floors[role], add_scaled(
-                shared, weights[role] * scale / 100.0))
-    taken = type(auction)(*([0] * len(auction)))
-    for role in weighted:
-        taken = add(taken, subtract(out[role], floors[role]))
-    remaining = type(auction)(*(max(0, x) for x in subtract(shared, taken)))
-    free_fill = [r for r in members if r in fills and r not in fixed]
-    if free_fill:
-        part = type(auction)(*(x // len(free_fill) for x in remaining))
-        for role in free_fill:
-            out[role] = add(floors[role], part)
+        for role in free:
+            if effective[role] > 0:
+                out[role] = add(floors[role], add_scaled(
+                    shared, effective[role] / total))
     return out
 
 
@@ -238,7 +246,8 @@ def auction(available, sets: dict[str, Expr], floors: dict,
 
     for name in sets:
         idle = [r for r in members[name]
-                if r in accepts and r not in fills and weights.get(r, 0.0) == 0.0]
+                if r in accepts and (r in fills
+                                     or weights.get(r, 0.0) == 0.0)]
         left = unallocated[name]
         if not idle or all(x <= 0 for x in left):
             continue
