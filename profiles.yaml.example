@@ -95,6 +95,7 @@ tasks:
     ttl: 0                 # keep the RAG pair warm
   rerank:
     endpoint: openai.rerank
+    min_context: 4096
     max_context: 4096
     ttl: 0
   image:

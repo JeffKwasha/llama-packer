@@ -41,7 +41,7 @@ from llama_packer.consts import (
     _RESERVE_VIDEO,
     ESTIMATE_ERROR_REASON,
 )
-from llama_packer import roles
+from llama_packer import allocation, roles
 from llama_packer.profiles import Profiles, parse_spare_mb
 from llama_packer.backends import (
     SETTING_KEYS,
@@ -1531,6 +1531,8 @@ class Planner:
         self.host_ledger_stems: set[str] = set()
         self.chat_ctx: int | None = None  # matrix-solved shared context, if any
         self.matrix_result: MatrixSolve | None = None
+        # Auction budgets for the authored sets, keyed by (role, pool).
+        self.role_budget: dict[tuple[str, str], int] = {}
         # Optional per-model tick (stem) for the progress bar; None in tests.
         self.progress_cb = progress_cb
         # Quads synthesized for unestimable matrix participants (stem →
@@ -1949,6 +1951,138 @@ class Planner:
                         result.chat_ctx, result.squeeze)
         return result
 
+    def _role_budgets(self) -> dict[tuple[str, str], int]:
+        """Price the authored sets with the auction, for logging today."""
+        raw = {str(n): str(e) for n, e in
+               ((self.matrix_cfg or {}).get("sets") or {}).items()}
+        if not raw:
+            return {}
+        role_floor: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        model_floor: dict[str, tuple[str, int]] = {}
+        leaf_role: dict[str, str] = {}
+        for m in self.models:
+            pool = "ram" if m.on_cpu else "default"
+            quad = _static_params(
+                m, self.fit_bin, self.profiles.default_cache_type,
+                measurement_args(self.profiles, m, self.llama_args),
+                allow_cpu=True)
+            if quad is None:
+                continue
+            demands = m.tasks_resolved or ()
+            pool_mb = self.capacity_pools.get(pool, 0)
+            feasible = []
+            for task in demands:
+                need = allocation.floor_mb(
+                    quad, task.min_context or self.min_context,
+                    task.min_parallel or 1, self.memory_margin)
+                if need > pool_mb:
+                    logger.info(
+                        "matrix: %s task %r floor %d MiB exceeds %s %d; "
+                        "dropped", m.stem, task.id or "fallback", need,
+                        pool, pool_mb)
+                    continue
+                feasible.append(need)
+            if not feasible:
+                fallback = allocation.floor_mb(
+                    quad, self.min_context, 1, self.memory_margin)
+                if fallback > pool_mb:
+                    logger.info("matrix: %s floor %d MiB exceeds %s %d; "
+                                "dropped", m.stem, fallback, pool, pool_mb)
+                    continue
+                feasible = [fallback]
+            best = max(feasible)
+            role_floor[pool][m.role] = max(
+                role_floor[pool].get(m.role, 0), best)
+            for key in (m.stem, m.template_id):
+                model_floor[key] = (pool, best)
+                leaf_role[key] = m.role
+
+        def floor_of_leaf(pool: str, leaf: str) -> int | None:
+            if leaf in role_floor[pool]:
+                return role_floor[pool][leaf]
+            found = model_floor.get(leaf)
+            if found is not None and found[0] == pool:
+                return found[1]
+            for key, (key_pool, mb) in model_floor.items():
+                if key_pool == pool and leaf.startswith(key + "."):
+                    return mb
+            return None
+
+        by_pool: dict[str, dict[str, allocation.Expr]] = {}
+        floors: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        leaves_by_pool: dict[str, dict[str, str]] = {"default": {}, "ram": {}}
+        for name, text in raw.items():
+            try:
+                expr = allocation.parse(text)
+            except ValueError as exc:
+                logger.warning("matrix: set %r does not parse: %s", name, exc)
+                continue
+            for pool in ("default", "ram"):
+                table = {}
+                roles_seen = {}
+                for leaf in allocation.leaves(expr):
+                    mb = floor_of_leaf(pool, leaf)
+                    if mb is None:
+                        continue
+                    table[leaf] = mb
+                    roles_seen[leaf] = leaf_role.get(
+                        leaf, leaf if leaf in role_floor[pool] else "")
+                if len(table) != len(allocation.leaves(expr)):
+                    missing = [leaf for leaf in allocation.leaves(expr)
+                               if leaf not in table]
+                    logger.info("matrix: set %r has no %s floor for %s; "
+                                "skipped", name, pool, ", ".join(missing))
+                    continue
+                by_pool.setdefault(pool, {})[name] = expr
+                floors[pool].update(table)
+                leaves_by_pool[pool].update(roles_seen)
+
+        logger.info("matrix: role floors %s",
+                    {p: dict(sorted(v.items())) for p, v in role_floor.items()
+                     if v})
+        budget: dict[tuple[str, str], int] = {}
+        for pool, setmap in by_pool.items():
+            available = self.capacity_pools.get(pool)
+            if not available:
+                continue
+            weights, fills, accepts = {}, set(), set()
+            for role in set(leaves_by_pool[pool].values()):
+                share = roles.get(role).share if roles.get(role) else None
+                if share is None:
+                    continue
+                weights[role] = share.weight if share.requests else 0.0
+                if share.kind == "fill":
+                    fills.add(role)
+                if share.accepts:
+                    accepts.add(role)
+            viable = {}
+            for name, expr in setmap.items():
+                need = allocation.floor_of(expr, floors[pool])
+                if need > available:
+                    logger.warning(
+                        "matrix: set %r floor %d MiB exceeds %s available %d",
+                        name, need, pool, available)
+                    continue
+                viable[name] = expr
+            if not viable:
+                continue
+            try:
+                alloc, left = allocation.auction(
+                    available, viable, floors[pool], weights,
+                    frozenset(fills), frozenset(accepts))
+            except (KeyError, ValueError) as exc:
+                logger.warning("matrix: set auction failed: %s", exc)
+                continue
+            for role, mb in alloc.items():
+                budget[(role, pool)] = mb
+            if any(mb > 0 for mb in left.values()):
+                logger.info("matrix: auction leaves %s", left)
+        if budget:
+            logger.info("matrix: auction budgets %s",
+                        ", ".join(f"{r}/{p}={mb}"
+                                  for (r, p), mb in sorted(budget.items())))
+        return budget
+
     def _build_ledger(self) -> PoolLedger:
         """Shared VRAM ledger from the matrix result + ``pools:`` overrides.
 
@@ -2150,6 +2284,7 @@ class Planner:
              if m.mmproj is not None and m.mmproj.gguf_path})
         if self.matrix_result is not None:
             self.chat_ctx = self.matrix_result.chat_ctx
+        self.role_budget = self._role_budgets()
         # Fixed CPU categories are judged before anything commits
         # (requirement #70): one that cannot fit the host pool alone gets
         # no id at all.
