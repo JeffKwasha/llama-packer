@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from llama_packer.allocation import PoolSchema, auction, floor_of, parse
+from llama_packer.allocation import (PoolSchema, auction, floor_mb,
+                                     floor_of, parse, role_floors)
 
 
 def test_the_pool_tuple_starts_with_cpu():
@@ -94,3 +95,19 @@ def test_infeasible_floor_is_an_error():
     with pytest.raises(ValueError, match="exceeds available"):
         auction(8, {"s": parse("a & b")}, {"a": 5, "b": 5},
                 {"a": 50, "b": 50})
+
+
+def test_floor_mb_from_the_quad():
+    # Validates: docs/allocation.md, 'Floor': weights + compute + KV per
+    # token per slot + slot overhead.
+    quad = (1000, 0.1, 50, 100)
+    assert floor_mb(quad, 1000, 1) == 1250
+    assert floor_mb(quad, 1000, 2) == 1400
+    assert floor_mb(quad, 1000, 2, 0.04) == 1456
+
+
+def test_role_floor_is_the_maximum_model_floor():
+    quad = (1000, 0.1, 50, 100)
+    entries = {"a": [(quad, 1000, 1), (quad, 1000, 2)],
+               "b": [(quad, 500, 1)]}
+    assert role_floors(entries) == {"a": 1400, "b": 1200}

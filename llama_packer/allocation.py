@@ -234,3 +234,28 @@ def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
         unallocated[name] = left - share * len(idle)
 
     return alloc, unallocated
+
+
+def floor_mb(quad: tuple[int, float, float, int], min_context: int,
+             min_parallel: int, margin: float = 0.0) -> int:
+    """One serving's floor in MiB from its affine quad.
+
+    ``quad`` is ``(model_mib, kv_per_token, slot_mib, compute_mib)``.
+    """
+    model_mib, kv, slot, compute = quad
+    raw = (model_mib + compute + kv * min_context * min_parallel
+           + slot * min_parallel)
+    return int(raw * (1.0 + margin))
+
+
+def role_floors(entries: dict[str, list[tuple]], margin: float = 0.0
+                ) -> dict[str, int]:
+    """Per-role floor: the maximum floor of the role's model/task pairs.
+
+    ``entries`` maps a role to ``(quad, min_context, min_parallel)`` triples.
+    """
+    return {
+        role: max(floor_mb(quad, ctx, parallel, margin)
+                  for quad, ctx, parallel in demands)
+        for role, demands in entries.items()
+    }
