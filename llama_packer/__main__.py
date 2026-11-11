@@ -389,30 +389,45 @@ def _expand_matrix_sets(sets: dict, role_by_stem: dict,
             return text
         return f"({text})"
 
-    def render(expr: str) -> str:
+    role_names = set(roles.names())
+    known = set(role_by_stem)
+    for ids in entry_ids_by_stem.values():
+        known.update(ids)
+
+    def render(expr: str, stack: tuple[str, ...] = ()) -> str:
         expr = _strip_parens(expr)
         alts = _split_top(expr, "|")
         if len(alts) > 1:
-            kept = [p for p in (render(a) for a in alts) if p]
+            kept = [p for p in (render(a, stack) for a in alts) if p]
             return " | ".join(_wrap(p, "&" in p or "|" in p) for p in kept)
         terms = _split_top(expr, "&")
         if len(terms) > 1:
-            kept = [p for p in (render(t) for t in terms) if p]
+            kept = [p for p in (render(t, stack) for t in terms) if p]
             return " & ".join(_wrap(p, "|" in p) for p in kept)
         atom = expr.strip()
         if atom.startswith("+"):
-            return atom
+            name = atom[1:]
+            if name.startswith("auto"):
+                raise ValueError(f"{atom} cannot be priced; name the roles")
+            if name not in sets:
+                raise ValueError(f"{atom} names no set")
+            if name in stack:
+                raise ValueError(
+                    "set reference cycle: " + " -> ".join(stack + (name,)))
+            return render(str(sets[name]), stack + (name,))
         if atom in role_repl:
             return role_repl[atom]
-        if roles.get(atom) is not None:
+        if atom in role_names:
             logger.warning("matrix.sets: role %r has no entries; dropped",
                            atom)
             return ""
-        return atom
+        if atom in known:
+            return atom
+        raise ValueError(f"{atom!r} is not a role, model stem, or entry id")
 
     expanded = {}
     for name, expr in sets.items():
-        text = render(str(expr))
+        text = render(str(expr), (name,))
         if not text:
             logger.warning("matrix.sets.%s: no entries left; set dropped", name)
             continue
@@ -1018,8 +1033,11 @@ def main(argv: list[str] | None = None) -> None:
     # capacity. llama-swap's matrix is a permission list, not a preload.
     sets = (profiles_cfg.get("matrix") or {}).get("sets") or {}
     role_by_stem = {m.stem: m.role for m in models}
-    expanded = _expand_matrix_sets(sets, role_by_stem,
-                                   config.entry_ids_by_stem)
+    try:
+        expanded = _expand_matrix_sets(sets, role_by_stem,
+                                       config.entry_ids_by_stem)
+    except ValueError as exc:
+        fatal("matrix.sets: %s", exc)
     if expanded:
         config["routing"] = {"router": {
             "use": "matrix",

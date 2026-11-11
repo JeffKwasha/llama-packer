@@ -488,12 +488,27 @@ def test_matrix_sets_validation():
 def test_expand_matrix_sets_replaces_only_role_leaves():
     from llama_packer.__main__ import _expand_matrix_sets
     out = _expand_matrix_sets(
-        {"rag": "chat & jina-embeddings-v3", "voice": "+chat & qwen"},
+        {"base": "chat", "rag": "+base & jina-embeddings-v3"},
         {"jina-embeddings-v3": "embeddings", "qwen": "chat"},
         {"jina-embeddings-v3": ["jina-embeddings-v3"],
          "qwen": ["qwen", "qwen.aux"]})
     assert out["rag"] == "(qwen | qwen.aux) & jina-embeddings-v3"
-    assert out["voice"] == "+chat & qwen"
+
+
+def test_expand_matrix_sets_rejects_an_unknown_literal():
+    import pytest
+    from llama_packer.__main__ import _expand_matrix_sets
+    with pytest.raises(ValueError, match="not a role"):
+        _expand_matrix_sets({"s": "chat & nope"}, {"qwen": "chat"},
+                            {"qwen": ["qwen"]})
+
+
+def test_expand_matrix_sets_rejects_orphans():
+    import pytest
+    from llama_packer.__main__ import _expand_matrix_sets
+    with pytest.raises(ValueError, match="cannot be priced"):
+        _expand_matrix_sets({"s": "chat & +auto:orphans"}, {"qwen": "chat"},
+                            {"qwen": ["qwen"]})
 
 
 def test_parse_device_auto():
