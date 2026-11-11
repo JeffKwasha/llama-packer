@@ -91,6 +91,7 @@ tasks:
     sacrifice: [draft]
   embeddings:
     endpoint: openai.embeddings
+    min_context: 4096
     max_context: 4096      # the served RAG window; clients chunk to fit
     ttl: 0                 # keep the RAG pair warm
   rerank:

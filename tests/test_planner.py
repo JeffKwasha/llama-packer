@@ -199,7 +199,9 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
     # rung worth an entry: one vision entry, not two identical ones.
     assert len(variants) == 1
     assert variants[0].include_mmproj is True   # main entry keeps vision
-    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    assert not [r for r in caplog.records
+                if r.levelno >= logging.WARNING
+                and "matrix: no sets" not in r.getMessage()]
 
 
 

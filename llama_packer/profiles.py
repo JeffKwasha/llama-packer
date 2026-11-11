@@ -16,7 +16,7 @@ import re
 
 from llama_packer import roles, utils
 from llama_packer.endpoints import EMBEDDINGS, RERANK
-from llama_packer.consts import DEFAULT_SACRIFICE_ORDER
+from llama_packer.consts import DEFAULT_SACRIFICE_ORDER, _MIN_AGENTIC_CTX
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +208,21 @@ def check_profiles(cfg: dict) -> list[str]:
     if routing:
         problems.append("routing: retired; remove it (matrix.sets selects "
                         "the router)")
+
+    top_min = cfg.get("min_context")
+    if top_min is not None and (isinstance(top_min, bool)
+                                or not isinstance(top_min, int)
+                                or top_min < 0):
+        problems.append("min_context: must be a non-negative integer")
+    top_min = top_min if isinstance(top_min, int) else _MIN_AGENTIC_CTX
+    for name, body in tasks.items():
+        if not isinstance(body, dict):
+            continue
+        mn = body.get("min_context", top_min)
+        mx = body.get("max_context")
+        if mn is not None and mx is not None and mn > mx:
+            problems.append(
+                f"tasks.{name}: min_context {mn} exceeds max_context {mx}")
 
     pools = _check_mapping(problems, "pools", cfg.get("pools"))
     for name, spec in pools.items():

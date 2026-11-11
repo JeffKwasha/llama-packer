@@ -2300,6 +2300,10 @@ class Planner:
         # pick that per model from a global context threshold, before any
         # category was read -- which is how it came to contradict the
         # category a model actually declared.
+        if not ((self.matrix_cfg or {}).get("sets")):
+            logger.warning(
+                "matrix: no sets; capacity sizes each model alone. Author "
+                "matrix.sets for co-residency.")
         self.role_budget = self._role_budgets()
         if self.role_budget:
             # The auction owns the sizing; the old shared solve and its
