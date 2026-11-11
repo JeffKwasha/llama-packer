@@ -575,48 +575,36 @@ def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
     assert yaml.safe_load(text)["models"]["m"]["cmd"] == cmd
 
 
-def test_overallocation_guard_catches_an_injected_violation(make_model,
-                                                           monkeypatch, caplog):
-    """The guard must fire on a planner that misbehaves, not just agree.
-
-    Validates: docs/plans/requirement-trace.md #27 -- the emit-time guard is
-    the backstop for "no emitted entry may need more VRAM than exists", so it
-    has to be shown to fire rather than merely agree with a healthy planner.
-
-    Everything upstream honours "never emit an entry that cannot load", so
-    on a healthy planner this check has nothing to do. That is exactly why
-    it needs a test that *breaks* the planner deliberately: otherwise it
-    passes vacuously forever and protects nothing.
-
-    Here solve_context is made to report a comfortable context while the quad
-    says the model needs more than the card has -- the shape of the bug it
-    was written for.
-    """
+def test_overallocation_guard_catches_an_injected_violation(make_model, caplog):
+    # Validates: docs/plans/requirement-trace.md, requirement #35
+    # An injected over-budget entry is removed at ERROR, never emitted.
     import logging
-    from llama_packer.writer import build_config
+
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import (EmittedConfig, Planner, Variant,
+                                     _verify_no_overallocation)
 
     m = make_model("liar", backend="llama-server", context_length=32768)
-    # Reports a fine context for any request...
-    monkeypatch.setattr(m.vram, "solve_context", lambda *a, **k: 32768)
-    # ...while the numbers say 90 GB of weights on a 48 GB card.
-    monkeypatch.setattr(m.vram, "effective_static",
-                        lambda *a, **k: (90000, 0.5, 0.0, 100))
-    monkeypatch.setattr(
-        m.vram, "fit_params_static",
-        lambda *a, **k: type("FP", (), {
-            "model_mib": 90000, "kv_per_token_mib": 0.5,
-            "slot_mib": 0.0, "compute_mib": 100, "source": "fit-params"})())
-
-    profiles = {"defaults": {"cache_type": "q8_0", "parallel": 1},
-                "profiles": {"default": {}}}
+    m.vram.solve_context = lambda *a, **k: 32768
+    m.vram.effective_static = lambda *a, **k: (90000, 0.5, 0.0, 100)
+    m.vram.fit_params_static = lambda *a, **k: type("FP", (), {
+        "model_mib": 90000, "kv_per_token_mib": 0.5,
+        "slot_mib": 0.0, "compute_mib": 100, "source": "fit-params"})()
+    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
+                         "profiles": {"default": {}}})
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024)
+    variant = Variant(parallel=1, cache_type="q8_0", spare_mb=0,
+                      profiles_group=[("default", {"cache_type": "q8_0",
+                                                   "parallel": 1})],
+                      ctx_size=32768, include_mmproj=True,
+                      mem_vram_mib=90000)
+    config = EmittedConfig(entry_ids_by_stem={"liar": ["liar"]})
+    config["models"] = {"liar": {"metadata": {"ctx_size": 32768}}}
     with caplog.at_level(logging.ERROR):
-        config = build_config(
-            [m], profiles, {"llama_bin": "/opt/llama-server"},
-            fit_bin="unused", vram_total=48 * 1024,
-        )
+        _verify_no_overallocation(config, {"liar": [variant]}, [m], planner)
     assert "invariant violated" in caplog.text
     assert "planner bug" in caplog.text
-    assert config["models"] == {}, "the impossible entry survived"
+    assert config["models"] == {}
 
 
 def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,

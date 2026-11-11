@@ -45,7 +45,7 @@ def test_pools_ram_spare_shrinks_the_host_pool():
     p = Planner([], Profiles({"pools": {"ram": {"spare": "2G"}}}), "fit",
                 32768, baseline_mb=4096, host_pool_mb=50000)
     assert p.capacity_pools["ram"] == 50000 - 2048
-    assert p.host_ledger.pool_mb == 50000 - 2048
+    assert p.host_pool_mb == 50000 - 2048
 
 
 def test_custom_role_gets_its_own_size_one_pool():

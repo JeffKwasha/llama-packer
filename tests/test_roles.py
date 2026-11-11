@@ -38,6 +38,7 @@ def test_share_values_are_uncapped():
 
 
 def test_bad_share_is_reported():
+    # Validates: docs/plans/requirement-trace.md, requirement #110
     _table, problems = roles.parse_roles({"roles": {
         "a": {"share": "banana"},
         "b": {"share": -1},

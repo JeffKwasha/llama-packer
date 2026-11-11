@@ -57,8 +57,7 @@ _TASK_KEYS = {
     "role",  # retired; accepted with a warning for old files
 }
 _MATRIX_KEYS = {
-    "min_chat_ctx", "tools_min_ctx", "coload_min_ctx", "ctx_gain_min",
-    "auto_parallel_max",
+    "tools_min_ctx", "auto_parallel_max",
     "vllm_auto_parallel_max", "estimate_headroom", "auto_parallel",
     "parallel_power",
 }
@@ -140,7 +139,6 @@ def check_profiles(cfg: dict) -> list[str]:
 
     role_table, role_problems = roles.parse_roles(cfg)
     problems.extend(role_problems)
-    served = tuple(role_table)
 
     tasks = _check_mapping(problems, "tasks", cfg.get("tasks"))
     for name, body in tasks.items():

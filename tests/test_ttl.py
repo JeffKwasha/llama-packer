@@ -33,10 +33,12 @@ def test_task_wins_over_role_even_when_larger():
 
 
 def test_role_wins_when_nothing_more_specific():
+    # Validates: docs/plans/requirement-trace.md, requirement #80
     assert resolve_entry_ttl(_m(), _task(), role_ttl=600) == 600
 
 
 def test_zero_is_a_value_not_an_absence():
+    # Validates: docs/plans/requirement-trace.md, requirement #80
     assert resolve_entry_ttl(
         _m(sidecar_keys=frozenset({"ttl"}), frontmatter={"ttl": 0}),
         _task(ttl=3600), role_ttl=600) == 0
@@ -44,10 +46,12 @@ def test_zero_is_a_value_not_an_absence():
 
 
 def test_device_entry_with_nothing_declared_inherits_the_top_level():
+    # Validates: docs/plans/requirement-trace.md, requirement #80
     assert resolve_entry_ttl(_m(), _task()) is None
 
 
 def test_role_ttl_reaches_a_helper_without_a_task_demand():
+    # Validates: docs/plans/requirement-trace.md, requirement #80
     assert resolve_entry_ttl(_m(on_cpu=True, role="embeddings"), None,
                              role_ttl=0) == 0
 

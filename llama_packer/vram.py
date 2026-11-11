@@ -1123,7 +1123,7 @@ class VramBudget:
         if getattr(self.model, "on_cpu", False) and not allow_cpu:
             # CPU-served models are not VRAM-bound (see allow_cpu).  This
             # guard must precede the cache read: a host-RAM measurement
-            # (allow_cpu=True, the host ledger) caches the same quad, and
+            # (allow_cpu=True, the CPU budget) caches the same quad, and
             # returning it here would charge a CPU-served model VRAM again.
             return None
         shape = (llama_args or "").strip()
@@ -1463,15 +1463,13 @@ class VramBudget:
         # CPU-served models (--n-gpu-layers 0) are not VRAM-bound, so size
         # them to their own architectural/sidecar context limit rather than the
         # (possibly tiny) GPU budget, which would otherwise shrink them.
-        if self.model.on_cpu:
-            return self._design_ctx()
-
         # Each solve reports its own budget: clear the gating flags so a
         # tight group's verdict does not leak into a looser group's plan.
         self.over_budget_reason = None
         self.vram_squeezed = False
 
-        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
+        reserve = (0 if self.model.on_cpu
+                   else _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb))
         available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
         if available <= 0:
@@ -1488,7 +1486,7 @@ class VramBudget:
         static = self.effective_static(
             fit_bin, cache_type=cache_type,
             design_ctx=design, include_mmproj=include_mmproj,
-            include_draft=include_draft,
+            include_draft=include_draft, allow_cpu=True,
             llama_args=llama_args,
         )
 

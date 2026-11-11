@@ -200,7 +200,7 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
     assert variants[0].include_mmproj is True   # main entry keeps vision
     assert not [r for r in caplog.records
                 if r.levelno >= logging.WARNING
-                and "matrix: no sets" not in r.getMessage()]
+                and "no matrix.sets" not in r.getMessage()]
 
 
 
@@ -228,12 +228,10 @@ FP_PARAMS = (1000.0, 0.5, 0.0, 100.0)
 def test_matrix_knobs_defaults_and_overrides():
     # Validates: SPEC.md, 'Usage categories (`usage:`)': Parse ``usage:`` from profiles.yaml. A malformed category is warned about and dropped rather than.
     k = MatrixKnobs.from_cfg(None)
-    assert (k.min_chat_ctx, k.tools_min_ctx, k.coload_min_ctx,
-            k.ctx_gain_min, k.estimate_headroom) == (
-        65536, 131072, 20480, 4096, 1.25)
-    k = MatrixKnobs.from_cfg({"min_chat_ctx": 32000, "estimate_headroom": 1.5})
-    assert k.min_chat_ctx == 32000
-    assert k.estimate_headroom == 1.5
+    assert (k.tools_min_ctx, k.auto_parallel_max, k.parallel_power) == (
+        131072, 8, 0.75)
+    k = MatrixKnobs.from_cfg({"tools_min_ctx": 32000})
+    assert k.tools_min_ctx == 32000
 
 
 def test_matrix_knobs_retired_context_knobs_warn(caplog):
@@ -515,14 +513,12 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
 def test_matrix_knobs_invalid_values_warn_and_default(caplog):
     # Validates: SPEC.md, 'Usage categories (`usage:`)': Parse ``usage:`` from profiles.yaml. A malformed category is warned about and dropped rather than.
     with caplog.at_level(logging.WARNING):
-        k = MatrixKnobs.from_cfg({"min_chat_ctx": -1, "coload_min_ctx": "big",
-                                  "estimate_headroom": 0.5})
-    assert k.min_chat_ctx == 65536
-    assert k.coload_min_ctx == 20480
-    assert k.estimate_headroom == 1.25
-    assert "min_chat_ctx" in caplog.text
-    assert "coload_min_ctx" in caplog.text
-    assert "estimate_headroom" in caplog.text
+        k = MatrixKnobs.from_cfg({"tools_min_ctx": -1,
+                                  "auto_parallel_max": "big"})
+    assert k.tools_min_ctx == 131072
+    assert k.auto_parallel_max == 8
+    assert "tools_min_ctx" in caplog.text
+    assert "auto_parallel_max" in caplog.text
 
 
 # ── opportunistic co-load pass ────────────────────────────────────────────
@@ -555,21 +551,6 @@ def test_served_ctx_caps_the_task_context(profiles):
     assert served_ctx(emb, tasks, 999999) == 8192
     chat = make("chat2", role="chat", context_length=65536, tasks=["chat"])
     assert served_ctx(chat, tasks) == 65536
-
-
-def test_fixed_cost_detail_names_the_terms(profiles):
-    # Validates: docs/plans/requirement-trace.md, requirement #87
-    # prints is the same quad the budget charges, broken into its terms.
-    from llama_packer.writer import fixed_cost_detail
-    m = make("jina", role="embeddings", context_length=4096)
-    m.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
-        model_mib=466, kv_per_token_mib=238 / 4096, slot_mib=0.0,
-        compute_mib=346, source="fit-params")
-    total, detail = fixed_cost_detail(
-        m, fit_bin="unused", cache_type="q8_0", profiles=profiles,
-        llama_args="", ctx=4096)
-    assert total == 1050
-    assert detail == "466 weights + 346 compute + 238 kv @4096"
 
 
 def make(stem, **fm):
@@ -1129,18 +1110,19 @@ def test_cpu_variant_refused_on_small_pool(profiles, caplog):
     assert any("host pool" in r.message for r in caplog.records)
 
 
-def test_cpu_parallel_charge_flips_refusal(profiles):
-    # Validates: docs/plans/requirement-trace.md, requirement #75
-    # multiplies D and the KV pool and can flip the refusal.
+def test_cpu_parallel_charge_flips_the_served_context(profiles):
+    # Validates: docs/allocation.md, 'The auction': a CPU model solves inside
+    # its ram allocation. A larger parallel charge lowers the context; a pool
+    # below the floor drops the serving.
     m = make("cpu", role="chat", device="cpu", parallel=2)
     _fake_vram(m, (466, 0.057, 346))
-    # parallel 2 charges two KV pools and two D terms: p=2 charge ≈ 4572 MiB
+    fits = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                   host_pool_mb=1800).plan()
+    assert fits["cpu"][0].parallel == 2
+    assert fits["cpu"][0].ctx_size <= 4096
     refused = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
-                      host_pool_mb=1800).plan()
+                      host_pool_mb=1000).plan()
     assert "cpu" not in refused
-    emitted = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
-                      host_pool_mb=8192).plan()
-    assert [v.parallel for v in emitted["cpu"]] == [2]
 
 
 def test_no_host_pool_never_gates(profiles, caplog):
@@ -1156,10 +1138,9 @@ def test_no_host_pool_never_gates(profiles, caplog):
     assert "cpu" in plan
 
 
-def test_host_charge_sizing_lifts_cpu_gate(profiles, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #74
-    # sizes CPU-served models through allow_cpu=True (fit_params_static
-    # otherwise returns None for a device: cpu model and the charge reads 0).
+def test_cpu_solve_measures_through_allow_cpu(profiles):
+    # Validates: docs/allocation.md, 'The auction': a CPU model's solve
+    # measures the host-resident quad under allow_cpu.
     m = make("e", role="embeddings", device="cpu", context_length=8192)
     seen = {}
 
@@ -1174,11 +1155,10 @@ def test_host_charge_sizing_lifts_cpu_gate(profiles, monkeypatch):
 
     m.vram.fit_params_static = fake_static
     planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
-                      host_pool_mb=4096)
-    mb = planner._host_charge_mb(m, 4096)
-    assert seen["allow_cpu"] is True
-    assert mb == 100 + 50 + int(0.1 * 4096)
-
+                      host_pool_mb=8192)
+    plan = planner.plan()
+    assert seen.get("allow_cpu") is True
+    assert "e" in plan
 
 # ── metadata.packing ──────────────────────────────────────────────────────
 

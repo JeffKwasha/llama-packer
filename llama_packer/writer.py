@@ -681,14 +681,7 @@ def _build_entry(
 class MatrixKnobs:
     """Tunables of the matrix solve, from the ``matrix:`` config section.
 
-    Context tiers, smallest to largest: ``coload_min_ctx`` (emb/rnk squeeze
-    floor) → ``min_chat_ctx`` (co-load decision floor) → ``tools_min_ctx``
-    (tools advertisement threshold).  ``embed_context`` / ``rerank_context``
-    are RAG caps — the maximum context those fixed-overhead roles serve at (default
-    4096, capped by each model's design context); the served value is
-    ``min(rag_cap(role), design_context)`` everywhere, including for
-    unestimable RAG models.  ``ctx_gain_min`` gates the squeeze adoption;
-    ``estimate_headroom`` pads estimated co-load overheads.
+    ``tools_min_ctx`` is the tools advertisement threshold.
     ``auto_parallel`` enables the value-function (ctx, slots) solve for
     unpinned chat models (see :func:`parallel_value`); ``auto_parallel_max``
     caps the slots and ``parallel_power`` is the score's slot exponent.
@@ -702,11 +695,7 @@ class MatrixKnobs:
     the rest).  On llama.cpp backends ``parallel: 0`` is invalid and falls
     back to the fleet default with a warning.
     """
-    min_chat_ctx: int = 65536
     tools_min_ctx: int = 131072
-    coload_min_ctx: int = 20480
-    ctx_gain_min: int = 4096
-    estimate_headroom: float = 1.25
     auto_parallel: bool = True
     auto_parallel_max: int = 8
     vllm_auto_parallel_max: int = 16
@@ -722,8 +711,7 @@ class MatrixKnobs:
             if cfg.get(key) is not None:
                 logger.warning("matrix: %s is retired; set max_context on the "
                                "embeddings/rerank task instead", key)
-        for key in ("min_chat_ctx", "tools_min_ctx", "coload_min_ctx",
-                    "ctx_gain_min", "auto_parallel_max",
+        for key in ("tools_min_ctx", "auto_parallel_max",
                     "vllm_auto_parallel_max"):
             v = cfg.get(key)
             if v is None:
@@ -736,16 +724,6 @@ class MatrixKnobs:
                                "using default", key, v)
                 continue
             knobs[key] = iv
-        v = cfg.get("estimate_headroom")
-        if v is not None:
-            try:
-                fv = float(v)
-                assert fv >= 1.0
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("matrix: estimate_headroom=%r is not a float "
-                               ">= 1.0; using default", v)
-            else:
-                knobs["estimate_headroom"] = fv
         v = cfg.get("auto_parallel")
         if v is not None:
             knobs["auto_parallel"] = _parse_bool_knob("auto_parallel", v)
@@ -778,26 +756,6 @@ def _parse_ctx_size(v: object) -> int | None:
         return None
     n = int(v)
     return n if n > 0 else None
-
-
-def _parse_capability_list(v: object) -> tuple[str, ...] | None:
-    """Parse a capability name list into a de-duplicated ordered tuple.
-
-    Order is preserved: ``sacrifice`` is a preference order and the ladder
-    walks it in the order written.
-    """
-    if isinstance(v, str):
-        v = [v]
-    if not isinstance(v, (list, tuple, set)):
-        return None
-    out: list[str] = []
-    for item in v:
-        if not isinstance(item, str):
-            return None
-        name = item.strip().lower()
-        if name and name not in out:
-            out.append(name)
-    return tuple(out)
 
 
 def shed_levels(sacrifice: tuple[str, ...] | None,
@@ -1073,25 +1031,6 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
     return max(int(view.design_context // 2), _MIN_CTX_SIZE)
 
 
-# Size buckets for footprint accounting: footprints bucket by size class, not
-# model type.  Tiny servings (speech, RAG) ride along beside chat for pocket
-# change; huge servings (diffusion) are chat-scale and tracked as exclusive
-# candidates; chat models evict each other.
-BUCKET_TINY_ENDPOINTS = frozenset({EMBEDDINGS, RERANK,
-                                   TRANSCRIPTIONS, SPEECH})
-BUCKET_HUGE_BACKENDS = frozenset({"sd-server"})
-
-
-def footprint_bucket(model) -> str:
-    """Size bucket of a model for ledger accounting: tiny/huge/chat."""
-    needed = {t.endpoint for t in model.tasks_resolved}
-    if needed and needed <= BUCKET_TINY_ENDPOINTS:
-        return "tiny"
-    if model.serves_endpoint(IMAGES) or model.backend in BUCKET_HUGE_BACKENDS:
-        return "huge"
-    return "chat"
-
-
 class PoolLedger:
     """One shared VRAM ledger: every pool's declared size and spare.
 
@@ -1136,24 +1075,6 @@ class PoolLedger:
             logger.warning("pools: %s spare=%r unreadable; using global",
                            pool_id, raw)
             return global_spare_mb
-
-
-class HostLedger:
-    """Sibling of PoolLedger: the host-RAM pool for ``device: cpu`` models.
-
-    A CPU-served entry is judged go/no-go against the pool — never solved
-    down, mirror of the VRAM `over_budget` refusal (SPEC.md §Host pool).
-    ``pool_mb=None`` (detection unavailable) means the ledger cannot gate:
-    it logs that once and reports an unbounded pool rather than inventing
-    one.
-    """
-
-    def __init__(self, pool_mb: int | None):
-        self.pool_mb = pool_mb
-
-    def available(self) -> int | None:
-        """Host pool size; None = cannot gate."""
-        return self.pool_mb
 
 
 @dataclass(frozen=True)
@@ -1321,7 +1242,7 @@ class Planner:
         if ram_spare is not None and host_pool_mb is not None:
             host_pool_mb = max(0, host_pool_mb - utils.parse_mem_mb(
                 str(ram_spare), host_pool_mb))
-        self.host_ledger = HostLedger(host_pool_mb)
+        self.host_pool_mb = host_pool_mb
         # Capacity-router pools.  The GPU limit is the same budget the solve
         # used (total minus reserve and spare); the host limit is the
         # detected/declared host pool.  One size-1 pool per scheduling role
@@ -1364,8 +1285,10 @@ class Planner:
         (*context_length*) and the CLI ``--max-context`` cap.  Measured
         under the model's resolved ``-ub`` shape (:func:`measurement_args`);
         *profile* adds the per-profile tier when the solve is group-scoped."""
+        total = (self.host_pool_mb
+                 if model.on_cpu and self.host_pool_mb else self.vram_total)
         ctx = model.vram.solve_context(
-            self.vram_total,
+            total,
             fit_bin=self.fit_bin,
             parallel=parallel,
             spare_mb=spare_mb,
@@ -1479,7 +1402,10 @@ class Planner:
                 include_draft="draft" not in shed,
                 design_ctx=design_ctx, context_length=context_length,
                 profile=profile)
-            if ctx <= 0 or ctx < (demand.min_context or self.min_context):
+            task_floor = (demand.min_context
+                          or (self.min_context if self.min_context_explicit
+                              else _MIN_CTX_SIZE))
+            if ctx <= 0 or ctx < task_floor:
                 continue
             over = getattr(view.vram, "over_budget_reason", None)
             if over is not None:
@@ -1659,8 +1585,6 @@ class Planner:
         """Price the authored sets, dropping any set that cannot fit."""
         raw = {str(n): str(e) for n, e in
                ((self.matrix_cfg or {}).get("sets") or {}).items()}
-        if not raw:
-            return {}
         inlined = _inline_set_refs(raw)
         role_floor: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
         role_source: dict[tuple[str, str], tuple[int, str, str]] = {}
@@ -1686,8 +1610,12 @@ class Planner:
                                             self.llama_args),
                 allow_cpu=True)
             if quad is None:
-                est = max(HOST_PROCESS_MIB,
-                          int(m.size_mb or 0) + HOST_PROCESS_MIB)
+                tasks = m.tasks_resolved or ()
+                min_ctx = (max(task.min_context or self.min_context
+                               for task in tasks)
+                           if tasks else _MIN_CTX_SIZE)
+                est = max(HOST_PROCESS_MIB, int(m.size_mb or 0)
+                          + HOST_PROCESS_MIB + int(0.001 * min_ctx))
                 previous = role_floor[pool].get(m.role, 0)
                 if est > previous:
                     role_source[(m.role, pool)] = (est, m.stem, "unmeasured")
@@ -1709,9 +1637,19 @@ class Planner:
             best = 0
             best_task = None
             for task in demands:
+                min_ctx = (task.min_context
+                           or (self.min_context
+                               if self.min_context_explicit
+                               else _MIN_CTX_SIZE))
+                if min_ctx > m.design_context:
+                    logger.info(
+                        "%s task %r min_context %d is above the design "
+                        "context %d; the task is unservable", m.stem,
+                        task.id or "fallback", min_ctx, m.design_context)
+                    continue
                 need = allocation.floor_mb(
-                    quad, task.min_context or self.min_context,
-                    task.min_parallel or 1, self.memory_margin)
+                    quad, min_ctx, task.min_parallel or 1,
+                    self.memory_margin)
                 if need > best:
                     best, best_task = need, task
             if best == 0:
@@ -1767,6 +1705,42 @@ class Planner:
                     return mb
             return None
 
+        if not raw:
+            fills: dict[str, int] = {}
+            for role, pools in role_pools.items():
+                share = roles.get(role).share if roles.get(role) else None
+                if share is not None and share.kind == "fill":
+                    for pool in pools:
+                        fills[pool] = fills.get(pool, 0) + 1
+            budget: dict[tuple[str, str], int] = {}
+            for role, pools in role_pools.items():
+                share = roles.get(role).share if roles.get(role) else None
+                if share is None:
+                    continue
+                for pool in pools:
+                    cap = self.capacity_pools.get(pool, 0)
+                    if not cap:
+                        continue
+                    floor = role_floor[pool].get(role, 0)
+                    if floor > cap:
+                        label = "host pool" if pool == "ram" else "GPU pool"
+                        logger.warning(
+                            "capacity: role %r floor %d MiB exceeds the %s "
+                            "%d; no entry", role, floor, label, cap)
+                        budget[(role, pool)] = 0
+                        continue
+                    if share.kind == "fill":
+                        alloc = max(floor, cap // max(1, fills.get(pool, 1)))
+                    elif share.kind == "weight":
+                        alloc = min(cap, floor + int(
+                            (cap - floor) * share.weight / 100.0))
+                    else:
+                        alloc = floor
+                    budget[(role, pool)] = alloc
+            logger.info("capacity: budgets %s",
+                        ", ".join(f"{r}/{p}={mb}"
+                                  for (r, p), mb in sorted(budget.items())))
+            return budget
         approved: dict[str, str] = {}
         rejected: dict[str, str] = {}
         for name, text in inlined.items():
@@ -1832,7 +1806,7 @@ class Planner:
             low = share.kind in ("min", "zero") or (
                 share.kind == "weight" and share.weight < 25)
             cap = self.capacity_pools.get(pool, 0)
-            if low and cap and mb > cap / 100:
+            if low and cap and mb > cap / 10:
                 logger.warning(
                     "matrix: role %r floor %d MiB on %s (share %s) is set by "
                     "%s/%s; that role cannot grow, so split it if the floor "
@@ -1878,28 +1852,6 @@ class Planner:
                         ", ".join(f"{r}/{p}={mb}"
                                   for (r, p), mb in sorted(budget.items())))
         return budget
-
-    def _host_charge_mb(self, model, ctx: int) -> int:
-        """Host-RAM (MiB) of a CPU-served model at its served ctx.
-
-        The same estimator the VRAM charge uses (requirement 11), single-
-        slot (a fixed-overhead role never takes declared parallel), 0 when
-        nothing can size it.
-        """
-        if getattr(self.host_ledger, "pool_mb", None) is None \
-                or self.host_ledger.pool_mb <= 0:
-            return 0
-        try:
-            mb = fixed_cost_mb(
-                model, fit_bin=self.fit_bin,
-                cache_type=self.profiles.default_cache_type,
-                profiles=self.profiles, llama_args=self.llama_args,
-                ctx=ctx, allow_cpu=True)
-            return 0 if mb is None else mb
-        except Exception as e:  # keep planning alive
-            logger.warning("host ledger: cannot size %s (%s)",
-                           model.stem, e)
-            return 0
 
     def _variant_memory(
         self,
@@ -1959,8 +1911,8 @@ class Planner:
         """
         if not ((self.matrix_cfg or {}).get("sets")):
             logger.warning(
-                "matrix: no sets; capacity sizes each model alone. Author "
-                "matrix.sets for co-residency.")
+                "capacity: no matrix.sets; pricing each role's share. "
+                "Author matrix.sets for cross-role co-residency.")
         self.role_budget = self._role_budgets()
         # Shared ledger: pools: overrides.  Per-model chat solves charge
         # this pool's extra reserve to their spare.
@@ -1995,10 +1947,19 @@ class Planner:
                 budget_pool = "ram" if view.on_cpu else "default"
                 budget = self.role_budget.get((model.role, budget_pool))
                 if budget is not None:
-                    reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO,
-                                                    self.baseline_mb)
-                    spare_eff = max(0, self.vram_total - reserve - budget
-                                    + spare_mb)
+                    if budget <= 0:
+                        logger.warning(
+                            "%s: role %r has no budget on %s; no entry",
+                            model.stem, model.role, budget_pool)
+                        continue
+                    if view.on_cpu:
+                        host = self.host_pool_mb or self.vram_total
+                        spare_eff = max(0, host - budget + spare_mb)
+                    else:
+                        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO,
+                                                        self.baseline_mb)
+                        spare_eff = max(0, self.vram_total - reserve - budget
+                                        + spare_mb)
                 else:
                     spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                     spare_eff = spare_mb
@@ -2078,7 +2039,9 @@ class Planner:
                             fallback_min_ctx=self.min_context,
                             fallback_explicit=self.min_context_explicit,
                             category_floor=(demand.min_context
-                                            or self.min_context))
+                                            or (self.min_context
+                                                if self.min_context_explicit
+                                                else None)))
                         rung = self.solve_rung(
                             model, demand, parallel=parallel,
                             cache_type=cache_type, spare_mb=spare_eff,
@@ -2123,6 +2086,8 @@ class Planner:
                                 continue
                         serves.append((demand, serve_view, par, ctx))
                     if not serves:
+                        logger.info("%s: no serving at the role budget; "
+                                    "entry omitted", model.stem)
                         continue
                 ctx_size = serves[0][3]
                 if est_error is None:
@@ -2176,14 +2141,13 @@ class Planner:
                             include_mmproj=not shed_vision,
                             ctx_size=serve_ctx, parallel=serve_par,
                             profile=group[0][1])
-                    host_free = self.host_ledger.available() \
-                        if serve_view.on_cpu else None
+                    host_free = (self.host_pool_mb
+                                 if serve_view.on_cpu else None)
                     host_charge = mem[1] if host_free is not None else None
                     if (host_charge is not None and host_charge > host_free):
-                        # Go/no-go on the host pool: the CPU-served quad does
-                        # not fit. No id may claim it and there is no
-                        # solve-down (requirement 12) — the operator picks a
-                        # smaller sidecar or a bigger box.
+                        # The solve already sized the context inside the
+                        # role's ram budget; this is the safety net for a
+                        # quad that still outgrows the pool.
                         logger.info(
                             "%s: %s over_budget_reason: host pool — %d MiB "
                             "needed, %d MiB in the pool; entry omitted",
@@ -2215,76 +2179,14 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
                    allow_cpu: bool = False,
                    ) -> tuple[int, float, float, int] | None:
     """(model_mib, kv_per_token_mib, slot_mib, compute_mib) quad, or None
-    when unmeasurable.  ``allow_cpu`` lifts the CPU gate — the host ledger
-    sizes `device: cpu` quads through the same gate."""
+    when unmeasurable.  ``allow_cpu`` lifts the CPU gate — a `device: cpu`
+    quad is measured under `-ngl 0`."""
     fp = model.vram.fit_params_static(fit_bin, cache_type=cache_type,
                                       llama_args=llama_args,
                                       allow_cpu=allow_cpu)
     if fp is None:
         return None
     return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)
-
-
-def _quad_cost_mb(quad: tuple[int, float, float, int], ctx: int,
-                  parallel: int = 1) -> int:
-    """Affine serving cost (MiB) of one measured quad at (ctx, parallel)."""
-    mib, kv_factor, slot_mib, compute = quad
-    return int(mib + compute + kv_factor * ctx * parallel
-               + slot_mib * parallel)
-
-
-def fixed_quad(model: Model, *, fit_bin: str, cache_type: str,
-               profiles, llama_args: str, allow_cpu: bool = False,
-               ) -> tuple[int, float, float, int] | None:
-    """The measured quad behind :func:`fixed_cost_mb`, or None.
-
-    Exposed separately so a cost comparison can name the terms — two
-    servings with the same total cost are not a bug if their weights, KV
-    and compute terms match.
-    """
-    return _static_params(model, fit_bin, cache_type,
-                          measurement_args(profiles, model, llama_args),
-                          allow_cpu=allow_cpu)
-
-
-def fixed_cost_mb(model: Model, *, fit_bin: str, cache_type: str,
-                  profiles, llama_args: str, ctx: int,
-                  parallel: int = 1, allow_cpu: bool = False) -> int | None:
-    """Measured serving cost (MiB) of one fixed-overhead serving at its ctx.
-
-    The one estimator behind the VRAM and host charges: the same affine
-    quad family (shape-stamped, so a `device: cpu` model measures under
-    `-ngl 0`), priced at the same context.  None when nothing can size it
-    — callers treat that as "not a candidate for a cost comparison", never
-    as 0.
-    """
-    quad = fixed_quad(model, fit_bin=fit_bin, cache_type=cache_type,
-                      profiles=profiles, llama_args=llama_args,
-                      allow_cpu=allow_cpu)
-    if quad is None:
-        return None
-    return _quad_cost_mb(quad, ctx, parallel)
-
-
-def fixed_cost_detail(model: Model, *, fit_bin: str, cache_type: str,
-                      profiles, llama_args: str, ctx: int,
-                      allow_cpu: bool = False) -> tuple[int, str] | None:
-    """(total MiB, term breakdown) for one fixed-overhead serving, or None.
-
-    The breakdown exists so two servings that both cost 1050 MiB can be
-    seen to be the same *shape* — same weights, same compute buffer, same
-    KV/token — rather than a repeated number masking a bug.
-    """
-    quad = fixed_quad(model, fit_bin=fit_bin, cache_type=cache_type,
-                      profiles=profiles, llama_args=llama_args,
-                      allow_cpu=allow_cpu)
-    if quad is None:
-        return None
-    mib, kv_factor, slot_mib, compute = quad
-    total = _quad_cost_mb(quad, ctx)
-    kv_mb = int(kv_factor * ctx + slot_mib)
-    return total, (f"{mib} weights + {compute} compute + {kv_mb} kv "
-                   f"@{ctx}")
 
 
 def served_ctx(model: Model, tasks: TaskCatalogue | None = None,
@@ -2398,7 +2300,6 @@ def emit_config(models: list[Model], plan: dict,
     :class:`EmittedConfig` whose ``entry_ids_by_stem`` maps each model stem to
     the ids it produced.
     """
-    catalogue = TaskCatalogue.from_cfg(getattr(profiles, "tasks_cfg", None))
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}

@@ -349,11 +349,18 @@ def test_plan_auto_parallel_off_keeps_today(make_model):
 
 
 def test_plan_non_chat_backend_untouched(make_model):
-    # Validates: SPEC.md, 'Knobs (matrix section keys)': only chat models without a parallel pin on llama-server and vLLM enter the auto-parallel solve
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': only chat models
+    # without a parallel pin on llama-server and vLLM enter the
+    # auto-parallel solve.
+    from llama_packer import roles
     m = make_model("ap", role="embeddings")
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768})
-    variants = _planner(m).plan()["ap"]
+    try:
+        roles.configure({"roles": {"embeddings": {"share": "100%"}}})
+        variants = _planner(m).plan()["ap"]
+    finally:
+        roles.configure(None)
     assert variants[0].parallel == 1
 
 
@@ -407,23 +414,6 @@ def test_pools_cfg_garbage_tolerated(caplog):
     assert Profiles({"pools": ["x"]}).pools_cfg == {}
 
 
-def test_buckets():
-    from conftest import fake_tasks
-    from llama_packer.writer import PoolLedger, footprint_bucket
-
-    def bucket(role, backend):
-        m = SimpleNamespace(role=role, backend=backend,
-                            tasks_resolved=fake_tasks({"role": role}))
-        m.serves_endpoint = lambda ep: any(t.endpoint == ep
-                                           for t in m.tasks_resolved)
-        return footprint_bucket(m)
-
-    assert bucket("s2t", "whisper-server") == "tiny"
-    assert bucket("rerank", "llama-server") == "tiny"
-    assert bucket("image", "sd-server") == "huge"
-    assert bucket("chat", "llama-server") == "chat"
-
-
 def test_ledger_spare_override_and_device_pools():
     from llama_packer.writer import PoolLedger
     pools = {"gpu1": {"vram": "24G", "spare": "2G"}}
@@ -447,6 +437,7 @@ def _planner_with_pools(model, pools):
 
 
 def test_default_pool_spare_reduces_the_emitted_pool(make_model):
+    # Validates: docs/plans/requirement-trace.md, requirement #108
     from llama_packer.writer import Planner
 
     m = make_model("ap", backend="llama-server", role="chat",

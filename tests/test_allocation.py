@@ -75,6 +75,7 @@ def test_fill_takes_the_remainder():
 
 
 def test_two_fills_split_the_remainder():
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     floors = {"a": 0, "b": 0, "c": 0}
     alloc, left = auction(10, {"s": parse("a & b & c")}, floors,
                           {"a": 60, "b": 0, "c": 0},
@@ -109,6 +110,7 @@ def test_floor_mb_from_the_quad():
 
 
 def test_role_floor_is_the_maximum_model_floor():
+    # Validates: docs/plans/requirement-trace.md, requirement #78
     quad = (1000, 0.1, 50, 100)
     entries = {"a": [(quad, 1000, 1), (quad, 1000, 2)],
                "b": [(quad, 500, 1)]}
