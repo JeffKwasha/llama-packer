@@ -182,8 +182,8 @@ requested model if it fits every pool, evicting by `evict_cost` when it does
 not. Any combination that fits is allowed.
 
 Capacity prices each role directly against its pool:
-`budget = floor + share × (available − floor)`. `fill` takes the pool,
-split equally among fills; `min` and `0` stay at the floor. Shares are
+`budget = floor + share × (available − floor)`. `fill` takes the remainder
+above the floors, split equally among fills; `min` and `0` stay at the floor. Shares are
 independent and admission decides co-residency. Set generation is future
 work; cross-role co-residency is authored in matrix mode.
 

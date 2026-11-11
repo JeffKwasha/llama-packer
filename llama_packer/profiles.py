@@ -58,7 +58,7 @@ _TASK_KEYS = {
 }
 _MATRIX_KEYS = {
     "tools_min_ctx", "auto_parallel_max",
-    "vllm_auto_parallel_max", "estimate_headroom", "auto_parallel",
+    "vllm_auto_parallel_max", "auto_parallel",
     "parallel_power",
 }
 _POOL_KEYS = {"vram", "spare"}

@@ -260,8 +260,6 @@ Sizing knobs, and matrix sets.
 ```yaml
 matrix:
   tools_min_ctx: 131072
-  coload_min_ctx: 20480
-  min_chat_ctx: 65536
   auto_parallel: false
   auto_parallel_max: 8
   parallel_power: 0.75
@@ -270,8 +268,8 @@ matrix:
     voice: "chat & t2s"
 ```
 
-- `tools_min_ctx`, `min_chat_ctx` — guards for squeezing helpers to buy
-  context.
+- `tools_min_ctx` — below this chat context the entry loses the `tools`
+  capability.
 - `auto_parallel`, `auto_parallel_max`, `parallel_power` — how leftover
   memory becomes slots vs context.
 - `sets` — llama-swap expressions (`&`, `|`, `()`, `+set`) over role labels
@@ -284,7 +282,7 @@ matrix:
 `sets:` is not a separate router switch. Writing it makes the config matrix;
 leaving it out makes it capacity. Each set is its own budget, sized by the
 auction in [allocation.md](allocation.md). Capacity has no set generation
-yet, so every model is its own set and is sized alone. Matrix never
+yet; it prices each role directly as `floor + share × (available − floor)`. Matrix never
 preloads: it evicts to the cheapest set containing the requested model and
 starts only that model.
 

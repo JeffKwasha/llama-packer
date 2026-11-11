@@ -31,6 +31,7 @@ from llama_packer.consts import (
     DEFAULT_SACRIFICE_ORDER,
     KNOWN_CAPABILITIES,
     _DIFFUSION_ARCH_RES,
+    _CTX_ROUND_TO,
     _KV_CACHE_BYTES,
     _LLAMA_CPP_DEFAULT_UBATCH,
     _MEMORY_MARGIN,
@@ -298,9 +299,6 @@ def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
     return set_params
 
 
-#: Default idle lifetime for a host-RAM helper with no declared value.
-#: Capacity pools bound RAM; TTL additionally yields to duties llama-swap
-#: cannot see. A chat serving on CPU inherits the global default instead.
 def resolve_entry_ttl(model: Model, demand: "Task | None",
                       task_ttl: int | None = None,
                       role_ttl: int | None = None) -> int | None:
@@ -1647,8 +1645,12 @@ class Planner:
                         "context %d; the task is unservable", m.stem,
                         task.id or "fallback", min_ctx, m.design_context)
                     continue
+                served_floor = max(
+                    _MIN_CTX_SIZE,
+                    ((min_ctx + _CTX_ROUND_TO - 1)
+                     // _CTX_ROUND_TO) * _CTX_ROUND_TO)
                 need = allocation.floor_mb(
-                    quad, min_ctx, task.min_parallel or 1,
+                    quad, served_floor, task.min_parallel or 1,
                     self.memory_margin)
                 if need > best:
                     best, best_task = need, task
@@ -1730,7 +1732,8 @@ class Planner:
                         budget[(role, pool)] = 0
                         continue
                     if share.kind == "fill":
-                        alloc = max(floor, cap // max(1, fills.get(pool, 1)))
+                        slack = max(0, cap - sum(role_floor[pool].values()))
+                        alloc = floor + slack // max(1, fills.get(pool, 1))
                     elif share.kind == "weight":
                         alloc = min(cap, floor + int(
                             (cap - floor) * share.weight / 100.0))
@@ -1941,6 +1944,10 @@ class Planner:
                 include_mmproj = True   # per-category now; see solve_rung
                 view = model.view_for(include_mmproj)
                 context_length = view.design_context
+                if (view.on_cpu and self.host_pool_mb is not None
+                        and self.host_pool_mb <= 0):
+                    logger.warning("%s: no host pool; no entry", model.stem)
+                    continue
                 # A role with an auction budget solves inside it; otherwise
                 # the pool's declared spare is the reserve.
                 pool_id = self.ledger.pool_id_for(view)
@@ -1952,14 +1959,14 @@ class Planner:
                             "%s: role %r has no budget on %s; no entry",
                             model.stem, model.role, budget_pool)
                         continue
+                    # The budget is already net of the pool spare.
                     if view.on_cpu:
                         host = self.host_pool_mb or self.vram_total
-                        spare_eff = max(0, host - budget + spare_mb)
+                        spare_eff = max(0, host - budget)
                     else:
                         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO,
                                                         self.baseline_mb)
-                        spare_eff = max(0, self.vram_total - reserve - budget
-                                        + spare_mb)
+                        spare_eff = max(0, self.vram_total - reserve - budget)
                 else:
                     spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                     spare_eff = spare_mb
@@ -1971,14 +1978,6 @@ class Planner:
                     self.knobs.auto_parallel
                     and view.serves_endpoint(CHAT)
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
-                    # A CPU-served model's KV pool lives in host RAM, which
-                    # no VRAM ledger sees or budgets, and solve_context returns
-                    # the design context regardless of the slot count. So
-                    # every candidate looks equally affordable and the score
-                    # reduces to p**power, which walks straight to the cap:
-                    # 8 slots on a model declared for one is an 8x KV
-                    # over-commit in an arena nothing accounts for.
-                    and not getattr(view, "on_cpu", False)
                     and "parallel" not in (view.frontmatter or {})
                     and not any("parallel" in resolved
                                 for _, resolved in group))

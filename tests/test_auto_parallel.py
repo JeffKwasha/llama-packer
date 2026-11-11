@@ -531,24 +531,25 @@ def test_multi_category_takes_the_heaviest():
     assert resolve_min_ctx(view, category_floor=133120) == 133120
 
 
-def test_cpu_served_chat_gets_no_auto_parallel(make_model):
-    """Host-RAM KV lives in an arena no VRAM ledger budgets.
+def test_cpu_served_chat_prices_slots_in_its_host_allocation(make_model):
+    """CPU slots charge the host budget, so auto-parallel can pick two.
 
-    solve_context returns the design context regardless of the slot count for a
-    CPU-served model, so every candidate looks equally affordable and the
-    score reduces to p**power — walking straight to the cap. Eight slots on
-    a model declared for one is an 8x KV over-commit nothing accounts for.
-
-    Validates: docs/plans/requirement-trace.md #29.
+    Validates: docs/allocation.md, 'The auction': every model solves its
+    context and parallel inside its role's allocation in its pool.
     """
     from llama_packer.profiles import Profiles as _P
-    model = make_model("cpu-chat", role="chat", device="cpu")
+    model = make_model("cpu-chat", role="chat", device="cpu",
+                       context_length=262144, tasks=["chat"])
+    _scripted_by_parallel(model, {1: 131072, 2: 65536})
     planner = Planner([model],
                       _P({"defaults": {"cache_type": "q8_0"},
-                          "profiles": {"default": {}}}),
-                      fit_bin="unused", vram_total=64 * 1024)
-    planner._bounded_ctx = lambda *a, **k: 131072
-    assert [v.parallel for v in planner.plan()["cpu-chat"]] == [1]
+                          "profiles": {"default": {}},
+                          "tasks": {"chat": {
+                              "endpoint": "openai.chat.completions",
+                              "min_context": 65536, "min_parallel": 1}}}),
+                      fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=64 * 1024)
+    assert planner.plan()["cpu-chat"][0].parallel == 2
 
 
 def test_pinned_parallel_below_min_parallel_emits_nothing(make_model):

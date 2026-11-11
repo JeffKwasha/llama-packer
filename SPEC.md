@@ -283,7 +283,7 @@ directly without scaling down. `memory_margin` (profiles.yaml
 `hardware.memory_margin`, default 0.01) inflates every measured term so
 measurement residual errs toward reserving more.
 
-`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes. It is **opt-in**: set via `--baseline` or `profiles.yaml` `hardware.baseline_mb`, and defaults to **0**. The fixed `_RESERVE_VIDEO` (1024 MiB) already covers driver/compositor overhead, so auto-detection of `used_vram` is intentionally NOT performed — llama-swap keeps model servers loaded, and counting that usage would make the budget assume a blank GPU and collapse every context to the minimum. The effective reserve is the fixed system reserve (1024) plus the larger of the fixed video reserve (1024) and any explicit `baseline_mb`. `--spare` is subtracted on top of this reserve. CPU-placed models (`device: cpu`) are excluded from VRAM budgeting entirely and are sized to their own architectural/sidecar context.
+`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes. It is **opt-in**: set via `--baseline` or `profiles.yaml` `hardware.baseline_mb`, and defaults to **0**. The fixed `_RESERVE_VIDEO` (1024 MiB) already covers driver/compositor overhead, so auto-detection of `used_vram` is intentionally NOT performed — llama-swap keeps model servers loaded, and counting that usage would make the budget assume a blank GPU and collapse every context to the minimum. The effective reserve is the fixed system reserve (1024) plus the larger of the fixed video reserve (1024) and any explicit `baseline_mb`. `--spare` is subtracted on top of this reserve. CPU-placed models (`device: cpu`) are excluded from VRAM budgeting entirely: they charge `ram` and solve inside the role's host allocation (§Host pool).
 
 **Design context:** When the affine pair is measured, it uses the model's GGUF architectural context length as the reference point (or sidecar `context_length`, or 32768 default). Sidecar `context_length` is the model's **design maximum** — a ceiling applied when serving (line 255), never a floor. The served size is solved from the VRAM budget, the task's demand and `parallel_power`; `min_context:` is the key that states a floor. Reading `context_length` as a pin (its own floor) made a 262144 design max an unreachable floor, forced the model to parallel 1, and left the only remedy editing the sidecar — rewriting a claim about the model to express an operating decision. If the design context fits within the remaining budget, it is used directly without scaling down.
 
@@ -357,7 +357,7 @@ no idle-unload CLI flag.
 
 ### Tasks (`tasks:`)
 
-The top-level `min_context` is the default floor for tasks that do not declare one; it cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, and the demand that work needs. A task that omits `min_context` uses the top-level value, and `min_context > max_context` is an error that stops the run before a config is written. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids. A task whose endpoint is not in that set is warned about and dropped:
+The top-level `min_context` is the default floor for tasks that do not declare one; it cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, and the demand that work needs. A task that omits `min_context` uses an explicitly set top-level value; with none set, the hard emit floor (4096) applies. `min_context > max_context` is an error that stops the run before a config is written. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids. A task whose endpoint is not in that set is warned about and dropped:
 
 ```yaml
 tasks:
@@ -476,7 +476,7 @@ models:
 ```
 
 - Capacity prices each role's share directly: `floor + share × (available −
-  floor)`; `fill` takes the pool, split equally among fills; `min` and `0`
+  floor)`; `fill` takes the remainder above the floors, split equally among fills; `min` and `0`
   stay at the floor. Set generation is future work; a fleet needing
   cross-role co-residency authors `matrix.sets:` (matrix mode).
 - Any combination whose summed capacities fit every pool may coexist.
@@ -614,7 +614,7 @@ model_id remains. A role that loses every model emits nothing and warns once.
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
 | `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score |
 
-`tools_min_ctx` and `min_chat_ctx` shape the solve. Defaults: 128k, 64k.
+`tools_min_ctx` (default 128k) is the context below which a chat entry loses the `tools` capability. The co-load squeeze knobs (`min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`) are retired.
 
 ### TTL
 

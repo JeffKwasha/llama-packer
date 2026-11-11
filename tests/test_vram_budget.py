@@ -590,16 +590,6 @@ def test_solve_context_memory_margin_shrinks_ctx(make_model):
     assert margined == 16384
 
 
-def test_solve_context_cpu_served_returns_design(make_model):
-    """
-    Validates: SPEC.md, 'VRAM Allocation': a CPU-served model costs no VRAM, so its
-    context is its design maximum.
-    """
-    model = make_model("e", device="cpu", context_length=8192)
-    ctx = model.vram.solve_context(1024, fit_bin="unused")
-    assert ctx == 8192
-
-
 # ── unestimable fallback (no estimate source works) ──────────────────────
 
 

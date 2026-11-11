@@ -6,8 +6,9 @@ superseded by capacity routing. Recorded 2026-10-23.
 rule is retired. CPU models charge the capacity `ram` pool and are evicted
 under pressure like any other resident; a non-chat helper defaults to
 `ttl: 3600`. See `SPEC.md` §Host pool / §Capacity routing.
-`matrix.sets` is retired with it (SPEC §Capacity routing), so the set
-composition section and the host-ledger unit judgement below are history:
+`matrix.sets` now selects matrix mode (SPEC §Capacity routing); capacity
+prices each role directly. The set composition section and the host-ledger
+unit judgement below are history:
 each fixed CPU category is judged on its own quad against what is free
 after the committed pair (requirement #70).
 **Amended 2026-11-11:** `HostLedger` is retired. A CPU model now solves its

@@ -78,7 +78,7 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 35 | No emitted entry may need more VRAM than exists | `test_solve_context_never_reports_a_context_it_cannot_afford`, `test_overallocation_guard_catches_an_injected_violation` |
 | 36 | The guard stays quiet and drops nothing on a sane plan | `test_overallocation_guard_is_quiet_when_the_plan_is_sane` |
-| 37 | A CPU-served chat model gets no free slots | `test_cpu_served_chat_gets_no_auto_parallel`, `test_solve_context_cpu_served_returns_design` |
+| 37 | A CPU-served chat model prices its slots inside the host allocation like any other model; a larger parallel charge lowers the context | `test_cpu_served_chat_prices_slots_in_its_host_allocation`, `test_cpu_parallel_charge_flips_the_served_context` |
 | 38 | `tools` is demoted on the entry's **own** served context | `test_plan_demotes_tools_below_the_threshold_without_a_matrix`, `test_plan_keeps_tools_when_the_context_clears_the_threshold` |
 
 ## Allocation

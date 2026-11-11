@@ -395,12 +395,8 @@ profiles:
 # on the embeddings/rerank tasks instead.
 #
 # Limits and guards for shared context:
-#   tools_min_ctx     below this chat context, helpers are squeezed to buy
-#                     context back (default 128k)
-#   coload_min_ctx    how far helpers may be squeezed (default 20k)
-#   ctx_gain_min      the minimum chat gain that makes the squeeze worth it
-#   min_chat_ctx      the floor kept for a co-load (default 64k)
-#   estimate_headroom pads an estimated, not measured, overhead (1.25)
+#   tools_min_ctx     below this chat context the entry loses the `tools`
+#                     capability (default 128k)
 #
 # `sets:` switches the emitted config to matrix mode. Each set is its own
 # memory budget: [A&B] [A&C] [A&D] constrains only the pairs, so all four can
@@ -412,10 +408,6 @@ profiles:
 #
 # matrix:
 #   tools_min_ctx: 131072
-#   coload_min_ctx: 20480
-#   ctx_gain_min: 4096
-#   min_chat_ctx: 65536
-#   estimate_headroom: 1.25
 #   auto_parallel: false        # on by default: the packer chooses context and slots
 #   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
 #   parallel_power: 0.75        # slot exponent; a task's own overrides it

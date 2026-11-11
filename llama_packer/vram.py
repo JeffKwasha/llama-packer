@@ -1460,9 +1460,6 @@ class VramBudget:
         measurement residual).  ``llama_args`` are the profiles global
         server flags the measurement mirrors (flash attention, batch).
         """
-        # CPU-served models (--n-gpu-layers 0) are not VRAM-bound, so size
-        # them to their own architectural/sidecar context limit rather than the
-        # (possibly tiny) GPU budget, which would otherwise shrink them.
         # Each solve reports its own budget: clear the gating flags so a
         # tight group's verdict does not leak into a looser group's plan.
         self.over_budget_reason = None

@@ -35,7 +35,8 @@ score = sqrt(ctx / task_min_context) * slots ** parallel_power
 ```
 
 - Context below the task floor is rejected. `min_context` comes from the
-  task, else the top-level `min_context`.
+  task, else an explicitly set top-level `min_context`, else the hard emit
+  floor (4096).
 - `auto_parallel: false` disables the value function; `parallel:` pins a
   slot count.
 - An entry whose endpoint keeps no KV cache serves one slot at the task's
@@ -46,7 +47,8 @@ score = sqrt(ctx / task_min_context) * slots ** parallel_power
 ## Sets: floors first, then the auction
 
 A serving's floor is the memory it needs at its task's `min_context` and
-`min_parallel`, through the measured memory law. A role's floor is the
+`min_parallel`, through the measured memory law. The context is priced at the
+first emitted step (8192 tokens) at or above `min_context`. A role's floor is the
 maximum floor of all models in the role.
 
 A set's floor follows its expression, component-wise:

@@ -1,6 +1,9 @@
 # Plan: Opportunistic co-loading of small models + main-chat context
 
 Status: **proposal — not scheduled**. Recorded 2026-08-30.
+**Amended 2026-11-11:** the co-load squeeze knobs (`min_chat_ctx`,
+`coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`) are retired; this
+plan predates the role allocation in `docs/allocation.md`.
 Related: the retired matrix-categories design (git history), `SPEC.md` §Capacity routing, `llama_packer/{vram,writer,__main__}.py`.
 
 ## Current state

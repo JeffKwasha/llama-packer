@@ -1112,18 +1112,98 @@ def test_cpu_variant_refused_on_small_pool(profiles, caplog):
 
 def test_cpu_parallel_charge_flips_the_served_context(profiles):
     # Validates: docs/allocation.md, 'The auction': a CPU model solves inside
-    # its ram allocation. A larger parallel charge lowers the context; a pool
-    # below the floor drops the serving.
-    m = make("cpu", role="chat", device="cpu", parallel=2)
-    _fake_vram(m, (466, 0.057, 346))
-    fits = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
-                   host_pool_mb=1800).plan()
-    assert fits["cpu"][0].parallel == 2
-    assert fits["cpu"][0].ctx_size <= 4096
-    refused = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
-                      host_pool_mb=1000).plan()
-    assert "cpu" not in refused
+    # its ram allocation. Two slots charge two KV pools and lower the served
+    # context; a pool below the floor drops the serving.
+    def ctx(parallel, host_mb):
+        m = make(f"cpu{parallel}", role="chat", device="cpu",
+                 parallel=parallel, context_length=262144)
+        _fake_vram(m, (466, 0.057, 346))
+        plan = Planner([m], profiles, fit_bin="unused",
+                       vram_total=64 * 1024, host_pool_mb=host_mb).plan()
+        return plan[m.stem][0].ctx_size if m.stem in plan else None
 
+    assert ctx(2, 10000) < ctx(1, 10000)
+    assert ctx(2, 1000) is None
+
+def test_min_share_serves_a_floor_between_rounding_steps(profiles):
+    # Validates: docs/allocation.md, 'Floor': the served context is a
+    # multiple of the emit granularity, so a floor between steps is priced
+    # at the next served context rather than one step below it.
+    from llama_packer.profiles import Profiles as _P
+    from llama_packer.endpoints import EMBEDDINGS
+    from llama_packer.tasks import Task
+    m = make("emb", role="embeddings", context_length=131072,
+             tasks=["emb"])
+    m.tasks_resolved = (Task("emb", EMBEDDINGS, min_context=100000),)
+    _fake_vram(m, (1000, 0.1, 0))
+    planner = Planner([m], _P({
+        "defaults": {"cache_type": "q8_0"},
+        "profiles": {"default": {}},
+        "tasks": {"emb": {"endpoint": "openai.embeddings",
+                          "min_context": 100000}}}),
+        fit_bin="unused", vram_total=64 * 1024)
+    variants = planner.plan()["emb"]
+    assert variants[0].ctx_size == 106496
+
+def test_capacity_budget_is_net_of_spare(profiles):
+    # Validates: docs/allocation.md, 'Routers': a role budget is already net
+    # of the pool spare, so the solve does not subtract it twice.
+    from llama_packer.profiles import Profiles as _P
+    m = make("s", role="chat", context_length=32768)
+    _fake_vram(m, (466, 0.057, 346))
+    seen = {}
+
+    def fake(total, *, spare_mb=0, **kw):
+        seen["total"], seen["spare"] = total, spare_mb
+        return 32768
+    m.vram.solve_context = fake
+    for flag in (True, False):
+        m.view_for(flag).vram.solve_context = fake
+    profiles = _P({"defaults": {"cache_type": "q8_0"},
+                   "profiles": {"default": {}},
+                   "pools": {"default": {"spare": "1G"}}})
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024)
+    planner.plan()
+    from llama_packer.vram import _RESERVE_SYSTEM, _RESERVE_VIDEO
+    assert (seen["total"] - _RESERVE_SYSTEM - _RESERVE_VIDEO - seen["spare"]
+            == planner.capacity_pools["default"])
+
+
+def test_capacity_fill_splits_the_pool_above_the_floors(profiles):
+    # Validates: docs/allocation.md, 'Routers': fill takes the remainder
+    # after every floor, split equally among the fills.
+    from llama_packer import allocation, roles
+    try:
+        roles.configure({"roles": {"a": {"share": "fill"},
+                                   "b": {"share": "fill"}}})
+        a = make("a", role="a", context_length=32768)
+        b = make("b", role="b", context_length=32768)
+        _fake_vram(a, (1000, 0.1, 0))
+        _fake_vram(b, (500, 0.1, 0))
+        planner = Planner([a, b], profiles, fit_bin="unused",
+                          vram_total=48 * 1024)
+        budget = planner._role_budgets()
+        fa, fb = budget[("a", "default")], budget[("b", "default")]
+        cap = planner.capacity_pools["default"]
+        floor = allocation.floor_mb
+        qa, qb = (1000, 0.1, 0, 0), (500, 0.1, 0, 0)
+        assert fa + fb <= cap
+        assert fa - fb == (floor(qa, planner.min_context, 1,
+                                 planner.memory_margin)
+                           - floor(qb, planner.min_context, 1,
+                                   planner.memory_margin))
+    finally:
+        roles.configure(None)
+
+
+def test_cpu_model_emits_nothing_without_a_host_pool(profiles):
+    # Validates: docs/allocation.md, 'Routers': a CPU serving charges ram;
+    # with no host pool there is no allocation to solve inside.
+    m = make("cpu", role="chat", device="cpu")
+    _fake_vram(m, (466, 0.057, 346))
+    plan = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
+                   host_pool_mb=0).plan()
+    assert "cpu" not in plan
 
 def test_no_host_pool_never_gates(profiles, caplog):
     # Validates: docs/plans/requirement-trace.md, requirement #76
