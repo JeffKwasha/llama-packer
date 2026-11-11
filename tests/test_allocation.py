@@ -48,9 +48,10 @@ def test_capped_role_renormalises_its_set():
     floors = {"a": ZERO, "b": ZERO, "c": m(gpu0=10)}
     sets = {"one": parse("a & b"), "two": parse("a & c")}
     alloc, _left = auction(m(gpu0=15), sets, floors,
-                           {"a": 100, "b": 100, "c": 0})
-    assert alloc["a"] == m(gpu0=5)
-    assert alloc["b"] == m(gpu0=10)
+                           {"a": 60, "b": 0, "c": 0},
+                           fills=frozenset({"b"}))
+    assert alloc["a"] == m(gpu0=3)
+    assert alloc["b"] == m(gpu0=12)
     assert alloc["c"] == m(gpu0=10)
 
 
@@ -75,21 +76,21 @@ def test_fill_takes_the_remainder():
     # it claims after the weighted roles.
     floors = {"a": ZERO, "b": ZERO}
     alloc, left = auction(m(gpu0=10), {"s": parse("a & b")}, floors,
-                          {"a": 50, "b": 0}, fills=frozenset({"b"}))
-    assert alloc["a"] == m(gpu0=5)
-    assert alloc["b"] == m(gpu0=5)
+                          {"a": 60, "b": 0}, fills=frozenset({"b"}))
+    assert alloc["a"] == m(gpu0=6)
+    assert alloc["b"] == m(gpu0=4)
     assert left["s"] == ZERO
 
 
 def test_two_fills_split_the_remainder():
     floors = {"a": ZERO, "b": ZERO, "c": ZERO}
     alloc, left = auction(m(gpu0=10), {"s": parse("a & b & c")}, floors,
-                          {"a": 50, "b": 0, "c": 0},
+                          {"a": 60, "b": 0, "c": 0},
                           fills=frozenset({"b", "c"}))
-    assert alloc["a"] == m(gpu0=5)
+    assert alloc["a"] == m(gpu0=6)
     assert alloc["b"] == m(gpu0=2)
     assert alloc["c"] == m(gpu0=2)
-    assert left["s"] == m(gpu0=1)
+    assert left["s"] == ZERO
 
 
 def test_two_zero_roles_split_the_leftover():

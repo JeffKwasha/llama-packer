@@ -27,7 +27,8 @@ available(pool) = physical(pool) − reserve(pool)
   for unified memory, plus any fake resource that exists to impose a limit
   (a role pool of 1 is one). A namedtuple is created from those ids, so
   every number has a name. `cpu` is emitted as `ram`; a single GPU as
-  `default`.
+  `default`. Detecting unified memory is future work; today the pools are
+  discrete.
 - An entry charges every field its serving touches. A pool absent from an
   entry's capacities is zero to that entry.
 
@@ -102,10 +103,10 @@ Each role in the set carries a request weight and an accept flag from its
 | `27%` | 27 | yes |
 | `fill` | the remainder after the weighted requests | yes |
 
-A weight is a percentage of the auction. Claims scale down only when they
-exceed 100 together: 60 and 90 become 60/150 and 90/150, while a lone 50
-leaves half for a fill. Any positive value is valid; 123 scales with the
-rest.
+A weight is a percentage of the auction. Each role takes its literal
+percentage, and fills take the remainder. When the weights in one set add up
+to more than 100, they scale down proportionally: 60 and 90 become 60/150
+and 90/150. A lone 60 leaves 40 for a fill. Any positive value is valid.
 
 Requests are normalised inside each set, never capped at an absolute
 percentage:
@@ -131,27 +132,26 @@ Accept in ascending floor order, then alphabetically on a tie. Roles accept
 first; the models inside a role follow the same order. The order makes the
 fixed point deterministic.
 
-Example — set `A & B` with auction 15 GiB, `A` at 60 and `B` at 90:
+Example — set `A & B` with auction 10 GiB, `A` at 60 and `B` at `fill`:
 
 ```
-A requests 60% × 15 = 9
-B requests 90% × 15 = 13.5
-the set is overclaimed, so both scale by 100/150: A 6, B 9
+A takes 60% × 10 = 6
+B takes the remaining 4
 ```
 
-`A`'s other set offers only 3, so `A` accepts 3. Recompute: the remaining
-auction is 12 and `B` requests 90% of it, which is 10 in whole MiB. `B`
-accepts 10.
+`A` also appears in another set that offers only 3, so `A` accepts 3. The
+first set recomputes with `A` fixed at 3, and `B` takes the new remainder.
 
 `min` stays at its floor. `0` requests nothing but accepts memory left after
 the requesters are placed; when several accepting roles share one set's
-leftover, it is split equally among them. `fill` is `100%` by another name.
+leftover, it is split equally among them. `fill` is not a weight; it takes
+the remainder.
 
 Each model then solves its context and parallel inside its role's allocation
 in its pool. Each set logs its unallocated memory at INFO.
 
-The normalised, iterative rule is the recorded design. A system of equations
-would do better; this is the algorithm to implement first.
+The iterative rule is the recorded design. A system of equations would do
+better; this is the algorithm to implement first.
 
 ## One serving per role
 
