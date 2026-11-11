@@ -78,18 +78,17 @@ and every one of them carries a `Validates:` citation.
 |---|---|---|
 | 35 | No emitted entry may need more VRAM than exists | `test_solve_context_never_reports_a_context_it_cannot_afford`, `test_overallocation_guard_catches_an_injected_violation` |
 | 36 | The guard stays quiet and drops nothing on a sane plan | `test_overallocation_guard_is_quiet_when_the_plan_is_sane` |
-| 37 | A CPU-resident model gets no free slots | `test_cpu_resident_chat_gets_no_auto_parallel` (planned) — covered today by `test_solve_context_cpu_resident_returns_design` |
+| 37 | A CPU-served chat model gets no free slots | `test_cpu_served_chat_gets_no_auto_parallel`, `test_solve_context_cpu_served_returns_design` |
 | 38 | `tools` is demoted on the entry's **own** served context | `test_plan_demotes_tools_below_the_threshold_without_a_matrix`, `test_plan_keeps_tools_when_the_context_clears_the_threshold` |
 
 ## Allocation
 
 | # | Requirement | Test |
 |---|---|---|
-| 39 | Residents serve a fixed small context and are charged for it | `test_resident_rag_is_reserved_at_its_fixed_context` |
-| 40 | Resident parallelism is ignored — never buys context from chat | `test_resident_parallelism_is_ignored` |
+| 39 | A fixed-overhead serving is capped at its task's context and charged for that | `test_served_ctx_caps_the_task_context` |
+| 40 | Fixed-role parallelism is ignored — never buys context from chat | `test_fixed_role_parallelism_is_ignored` |
 | 43 | The fallback runs the slot solve at exponent 0 | `test_fallback_slot_exponent_is_zero` |
 | 44 | Ties in the slot score go to more slots | `test_ties_go_to_more_slots` |
-| 87 | A priced resident logs the terms the budget charged (weights + compute + KV at ctx) | `test_selection_reason_names_the_cost_terms`, `test_resident_cost_detail_names_the_terms` |
 
 ## Deploy
 
@@ -151,18 +150,17 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 70 | Host pool floor: an infeasible read clamps the pool to 0, and an over-pool `device: cpu` serving — a variant or a declared fixed category — emits no id | `test_host_pool_clamps_to_zero`, `test_cpu_variant_refused_on_small_pool`, `test_host_unit_refusal_drops_a_category_that_cannot_fit_alone` |
+| 70 | Host pool floor: an infeasible read clamps the pool to 0, and an over-pool `device: cpu` serving emits no id | `test_host_pool_clamps_to_zero`, `test_cpu_variant_refused_on_small_pool` |
 | 71 | Pressure zone: sysctl `(zone high sum, min_free_kbytes floor)` primary; missing/zeroed zoneinfo falls back to 25% of total, called out in the log | `test_pressure_zone_from_zoneinfo`, `test_pressure_zone_fallback_is_logged`, `test_pressure_zone_override_asserted` |
 | 72 | `host_pool = min(sys_free, cgroup_free)` with every override arm (`system_ram`, `host_pool` abs/frac) honored | `test_host_pool_mixed_terms`, `test_host_pool_overrides_arm` |
 | 73 | Service cgroup caps the pool; no llama-swap cgroup skips the term with a warning | `test_host_pool_mixed_terms`, `test_cgroup_missing_service_skips_term` |
-| 74 | A `device: cpu` resident is charged to the host ledger (RAG pair and declared fixed categories); its VRAM charge stays 0 | `test_cpu_resident_charges_host_not_vram`, `test_host_resident_sizing_lifts_cpu_gate`, `test_cpu_fixed_category_resident_charged_host`, `test_host_measurement_does_not_leak_into_vram_pricing` |
-| 75 | Host charge is the serving quad at the served context — declared parallel multiplies D and the KV pool and can flip the refusal | `test_cpu_variant_refused_on_small_pool`, `test_cpu_parallel_charge_flips_refusal` |
+| 74 | A `device: cpu` serving charges `ram` only, never VRAM; its host quad is measured under `allow_cpu` | `test_capacity_fields_cpu_helper_charges_host_only`, `test_host_measurement_does_not_leak_into_vram_pricing`, `test_cpu_solve_measures_through_allow_cpu` |
+| 75 | A CPU model solves inside its `ram` allocation — declared parallel multiplies D and the KV pool, lowering the served context and able to drop the serving | `test_cpu_variant_refused_on_small_pool`, `test_cpu_parallel_charge_flips_the_served_context` |
 | 76 | No pool knowledge, no gate — a planner without a host pool never refuses on host grounds | `test_no_host_pool_never_gates` |
 | 77 | Every entry carries `metadata.packing`; `device: cpu` entries name device/ctx/parallel/ram and carry no `vram_mib` | `test_metadata_packing_cpu_entry`, `test_metadata_packing_gpu_entry` |
-| 78 | `device: cpu` wins the resident role; inside that set the cheapest **measured serving at the role's ctx** wins (file size only when unmeasurable); a selector overrides and is priced; every arm is logged | `test_select_model_prefers_cpu_candidate`, `test_select_model_smallest_among_cpu_candidates`, `test_select_model_no_cpu_keeps_size_rule`, `test_select_model_selector_overrides_cpu_preference`, `test_selection_reason_names_the_arm`, `test_selection_reason_measured_and_selector_arms`, `test_select_model_picks_measured_cheapest_over_file_size`, `test_select_model_falls_back_to_size_when_unmeasurable`, `test_select_model_cpu_preference_beats_cheaper_device`, `test_select_model_selector_prices_only_the_pick` |
-| 79 | `profiles.yaml device_roles:` places every model of a named role on the host (logged with its count); absent key is a no-op; unmatched or unknown roles warn; a mapping value other than `cpu` (the key is a role, the value a device) places nothing and warns | `test_device_roles_place_every_role_model`, `test_device_roles_absent_and_unmatched`, `test_device_roles_rejects_unknown_role`, `test_device_roles_rejects_a_non_cpu_value`, `test_device_roles_rejects_a_scalar` |
-| 80 | TTL resolves sidecar > task > placement default: `0` disables idle unload, the smallest declared lifetime wins, an undeclared CPU-resident serving gets 3600 s (chat is not special), and an undeclared device entry carries none | `test_ttl_sidecar_wins_when_tighter`, `test_ttl_task_wins_when_tighter`, `test_ttl_zero_means_never_unload_and_wins`, `test_ttl_cpu_helper_defaults_to_host_lifetime`, `test_ttl_cpu_serving_gets_cpu_default`, `test_cpu_chat_entry_gets_cpu_default_ttl`, `test_gpu_entry_has_no_ttl` |
-| 81 | A category selector defines the RAG pair too — solve, charge, `emb`/`rnk` vars and resident entry name one model | `test_detect_matrix_category_selector_defines_the_pair` |
+| 78 | A role's floor is the maximum floor of its models; the auction splits each pool by weight, `fill` remainder, and `min`/`0` floors; each set is priced independently and the role takes the minimum offer | `test_role_floor_is_the_maximum_model_floor`, `test_auction_splits_by_weight`, `test_min_and_zero`, `test_fill_takes_the_remainder`, `test_two_fills_split_the_remainder`, `test_each_set_keeps_its_own_offer_and_the_role_takes_the_minimum` |
+| 79 | `roles.<name>.device:` places every model of the role (vocabulary `auto`/`cpu`/GPU index); a sidecar `device:` wins | `test_role_device_places_every_model_of_the_role`, `test_role_device_does_not_override_a_sidecar`, `test_role_device_uses_the_sidecar_vocabulary` |
+| 80 | TTL resolves sidecar > task > role > top-level: `0` disables idle unload, the most specific declaration wins even when larger, and the top-level default is 3600 s | `test_sidecar_wins_over_task_and_role`, `test_task_wins_over_role_even_when_larger`, `test_role_wins_when_nothing_more_specific`, `test_zero_is_a_value_not_an_absence`, `test_device_entry_with_nothing_declared_inherits_the_top_level`, `test_role_ttl_reaches_a_helper_without_a_task_demand`, `test_cpu_chat_entry_inherits_the_global_ttl`, `test_gpu_entry_has_no_ttl` |
 
 ## Alien keys
 
@@ -172,9 +170,9 @@ and every one of them carries a `Validates:` citation.
 | 89 | An unknown top-level profiles.yaml key warns with a near-miss hint instead of being ignored | `test_unknown_profiles_key_warns_with_a_hint` |
 | 106 | `--check` validates profiles.yaml without discovery or a server and names every known error: unknown top-level and nested keys with a near-miss hint, required sections, retired keys, bad types, non-roles and a missing `when:` | `test_check_profiles_names_every_nested_error`, `test_check_profiles_accepts_the_example` |
 | 107 | A role is operator data: a label, the trees it owns, and an allocation policy. It gets its own capacity pool; models declare `role:` and tasks declare `device`/`max_context`. A role has no behaviour | `test_custom_role_is_data_and_gets_its_own_pool`, `test_custom_role_parse_reports_every_problem`, `test_custom_role_gets_its_own_size_one_pool`, `test_custom_role_entry_charges_its_own_pool`, `test_task_declares_device_and_max_context` |
-| 108 | `pools.ram.spare` keeps that much host RAM out of both the generated `ram` pool and the host ledger | `test_pools_ram_spare_shrinks_the_host_pool` |
+| 108 | `pools.<id>.spare` keeps that much memory out of the generated pool | `test_pools_ram_spare_shrinks_the_host_pool`, `test_default_pool_spare_reduces_the_emitted_pool` |
 | 109 | `matrix.sets` is a mapping of name to expression string; its presence selects the matrix router, its absence capacity; `routing` is retired | `test_check_profiles_validates_sets_and_retired_routing`, `test_matrix_sets_are_accepted_and_select_the_router`, `test_matrix_sets_expand_roles_to_entry_ids` |
-| 110 | A role's `share` is a percentage of slack; `share` and `fill` are mutually exclusive, at most one role fills, and shares sum to at most 100% | `test_share_is_a_percentage_of_slack`, `test_share_and_fill_are_validated` |
+| 110 | A role's `share` is a relative request weight, uncapped and allowed to exceed 100; `fill` is its own kind, not a share; a malformed share is reported | `test_share_is_a_request_weight`, `test_share_values_are_uncapped`, `test_share_forms`, `test_bad_share_is_reported`, `test_fill_is_not_a_role_key` |
 
 ## Roles (docs/architecture.md §Models, tasks, engines and endpoints)
 
@@ -194,7 +192,7 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 97 | One registry owns the closed endpoint set, the task→endpoint map and the engine→endpoints table; engines read their list from it, a bad sidecar value is reported, and the docs that state endpoints are checked against the table | `test_registry_invariants_hold`, `test_registry_task_mapping_is_total`, `test_registry_engine_table_matches_backends`, `test_registry_docs_agree`, `test_registry_unknown_endpoint_is_rejected`, `test_registry_engines_value_shape` |
+| 97 | One registry owns the closed endpoint set, the task→endpoint map and the engine→endpoints table; engines read their list from it, a bad sidecar value is reported, and the docs that state endpoints are checked against the table | `test_registry_invariants_hold`, `test_registry_engine_table_matches_backends`, `test_registry_docs_agree`, `test_registry_engines_value_shape` |
 
 ## Task catalogue (SPEC.md §Tasks)
 
@@ -212,15 +210,12 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 92 | A per-category `ctx:` caps the served context at one seam (`resident_ctx`) and is never a floor | `test_category_ctx_caps_at_one_seam` |
 
 ## Capacity routing (SPEC.md §Capacity routing)
 
 | # | Requirement | Test |
 |---|---|---|
 | 100 | The emitted pools are the packer's available VRAM (`default`), the detected host pool (`ram`), and one size-1 pool per scheduling role | `test_capacity_pools_are_gpu_budget_host_pool_and_role_singletons` |
-| 101 | Every entry declares the pools it charges, carrying the solve's measurement margin; an unmeasured serving reserves the whole pool and runs alone | `test_capacity_fields_charge_gpu_ram_and_role`, `test_capacity_unestimated_serving_reserves_the_whole_pool` |
+| 101 | Every entry declares the pools it charges, carrying the solve's measurement margin; an unestimated serving is priced from its file size | `test_capacity_fields_charge_gpu_ram_and_role`, `test_capacity_unestimated_serving_uses_the_file_size_estimate` |
 | 102 | A `device: cpu` serving charges `ram` only, never a GPU pool | `test_capacity_fields_cpu_helper_charges_host_only` |
 | 103 | `evict_cost` prices reload time plus lost prefill for chat only; a sidecar `pp_tps:` overrides the fleet rate | `test_capacity_evict_cost_ignores_prefill_for_stateless_roles`, `test_capacity_evict_cost_uses_sidecar_prompt_rate` |
-| 104 | Matrix measurement runs the sibling `llama-fit-params` binary; `llama-server` rejects `--fit-print` | `test_matrix_resolution_measures_with_fit_binary` |
-| 105 | A declared GPU fixed category is charged to the VRAM ledger at the emission margin, so the per-model chat solve leaves it room instead of filling the pool | `test_gpu_fixed_category_charges_vram_ledger` |

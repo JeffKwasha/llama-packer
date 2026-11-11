@@ -23,11 +23,11 @@ TRACE = ROOT / "docs/plans/requirement-trace.md"
 # requirement -> (file, substring[, replacement]) whose removal/replacement
 # should break the tests
 MUTATIONS = {
-    "test_every_category_gets_an_entry": ("llama_packer/writer.py", "for demand in (*self.demands_for(model), FALLBACK):"),
+    "test_every_category_gets_an_entry": ("llama_packer/writer.py", "for demand in (*self.demands_for(model), fallback):"),
     "test_untagged_gets_a_bare_id": (
         "llama_packer/writer.py",
-        'cat_id = utils.slugify(cat) if cat is not None else ""',
-        'cat_id = utils.slugify(cat) if cat is not None else "x"'),
+        'tail = "" if not cats else',
+        'tail = "x" if not cats else'),
     "test_rung_drops_vision_when_it_buys_context": ("llama_packer/writer.py", "                best = rung\n"),
     "test_fallback_keeps_capability_until_the_minimum_forces_it": ("llama_packer/writer.py", "                return best\n"),
     "test_require_gates_existence": ("llama_packer/writer.py", "def can_meet(self, model, demand"),
@@ -39,7 +39,7 @@ MUTATIONS = {
     "test_min_image_megapixels_too_large_warns": ("llama_packer/vram.py", "        if cap is not None and image > cap:\n"),
     "test_min_image_megapixels_keeps_vision": ("llama_packer/writer.py", 'demands = tuple(replace(d, keep=d.keep | {"vision"}) for d in demands)\n'),
     "test_serving_pin_ignores_the_design_max": ("llama_packer/writer.py", "        return min(pins) if pins else None\n"),
-    "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
+    "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", "        while cand in taken:"),
     "test_fallback_slot_exponent_is_zero": ("llama_packer/writer.py", "power=0.0 if is_null else demand.parallel_power,"),
     "test_capabilities_context_is_served_window": (
         "llama_packer/writer.py", '"context": ctx_size,',
@@ -53,11 +53,11 @@ MUTATIONS = {
         'metadata["max_output_tokens"] = ceiling or ctx_size'),
     "test_pack_run_is_quiet_by_default": (
         "llama_packer/__main__.py",
-        "floor=logging.INFO if args.dry_run else None",
+        "floor=logging.INFO if (args.dry_run or args.check) else None",
         "floor=logging.INFO"),
     "test_dry_run_preview_is_visible_without_a_flag": (
         "llama_packer/__main__.py",
-        "floor=logging.INFO if args.dry_run else None",
+        "floor=logging.INFO if (args.dry_run or args.check) else None",
         "floor=None"),
     "test_verbosity_ladder_and_floor": (
         "llama_packer/__main__.py",
@@ -117,77 +117,66 @@ MUTATIONS = {
         "           pressure_mb = total_mb or 0"),
     "test_cpu_variant_refused_on_small_pool": (
         "llama_packer/writer.py",
-        ("                    host_free = self.host_ledger.available() \\\n"
-         "                        if serve_view.on_cpu else None"),
-        "                    host_free = None"),
-    "test_cpu_parallel_charge_flips_refusal": (
+        "                    if floor > cap:",
+        "                    if False:"),
+    "test_cpu_parallel_charge_flips_the_served_context": (
         "llama_packer/writer.py",
-        ("                    host_free = self.host_ledger.available() \\\n"
-         "                        if serve_view.on_cpu else None"),
-        "                    host_free = None"),
+        ("        total = (self.host_pool_mb\n"
+         "                 if model.on_cpu and self.host_pool_mb else self.vram_total)"),
+        "        total = self.vram_total"),
     "test_no_host_pool_never_gates": (
         "llama_packer/writer.py",
-        "self.host_ledger = HostLedger(host_pool_mb)",
-        "self.host_ledger = HostLedger(host_pool_mb or 0)"),
+        ("        total = (self.host_pool_mb\n"
+         "                 if model.on_cpu and self.host_pool_mb else self.vram_total)"),
+        ("        total = ((self.host_pool_mb or 0)\n"
+         "                 if model.on_cpu else self.vram_total)")),
     "test_metadata_packing_cpu_entry": (
         "llama_packer/writer.py",
         'packing: dict = {"device": "cpu" if model.on_cpu else "gpu"}',
         "packing: dict = {}"),
-    "test_host_charge_sizing_lifts_cpu_gate": (
+    "test_cpu_solve_measures_through_allow_cpu": (
         "llama_packer/writer.py",
-        "                ctx=ctx, allow_cpu=True)",
-        "                ctx=ctx, allow_cpu=False)"),
-    "test_cpu_chat_entry_gets_cpu_default_ttl": (
+        ("                llama_args=measurement_args(self.profiles, view,\n"
+         "                                            self.llama_args),\n"
+         "                allow_cpu=True)"),
+        ("                llama_args=measurement_args(self.profiles, view,\n"
+         "                                            self.llama_args),\n"
+         "                allow_cpu=False)")),
+    "test_cpu_chat_entry_inherits_the_global_ttl": (
         "llama_packer/writer.py",
-        "    if model.on_cpu:\n        return CPU_HELPER_TTL",
-        "    if model.on_cpu:\n        return None"),
+        ("    if role_ttl is not None:\n"
+         "        return role_ttl\n"
+         "    return None"),
+        ("    if role_ttl is not None:\n"
+         "        return role_ttl\n"
+         "    return 3600 if model.on_cpu else None")),
     "test_gpu_entry_has_no_ttl": (
         "llama_packer/writer.py",
         '    if ttl is not None:\n        entry["ttl"] = ttl',
         '    entry["ttl"] = ttl'),
-    "test_detect_matrix_category_selector_defines_the_pair": (
-        "llama_packer/__main__.py",
-        '        embed_model = categories["emb"]',
-        "        embed_model = embed_model"),
     "test_host_measurement_does_not_leak_into_vram_pricing": (
         "llama_packer/vram.py",
         '        if getattr(self.model, "on_cpu", False) and not allow_cpu:',
         "        if False:"),
     # ── set composition: pricing, worst set, per-role pin ──
-    "test_unknown_role_value_warns_with_a_hint": (
-        "llama_packer/discover.py",
-        '        if alien in model.sidecar_keys:',
-        '        if False:'),
     "test_unknown_device_value_warns": (
         "llama_packer/discover.py",
         "    if problem:",
         "    if False:"),
     "test_role_registry_derives_its_sets": (
         "llama_packer/roles.py",
-        "if r.device_role)",
-        "if True)"),
-    "test_every_task_maps_to_a_served_endpoint": (
-        "llama_packer/endpoints.py",
-        '    "s2t": TRANSCRIPTIONS,',
-        '    "s2t": "openai.nonexistent",'),
+        "return tuple(ROLES)",
+        'return tuple(ROLES) + ("bogus",)'),
     "test_unknown_profiles_key_warns_with_a_hint": (
         "llama_packer/profiles.py",
         "        if key in PROFILES_KEYS:",
         "        if True:"),
-    "test_fixed_cost_detail_names_the_terms": (
-        "llama_packer/writer.py",
-        "    kv_mb = int(kv_factor * ctx + slot_mib)",
-        "    kv_mb = 0"),
     "test_engines_refusal_names_every_engine": (
         "llama_packer/backends/__init__.py",
-        '            if fmt not in backend.formats:\n'
-        '                why = f"cannot load {fmt}"\n'
-        '                continue\n'
-        '            if not endpoints.serves(backend.endpoints, model.role):',
-        '            if fmt not in backend.formats:\n'
-        '                why = f"cannot load {fmt}"\n'
-        '                continue\n'
-        '            if False:'),
+        ("        reasons[name] = why\n"
+         "    return None, reasons"),
+        ("        reasons[name] = \"\"\n"
+         "    return None, reasons")),
     "test_a_declared_task_id_is_arbitrary": (
         "llama_packer/tasks.py",
         '_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")',
