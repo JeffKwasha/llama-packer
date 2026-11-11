@@ -2,7 +2,7 @@
 
 A VRAM measurement is only as good as the exclusivity of the GPU it runs
 on — and the 2026-09-07 incident (a measurement ``llama-server`` left
-resident for ~8 h, silently shifting every later reading) happened
+running for ~8 h, silently shifting every later reading) happened
 because nothing verified the probe's own children died.  Non-root, this
 process can only ever see per-pid VRAM for *its own* processes — and
 that is exactly sufficient:
@@ -11,9 +11,9 @@ that is exactly sufficient:
   structural kill (:func:`kill_process_group`, used by the serve
   measurement on every exit path) plus post-flight verification means a
   child cannot outlive its measurement.
-- **foreign llama processes** — a zombie from any earlier run, or the
-  live llama-swap — are visible by name via ``ps``;
-  :func:`llama_residents` is the pre-flight refusal list.
+- **foreign llama processes** — a zombie from any earlier run, or a
+  running llama-swap — are visible by name via ``ps``;
+  :func:`llama_processes` is the pre-flight refusal list.
 - **everything else** (games, desktop) is invisible per-process and
   irrelevant: a measurement whose buffers cannot fit beside it spills
   into host-visible memory, which the llama.cpp log itself reports —
@@ -40,12 +40,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-#: A llama.cpp process resident on the box (any user, any working
+#: A llama.cpp process already running on the box (any user, any working
 #: directory) makes a VRAM measurement untrustworthy: it holds VRAM our
 #: measurement server cannot account for.  The match is anchored on a
 #: path component, so a test double named ``fake-llama-server`` (or a
 #: document called ``llama-server.txt``) does not trigger it.
-_RESIDENT_RE = re.compile(
+_PROCESS_RE = re.compile(
     r"(?:^|/)llama-(?:server|fit-params)(?:\s|$)|llama-swap(?:\s|$)")
 
 #: Seconds a graceful kill is given before escalation to SIGKILL.
@@ -61,8 +61,8 @@ def cache_dir() -> Path:
     return root
 
 
-def llama_residents(ps_bin: str = "ps") -> list[str]:
-    """Descriptions of resident llama.cpp processes, ``[]`` when clear.
+def llama_processes(ps_bin: str = "ps") -> list[str]:
+    """Descriptions of running llama.cpp processes, ``[]`` when clear.
 
     The pre-flight for any measurement that allocates VRAM: a leftover
     measurement server from an earlier run squats the GPU and poisons
@@ -76,7 +76,7 @@ def llama_residents(ps_bin: str = "ps") -> list[str]:
         # ps is coreutils-grade available; failing open is the honest
         # choice only because the spill check independently rejects
         # points that could not fit device memory.
-        logger.warning("resident scan failed (%s); proceeding unguarded", e)
+        logger.warning("process scan failed (%s); proceeding unguarded", e)
         return []
     # Exclude self "llama-packer" to prevent false-positive.
     own_pids = {str(os.getpid()), str(os.getppid())}
@@ -88,7 +88,7 @@ def llama_residents(ps_bin: str = "ps") -> list[str]:
             continue
         if "llama-packer" in line or "probe-memory" in line:
             continue
-        if _RESIDENT_RE.search(line):
+        if _PROCESS_RE.search(line):
             out_lines.append(line.strip())
     return out_lines
 
@@ -166,7 +166,7 @@ def measurement_lock(name: str = "measure"):
     An ``O_EXCL`` lock file in :func:`cache_dir` holding the owner's
     pid; a lock whose pid is provably dead is stolen (crashed runs must
     not wedge the tool forever).  Raises ``RuntimeError`` when another
-    live process holds it — two concurrent measurement campaigns would
+    running process holds it — two concurrent measurement campaigns would
     contend for the GPU (and, on platter storage, the drives).
     """
     path = cache_dir() / f"{name}.lock"

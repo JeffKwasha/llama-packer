@@ -12,9 +12,7 @@ import pytest
 
 from llama_packer.__main__ import (resolve_host_binary,
                                  _apply_env_subst,
-                                 _health_check_timeout,
-                                 _select_model,
-                                 _selection_reason)
+                                 _health_check_timeout)
 from llama_packer.utils import make_subst
 
 
@@ -71,25 +69,6 @@ def test_health_check_explicit_speed_and_env(tmp_path, monkeypatch):
     assert _health_check_timeout(models, _args(drive_speed=None)) == 120
 
 
-def test_matrix_resolution_measures_with_fit_binary(monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #104
-    # llama-fit-params, never llama-server.
-    import logging
-    import llama_packer.__main__ as main_mod
-
-    seen = {}
-
-    def fake(cfg, models, args, logger, *, fit_bin="", llama_args=""):
-        seen["fit_bin"] = fit_bin
-        return ("cfg", None, None, {}, (), {})
-
-    monkeypatch.setattr(main_mod, "_detect_matrix", fake)
-    main_mod._resolve_matrix({}, [], None, logging.getLogger("t"),
-                             llama_bin="/bin/llama-server",
-                             fit_bin="/bin/llama-fit-params")
-    assert seen["fit_bin"] == "/bin/llama-fit-params"
-
-
 def test_apply_env_subst_longest_prefix_wins():
     # Manual prefix map: compute_env_prefixes groups by mount, which is
     # environment-dependent; this test targets substitution ordering only.
@@ -140,61 +119,19 @@ def test_backend_args_validation(caplog):
     assert "stringified container" in caplog.text
 
 
-def _stub_model(stem, role):
-    from types import SimpleNamespace
-    from conftest import fake_tasks
-    m = SimpleNamespace(stem=stem, role=role, frontmatter={},
-                        name=stem, template_id=stem, vram_mb=100)
-    m.tasks_resolved = fake_tasks({"role": role})
-    m.serves_endpoint = lambda ep: any(t.endpoint == ep
-                                       for t in m.tasks_resolved)
-    return m
-
-
-def test_detect_matrix_silent_without_rag_models(caplog):
-    import logging
-    from types import SimpleNamespace
-
-    from llama_packer.__main__ import _detect_matrix
-
-    models = [_stub_model("c1", "chat")]
-    args = SimpleNamespace(embed=None, rerank=None)
-    with caplog.at_level(logging.WARNING):
-        cfg, _, _, cats, fixed, _ctx = _detect_matrix({}, models, args,
-                                                logging.getLogger("test"))
-    assert cfg is None
-    assert "matrix: disabled" not in caplog.text
-
-
 def test_detect_matrix_returns_none_without_a_section():
-    import logging
-    from types import SimpleNamespace
-
     from llama_packer.__main__ import _detect_matrix
 
-    models = [_stub_model("emb1", "embeddings"), _stub_model("rnk1", "rerank")]
-    args = SimpleNamespace()
-    cfg, emb, rnk, cats, fixed, ctx = _detect_matrix(
-        {}, models, args, logging.getLogger("test"))
-    assert cfg is None and emb is None and rnk is None
-    assert cats == {} and fixed == () and ctx == {}
+    assert _detect_matrix({}) is None
 
 
-def test_detect_matrix_returns_the_section_and_no_pair():
+def test_detect_matrix_returns_the_section():
     # Validates: docs/allocation.md, 'Routers': sets are priced by roles and
     # model ids; there is no RAG pair or category pick.
-    import logging
-    from types import SimpleNamespace
-
     from llama_packer.__main__ import _detect_matrix
 
     matrix_cfg = {"sets": {"rag": "chat & embeddings & rerank"}}
-    cfg, emb, rnk, cats, fixed, ctx = _detect_matrix(
-        {"matrix": matrix_cfg}, [], SimpleNamespace(),
-        logging.getLogger("test"))
-    assert cfg == matrix_cfg
-    assert emb is None and rnk is None
-    assert cats == {} and fixed == () and ctx == {}
+    assert _detect_matrix({"matrix": matrix_cfg}) == matrix_cfg
 
 
 def test_parse_args_spare_pool_is_repeatable():
@@ -224,11 +161,11 @@ def _bin(path, name="engine", text="#!/bin/sh\n"):
 
 
 def test_host_binary_found_in_run_directory(tmp_path, monkeypatch):
-    # The standard: binaries live beside the config, so no profiles.yaml
+    # The standard: binaries sit beside the config, so no profiles.yaml
     # entry, no env var, and no PATH edit is needed. llama.cpp has always
     # worked this way (a cwd scan for llama-b[0-9]*); every other backend
     # used to require its own *_BIN_DIR to match.
-    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may be found under *base_dir*, most specific first.
     monkeypatch.delenv("AUDIOCPP_BIN_DIR", raising=False)
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "audiocpp_server")
@@ -240,7 +177,7 @@ def test_host_binary_found_in_run_directory(tmp_path, monkeypatch):
 
 def test_host_binary_precedence_cli_then_profiles_then_env_then_run_dir(
         tmp_path, monkeypatch):
-    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may be found under *base_dir*, most specific first.
     monkeypatch.setenv("AUDIOCPP_BIN_DIR", str(tmp_path / "from-env"))
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "audiocpp_server")
@@ -264,7 +201,7 @@ def test_host_binary_precedence_cli_then_profiles_then_env_then_run_dir(
 
 def test_host_binary_env_var_may_name_a_directory(tmp_path, monkeypatch):
     # Mirrors LLAMA_BIN_DIR: a directory expands to <dir>/<name>.
-    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may be found under *base_dir*, most specific first.
     monkeypatch.setenv("WHISPER_BIN_DIR", str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "whisper-server")
@@ -274,7 +211,7 @@ def test_host_binary_env_var_may_name_a_directory(tmp_path, monkeypatch):
 
 
 def test_host_binary_path_used_when_nothing_resolves(tmp_path, monkeypatch):
-    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may be found under *base_dir*, most specific first.
     monkeypatch.setattr(shutil, "which", lambda n: None)
     got = resolve_host_binary(None, None, "SD_BIN_DIR", "sd-server",
                               run_dir=tmp_path)
@@ -289,7 +226,7 @@ def test_host_binary_stale_explicit_path_is_not_silently_replaced(
     # A stale `bin:` must keep pointing there: is_available then reports
     # False and the operator gets a message naming what is wrong, rather
     # than a different binary being used without their knowledge.
-    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may live under *base_dir*, most specific first.
+    # Validates: SPEC.md, 'llama.cpp Build Selection': Where an engine binary may be found under *base_dir*, most specific first.
     monkeypatch.setattr(shutil, "which", lambda n: None)
     _bin(tmp_path / "sd-server")
     got = resolve_host_binary(None, str(tmp_path / "gone"), "SD_BIN_DIR",
@@ -308,72 +245,6 @@ def test_every_backend_uses_the_same_chain():
     body = src.split('"""', 2)[-1]
     for tier in ("run_dir", "shutil.which", "env_var"):
         assert tier in body
-
-
-# ── resident selection (`device: cpu` wins the role) ─────────────────────
-
-
-def _role_model(stem, mb, role="embeddings", **fm):
-    m = SimpleNamespace(stem=stem, role=role, vram_mb=mb,
-                        template_id=stem,
-                        frontmatter={"name": stem, **fm})
-    m.on_cpu = str(m.frontmatter.get("device", "")).strip().lower() == "cpu"
-    return m
-
-
-def test_select_model_prefers_cpu_candidate():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # candidate wins the resident role over a smaller device model.
-    gpu_small = _role_model("voyage", 355)
-    cpu_big = _role_model("jina", 472, device="cpu")
-    assert _select_model([gpu_small, cpu_big], "embeddings", None, None) is cpu_big
-
-
-def test_select_model_smallest_among_cpu_candidates():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # cost available, the smallest footprint is the fallback among CPU
-    # candidates.
-    cpu_big = _role_model("qwen3-embed", 640, device="cpu")
-    cpu_small = _role_model("jina", 472, device="cpu")
-    assert _select_model([cpu_big, cpu_small], "embeddings", None,
-                         None) is cpu_small
-
-
-def test_select_model_no_cpu_keeps_size_rule():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # candidate the selection is unchanged (smallest footprint).
-    big = _role_model("big", 900)
-    small = _role_model("small", 355)
-    assert _select_model([big, small], "embeddings", None, None) is small
-
-
-def test_select_model_selector_overrides_cpu_preference():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # selector overrides the CPU preference.
-    cpu = _role_model("jina", 472, device="cpu")
-    gpu = _role_model("voyage", 355)
-    assert _select_model([cpu, gpu], "embeddings", "voyage", None) is gpu
-
-
-def test_selection_reason_names_the_arm():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # logs why it won (explicit CPU placement vs smallest footprint).
-    cpu = _role_model("jina", 472, device="cpu")
-    gpu = _role_model("voyage", 355)
-    assert _selection_reason(cpu) == "device: cpu — explicit placement"
-    assert _selection_reason(gpu) == "smallest footprint 355 MiB"
-
-
-def test_selection_reason_names_the_cost_terms():
-    # Validates: docs/plans/requirement-trace.md, requirement #87
-    # weights/compute/KV, so two residents that both cost 1050 MiB can be seen
-    # to be the same shape rather than a repeated number hiding a bug.
-    m = _role_model("jina", 1050, device="cpu")
-    detail = "466 weights + 346 compute + 238 kv @4096"
-    assert _selection_reason(m, 1050, detail=detail) == \
-        f"cheapest measured resident, 1050 MiB = {detail}"
-    assert _selection_reason(m, 1050, by_selector=True, detail=detail) == \
-        f"selector, 1050 MiB resident = {detail}"
 
 
 # ── role-wide placement ──────────────────────────────────────────────────
@@ -416,62 +287,6 @@ def test_role_device_does_not_override_a_sidecar(tmp_path):
     finally:
         roles.configure(None)
     assert not model.on_cpu
-
-
-def test_select_model_picks_measured_cheapest_over_file_size():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # cheapest *measured serving at its ctx*, not the smallest file: a big
-    # file with cheap KV beats a small file with expensive KV.
-    cheap = _role_model("cheap-big", 900, device="cpu")
-    small = _role_model("small-costly", 300, device="cpu")
-    costs = {cheap.stem: 800, small.stem: 1100}
-    # Cheapest last, so "first priced candidate" is not accidentally right.
-    picked = _select_model([small, cheap], "embeddings", None, None,
-                           cost=lambda m: costs[m.stem])
-    assert picked is cheap
-
-
-def test_select_model_falls_back_to_size_when_unmeasurable():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # candidate the size rule is the fallback, never an invented cost.
-    a = _role_model("a", 900, device="cpu")
-    b = _role_model("b", 300, device="cpu")
-    assert _select_model([a, b], "embeddings", None, None,
-                         cost=lambda m: None) is b
-
-
-def test_select_model_cpu_preference_beats_cheaper_device():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # wins the role before cost is compared (placement is the operator's).
-    gpu = _role_model("gpu-cheap", 100)
-    cpu = _role_model("cpu-costly", 900, device="cpu")
-    costs = {gpu.stem: 400, cpu.stem: 2000}
-    assert _select_model([gpu, cpu], "embeddings", None, None,
-                         cost=lambda m: costs[m.stem]) is cpu
-
-
-def test_select_model_selector_prices_only_the_pick():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # resident and prices it; it never re-ranks the other candidates.
-    a = _role_model("jina", 472, device="cpu")
-    b = _role_model("voyage", 355, device="cpu")
-    import logging
-    seen = []
-    picked = _select_model([a, b], "embeddings", "jina",
-                           logging.getLogger("t"),
-                           cost=lambda m: seen.append(m.stem) or 1050)
-    assert picked is a
-    assert seen == ["jina"]
-
-
-def test_selection_reason_measured_and_selector_arms():
-    # Validates: docs/plans/requirement-trace.md, requirement #78
-    # arm that won: measured cost, selector, or the size fallback.
-    m = _role_model("jina", 472, device="cpu")
-    assert _selection_reason(m, 1050) == "cheapest measured resident, 1050 MiB"
-    assert _selection_reason(m, 1050, by_selector=True) == \
-        "selector, 1050 MiB resident"
-    assert _selection_reason(m) == "device: cpu — explicit placement"
 
 
 def test_matrix_sets_validation():

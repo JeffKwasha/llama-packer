@@ -206,7 +206,7 @@ ubatch.
 
 | Architecture | mmproj file? | `include_mmproj` axis | Megapixel knob |
 |---|---|---|---|
-| LLaVA, MiniCPM-V, Gemma 3 | Yes | Live — shedding frees VRAM | warned + ignored (fixed/resampled tokens) |
-| Qwen2-VL / Qwen3-VL | Yes | Live — shedding frees VRAM | honoured (`spatial_merge_size` present) |
+| LLaVA, MiniCPM-V, Gemma 3 | Yes | Dynamic — shedding frees VRAM | warned + ignored (fixed/resampled tokens) |
+| Qwen2-VL / Qwen3-VL | Yes | Dynamic — shedding frees VRAM | honoured (`spatial_merge_size` present) |
 | Native multimodal | No | No-op — nothing to shed | warned + ignored (no projector geometry) |
 

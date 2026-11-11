@@ -185,13 +185,11 @@ def test_share_forms():
     assert share(0) == Share("zero", 0.0)
 
 
-def test_fill_and_live_are_not_keys():
+def test_fill_is_not_a_role_key():
     # Validates: docs/roles-tasks-routing.md, Role: `share` carries the
     # request; there is no fill or per-role count key.
     _table, problems = roles.parse_roles({"roles": {
         "a": {"fill": True},
-        "b": {"live": 1},
     }})
     text = "\n".join(problems)
     assert "unknown key 'fill'" in text
-    assert "unknown key 'live'" in text

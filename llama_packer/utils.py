@@ -1,7 +1,7 @@
 # llama_packer/utils.py
 """Shared utilities for llama-packer.
 
-Constants live in :mod:`llama_packer.consts`; this module holds
+Constants are defined in :mod:`llama_packer.consts`; this module holds
 general-purpose functions with simple input→output semantics.
 """
 
@@ -339,7 +339,7 @@ TOOLS_SUBDIR = "tools"
 
 
 def binary_search_dirs(base_dir: Path) -> list[Path]:
-    """Where an engine binary may live under *base_dir*, most specific first.
+    """Where an engine binary may be found under *base_dir*, most specific first.
 
     ``tools/`` first: a deployment that keeps its binaries there is the shape
     everything now writes, and finding a stale flat leftover in preference to
@@ -365,7 +365,7 @@ def find_bin_dir(version: str, base_dir: Path) -> str:
     """Resolve llama-server binary directory.
 
     Returns a path **relative to** *base_dir* (e.g. ``llama-b11714``, or
-    ``tools/llama-b11714`` when the binaries live in the tools directory), so
+    ``tools/llama-b11714`` when the binaries sit in the tools directory), so
     the caller can join it against the directory it was given.
 
     Searching ``tools/`` first is what lets a deployment keep its binaries out
@@ -531,7 +531,8 @@ def companion_kind(stem: str) -> str | None:
 # out of served text roles; the vocabulary below comes from converter
 # architecture strings and tensor names, never filenames.
 
-# Diffusion arch prefixes live in llama_packer.consts (_DIFFUSION_ARCH_RES).
+# Diffusion arch prefixes are defined in llama_packer.consts
+# (_DIFFUSION_ARCH_RES).
 
 # Safetensors tensor-name fragments unique to diffusion weights (DiT/UNet/
 # VAE blocks).  Text-model transformers never use these block layouts.
@@ -874,7 +875,7 @@ def make_fast_storage_predicate(
     the test is structural: the file's path *relative to its mount root*
     must exist under the branch (mergerfs keeps the directory structure
     identical across branches).  ``realpath`` is applied first, so
-    HF-hub snapshot symlinks classify by where the bytes (the blob) live.
+    HF-hub snapshot symlinks classify by where the bytes (the blob) sit.
     Empty/None roots yield an always-False predicate: no tier knowledge,
     behave as before.
     """
@@ -1197,7 +1198,7 @@ def compute_env_prefixes(paths: Sequence[str | os.PathLike], project_hint: str |
     """Compute ``${VAR}`` macro names for the longest common path of each
     group among *paths*.
 
-    Paths are grouped by the mount they live on; within a group the deepest
+    Paths are grouped by the mount they sit on; within a group the deepest
     directory shared by all paths becomes the prefix. This yields the shortest
     possible substituted paths while keeping each prefix a real directory on a
     single mount (useful as a docker bind source).

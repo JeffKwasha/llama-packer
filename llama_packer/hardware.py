@@ -324,9 +324,9 @@ class GpuProfile:
         family = gpu_family or yaml_hw.get("gpu_family", "default")
 
         # Baseline reserve: explicit (profiles.yaml hardware.baseline_mb or
-        # --baseline) > 0. Auto-detection of the live ``used_vram`` is
+        # --baseline) > 0. Auto-detection of the current ``used_vram`` is
         # intentionally NOT used by default: it includes the packer's own
-        # resident model servers (llama-swap keeps models loaded), which would
+        # model servers (llama-swap keeps models loaded), which would
         # make the budget assume a blank GPU and collapse every context to the
         # minimum. The fixed _RESERVE_VIDEO (1024 MiB) already covers driver/
         # compositor overhead. Set hardware.baseline_mb or --baseline to opt in
@@ -346,7 +346,7 @@ class GpuProfile:
         # knob reads as the total system cost: reserve = _RESERVE_SYSTEM +
         # max(_RESERVE_VIDEO, baseline).  Setting baseline_mb = knob -
         # _RESERVE_SYSTEM makes the reserve exactly the knob.  Explicit
-        # --baseline/hardware.baseline_mb (live spike detection) wins instead.
+        # --baseline/hardware.baseline_mb (spike detection) wins instead.
         if is_unified and not explicit_baseline:
             baseline_mb = max(baseline_mb, system_mb - _RESERVE_SYSTEM)
             logger.info("unified memory: reserving %d MiB for the system (knob %d MiB)",
@@ -465,7 +465,7 @@ class HostProfile:
         """Detect the host pool, honored precedence: declared > detected.
 
         ``stable`` forces the deterministic fixture arms only: no pid scan
-        and no live sysctl, so unit tests (and dry runs without a service)
+        and no running sysctl, so unit tests (and dry runs without a service)
         exercise the declared/fallback paths instead of box state.
         """
         hw = yaml_hw or {}

@@ -36,14 +36,14 @@ def test_chat_cmd_shape(make_model):
     _, entry = _entry(make_model)
     cmd = entry["cmd"]
     assert cmd.startswith("/opt/llama-server --port ${PORT} -m ")
-    # GPU-resident models rely on llama-server's "auto" default; only
-    # CPU-resident models pin --n-gpu-layers 0.
+    # GPU-served models rely on llama-server's "auto" default; only
+    # CPU-served models pin --n-gpu-layers 0.
     assert "--n-gpu-layers" not in cmd
     assert "--cache-type-k q8_0 --cache-type-v q8_0" in cmd
 
 
-def test_cpu_resident_uses_cpu_layers(make_model):
-    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers 0 is emitted only when the model is CPU-resident
+def test_cpu_served_uses_cpu_layers(make_model):
+    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers 0 is emitted only when the model is CPU-served
     _, entry = _entry(make_model, device="cpu")
     assert "--n-gpu-layers 0" in entry["cmd"]
 

@@ -347,7 +347,7 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
 def _model_from_sidecar(md_path: Path, root: Path, role: str | None,
                          stack: ScopeStack, hf_home, out: list[Model],
                          problems: list[str]) -> None:
-    # Never serve sidecars that live inside the HF hub cache hierarchy
+    # Never serve sidecars found inside the HF hub cache hierarchy
     # (snapshots contain README.md plus any stray .md a user may have dropped).
     try:
         hf_root_path = utils.hf_cache_root(hf_home)

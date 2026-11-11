@@ -242,9 +242,9 @@ def test_format_reports_shows_verdicts(tmp_path):
 
 
 def test_run_probe_end_to_end(tmp_path, monkeypatch):
-    # The probe pre-flight reads live processes; this repo's normal state is
-    # a resident llama-swap, so the test stubs a clean GPU.
-    monkeypatch.setattr("llama_packer.gpu_state.llama_residents", lambda: [])
+    # The probe pre-flight reads running processes; this repo's normal state
+    # is a running llama-swap, so the test stubs a clean GPU.
+    monkeypatch.setattr("llama_packer.gpu_state.llama_processes", lambda: [])
 
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,
@@ -275,7 +275,7 @@ def test_probe_does_not_file_companion_draft_as_baked_in(tmp_path, monkeypatch):
     # double-count companion models and over-reserve every baked-in model
     # of the same arch.  Regression (2026-09-26): a DSpark companion probe
     # wrote qwen35|q8_0|1, a row the packer never reads for that model.
-    monkeypatch.setattr("llama_packer.gpu_state.llama_residents", lambda: [])
+    monkeypatch.setattr("llama_packer.gpu_state.llama_processes", lambda: [])
 
     class FakeVram:
         def _run_measure_server(self, server_bin, cache_type, ctx, parallel,

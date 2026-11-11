@@ -19,8 +19,6 @@ from llama_packer.backends import (
 )
 from llama_packer import endpoints
 from llama_packer.backends.llama_server import LlamaServerBackend
-from llama_packer.profiles import Profiles
-from llama_packer.writer import MatrixKnobs
 
 
 def _tvars():
@@ -147,12 +145,12 @@ def test_llama_server_mtp_draft_p_min_invalid_falls_back(make_model, caplog):
 
 
 def test_llama_server_cmd_has_mmap_layers_and_cache(make_model):
-    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers is emitted only for a CPU-resident model, and the cache type as --cache-type-k/--cache-type-v
+    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers is emitted only for a CPU-served model, and the cache type as --cache-type-k/--cache-type-v
     m = make_model("m")
     b = LlamaServerBackend()
     cmd, meta = b.build_cmd(m, 32768, 1, "q8_0", _tvars())
     assert cmd.startswith("/opt/llama-server --port ${PORT} -m ")
-    # GPU-resident models rely on llama-server's "auto" default.
+    # GPU-served models rely on llama-server's "auto" default.
     assert "--n-gpu-layers" not in cmd
     assert "--cache-type-k q8_0 --cache-type-v q8_0" in cmd
     assert meta == {"mtp_enabled": False}
@@ -287,86 +285,6 @@ def test_vllm_batch_flag_and_llama_only_strip(make_model):
         assert gone not in toks
     assert "deepseek" not in cmd
     assert " 512" not in cmd
-
-
-def test_solve_matrix_uses_declared_embed_rerank_contexts(make_model,
-                                                          monkeypatch):
-    from llama_packer import writer
-
-    from llama_packer.endpoints import EMBEDDINGS, RERANK
-    from llama_packer.tasks import TaskCatalogue
-    tasks = TaskCatalogue.from_cfg({
-        "embeddings": {"endpoint": EMBEDDINGS, "max_context": 32768},
-        "rerank": {"endpoint": RERANK, "max_context": 16384}})
-    chat = make_model("chat", context_length=32768)
-    embed = make_model("e", role="embeddings", context_length=32768,
-                       tasks=["embeddings"])
-    rerank = make_model("r", role="rerank", context_length=16384,
-                        tasks=["rerank"])
-
-    def fake_effective_static(fit_bin, cache_type="q8_0", **kw):
-        return (1000.0, 0.05, 0.0, 50.0)
-
-    def fake_fp(fit_bin, cache_type="q8_0", **kw):
-        return SimpleNamespace(model_mib=1000.0, kv_per_token_mib=0.05,
-                               slot_mib=0.0, compute_mib=50.0,
-                               source="fit-params")
-
-    for m in (chat, embed, rerank):
-        m.vram.effective_static = fake_effective_static
-        m.vram.fit_params_static = fake_fp
-
-    calls: list[dict] = []
-    monkeypatch.setattr(writer, "solve_matrix_ctx",
-                        lambda **kw: calls.append(dict(kw)) or 8192)
-    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    result = writer._solve_matrix_context(
-        [chat], embed, rerank, "unused", 48000, None, profiles, tasks=tasks)
-    assert result is not None
-    assert calls[0]["embed_ctx"] == 32768   # configured, not hardcoded 8192
-    assert calls[0]["rerank_ctx"] == 16384
-    # The fake solver returns 8192 (< tools_min_ctx) so the squeeze fires,
-    # but its gain is 0 (< ctx_gain_min) — configured contexts must survive.
-    assert (result.embed_ctx, result.rerank_ctx) == (32768, 16384)
-    assert result.squeeze is False
-
-
-def test_solve_matrix_reserves_declared_category(make_model, monkeypatch):
-    # A declared non-RAG category (e.g. tts) is reserved as fixed overhead:
-    # the solver sees fixed_overhead_mb > 0 for it.
-    from llama_packer import writer
-
-    from llama_packer.endpoints import EMBEDDINGS, RERANK
-    from llama_packer.tasks import TaskCatalogue
-    tasks = TaskCatalogue.from_cfg({
-        "embeddings": {"endpoint": EMBEDDINGS, "max_context": 32768},
-        "rerank": {"endpoint": RERANK, "max_context": 16384}})
-    chat = make_model("chat", context_length=32768)
-    embed = make_model("e", role="embeddings", context_length=32768,
-                       tasks=["embeddings"])
-    rerank = make_model("r", role="rerank", context_length=16384,
-                        tasks=["rerank"])
-    tts = make_model("t", role="t2s", context_length=4096)
-
-    def fake_fp(fit_bin, cache_type="q8_0", **kw):
-        return SimpleNamespace(model_mib=1000.0, kv_per_token_mib=0.0,
-                               slot_mib=0.0, compute_mib=50.0,
-                               source="fit-params")
-
-    for m in (chat, embed, rerank, tts):
-        m.vram.effective_static = lambda *a, **k: (1000.0, 0.0, 0.0, 50.0)
-        m.vram.fit_params_static = fake_fp
-
-    calls: list[dict] = []
-    monkeypatch.setattr(writer, "solve_matrix_ctx",
-                        lambda **kw: calls.append(dict(kw)) or 100000)
-    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    result = writer._solve_matrix_context(
-        [chat], embed, rerank, "unused", 100000, None, profiles,
-        tasks=tasks, fixed_categories=[("tts", tts)])
-    assert result is not None
-    assert any(c.get("fixed_overhead_mb", 0) > 0 for c in calls)
-
 
 
 def test_vllm_docker_cmd_and_mounts(make_model, tmp_path):
@@ -689,7 +607,7 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
 
 def test_measurement_shape_stamps_cpu_device(make_model):
     # Validates: docs/plans/requirement-trace.md, requirement #61
-    """A CPU-resident model's measurement shape carries the device pin:
+    """A CPU-served model's measurement shape carries the device pin:
     fit-params reports host buffers under it, and a later device flip
     (sidecar edit) invalidates the persisted block by shape."""
     from llama_packer.profiles import Profiles

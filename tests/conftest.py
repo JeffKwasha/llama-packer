@@ -78,7 +78,7 @@ def fit_params_block():
 def _isolated_cache(tmp_path, monkeypatch):
     """Tests never touch the machine-local measurement artifacts
     (corrections, lock, journal) — one test wrote a garbage correction
-    row into the live cache (2026-09-08, rep_stem "m")."""
+    row into the active cache (2026-09-08, rep_stem "m")."""
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LLAMA_PACKER_CORRECTIONS",
                        str(tmp_path / "cache" / "serve-corrections.yaml"))

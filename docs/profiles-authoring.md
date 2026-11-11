@@ -126,6 +126,8 @@ set it.
 | `llama_server`, `vllm`, `sd`, `whisper`, `audio_cpp` | Per-backend fleet-wide args and resources | [SPEC §Global backend args](../SPEC.md#global-backend-args) |
 | `macros` | Named flag chunks for `cmd` | [SPEC §Path Macros](../SPEC.md#path-macros-macros-block-and-configenv) |
 | `shed` | Default capability-shedding order | [SPEC §profiles.yaml](../SPEC.md#profilesyaml) |
+| `ttl` | Top-level idle lifetime, default 3600 | [SPEC §TTL](../SPEC.md#ttl) |
+| `min_context` | Default task floor | [SPEC §Tasks](../SPEC.md#tasks-tasks) |
 
 ### `defaults`
 
@@ -242,9 +244,8 @@ roles:
   [SPEC §Device](../SPEC.md#device-device) for the precedence and the
   `ram`/`-ngl 0` effect.
 
-`share` is parsed and validated; the auction it describes is not applied yet —
-the solver still uses the global spare (see
-[roles-tasks-routing](roles-tasks-routing.md) §Implementation status).
+`share` is applied per set: the role's budget is the minimum offer across
+the sets it belongs to. See [allocation.md](allocation.md).
 
 There is no `min`, `preferred`, `cap`, `weight`, `exclusive`, `persistent`,
 `fill`, or per-role count key. A floor is derived per model from its task's
@@ -289,8 +290,8 @@ starts only that model.
 
 ### `pools`
 
-The default config emits one GPU pool, one RAM pool, and one size-1 pool
-per role (built-in and custom). `pools:` adjusts a pool or reserves memory
+Capacity mode emits one GPU pool, one RAM pool, and one size-1 pool per
+role. Matrix mode emits sets instead. `pools:` adjusts a pool or reserves memory
 for something llama-packer does not model. Keys per pool id (`default`,
 `ram`, `gpu0`, a role name, …):
 
@@ -497,7 +498,7 @@ llama-swap -config /tmp/config.yaml -validate
 
 `--check` loads the profile and names every problem it knows: unknown
 top-level and nested keys (with a did-you-mean hint), missing `profiles:` or
-task `endpoint:`/`role:`, retired `matrix.evict_costs:`/`routing:` and role
+task `endpoint:`, retired `matrix.evict_costs:`/`routing:` and role
 keys, a `matrix.sets:` that is not name → expression, wrong types, non-role
 retired `device_roles:`, and rules without `when:`. It exits 1 on the first run that finds anything. It does not
 discover models, measure, or start a server.

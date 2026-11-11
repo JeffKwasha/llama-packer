@@ -95,18 +95,6 @@ MUTATIONS = {
         "llama_packer/tasks.py",
         '    who = f"{stem}: tasks:" if stem else "tasks:"',
         '    who = "tasks:"'),
-    "test_resident_options_branch_alternatives_not_co_resident": (
-        "llama_packer/writer.py",
-        '                elif op == "&":',
-        "                elif False:"),
-    "test_category_ctx_caps_at_one_seam": (
-        "llama_packer/writer.py",
-        "    ctx = (model.design_context if model.role not in (",
-        "    ctx = (model.design_context if True not in ("),
-    "test_host_unit_refusal_drops_a_category_that_cannot_fit_alone": (
-        "llama_packer/writer.py",
-        "        refused = {n for n, mb in cats.items() if mb > available}",
-        "        refused = set()"),
     "test_warn_unhandled_names_the_sidecar": (
         "llama_packer/backends/base.py",
         '        who = f"{stem}: " if stem else ""',
@@ -137,10 +125,6 @@ MUTATIONS = {
         ("                    host_free = self.host_ledger.available() \\\n"
          "                        if serve_view.on_cpu else None"),
         "                    host_free = None"),
-    "test_cpu_resident_charges_host_not_vram": (
-        "llama_packer/writer.py",
-        "mb = self._host_resident_mb(model, ctx)",
-        "mb = self._resident_overhead(model, ctx)"),
     "test_no_host_pool_never_gates": (
         "llama_packer/writer.py",
         "self.host_ledger = HostLedger(host_pool_mb)",
@@ -149,30 +133,10 @@ MUTATIONS = {
         "llama_packer/writer.py",
         'packing: dict = {"device": "cpu" if model.on_cpu else "gpu"}',
         "packing: dict = {}"),
-    "test_host_resident_sizing_lifts_cpu_gate": (
+    "test_host_charge_sizing_lifts_cpu_gate": (
         "llama_packer/writer.py",
-        "                          allow_cpu=allow_cpu)",
-        "                          allow_cpu=False)"),
-    "test_select_model_prefers_cpu_candidate": (
-        "llama_packer/__main__.py",
-        'cpu = [m for m in cands if getattr(m, "on_cpu", False)]',
-        "cpu = []"),
-    "test_select_model_smallest_among_cpu_candidates": (
-        "llama_packer/__main__.py",
-        "    return min(pool, key=lambda m: m.vram_mb)",
-        "    return min(pool, key=lambda m: -m.vram_mb)"),
-    "test_select_model_no_cpu_keeps_size_rule": (
-        "llama_packer/__main__.py",
-        "    return min(pool, key=lambda m: m.vram_mb)",
-        "    return pool[0]"),
-    "test_select_model_selector_overrides_cpu_preference": (
-        "llama_packer/__main__.py",
-        "        return hits[0]",
-        "        return min(pool, key=lambda m: m.vram_mb)"),
-    "test_selection_reason_names_the_arm": (
-        "llama_packer/__main__.py",
-        '        return "device: cpu — explicit placement"',
-        '        return "explicit placement"'),
+        "                ctx=ctx, allow_cpu=True)",
+        "                ctx=ctx, allow_cpu=False)"),
     "test_cpu_chat_entry_gets_cpu_default_ttl": (
         "llama_packer/writer.py",
         "    if model.on_cpu:\n        return CPU_HELPER_TTL",
@@ -181,73 +145,15 @@ MUTATIONS = {
         "llama_packer/writer.py",
         '    if ttl is not None:\n        entry["ttl"] = ttl',
         '    entry["ttl"] = ttl'),
-    "test_select_model_picks_measured_cheapest_over_file_size": (
-        "llama_packer/__main__.py",
-        "            return min(priced, key=lambda t: t[1])[0]",
-        "            return priced[0][0]"),
-    "test_select_model_falls_back_to_size_when_unmeasurable": (
-        "llama_packer/__main__.py",
-        "    return min(pool, key=lambda m: m.vram_mb)",
-        "    return pool[0]"),
-    "test_select_model_cpu_preference_beats_cheaper_device": (
-        "llama_packer/__main__.py",
-        "    pool = cpu or cands",
-        "    pool = cands"),
-    "test_select_model_selector_prices_only_the_pick": (
-        "llama_packer/__main__.py",
-        "        if cost is not None and logger is not None:",
-        "        if False:"),
     "test_detect_matrix_category_selector_defines_the_pair": (
         "llama_packer/__main__.py",
         '        embed_model = categories["emb"]',
         "        embed_model = embed_model"),
-    "test_cpu_fixed_category_resident_charged_host": (
-        "llama_packer/writer.py",
-        "                if model.on_cpu:\n"
-        "                    mb = self._host_resident_mb(model, ctx)\n"
-        "                    self.host_ledger.add_resident(f\"{name}:{model.stem}\",",
-        "                if False:\n"
-        "                    mb = self._host_resident_mb(model, ctx)\n"
-        "                    self.host_ledger.add_resident(f\"{name}:{model.stem}\","),
     "test_host_measurement_does_not_leak_into_vram_pricing": (
         "llama_packer/vram.py",
         '        if getattr(self.model, "on_cpu", False) and not allow_cpu:',
         "        if False:"),
     # ── set composition: pricing, worst set, per-role pin ──
-    "test_set_overhead_prices_nested_branches": (
-        "llama_packer/writer.py",
-        '    alternatives = _split_top(expr, "|")\n'
-        "    if len(alternatives) > 1:",
-        '    alternatives = [expr]\n'
-        "    if len(alternatives) > 1:"),
-    "test_solve_matrix_prices_a_nested_and_branch": (
-        "llama_packer/writer.py",
-        '    alternatives = _split_top(expr, "|")\n'
-        "    if len(alternatives) > 1:",
-        '    alternatives = [expr]\n'
-        "    if len(alternatives) > 1:"),
-    "test_set_overhead_expands_named_sets": (
-        "llama_packer/writer.py",
-        "        if sets_cfg and name in sets_cfg and name not in _seen:\n"
-        "            return set_overhead_mb(",
-        "        if False:\n"
-        "            return set_overhead_mb("),
-    "test_expr_leaves_walks_nested_branches": (
-        "llama_packer/writer.py",
-        "        for part in parts:\n            out |= _expr_leaves(part, sets_cfg, _seen)",
-        "        return set(parts)"),
-    "test_solve_matrix_reserves_worst_set_not_category_union": (
-        "llama_packer/writer.py",
-        "        return max(_set_costs(embed_ctx_, rerank_ctx_).values(), default=0)",
-        "        return sum(_set_costs(embed_ctx_, rerank_ctx_).values())"),
-    "test_solve_matrix_unreferenced_category_reserves_nothing": (
-        "llama_packer/writer.py",
-        "        return {name: set_overhead_mb(expr, var_mb, sets_cfg=raw_sets)\n"
-        "                for name, expr in chat_sets.items()}",
-        "        return {name: set_overhead_mb(expr, var_mb, sets_cfg=raw_sets)\n"
-        "                       + sum(v for n, v in fixed_mb.items()\n"
-        "                             if n not in _expr_leaves(expr, raw_sets))\n"
-        "                for name, expr in chat_sets.items()}"),
     "test_unknown_role_value_warns_with_a_hint": (
         "llama_packer/discover.py",
         '        if alien in model.sidecar_keys:',
@@ -268,15 +174,7 @@ MUTATIONS = {
         "llama_packer/profiles.py",
         "        if key in PROFILES_KEYS:",
         "        if True:"),
-    "test_matrix_resolution_measures_with_fit_binary": (
-        "llama_packer/__main__.py",
-        "                          fit_bin=fit_bin or llama_bin,",
-        "                          fit_bin=llama_bin,"),
-    "test_selection_reason_names_the_cost_terms": (
-        "llama_packer/__main__.py",
-        '    suffix = f" = {detail}" if detail else ""',
-        '    suffix = ""'),
-    "test_resident_cost_detail_names_the_terms": (
+    "test_fixed_cost_detail_names_the_terms": (
         "llama_packer/writer.py",
         "    kv_mb = int(kv_factor * ctx + slot_mib)",
         "    kv_mb = 0"),

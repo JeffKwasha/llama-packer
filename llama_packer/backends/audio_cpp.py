@@ -15,7 +15,7 @@ audio GGUFs are never routed to ``llama-server``, and whisper ``.bin`` models
 are never routed here (audio.cpp has no whisper family).  VRAM is
 fixed-overhead (weights + a family buffer).
 
-Verified against audio.cpp 0.8.0 (upstream docs + live binary, 2026-09-16):
+Verified against audio.cpp 0.8.0 (upstream docs + running binary, 2026-09-16):
 server.json keys, ``hip`` backend + ``rocm`` CLI alias, ``lazy_load``,
 ``default_voice_preset``/``voice_presets``, ``load_options``/
 ``session_options``, ``model_spec_override``, per-model ``busy_timeout_ms``.

@@ -176,7 +176,7 @@ def test_emit_config_duplicate_id_raises(make_model):
     # Validates: SPEC.md, 'Entry ids name the task, not the solve': two
     # sidecars that slug to the same id are a duplicate, and the run
     # stops.
-    from llama_packer.writer import emit_config, Planner
+    from llama_packer.writer import emit_config
 
     # template_id is slug of sidecar stem (not name). Two different stems that
     # slug to the same id are "my model" and "my-model" -> both "my-model".
@@ -186,9 +186,6 @@ def test_emit_config_duplicate_id_raises(make_model):
     class P:
         pass
 
-    plan = Planner.__new__(Planner)  # not used: empty plans per model
-    plan.chat_ctx = None
-    plans = {m.stem: [] for m in (a, b)}
     # Build entries directly through emit_config with one variant each.
     from llama_packer.writer import Variant
     v = Variant(parallel=1, cache_type="q8_0", spare_mb=0,

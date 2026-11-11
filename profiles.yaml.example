@@ -93,7 +93,7 @@ tasks:
     endpoint: openai.embeddings
     min_context: 4096
     max_context: 4096      # the served RAG window; clients chunk to fit
-    ttl: 0                 # keep the RAG pair warm
+    ttl: 0                 # keep it loaded
   rerank:
     endpoint: openai.rerank
     min_context: 4096
@@ -294,7 +294,7 @@ profiles:
 # ── whisper-server backend (optional, speech-to-text) ─────
 # Defaults for `backend: whisper-server` (whisper.cpp examples/server).
 # CLI --whisper-server wins over this, then $WHISPER_BIN_DIR, then the
-# run directory (cwd), then `whisper-server` on PATH.  Opt-in: add `s2t: s2t` under `dirs:` above;
+# run directory (cwd), then `whisper-server` on PATH.  Opt-in: give the s2t role a `dir:` that owns the whisper tree;
 # each model needs an authored same-stem sidecar next to its GGML .bin
 # (e.g. ggml-large-v3.md beside ggml-large-v3.bin).  Fixed VRAM overhead,
 # excluded from the shared chat matrix.
@@ -309,7 +309,7 @@ profiles:
 # CLI --audio-cpp-server/--audio-cpp-backend win over this, then
 # $AUDIOCPP_BIN_DIR, then the run directory (cwd), then
 # `audiocpp_server` on PATH.  Opt-in: add
-# `t2s: t2s` and/or `s2t: s2t` under `dirs:` above.  Fixed VRAM overhead
+# give the t2s and s2t roles a `dir:` that owns the audio trees.  Fixed VRAM overhead
 # (file size + family buffer), excluded from the shared chat matrix.
 # One entry per sidecar (1:1) — switching models reloads audio.cpp.
 # audio_cpp:
@@ -406,7 +406,7 @@ profiles:
 # memory budget: [A&B] [A&C] [A&D] constrains only the pairs, so all four can
 # take half the pool, where capacity would force each to a quarter. Only a set
 # can forbid a combination that fits. Expressions use llama-swap syntax:
-# & (together), | (alternative), +set, +auto:orphans. A model in no set runs
+# & (together), | (alternative), +set. A model in no set runs
 # alone. Matrix never preloads: it evicts to the cheapest set containing the
 # requested model and starts only that model.
 #

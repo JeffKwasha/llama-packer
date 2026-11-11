@@ -330,7 +330,7 @@ def test_a_flat_run_directory_still_resolves(tmp_path):
 
 def test_tools_wins_over_a_stale_flat_copy(tmp_path):
     # Validates: docs/install.md, 'The updater is the installer for binaries': The llama-swap this deployment actually has.
-    """Both layouts present: the deployment one is the live one."""
+    """Both layouts present: the deployment one is the current one."""
     for base in (tmp_path, ins.tools_dir(tmp_path)):
         (build := base / "llama-b11714").mkdir(parents=True)
         (build / "llama-server").write_text("x")
@@ -362,14 +362,14 @@ def test_backup_keeps_the_previous_config(tmp_path):
     # Both are gitignored and machine-local, so an install that overwrites
     # them has no other way back: a regeneration can move every context.
     # Validates: docs/install.md, 'Two orderings that are load-bearing': Copy *path* aside to ``<name>.bak-<n>`` before overwriting it. An install replaces a working config and a working unit in one step.
-    live = tmp_path / "config.yaml"
-    live.write_text("models: {}\n")
-    made = ins.backup(live, dry_run=False)
+    deployed = tmp_path / "config.yaml"
+    deployed.write_text("models: {}\n")
+    made = ins.backup(deployed, dry_run=False)
     assert made.read_text() == "models: {}\n"
-    assert live.read_text() == "models: {}\n"      # untouched by the copy
+    assert deployed.read_text() == "models: {}\n"   # untouched by the copy
     # A second backup must not clobber the first.
-    live.write_text("models: {a: 1}\n")
-    again = ins.backup(live, dry_run=False)
+    deployed.write_text("models: {a: 1}\n")
+    again = ins.backup(deployed, dry_run=False)
     assert again.name == "config.yaml.bak-2"
     assert made.name == "config.yaml.bak-1"
 
@@ -573,7 +573,7 @@ def test_validate_runs_as_the_service_user(tmp_path, monkeypatch):
                                       "stdout": ""})())
     (tmp_path / "llama-swap").write_bytes(b"bin")
     (tmp_path / "config.yaml").write_text("models: {}\n")
-    monkeypatch.setattr(ins, "probe", lambda *a, **k: None)   # no live server
+    monkeypatch.setattr(ins, "probe", lambda *a, **k: None)   # no running server
     ins.start(r, tmp_path / "llama-swap.service", tmp_path, "127.0.0.1:1",
               "lemonade")
     validate = [c for c in commands if "-validate" in c]

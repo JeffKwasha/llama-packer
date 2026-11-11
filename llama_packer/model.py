@@ -61,7 +61,7 @@ def _ref_name(ref) -> str:
 _CL_RE = re.compile(r"^context_limit_\d+G$")
 
 # The single dynamically generated sidecar branch. Machine-measured values
-# (fit-params VRAM numbers, file intrinsics) live here and only here;
+# (fit-params VRAM numbers, file intrinsics) are defined here and only here;
 # everything else in the sidecar is authored. ``fit-params`` is the legacy
 # name, still read as a fallback but never written.
 MEASURED_KEY = "derived"
@@ -1618,14 +1618,14 @@ class Model:
 
     @property
     def on_cpu(self) -> bool:
-        """True when the model is CPU-resident (`device: cpu` in frontmatter)."""
+        """True when the model is served on the CPU (`device: cpu`)."""
         return utils.parse_device(self.frontmatter.get("device"))[0] == "cpu"
 
     @property
     def device(self) -> int | None:
         """Explicit GPU device index (for multi-GPU pinning), if declared.
 
-        Returns None for CPU-resident models (`device: cpu`).
+        Returns None for CPU-served models (`device: cpu`).
         """
         value = utils.parse_device(self.frontmatter.get("device"))[0]
         return value if isinstance(value, int) else None
@@ -1674,8 +1674,8 @@ class Model:
     def view_for(self, include_mmproj: bool) -> Model:
         """Frontmatter view for a serving variant.
 
-        The companion-off variant is this model itself: overlay keys live
-        only inside the mmproj block, so the base frontmatter already
+        The companion-off variant is this model itself: overlay keys are
+        found only inside the mmproj block, so the base frontmatter already
         describes serving without the companion.  The companion-on variant
         is a cached shallow copy with the block merged over the frontmatter
         (single merge rule); resolved files are shared, the VRAM budget is

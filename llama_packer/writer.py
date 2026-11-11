@@ -17,12 +17,11 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable
 
 import yaml
 
 from llama_packer.model import Model
-from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
 from llama_packer.endpoints import (CHAT, EMBEDDINGS, IMAGES, RERANK,
@@ -39,10 +38,9 @@ from llama_packer.consts import (
     _MIN_CTX_SIZE,
     _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
-    ESTIMATE_ERROR_REASON,
 )
 from llama_packer import allocation, roles
-from llama_packer.profiles import Profiles, parse_spare_mb
+from llama_packer.profiles import Profiles
 from llama_packer.backends import (
     SETTING_KEYS,
     FRAMEWORK_CONSUMED,
@@ -100,8 +98,8 @@ def format_mem_tag(
     entry (weights + companions + context at the served ``(ctx, slots)``)
     — never capped, never re-solved: an impossible-looking ``VRAM 73.0GB``
     on a 32 GB card is printed as decided.  ``vram_mib=None`` is a
-    CPU-resident serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
-    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (disk-resident weights)
+    host-RAM serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
+    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (on-disk weights)
     are reserved grammar for a future allocator that decides a split —
     today's allocator never splits, so callers leave them None.
     """
@@ -300,7 +298,7 @@ def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
     return set_params
 
 
-#: Default idle lifetime for a host-resident helper with no declared value.
+#: Default idle lifetime for a host-RAM helper with no declared value.
 #: Capacity pools bound RAM; TTL additionally yields to duties llama-swap
 #: cannot see. A chat serving on CPU inherits the global default instead.
 def resolve_entry_ttl(model: Model, demand: "Task | None",
@@ -689,7 +687,7 @@ class MatrixKnobs:
     Context tiers, smallest to largest: ``coload_min_ctx`` (emb/rnk squeeze
     floor) → ``min_chat_ctx`` (co-load decision floor) → ``tools_min_ctx``
     (tools advertisement threshold).  ``embed_context`` / ``rerank_context``
-    are RAG caps — the maximum context those residents serve at (default
+    are RAG caps — the maximum context those fixed-overhead roles serve at (default
     4096, capped by each model's design context); the served value is
     ``min(rag_cap(role), design_context)`` everywhere, including for
     unestimable RAG models.  ``ctx_gain_min`` gates the squeeze adoption;
@@ -855,13 +853,20 @@ def fallback_task(model: Model,
 
     A client may call the model by its bare id. The entry serves it at the
     smallest floor among the model's tasks, so the alias never claims a
-    larger serving than the model already declares.
+    larger serving than the model already declares. A task floor above the
+    design context is unreachable and is not a candidate.
     """
     design = model.design_context
-    mins = [task.min_context for task in (model.tasks_resolved or ())
-            if task.min_context and task.min_context <= design]
-    return Task("", "", min_context=min(mins) if mins else empty_min,
-                min_parallel=1, require=frozenset(), sacrifice=())
+    tasks = [task for task in (model.tasks_resolved or ())
+             if (task.min_context or 0) <= design]
+    if tasks:
+        task = min(tasks, key=lambda t: ((t.min_context or empty_min)
+                                         * (t.min_parallel or 1)))
+        return Task("", "", min_context=task.min_context or empty_min,
+                    min_parallel=task.min_parallel or 1,
+                    require=frozenset(), sacrifice=())
+    return Task("", "", min_context=empty_min, min_parallel=1,
+                require=frozenset(), sacrifice=())
 
 
 @dataclass(frozen=True)
@@ -920,119 +925,6 @@ def _split_top(expr: str, op: str) -> list[str]:
             cur.append(ch)
     parts.append("".join(cur))
     return [s for s in (_strip_parens(p) for p in parts) if s]
-
-
-def _expr_leaves(expr: str, sets_cfg: Mapping[str, str] | None = None,
-                 _seen: frozenset[str] = frozenset()) -> set[str]:
-    """Every leaf in a set expression, with ``+set`` references expanded.
-
-    The leaves are var names (or model IDs — llama-swap accepts both) plus
-    the two placeholders.  An unknown reference stays as its literal token so
-    callers can report it.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return set()
-    parts = _split_top(expr, "|")
-    if len(parts) == 1:
-        parts = _split_top(expr, "&")
-    if len(parts) > 1:
-        out: set[str] = set()
-        for part in parts:
-            out |= _expr_leaves(part, sets_cfg, _seen)
-        return out
-    atom = expr.strip()
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return _expr_leaves(str(sets_cfg[name]), sets_cfg,
-                                _seen | {name})
-        return {atom}
-    return {atom}
-
-
-def _resident_options(expr: str, sets_cfg: Mapping[str, str] | None = None,
-                      _seen: frozenset[str] = frozenset(),
-                      ) -> list[frozenset[str]]:
-    """Every and-set the expression may hold simultaneously.
-
-    `&` merges members (all live together); `|` branches (one of the
-    alternatives lives) — so an expression yields one option per
-    substitution path, and a role pair co-resides only when an option
-    holds both.  ``three | (two & one)`` yields ``{three}`` and
-    ``{two, one}``: `one` and `three` never ride together.  ``+set``
-    references expand (cycle-guarded), like :func:`_expr_leaves`.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return []
-    for op in ("|", "&"):
-        parts = _split_top(expr, op)
-        if len(parts) > 1:
-            options: list[frozenset[str]] = []
-            for part in parts:
-                sub = _resident_options(part, sets_cfg, _seen)
-                if not sub:
-                    continue
-                if not options:
-                    options = list(sub)
-                elif op == "&":
-                    options = [a | b for a in options for b in sub]
-                else:
-                    options.extend(sub)
-            return options or []
-    atom = expr
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return _resident_options(str(sets_cfg[name]), sets_cfg,
-                                     _seen | {name})
-        return [frozenset({atom})]
-    return [frozenset({atom})]
-
-
-def _has_chat_slot(expr: str, sets_cfg: Mapping[str, str] | None = None,
-                   chat_roles: frozenset[str] = frozenset(),
-                   chat_ids: frozenset[str] = frozenset()) -> bool:
-    """True when the expression allows a chat role or chat model to be resident."""
-    wanted = {x.lower() for x in (*chat_roles, *chat_ids)}
-    return any(leaf.lower() in wanted for leaf in _expr_leaves(expr, sets_cfg))
-
-
-def set_overhead_mb(expr: str, var_mb: Mapping[str, int],
-                    sets_cfg: Mapping[str, str] | None = None,
-                    _seen: frozenset[str] = frozenset()) -> int:
-    """Worst-case co-resident VRAM (MB) a set allows beside chat.
-
-    The expression is a boolean tree: ``&`` means the terms are resident
-    together (sum), ``|`` means one alternative is chosen (max).  Nesting is
-    priced recursively, so ``(3 | (2 & 1))`` costs ``max(3, 2 + 1)`` and
-    ``(1 | (2 & 3))`` costs 5 — the old depth-0 split priced the second as 1.
-
-    A leaf is a role label or a literal model id; *var_mb* is the caller's
-    answer for every leaf it can price.  The caller prices the roles of the
-    models being solved at 0, because they are the budget this expression
-    is solved against.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return 0
-    alternatives = _split_top(expr, "|")
-    if len(alternatives) > 1:
-        return max(set_overhead_mb(a, var_mb, sets_cfg, _seen)
-                   for a in alternatives)
-    terms = _split_top(expr, "&")
-    if len(terms) > 1:
-        return sum(set_overhead_mb(t, var_mb, sets_cfg, _seen)
-                   for t in terms)
-    atom = expr.strip()
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return set_overhead_mb(str(sets_cfg[name]), var_mb, sets_cfg,
-                                   _seen | {name})
-        return 0
-    return var_mb.get(atom, 0)
 
 
 def ctx_label(ctx: int) -> str:
@@ -1185,9 +1077,9 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
     return max(int(view.design_context // 2), _MIN_CTX_SIZE)
 
 
-# Size buckets for resident accounting: footprints bucket by size class, not
-# model type.  Tiny residents (speech, RAG) ride along beside chat for pocket
-# change; huge residents (diffusion) are chat-scale and tracked as exclusive
+# Size buckets for footprint accounting: footprints bucket by size class, not
+# model type.  Tiny servings (speech, RAG) ride along beside chat for pocket
+# change; huge servings (diffusion) are chat-scale and tracked as exclusive
 # candidates; chat models evict each other.
 BUCKET_TINY_ENDPOINTS = frozenset({EMBEDDINGS, RERANK,
                                    TRANSCRIPTIONS, SPEECH})
@@ -1205,23 +1097,18 @@ def footprint_bucket(model) -> str:
 
 
 class PoolLedger:
-    """One shared VRAM ledger: every claimant charged to a named pool.
+    """One shared VRAM ledger: every pool's declared size and spare.
 
     Single-pool math today (the detected total), keyed by pool id so
     per-GPU attribution slots in later: ``pool_id_for`` maps a model's
     ``device:`` pin to ``gpuN``, unpinned models land on ``default``.  An
-    operator-declared ``pools: <id>: vram:`` overrides the pool size;
-    per-pool ``spare:`` overrides the global spare; ``reserve_extra:`` and
-    explicit ``pins:`` (``"auto"`` = derived math stays authoritative)
-    accumulate into :meth:`extra_reserve_mb`, which callers add to the
-    solve's spare.  Residents (RAG at solved ctx, adopted co-loads) are
-    registered by the planner after the matrix solve.
+    operator-declared ``pools: <id>: vram:`` overrides the pool size and a
+    per-pool ``spare:`` overrides the global spare.
     """
 
     def __init__(self, vram_total_mb: int, pools_cfg: dict | None = None):
         self.vram_total_mb = vram_total_mb
         self.pools_cfg = pools_cfg or {}
-        self.residents: list[tuple[str, str, int]] = []  # (label, pool, mb)
 
     def pool_id_for(self, model) -> str:
         dev = (model.frontmatter or {}).get("device")
@@ -1242,11 +1129,6 @@ class PoolLedger:
                                "total", pool_id, raw)
         return self.vram_total_mb
 
-    def add_resident(self, label: str, mb: int, pool_id: str = "default"
-                     ) -> None:
-        if mb > 0:
-            self.residents.append((label, pool_id, int(mb)))
-
     def spare_for(self, pool_id: str, global_spare_mb: int) -> int:
         raw = self.pools_cfg.get(pool_id, {}).get("spare")
         if raw is None:
@@ -1260,57 +1142,22 @@ class PoolLedger:
             return global_spare_mb
 
 
-
 class HostLedger:
-    """Sibling of PoolLedger: host-RAM claims by ``device: cpu`` models.
+    """Sibling of PoolLedger: the host-RAM pool for ``device: cpu`` models.
 
-    Committed residents (embed/rerank winners, one per role) are charged
-    at build time; every other CPU-resident entry is judged go/no-go
-    against the pool remaining after them — never solved down, mirror of
-    the VRAM `over_budget` refusal (SPEC.md §Host pool).  ``pool_mb=None``
-    (detection unavailable) means the ledger cannot gate: it logs that
-    once and reports an unbounded pool rather than inventing one.
+    A CPU-served entry is judged go/no-go against the pool — never solved
+    down, mirror of the VRAM `over_budget` refusal (SPEC.md §Host pool).
+    ``pool_mb=None`` (detection unavailable) means the ledger cannot gate:
+    it logs that once and reports an unbounded pool rather than inventing
+    one.
     """
 
     def __init__(self, pool_mb: int | None):
         self.pool_mb = pool_mb
-        self.residents: list[tuple[str, str, int]] = []  # (label, role, mb)
-        self._roles: set[str] = set()
-
-    def add_resident(self, label: str, role: str, mb: int) -> None:
-        # One co-resident per role (design decision 2): the resident
-        # selection already picks one winner — two quads for one role is
-        # a planner bug, not a pool this ledger would silently book.
-        if role in self._roles:
-            raise AssertionError(
-                f"host ledger: two committed residents for role {role!r} "
-                f"({label!r}, already have one)")
-        self._roles.add(role)
-        if mb > 0:
-            self.residents.append((label, role, int(mb)))
-
-    def resident_mb(self) -> int:
-        return sum(mb for _, _, mb in self.residents)
 
     def available(self) -> int | None:
-        """Pool remaining after committed residents; None = cannot gate."""
-        if self.pool_mb is None:
-            return None
-        return self.pool_mb - self.resident_mb()
-
-
-@dataclass(frozen=True)
-class MatrixSolve:
-    """Result of the shared matrix solve.
-
-    ``chat_ctx`` is the solved shared chat context.  ``embed_ctx`` /
-    ``rerank_ctx`` are the contexts the RAG models should be served at
-    (design context, or the squeezed value when the squeeze was adopted).
-    """
-    chat_ctx: int
-    embed_ctx: int
-    rerank_ctx: int
-    squeeze: bool = False
+        """Host pool size; None = cannot gate."""
+        return self.pool_mb
 
 
 @dataclass(frozen=True)
@@ -1349,7 +1196,7 @@ class Variant:
     #: Decided TOTAL memory attributable to this serving (weights +
     #: companions + context at the served ctx/slots), in MiB — the numbers
     #: the emitted description tag reports verbatim.  ``mem_vram_mib=None``
-    #: is a CPU-resident serving (RAM-only tag).  Both None when undecided
+    #: is a host-RAM serving (RAM-only tag).  Both None when undecided
     #: (no estimate) — then no tag is emitted.
     mem_vram_mib: float | None = None
     mem_ram_mib: float | None = None
@@ -1381,7 +1228,7 @@ def measurement_args(
 ) -> str:
     """The exact flag string VRAM constants are measured (and shape-stamped)
     under: global args + the CPU device pin when the model is
-    CPU-resident (`--n-gpu-layers 0`, the measurement of the host-side
+    CPU-served (`--n-gpu-layers 0`, the measurement of the host-side
     quads — docs/plans/cpu-residency-budget.md) + the model's effective
     ``-ub``.  ``batch`` is excluded — measured to have no VRAM effect, so
     throughput tuning must not invalidate estimates.
@@ -1404,6 +1251,24 @@ def measurement_args(
     return f"{base} -ub {ubatch}".strip()
 
 
+def _inline_set_refs(raw: dict[str, str]) -> dict[str, str]:
+    """Inline +set references; reject cycles and any other + form."""
+    def resolve(name: str, stack: tuple[str, ...]) -> str:
+        def repl(match):
+            ref = match.group(1)
+            if ref.startswith("auto"):
+                raise ValueError(f"+{ref} cannot be priced; name the roles")
+            if ref not in raw:
+                raise ValueError(f"+{ref} names no set")
+            if ref in stack:
+                raise ValueError(
+                    "set reference cycle: " + " -> ".join(stack + (ref,)))
+            return "(" + resolve(ref, stack + (ref,)) + ")"
+        return re.sub(r"\+([A-Za-z0-9._:-]+)", repl, raw[name])
+
+    return {name: resolve(name, (name,)) for name in raw}
+
+
 class Planner:
     """Turn models + VRAM budget into per-model serving :class:`Variant`s.
 
@@ -1424,10 +1289,6 @@ class Planner:
         spare: str | None = None,
         max_context: int | None = None,
         matrix_cfg: dict | None = None,
-        embed_model: Model | None = None,
-        rerank_model: Model | None = None,
-        fixed_categories: list[tuple[str, Model]] | None = None,
-        category_ctx: dict[str, int] | None = None,
         baseline_mb: int = 0,
         min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
@@ -1447,33 +1308,12 @@ class Planner:
                       else f"{int(spare)}m")
         self.max_context = max_context
         self.matrix_cfg = matrix_cfg
-        # `matrix.sets` belongs to the emitted router; the solver reads knobs.
+        # `matrix.sets` belongs to the emitted router; the solve reads knobs.
         self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
-        self.embed_model = embed_model
-        self.rerank_model = rerank_model
         # Blessed usage categories.  A model may only *tag* itself with one
         # of these; an unblessed tag is warned about and ignored.
         self.tasks = TaskCatalogue.from_cfg(
             getattr(profiles, "tasks_cfg", None))
-        # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
-        # fixed-overhead residents reserved alongside chat and RAG.
-        self.fixed_categories = fixed_categories or []
-        # Per-category served context (requirement 32): category var name ->
-        # the ctx the operator declared for that model. A cap applied at
-        # one seam (resident_ctx / the category seam in the planner loop),
-        # never a floor.
-        self.category_ctx = category_ctx or {}
-        self._cat_vars_by_stem: dict[str, list[str]] = {}
-        for var, m in self.fixed_categories:
-            if m is not None:
-                self._cat_vars_by_stem.setdefault(m.stem, []).append(var)
-        for var, m in (("emb", embed_model), ("rnk", rerank_model)):
-            if m is not None:
-                self._cat_vars_by_stem.setdefault(m.stem, []).append(var)
-        # Categories refused by the host-unit pass (requirement #70): filled
-        # in by plan(), before _build_ledger judges the fixed categories.
-        self.host_unit_refused_vars: frozenset[str] = frozenset()
-        self.host_unit_refused_stems: frozenset[str] = frozenset()
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.min_context_explicit = min_context_explicit
@@ -1489,7 +1329,7 @@ class Planner:
         # Capacity-router pools.  The GPU limit is the same budget the solve
         # used (total minus reserve and spare); the host limit is the
         # detected/declared host pool.  One size-1 pool per scheduling role
-        # makes "one live serving per role" a capacity constraint.
+        # makes "one served entry per role" a capacity constraint.
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
         spare_mb = profiles.global_spare_mb(self.spare, vram_total)
         default_spare = self.ledger.spare_for("default", spare_mb)
@@ -1502,19 +1342,12 @@ class Planner:
         for role in roles.names():
             pools[role] = 1
         self.capacity_pools = pools
-        # Stems committed to the host ledger as residents: their serving is
-        # charged once (the unit pass), never re-checked at emission.
-        self.host_ledger_stems: set[str] = set()
-        self.chat_ctx: int | None = None  # matrix-solved shared context, if any
-        self.matrix_result: MatrixSolve | None = None
         # Auction budgets for the authored sets, keyed by (role, pool).
         self.role_budget: dict[tuple[str, str], int] = {}
+        self.matrix_sets_approved: dict[str, str] = {}
+        self.matrix_sets_rejected: dict[str, str] = {}
         # Optional per-model tick (stem) for the progress bar; None in tests.
         self.progress_cb = progress_cb
-        # Quads synthesized for unestimable matrix participants (stem →
-        # (model_mib, kv_per_token, slot_mib, compute_mib)); see
-        # _solve_matrix_context. Kept for ledger resident charging.
-        self.synthetic_quads: dict[str, tuple[int, float, float, int]] = {}
 
     # ── bounded ctx: the single home of the clamp invariant ──
 
@@ -1558,16 +1391,12 @@ class Planner:
     def _unestimated_ctx(self, view) -> int:
         """Minimum useful context for a model with no VRAM estimate.
 
-        Type-based floor: a matrix chat model follows the shared solved
-        context like every chat (the solve charged exactly that for it);
-        chat without a matrix gets the per-model floor cascade; a resident
-        serves its task's ``max_context`` (capped by the trained design
-        context and ``--max-context``).
+        Type-based floor: a fixed-overhead serving uses its task's
+        ``max_context`` (capped by the trained design context and
+        ``--max-context``); chat gets the per-model floor cascade.
         """
         if view.serves_endpoint(EMBEDDINGS) or view.serves_endpoint(RERANK):
-            ctx = resident_ctx(view, self.tasks)
-        elif view.serves_endpoint(CHAT) and self.chat_ctx is not None:
-            ctx = self.chat_ctx
+            ctx = served_ctx(view, self.tasks)
         else:
             ctx = resolve_min_ctx(
                 view, pin_ctx=self._serving_pin(view),
@@ -1592,9 +1421,9 @@ class Planner:
         category at all, so no entry may be named for it. ``keep`` only
         forbids shedding.
 
-        This gate used to live in ``met_demands`` and went with it, which left
-        a text-only model free to claim ``require: [vision]`` -- an id that
-        promised a capability the entry did not advertise.
+        This gate used to be in ``met_demands``, which left a text-only
+        model free to claim ``require: [vision]`` -- an id that promised a
+        capability the entry did not advertise.
         """
         have_vision = (model.mmproj is not None
                        and model.mmproj.gguf_path is not None)
@@ -1654,7 +1483,7 @@ class Planner:
                 include_draft="draft" not in shed,
                 design_ctx=design_ctx, context_length=context_length,
                 profile=profile)
-            if ctx <= 0 or ctx < demand.min_context:
+            if ctx <= 0 or ctx < (demand.min_context or self.min_context):
                 continue
             over = getattr(view.vram, "over_budget_reason", None)
             if over is not None:
@@ -1763,8 +1592,7 @@ class Planner:
                 solved[p] = self._bounded_ctx(
                     view, parallel=p, cache_type=cache_type,
                     spare_mb=spare_mb, include_mmproj=include_mmproj,
-                    design_ctx=self.chat_ctx, context_length=cap_ctx,
-                    profile=profile)
+                    context_length=cap_ctx, profile=profile)
             return solved[p]
 
         cands: list[tuple[int, int]] = []
@@ -1831,113 +1659,26 @@ class Planner:
         return demands
 
 
-    def _category_ctx_cap(self, model: Model) -> int | None:
-        """The per-category ``ctx:`` cap for *model*, min over its vars."""
-        caps = [self.category_ctx[v]
-                for v in self._cat_vars_by_stem.get(model.stem, ())
-                if self.category_ctx.get(v) is not None]
-        return min(caps) if caps else None
-
-    def _rag_ctx(self, model: Model, name: str | None = None) -> int:
-        """Served context for a RAG/fixed-overhead category.
-
-        The role keeps its policy (RAG cap, design context); a per-category
-        ``ctx:`` (requirement 32) caps the result for the named category,
-        never floors it.
-        """
-        res = self.matrix_result
-        if res is None:
-            ctx = model.design_context
-        elif model.serves_endpoint(EMBEDDINGS):
-            ctx = min(model.design_context, res.embed_ctx)
-        elif model.serves_endpoint(RERANK):
-            ctx = min(model.design_context, res.rerank_ctx)
-        else:
-            ctx = model.design_context
-        if name is not None:
-            cap = self.category_ctx.get(name)
-            if cap is not None:
-                ctx = min(ctx, cap)
-        return ctx
-
-    def _host_unit_refusals(self) -> frozenset[str]:
-        """Judge each fixed CPU category against the pool left for it.
-
-        Requirement #70: a ``device: cpu`` category's own quad must fit the
-        pool remaining after the committed embed/rerank pair — one that
-        cannot fit alone emits no id.  The pair is charged to the pool, not
-        judged: it is what the rest is measured against.  No pool, no gate
-        (requirement #76): without a host pool nothing is refused.
-        """
-        if self.host_ledger.pool_mb is None or self.host_ledger.pool_mb <= 0:
-            return frozenset()
-        res = self.matrix_result
-        if res is None:
-            return frozenset()
-        pair_rent = 0
-        pair_stems: set[str] = set()
-        for model, ctx in ((self.embed_model, res.embed_ctx),
-                           (self.rerank_model, res.rerank_ctx)):
-            if model is None or not model.on_cpu:
-                continue
-            pair_rent += self._host_resident_mb(model, ctx)
-            pair_stems.add(model.stem)
-        available = self.host_ledger.pool_mb - pair_rent
-        cats: dict[str, int] = {}
-        for name, m in self.fixed_categories:
-            if not m.on_cpu or name in pair_stems:
-                continue
-            cats[name] = self._host_resident_mb(m, self._rag_ctx(m, name))
-        refused = {n for n, mb in cats.items() if mb > available}
-        if refused:
-            logger.warning(
-                "host ledger: %s exceed(s) the %d MiB free after residents; "
-                "refused",
-                ", ".join(f"{n} ({cats[n]} MiB)" for n in sorted(refused)),
-                available)
-        return frozenset(refused)
-
-
-    def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
-        """Shared chat context when a matrix section is configured."""
-        if not (self.matrix_cfg and self.embed_model and self.rerank_model):
-            return None
-        synthetic: dict[str, tuple[int, float, float, int]] = {}
-        result = _solve_matrix_context(
-            self.models, self.embed_model, self.rerank_model,
-            self.fit_bin, self.vram_total, self.spare, self.profiles,
-            baseline_mb=self.baseline_mb, drop_stems=drop_stems,
-            knobs=self.knobs, memory_margin=self.memory_margin,
-            llama_args=self.llama_args, synthetic=synthetic,
-            fixed_categories=self.fixed_categories,
-            category_ctx=self.category_ctx,
-            routing_sets=self.matrix_cfg.get("sets"),
-            tasks=self.tasks,
-        )
-        self.synthetic_quads = synthetic
-        # Flag the synthesized models so plan() serves them at their
-        # minimum useful context and emission marks them unestimated.
-        for stem in synthetic:
-            for m in self.models:
-                if m.stem == stem:
-                    m.vram.unestimated_reason = ESTIMATE_ERROR_REASON
-                    break
-        if result is not None:
-            logger.info("matrix: solved chat_ctx=%d (squeeze=%s)",
-                        result.chat_ctx, result.squeeze)
-        return result
-
     def _role_budgets(self) -> dict[tuple[str, str], int]:
-        """Price the authored sets with the auction, for logging today."""
+        """Price the authored sets, dropping any set that cannot fit."""
         raw = {str(n): str(e) for n, e in
                ((self.matrix_cfg or {}).get("sets") or {}).items()}
         if not raw:
             return {}
+        inlined = _inline_set_refs(raw)
         role_floor: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
         role_source: dict[tuple[str, str], tuple[int, str, str]] = {}
         role_pools: dict[str, set[str]] = {}
         model_floor: dict[str, tuple[str, int]] = {}
         leaf_role: dict[str, str] = {}
+
+        def model_keys(m):
+            keys = {m.stem, m.template_id,
+                    str(m.frontmatter.get("model_id", "")),
+                    utils.slugify(str(m.frontmatter.get("name", "")))}
+            keys.discard("")
+            return keys
+
         for m in self.models:
             pool = "ram" if m.on_cpu else "default"
             role_pools.setdefault(m.role, set()).add(pool)
@@ -1949,41 +1690,42 @@ class Planner:
                                             self.llama_args),
                 allow_cpu=True)
             if quad is None:
-                role_floor[pool].setdefault(m.role, 0)
-                for key in (m.stem, m.template_id):
-                    model_floor[key] = (pool, 0)
+                est = max(HOST_PROCESS_MIB,
+                          int(m.size_mb or 0) + HOST_PROCESS_MIB)
+                previous = role_floor[pool].get(m.role, 0)
+                if est > previous:
+                    role_source[(m.role, pool)] = (est, m.stem, "unmeasured")
+                role_floor[pool][m.role] = max(previous, est)
+                if not m.on_cpu:
+                    role_floor["ram"][m.role] = max(
+                        role_floor["ram"].get(m.role, 0), HOST_PROCESS_MIB)
+                for key in model_keys(m):
+                    model_floor[key] = (pool, est)
+                    model_floor[key.lower()] = (pool, est)
+                    if not m.on_cpu:
+                        model_floor[key + "#ram"] = ("ram", HOST_PROCESS_MIB)
+                        model_floor[key.lower() + "#ram"] = (
+                            "ram", HOST_PROCESS_MIB)
                     leaf_role[key] = m.role
+                    leaf_role[key.lower()] = m.role
                 continue
             demands = m.tasks_resolved or ()
-            pool_mb = self.capacity_pools.get(pool, 0)
             best = 0
             best_task = None
             for task in demands:
                 need = allocation.floor_mb(
                     quad, task.min_context or self.min_context,
                     task.min_parallel or 1, self.memory_margin)
-                if need > pool_mb:
-                    logger.info(
-                        "matrix: %s task %r floor %d MiB exceeds %s %d; "
-                        "dropped", m.stem, task.id or "fallback", need,
-                        pool, pool_mb)
-                    continue
                 if need > best:
                     best, best_task = need, task
             if best == 0:
-                fallback = allocation.floor_mb(
-                    quad, self.min_context, 1, self.memory_margin)
-                if fallback > pool_mb:
-                    logger.info("matrix: %s floor %d MiB exceeds %s %d; "
-                                "dropped", m.stem, fallback, pool, pool_mb)
-                    continue
-                best = fallback
+                best = allocation.floor_mb(
+                    quad, _MIN_CTX_SIZE, 1, self.memory_margin)
             previous = role_floor[pool].get(m.role, 0)
             if best > previous:
                 role_source[(m.role, pool)] = (
                     best, m.stem, best_task.id if best_task else "")
             role_floor[pool][m.role] = max(previous, best)
-            role_pools.setdefault(m.role, set()).add(pool)
             if not m.on_cpu:
                 files = m.size_mb or 0
                 if m.mmproj is not None and m.mmproj.gguf_path is not None:
@@ -1993,54 +1735,89 @@ class Planner:
                 host = max(HOST_PROCESS_MIB, int(files - quad[0]))
                 role_floor["ram"][m.role] = max(
                     role_floor["ram"].get(m.role, 0), host)
-                model_floor[m.stem + "#ram"] = ("ram", host)
-            for key in (m.stem, m.template_id):
+                for key in model_keys(m):
+                    model_floor[key + "#ram"] = ("ram", host)
+                    model_floor[key.lower() + "#ram"] = ("ram", host)
+            for key in model_keys(m):
                 model_floor[key] = (pool, best)
+                model_floor[key.lower()] = (pool, best)
                 leaf_role[key] = m.role
+                leaf_role[key.lower()] = m.role
 
         def floor_of_leaf(pool: str, leaf: str) -> int | None:
+            leaf = leaf.lower()
             if leaf in roles.names():
                 return role_floor[pool].get(leaf, 0)
             found = model_floor.get(leaf)
-            if found is not None and found[0] == pool:
-                return found[1]
             if found is not None and pool == "ram":
                 host = model_floor.get(leaf + "#ram")
-                if host is not None:
+                if host is not None and found[0] == "default":
                     return host[1]
+            if found is not None and found[0] == pool:
+                return found[1]
             for key, (key_pool, mb) in model_floor.items():
                 if key_pool == pool and leaf.startswith(key + "."):
                     return mb
             return None
 
-        by_pool: dict[str, dict[str, allocation.Expr]] = {}
-        floors: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
-        leaves_by_pool: dict[str, dict[str, str]] = {"default": {}, "ram": {}}
-        for name, text in raw.items():
+        approved: dict[str, str] = {}
+        rejected: dict[str, str] = {}
+        for name, text in inlined.items():
             try:
                 expr = allocation.parse(text)
             except ValueError as exc:
-                logger.warning("matrix: set %r does not parse: %s", name, exc)
-                continue
+                raise ValueError(f"set {name!r}: {exc}") from None
+            leaves = allocation.leaves(expr)
+            seen: dict[str, str] = {}
+            for leaf in leaves:
+                role = leaf_role.get(
+                    leaf, leaf if leaf in roles.names() else None)
+                if role is None:
+                    raise ValueError(
+                        f"set {name!r}: {leaf!r} is not a role, model stem, "
+                        "or entry id")
+                if role in seen:
+                    raise ValueError(
+                        f"set {name!r}: role {role!r} appears twice")
+                seen[role] = leaf
+            bad = False
             for pool in ("default", "ram"):
                 table = {}
-                roles_seen = {}
-                for leaf in allocation.leaves(expr):
+                for leaf in leaves:
                     mb = floor_of_leaf(pool, leaf)
                     if mb is None:
-                        continue
+                        raise ValueError(
+                            f"set {name!r}: {leaf!r} has no {pool} floor")
                     table[leaf] = mb
-                    roles_seen[leaf] = leaf_role.get(
-                        leaf, leaf if leaf in role_floor[pool] else "")
-                if len(table) != len(allocation.leaves(expr)):
-                    missing = [leaf for leaf in allocation.leaves(expr)
-                               if leaf not in table]
-                    logger.info("matrix: set %r has no %s floor for %s; "
-                                "skipped", name, pool, ", ".join(missing))
-                    continue
+                need = allocation.floor_of(expr, table)
+                cap = self.capacity_pools.get(pool, 0)
+                if cap and need > cap:
+                    logger.error(
+                        "matrix: set %r floor %d MiB exceeds %s %d; dropped",
+                        name, need, pool, cap)
+                    bad = True
+            if bad:
+                rejected[name] = inlined[name]
+                continue
+            approved[name] = inlined[name]
+        if not approved:
+            raise ValueError("matrix.sets: no set fits the available pools")
+        self.matrix_sets_approved = dict(approved)
+        self.matrix_sets_rejected = dict(rejected)
+
+        by_pool: dict[str, dict[str, allocation.Expr]] = {}
+        floors: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        leaves_by_pool: dict[str, dict[str, str]] = {"default": {}, "ram": {}}
+        for name, text in approved.items():
+            expr = allocation.parse(text)
+            for pool in ("default", "ram"):
+                table = {leaf: floor_of_leaf(pool, leaf)
+                         for leaf in allocation.leaves(expr)}
                 by_pool.setdefault(pool, {})[name] = expr
                 floors[pool].update(table)
-                leaves_by_pool[pool].update(roles_seen)
+                for leaf in allocation.leaves(expr):
+                    leaves_by_pool[pool][leaf] = leaf_role.get(
+                        leaf, leaf if leaf in roles.names() else "")
 
         for (role, pool), (mb, stem, task) in sorted(role_source.items()):
             share = roles.get(role).share if roles.get(role) else None
@@ -2064,38 +1841,31 @@ class Planner:
             if not available:
                 continue
             weights, fills, accepts = {}, set(), set()
-            for role in set(leaves_by_pool[pool].values()):
-                share = roles.get(role).share if roles.get(role) else None
+            for leaf, role in leaves_by_pool[pool].items():
+                share = roles.get(role).share if role else None
                 if share is None or pool not in role_pools.get(role, set()):
-                    weights[role] = 0.0
+                    weights[leaf] = 0.0
                     continue
-                weights[role] = share.weight if share.requests else 0.0
+                weights[leaf] = share.weight if share.requests else 0.0
                 if share.kind == "fill":
-                    fills.add(role)
+                    fills.add(leaf)
                 if share.accepts:
-                    accepts.add(role)
-            viable = {}
-            for name, expr in setmap.items():
-                need = allocation.floor_of(expr, floors[pool])
-                if need > available:
-                    logger.warning(
-                        "matrix: set %r floor %d MiB exceeds %s available %d",
-                        name, need, pool, available)
-                    continue
-                viable[name] = expr
-            if not viable:
-                continue
+                    accepts.add(leaf)
             try:
                 alloc, left = allocation.auction(
-                    available, viable, floors[pool], weights,
+                    available, setmap, floors[pool], weights,
                     frozenset(fills), frozenset(accepts))
             except (KeyError, ValueError) as exc:
-                logger.warning("matrix: set auction failed: %s", exc)
-                continue
+                raise ValueError(f"set auction failed: {exc}") from None
             logger.info("matrix: %s auction %s -> %s (floor %d)",
-                        pool, sorted(viable), alloc, available)
-            for role, mb in alloc.items():
-                budget[(role, pool)] = mb
+                        pool, sorted(setmap), alloc, available)
+            for leaf, mb in alloc.items():
+                role = leaf_role.get(
+                    leaf, leaf if leaf in roles.names() else None)
+                if role is None:
+                    continue
+                budget[(role, pool)] = min(
+                    budget.get((role, pool), mb), mb)
             if any(mb > 0 for mb in left.values()):
                 logger.info("matrix: auction leaves %s", left)
         if budget:
@@ -2104,136 +1874,25 @@ class Planner:
                                   for (r, p), mb in sorted(budget.items())))
         return budget
 
-    def _build_ledger(self) -> PoolLedger:
-        """Shared VRAM ledger from the matrix result + ``pools:`` overrides.
-
-        Residents = RAG models at their solved contexts plus adopted
-        co-loads (the models actually served alongside chat), each charged
-        to its device pool with its size bucket logged.  Per-model chat
-        solves add this pool's extra reserve to their spare so slots can't
-        OOM co-residents.
-        """
-        ledger = PoolLedger(self.vram_total,
-                            self.profiles.pools_cfg)
-        if self.host_ledger.pool_mb is None:
-            # Cannot gate what cannot be read — say so once, loudly.
-            logger.info("host ledger: no pool detected and none declared — "
-                        "device: cpu models are ungated "
-                        "(profiles.yaml hardware: host keys)")
-        res = self.matrix_result
-        if res is not None:
-            for model, ctx, label in ((self.embed_model, res.embed_ctx,
-                                       "embed"),
-                                      (self.rerank_model, res.rerank_ctx,
-                                       "rerank")):
-                if model is None:
-                    continue
-                if model.on_cpu:
-                    # A CPU resident charges host RAM, not VRAM (decision 5).
-                    mb = self._host_resident_mb(model, ctx)
-                    # The co-residency role is the matrix slot, not the
-                    # frontmatter role: the resident selection picks one
-                    # winner per slot.
-                    self.host_ledger.add_resident(
-                        f"{label}:{model.stem}", label, mb)
-                    self.host_ledger_stems.add(model.stem)
-                    logger.info("host ledger: %s resident %s (%d MiB of "
-                                "%s pool, ctx %d)", label, model.stem, mb,
-                                self.host_ledger.pool_mb, ctx)
-                    continue
-                mb = self._resident_overhead(model, ctx)
-                pool = ledger.pool_id_for(model)
-                ledger.add_resident(f"{label}:{model.stem}", mb, pool)
-                logger.info("ledger: %s resident %s (%s bucket, pool %s%s)",
-                            label, model.stem, footprint_bucket(model), pool,
-                            " — no reserve (unestimated)"
-                            if model.stem in self.synthetic_quads else "")
-            # Declared fixed categories (stt/tts/rnk2/…) are residents too,
-            # one per category, at the same served context the planner prices
-            # them at: a CPU one charges the host pool, a GPU one the VRAM
-            # ledger.  Charging both keeps the shared solve and the per-model
-            # chat solve from leaving a declared resident no room.
-            for name, model in (self.fixed_categories or []):
-                if model is None:
-                    continue
-                if name in self.host_unit_refused_vars:
-                    logger.info(
-                        "host ledger: %s (%s) refused as a unit; nothing "
-                        "committed and no id is emitted", name, model.stem)
-                    continue
-                ctx = self._rag_ctx(model, name)
-                if model.on_cpu:
-                    mb = self._host_resident_mb(model, ctx)
-                    self.host_ledger.add_resident(f"{name}:{model.stem}",
-                                                  name, mb)
-                    self.host_ledger_stems.add(model.stem)
-                    logger.info("host ledger: %s resident %s (%d MiB of %s "
-                                "pool, ctx %d)", name, model.stem, mb,
-                                self.host_ledger.pool_mb, ctx)
-                    continue
-                # Same margin the emitted capacity carries, so the reserve
-                # is never smaller than the charge the router enforces.
-                base_mb = _coload_overhead(model, self.fit_bin, self.profiles,
-                                           self.knobs, self.tasks,
-                                           self.llama_args, ctx=ctx)
-                if base_mb is None:
-                    base_mb = self._resident_overhead(model, ctx)
-                mb = int(round(base_mb * (1.0 + self.memory_margin)))
-                pool = ledger.pool_id_for(model)
-                ledger.add_resident(f"{name}:{model.stem}", mb, pool)
-                logger.info("ledger: %s resident %s (%d MiB of %s, ctx %d)",
-                            name, model.stem, mb, pool, ctx)
-        return ledger
-
-    def _resident_overhead(self, model, ctx: int) -> int:
-        """VRAM (MB) of a resident model at its served context, 0 on error."""
-        if model is None or model.on_cpu:
-            return 0
-        try:
-            parallel = model.parallel_for(self.profiles.default_parallel)
-            mb = resident_cost_mb(
-                model, fit_bin=self.fit_bin,
-                cache_type=self.profiles.default_cache_type,
-                profiles=self.profiles, llama_args=self.llama_args,
-                ctx=ctx, parallel=parallel, allow_cpu=True)
-            if mb is None:
-                # Unestimable resident: charged 0 — the no-expansion rider
-                # policy (see _solve_matrix_context).
-                quad = self.synthetic_quads.get(model.stem)
-                if quad is None:
-                    return 0
-                mb = _quad_cost_mb(quad, ctx, parallel)
-            return mb
-        except Exception as e:  # keep planning alive; matrix already solved
-            logger.warning("ledger: cannot size resident %s (%s)",
-                           model.stem, e)
-            return 0
-
-    def _host_resident_mb(self, model, ctx: int) -> int:
-        """Host-RAM (MiB) of a CPU-resident resident at its served ctx.
+    def _host_charge_mb(self, model, ctx: int) -> int:
+        """Host-RAM (MiB) of a CPU-served model at its served ctx.
 
         The same estimator the VRAM charge uses (requirement 11), single-
-        slot (residents never take declared parallel), 0 on shader — a
-        resident that cannot be measured is a rider charged nothing (the
-        matrix solve's no-expansion rule).
+        slot (a fixed-overhead role never takes declared parallel), 0 when
+        nothing can size it.
         """
         if getattr(self.host_ledger, "pool_mb", None) is None \
                 or self.host_ledger.pool_mb <= 0:
             return 0
         try:
-            mb = resident_cost_mb(
+            mb = fixed_cost_mb(
                 model, fit_bin=self.fit_bin,
                 cache_type=self.profiles.default_cache_type,
                 profiles=self.profiles, llama_args=self.llama_args,
                 ctx=ctx, allow_cpu=True)
-            if mb is None:
-                quad = self.synthetic_quads.get(model.stem)
-                if quad is None:
-                    return 0
-                mb = _quad_cost_mb(quad, ctx)
-            return mb
-        except Exception as e:  # keep planning alive; matrix already solved
-            logger.warning("host ledger: cannot size resident %s (%s)",
+            return 0 if mb is None else mb
+        except Exception as e:  # keep planning alive
+            logger.warning("host ledger: cannot size %s (%s)",
                            model.stem, e)
             return 0
 
@@ -2254,7 +1913,7 @@ class Planner:
         weights + folded companions + context — exactly what the emitted
         description tag reports verbatim (no capping, no re-solving).
         ``kv_per_token_mib`` is the affine ``c`` — None for fixed-overhead
-        backends.  CPU-resident servings return ``(None, ram_mib, …)``
+        backends.  CPU-served servings return ``(None, ram_mib, …)``
         (host-RAM constants via ``allow_cpu`` — never used for VRAM sizing).
         ``(None, None, None)`` when undecidable (no estimate source worked).
         ``parallel <= 0`` (uncapped vLLM) is priced single-seq, matching its
@@ -2281,85 +1940,42 @@ class Planner:
             files_mb += view.mmproj.size_mb
         if view.mtp is not None and view.mtp.gguf_path is not None:
             files_mb += view.mtp.size_mb
-        return (float(total), max(0.0, float(files_mb - model_mib)),
+        return (float(total),
+                max(float(HOST_PROCESS_MIB), float(files_mb - model_mib)),
                 float(kv_factor))
 
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
-        Order matters: the mmproj drop decision runs first (its result feeds
-        the matrix solve), then per-model variants are grouped by profile.
-        The matrix result threads through everywhere: the solved chat context
-        clamps chat entries, an adopted emb/rnk squeeze clamps the RAG
-        entries' contexts, and tools are demoted on chat entries solved
-        below ``tools_min_ctx``.
+        Order matters: the authored sets are priced first (their role
+        budgets feed the per-model solve), then variants are grouped by
+        profile. Tools are demoted on chat entries solved below
+        ``tools_min_ctx``.
         """
-        # The shared budget assumes every projector is shed, which holds for
-        # the categories that drop vision and leaves one that keeps its
-        # projector to decide in its own rung. `_mmproj_drop_pass` used to
-        # pick that per model from a global context threshold, before any
-        # category was read -- which is how it came to contradict the
-        # category a model actually declared.
         if not ((self.matrix_cfg or {}).get("sets")):
             logger.warning(
                 "matrix: no sets; capacity sizes each model alone. Author "
                 "matrix.sets for co-residency.")
         self.role_budget = self._role_budgets()
-        if self.role_budget:
-            # The auction owns the sizing; the old shared solve and its
-            # RAG pair are not used.
-            self.matrix_result = None
-            self.chat_ctx = None
-        else:
-            self.matrix_result = self._solve_matrix(
-                {m.stem for m in self.models
-                 if m.mmproj is not None and m.mmproj.gguf_path})
-            if self.matrix_result is not None:
-                self.chat_ctx = self.matrix_result.chat_ctx
-        # Fixed CPU categories are judged before anything commits
-        # (requirement #70): one that cannot fit the host pool alone gets
-        # no id at all.
-        self.host_unit_refused_vars = self._host_unit_refusals()
-        self.host_unit_refused_stems = frozenset(
-            m.stem for name, m in self.fixed_categories
-            if name in self.host_unit_refused_vars and m is not None)
-        # Shared ledger: matrix residents + pools: overrides.  Per-model
-        # chat solves charge this pool's extra reserve to their spare.
-        self.ledger = self._build_ledger()
+        # Shared ledger: pools: overrides.  Per-model chat solves charge
+        # this pool's extra reserve to their spare.
+        self.ledger = PoolLedger(self.vram_total, self.profiles.pools_cfg)
 
         plan: dict = {}
         n_models = len(self.models)
         for i, model in enumerate(self.models, 1):
             logger.info("planning %d/%d: %s", i, n_models, model.stem)
             model.image_budget_warnings()
-            if model.stem in self.host_unit_refused_stems:
-                # Refused on host grounds (requirement #70): no id may
-                # claim it, so no variants are built at all.
-                logger.info("host ledger: %s is a refused host category; "
-                            "entry omitted", model.stem)
-                if self.progress_cb is not None:
-                    self.progress_cb(model.stem)
-                continue
             include_mmproj = True   # per-category now; see solve_rung
             view = model.view_for(include_mmproj)
-            on_view = model.view_for(True)
             context_length = view.design_context
             # Unestimable model: no measurement source worked. Serve at the
-            # minimum useful context (type-based floor) — the matrix solve
-            # carries it with no extra reserve — and mark every entry for
-            # client-facing metadata.  The flag may sit on either budget:
-            # view_for() rebuilds VramBudget per view (mmproj models carry
-            # a separate companion-on budget that runs its own solves).
+            # minimum useful context (type-based floor) and mark every entry
+            # for client-facing metadata.  The flag may sit on either
+            # budget: view_for() rebuilds VramBudget per view (mmproj models
+            # carry a separate companion-on budget that runs its own solves).
             est_error = getattr(model.vram, "unestimated_reason", None) \
                 or getattr(view.vram, "unestimated_reason", None)
-            # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
-            # RAG entry's served context (the emit is what frees the VRAM).
-            if view.serves_endpoint(EMBEDDINGS) and self.matrix_result:
-                context_length = min(context_length,
-                                     self.matrix_result.embed_ctx)
-            elif view.serves_endpoint(RERANK) and self.matrix_result:
-                context_length = min(context_length,
-                                     self.matrix_result.rerank_ctx)
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
             for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
@@ -2368,19 +1984,8 @@ class Planner:
                 include_mmproj = True   # per-category now; see solve_rung
                 view = model.view_for(include_mmproj)
                 context_length = view.design_context
-                if view.serves_endpoint(EMBEDDINGS) and self.matrix_result:
-                    context_length = min(context_length,
-                                         self.matrix_result.embed_ctx)
-                elif view.serves_endpoint(RERANK) and self.matrix_result:
-                    context_length = min(context_length,
-                                         self.matrix_result.rerank_ctx)
-                cap = self._category_ctx_cap(model)
-                if cap is not None and cap < context_length:
-                    context_length = cap
-                # Ledger charge: this pool's extra reserve (pools: overrides
-                # + co-residents) joins the spare for chat solves only — RAG
-                # and fixed-overhead roles ARE residents; charging them
-                # themselves would double-count.
+                # A role with an auction budget solves inside it; otherwise
+                # the pool's declared spare is the reserve.
                 pool_id = self.ledger.pool_id_for(view)
                 budget_pool = "ram" if view.on_cpu else "default"
                 budget = self.role_budget.get((model.role, budget_pool))
@@ -2399,7 +2004,7 @@ class Planner:
                     self.knobs.auto_parallel
                     and view.serves_endpoint(CHAT)
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
-                    # A CPU-resident model's KV pool lives in host RAM, which
+                    # A CPU-served model's KV pool lives in host RAM, which
                     # no VRAM ledger sees or budgets, and solve_context returns
                     # the design context regardless of the slot count. So
                     # every candidate looks equally affordable and the score
@@ -2466,12 +2071,11 @@ class Planner:
                             tools_min_ctx=self.knobs.tools_min_ctx,
                             fallback_min_ctx=self.min_context,
                             fallback_explicit=self.min_context_explicit,
-                            category_floor=demand.min_context)
+                            category_floor=(demand.min_context
+                                            or self.min_context))
                         rung = self.solve_rung(
                             model, demand, parallel=parallel,
                             cache_type=cache_type, spare_mb=spare_eff,
-                            design_ctx=(None if self.role_budget
-                                        else self.chat_ctx),
                             context_length=demand_cap, profile=group[0][1],
                             prefer_capability=is_null)
                         if rung is None:
@@ -2500,8 +2104,6 @@ class Planner:
                                 serve_view, parallel=par,
                                 cache_type=cache_type, spare_mb=spare_eff,
                                 include_mmproj=not shed_vision,
-                                design_ctx=(None if self.role_budget
-                                            else self.chat_ctx),
                                 context_length=demand_cap,
                                 profile=group[0][1])
                             if ctx < demand.min_context:
@@ -2540,9 +2142,7 @@ class Planner:
                 # is what pushed it over — stamp the entry description.
                 # Gate on the user-declared spare (pool-adjusted, before the
                 # pool's extra reserve) or a baseline above the fixed floor;
-                # and only when the served ctx is actually below design
-                # (the matrix chat_ctx target can squeeze without landing
-                # under the model's own context_length).
+                # and only when the served ctx is actually below design.
                 vram_note: str | None = None
                 if (est_error is None
                         and getattr(view.vram, "vram_squeezed", False)
@@ -2572,24 +2172,17 @@ class Planner:
                             profile=group[0][1])
                     host_free = self.host_ledger.available() \
                         if serve_view.on_cpu else None
-                    # A committed resident's serving is not re-charged: the
-                    # host pass already judged that stem's quad against the
-                    # pool — counting it again here would always refuse a
-                    # resident on a pool sized to hold only it.
-                    host_extra = mem[1] if (host_free is not None
-                                            and serve_view.stem
-                                            not in self.host_ledger_stems
-                                            ) else None
-                    if (host_extra is not None and host_extra > host_free):
-                        # Go/no-go on the host pool: the CPU-resident quad
-                        # does not fit after committed residents. No id may
-                        # claim it and there is no solve-down (requirement 12) —
-                        # the operator picks a smaller sidecar or a bigger box.
+                    host_charge = mem[1] if host_free is not None else None
+                    if (host_charge is not None and host_charge > host_free):
+                        # Go/no-go on the host pool: the CPU-served quad does
+                        # not fit. No id may claim it and there is no
+                        # solve-down (requirement 12) — the operator picks a
+                        # smaller sidecar or a bigger box.
                         logger.info(
                             "%s: %s over_budget_reason: host pool — %d MiB "
-                            "needed, %d MiB free after residents; entry "
-                            "omitted", serve_view.stem,
-                            demand.id or "fallback", int(mem[1]), host_free)
+                            "needed, %d MiB in the pool; entry omitted",
+                            serve_view.stem, demand.id or "fallback",
+                            int(mem[1]), host_free)
                         continue
                     variants.append(Variant(
                         parallel=(0 if uncapped else serve_par),
@@ -2616,8 +2209,8 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
                    allow_cpu: bool = False,
                    ) -> tuple[int, float, float, int] | None:
     """(model_mib, kv_per_token_mib, slot_mib, compute_mib) quad, or None
-    when unmeasurable.  ``allow_cpu`` lifts the CPU-resident gate — the
-    host ledger sizes `device: cpu` quads through the same gate."""
+    when unmeasurable.  ``allow_cpu`` lifts the CPU gate — the host ledger
+    sizes `device: cpu` quads through the same gate."""
     fp = model.vram.fit_params_static(fit_bin, cache_type=cache_type,
                                       llama_args=llama_args,
                                       allow_cpu=allow_cpu)
@@ -2634,13 +2227,13 @@ def _quad_cost_mb(quad: tuple[int, float, float, int], ctx: int,
                + slot_mib * parallel)
 
 
-def resident_quad(model: Model, *, fit_bin: str, cache_type: str,
-                  profiles, llama_args: str, allow_cpu: bool = False,
-                  ) -> tuple[int, float, float, int] | None:
-    """The measured quad behind :func:`resident_cost_mb`, or None.
+def fixed_quad(model: Model, *, fit_bin: str, cache_type: str,
+               profiles, llama_args: str, allow_cpu: bool = False,
+               ) -> tuple[int, float, float, int] | None:
+    """The measured quad behind :func:`fixed_cost_mb`, or None.
 
-    Exposed separately so the resident-selection log can name the terms —
-    two models with the same total cost are not a bug if their weights, KV
+    Exposed separately so a cost comparison can name the terms — two
+    servings with the same total cost are not a bug if their weights, KV
     and compute terms match.
     """
     return _static_params(model, fit_bin, cache_type,
@@ -2648,37 +2241,37 @@ def resident_quad(model: Model, *, fit_bin: str, cache_type: str,
                           allow_cpu=allow_cpu)
 
 
-def resident_cost_mb(model: Model, *, fit_bin: str, cache_type: str,
-                     profiles, llama_args: str, ctx: int,
-                     parallel: int = 1, allow_cpu: bool = False) -> int | None:
-    """Measured serving cost (MiB) of one resident at its served context.
+def fixed_cost_mb(model: Model, *, fit_bin: str, cache_type: str,
+                  profiles, llama_args: str, ctx: int,
+                  parallel: int = 1, allow_cpu: bool = False) -> int | None:
+    """Measured serving cost (MiB) of one fixed-overhead serving at its ctx.
 
-    The one estimator behind resident *selection*, the VRAM resident
-    charge and the host resident charge: the same affine quad family
-    (shape-stamped, so a `device: cpu` model measures under `-ngl 0`),
-    priced at the same context.  None when nothing can size it — callers
-    treat that as "not a candidate for a cost comparison", never as 0.
+    The one estimator behind the VRAM and host charges: the same affine
+    quad family (shape-stamped, so a `device: cpu` model measures under
+    `-ngl 0`), priced at the same context.  None when nothing can size it
+    — callers treat that as "not a candidate for a cost comparison", never
+    as 0.
     """
-    quad = resident_quad(model, fit_bin=fit_bin, cache_type=cache_type,
-                         profiles=profiles, llama_args=llama_args,
-                         allow_cpu=allow_cpu)
+    quad = fixed_quad(model, fit_bin=fit_bin, cache_type=cache_type,
+                      profiles=profiles, llama_args=llama_args,
+                      allow_cpu=allow_cpu)
     if quad is None:
         return None
     return _quad_cost_mb(quad, ctx, parallel)
 
 
-def resident_cost_detail(model: Model, *, fit_bin: str, cache_type: str,
-                         profiles, llama_args: str, ctx: int,
-                         allow_cpu: bool = False) -> tuple[int, str] | None:
-    """(total MiB, term breakdown) for one resident, or None.
+def fixed_cost_detail(model: Model, *, fit_bin: str, cache_type: str,
+                      profiles, llama_args: str, ctx: int,
+                      allow_cpu: bool = False) -> tuple[int, str] | None:
+    """(total MiB, term breakdown) for one fixed-overhead serving, or None.
 
-    The breakdown exists so two residents that both cost 1050 MiB can be
+    The breakdown exists so two servings that both cost 1050 MiB can be
     seen to be the same *shape* — same weights, same compute buffer, same
     KV/token — rather than a repeated number masking a bug.
     """
-    quad = resident_quad(model, fit_bin=fit_bin, cache_type=cache_type,
-                         profiles=profiles, llama_args=llama_args,
-                         allow_cpu=allow_cpu)
+    quad = fixed_quad(model, fit_bin=fit_bin, cache_type=cache_type,
+                      profiles=profiles, llama_args=llama_args,
+                      allow_cpu=allow_cpu)
     if quad is None:
         return None
     mib, kv_factor, slot_mib, compute = quad
@@ -2688,14 +2281,14 @@ def resident_cost_detail(model: Model, *, fit_bin: str, cache_type: str,
                    f"@{ctx}")
 
 
-def resident_ctx(model: Model, tasks: TaskCatalogue | None = None,
-                 ctx_override: int | None = None) -> int:
-    """The context a resident is served at — the use-case size.
+def served_ctx(model: Model, tasks: TaskCatalogue | None = None,
+               ctx_override: int | None = None) -> int:
+    """The context a fixed-overhead serving is served at — the use-case size.
 
     The cap is the tightest ``max_context`` among the model's tasks (for
     embeddings/rerank that is the RAG window); a model whose tasks declare
-    none serves its design context.  A per-category ``ctx:`` caps it
-    further.  It is always a cap, never a floor.
+    none serves its design context.  ``ctx_override`` caps it further.  It
+    is always a cap, never a floor.
     """
     cap = tasks.max_context_for(model.task_ids) if tasks else None
     ctx = (model.design_context if cap is None
@@ -2703,398 +2296,6 @@ def resident_ctx(model: Model, tasks: TaskCatalogue | None = None,
     if ctx_override is not None:
         ctx = min(ctx, ctx_override)
     return ctx
-
-
-def _solve_matrix_context(
-    chat_models: list[Model],
-    embed_model: Model,
-    rerank_model: Model,
-    fit_bin: str,
-    vram_total: int,
-    spare: str | None,
-    profiles: Profiles,
-    tasks: TaskCatalogue | None = None,
-    baseline_mb: int = 0,
-    drop_stems: set[str] | None = None,
-    knobs: MatrixKnobs | None = None,
-    memory_margin: float = _MEMORY_MARGIN,
-    llama_args: str = "",
-    synthetic: dict[str, tuple[int, float, float, int]] | None = None,
-    fixed_categories: list[tuple[str, Model]] | None = None,
-    category_ctx: dict[str, int] | None = None,
-    routing_sets: dict | None = None,
-) -> MatrixSolve | None:
-    """Solve the shared VRAM budget for chat context plus co-loads.
-
-    Runs the affine measurement once per model to get static constants, then
-    solves:
-        available = Σ(chat_weight + chat_kv*slots*chat_ctx + slots*chat_slot)
-                  + (embed_weight + embed_kv*embed_ctx + embed_slot)
-                  + (rerank_weight + rerank_kv*rerank_ctx + rerank_slot)
-
-    Three passes, in order:
-
-    1. *Baseline*: the worst branch of any chat-capable routing set
-       (*routing_sets*) is reserved, with embed/rerank at their configured
-       context (``rag_cap`` capped by design context) → ``chat_ctx₀``.
-    2. *Squeeze* (§2b): when ``chat_ctx₀`` is below ``tools_min_ctx``, re-solve
-       with embed/rerank contexts clamped to ``coload_min_ctx``; adopt only
-       when the gain reaches ``ctx_gain_min``.
-    3. *Legacy categories* (no routing sets): declared categories are
-       reserved one at a time while the chat solve stays at or above the
-       floor (``tools_min_ctx`` when a tools chat model can keep it, else
-       ``min_chat_ctx``).  With sets, a category is already part of the set
-       cost tree.
-
-    Unestimable participants (every estimate source failed) stay in the
-    solve with a zero-cost placeholder — charged nothing extra — served at
-    their minimum useful context, assumed to fit within the set's measured
-    allocation. Synthesized stems are reported through ``synthetic`` (stem
-    → quad) so the planner can flag the models and charge the ledger the
-    same numbers.
-
-    Returns the :class:`MatrixSolve` (chat context, adopted RAG contexts)
-    or None on failure.
-    """
-    knobs = knobs or MatrixKnobs()
-    spare_mb = parse_spare_mb(spare, vram_total)
-
-    drop_stems = drop_stems or set()
-    fixed_categories = fixed_categories or []
-
-    # Get static params for chat models (companion VRAM folded in).
-    # Two-phase: measure everything first, then give models with no
-    # estimate a zero-cost placeholder — the rider stays at its minimum
-    # useful context and is assumed to fit the measured allocation
-    # without expanding it (no extra reserve).
-    chat_params: list[tuple[Model, int, float, float, int, int, int]] = []
-    chat_meta: list[tuple[Model, int, int, tuple[int, float, float, int] | None]] = []
-    real_quads: list[tuple[int, float, float, int]] = []
-    for m in chat_models:
-        # Embed/rerank/image/s2t models are handled outside the shared chat
-        # budget (fixed overhead / separate pool). Including a 40 GB
-        # diffusion model would collapse the chat budget, so exclude it.
-        if not m.serves_endpoint(CHAT) or m.on_cpu:
-            continue
-        # Overlay keys (cache_type/parallel/context_length/image_max_tokens)
-        # live in the block and are only visible on the companion-on view.
-        on = m.view_for(m.stem not in drop_stems)
-        cache_type = on.cache_type_for(profiles.default_cache_type)
-        parallel = on.parallel_for(profiles.default_parallel)
-        if parallel <= 0:
-            # Uncapped vLLM: the shared solve is single-seq safe (its own
-            # emission solves ctx for one max-length sequence).  On
-            # llama.cpp backends 0 is invalid — warn, use the default.
-            if on.backend in VLLM_BACKENDS:
-                parallel = 1
-            else:
-                logger.warning("%s: parallel %d is invalid; using default",
-                               on.stem, profiles.default_parallel)
-                parallel = profiles.default_parallel
-        img_floor = 0
-        if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
-                and on.image_max_tokens):
-            img_floor = on.image_max_tokens
-        fp = on.vram.effective_static(fit_bin, cache_type=cache_type,
-                                      include_mmproj=m.stem not in drop_stems,
-                                      llama_args=measurement_args(profiles, m,
-                                                                  llama_args))
-        if fp is not None:
-            real_quads.append(fp)
-        chat_meta.append((m, parallel, img_floor, fp))
-
-    # Get static params for embed/rerank. CPU-resident models cost 0 VRAM.
-    embed_params = None
-    if not embed_model.on_cpu:
-        embed_params = _static_params(embed_model, fit_bin,
-                                      profiles.default_cache_type,
-                                      measurement_args(profiles, embed_model,
-                                                       llama_args))
-    rerank_params = None
-    if not rerank_model.on_cpu:
-        rerank_params = _static_params(rerank_model, fit_bin,
-                                       profiles.default_cache_type,
-                                       measurement_args(profiles, rerank_model,
-                                                        llama_args))
-    for quad in (embed_params, rerank_params):
-        if quad is not None:
-            real_quads.append(quad)
-
-    if not chat_meta:
-        # No chat participants: the shared solve has nothing to solve.
-        return None
-    if not real_quads:
-        logger.warning("matrix: no measurable model to bound unestimated "
-                       "participants; aborting shared solve")
-        return None
-
-    def _with_bound(quad: tuple[int, float, float, int] | None,
-                    stem: str) -> tuple[int, float, float, int]:
-        """Measured quad, or a zero-cost placeholder for an unestimable one.
-
-        Policy: the rider stays in the set at its minimum useful context and
-        is assumed to fit within the set's measured allocation — it does not
-        expand it (no extra reserve). Runtime OOM on such a rider is the
-        accepted risk; the entry is flagged ``estimated: false``.
-        """
-        if quad is not None:
-            return quad
-        if synthetic is not None:
-            synthetic[stem] = (0, 0.0, 0.0, 0)
-        logger.warning(
-            "matrix: %s has no VRAM estimate; serving it in the set at its "
-            "minimum useful context with no extra reserve (assumed to fit "
-            "the measured allocation)", stem)
-        return (0, 0.0, 0.0, 0)
-
-    for m, parallel, img_floor, fp in chat_meta:
-        quad = _with_bound(fp, m.stem)
-        chat_params.append((m, quad[0], quad[1], quad[2], quad[3],
-                            parallel, img_floor))
-
-    if embed_params is None and not embed_model.on_cpu:
-        embed_params = _with_bound(None, embed_model.stem)
-    if rerank_params is None and not rerank_model.on_cpu:
-        rerank_params = _with_bound(None, rerank_model.stem)
-
-    # Reserve for embed/rerank at their configured context (the
-    # ``embed_context`` / ``rerank_context`` knobs), capped by the model's
-    # declared context (sidecar context_length > GGUF architectural max) —
-    # a 32k reranker costs ~4x the KV of an 8k one and must be budgeted as
-    # declared.  Unestimable RAG residents ride free (zero-cost placeholder,
-    # like unestimable chat riders) and are served at the same configured
-    # context — the operator's contract, accepted unverified.
-    ctx_by_cat = category_ctx or {}
-    embed_ctx = resident_ctx(embed_model, tasks, ctx_by_cat.get("emb"))
-    rerank_ctx = resident_ctx(rerank_model, tasks, ctx_by_cat.get("rnk"))
-
-    # The routing sets are the budget contract (design decision 13): a set
-    # expression says which models are allowed to be resident together, so
-    # the chat solve reserves the most expensive *branch* any chat-capable
-    # set allows — not the sum of every category the operator declared.
-    # ``(3 | (2 & 1))`` costs 3; ``(1 | (2 & 3))`` costs 5.  A category no
-    # chat set names reserves nothing, because llama-swap can never hold it
-    # beside chat ("a model in no set can only run alone").
-    raw_sets = {str(n): str(e) for n, e in (routing_sets or {}).items()}
-    chat_roles = frozenset(
-        m.role for m in chat_models
-        if m.serves_endpoint(CHAT) and not m.on_cpu)
-    chat_ids = frozenset(
-        x for m in chat_models if m.role in chat_roles
-        for x in (m.stem, m.template_id))
-    chat_sets = {n: e for n, e in raw_sets.items()
-                 if _has_chat_slot(e, raw_sets, chat_roles, chat_ids)}
-    fixed_mb: dict[str, int] = {}
-    for name, m in fixed_categories:
-        if m.on_cpu:
-            mb = 0
-        else:
-            mb = _coload_overhead(m, fit_bin, profiles, knobs, tasks,
-                                  llama_args, ctx=ctx_by_cat.get(name))
-            if mb is None:
-                logger.warning("matrix: category %r (%s) cannot be sized; "
-                               "charged 0", name, m.stem)
-                mb = 0
-        fixed_mb[name] = mb
-        fixed_mb.setdefault(m.stem, mb)
-    if raw_sets:
-        leaves: set[str] = set()
-        for expr in raw_sets.values():
-            leaves |= _expr_leaves(expr, raw_sets)
-        for name, m in fixed_categories:
-            if (name not in leaves and m.stem not in leaves
-                    and m.template_id not in leaves
-                    and m.role not in leaves):
-                logger.info(
-                    "matrix: category %r (%s) is in no set; it can only "
-                    "run alone, so no VRAM is reserved for it",
-                    name, m.stem)
-
-    # Every leaf a set can name: a role label, a model stem, or the model id
-    # llama-swap sees.  Price each by the worst resident it can select.
-    wanted = set()
-    for expr in chat_sets.values():
-        wanted |= _expr_leaves(expr, raw_sets)
-    wanted_lower = {w.lower() for w in wanted}
-    resident_cache: dict[tuple[str, int | None], int | None] = {}
-
-    def _resident_mb(m: Model, ctx: int | None = None) -> int | None:
-        key = (m.stem, ctx)
-        if key not in resident_cache:
-            resident_cache[key] = _coload_overhead(
-                m, fit_bin, profiles, knobs, tasks, llama_args, ctx=ctx)
-        return resident_cache[key]
-
-    def _leaf_costs(embed_ctx_: int, rerank_ctx_: int) -> dict[str, int]:
-        """Leaf → worst resident cost at the given RAG contexts."""
-        var_mb = dict(fixed_mb)
-        emb_mb = (_quad_cost_mb(embed_params, embed_ctx_)
-                  if embed_params is not None else 0)
-        rnk_mb = (_quad_cost_mb(rerank_params, rerank_ctx_)
-                  if rerank_params is not None else 0)
-        var_mb["emb"] = emb_mb
-        var_mb["rnk"] = rnk_mb
-        for m in chat_models:
-            if m.role in chat_roles:
-                continue
-            keys = (m.role, m.stem, m.template_id)
-            if not any(k.lower() in wanted_lower for k in keys):
-                continue
-            ctx = (embed_ctx_ if m is embed_model
-                   else rerank_ctx_ if m is rerank_model else None)
-            mb = _resident_mb(m, ctx)
-            if mb is None:
-                continue
-            for k in keys:
-                var_mb[k] = max(var_mb.get(k, 0), mb)
-        # The roles being solved are the budget, not a resident.
-        for role in chat_roles:
-            var_mb[role] = 0
-        return var_mb
-
-    def _set_costs(embed_ctx_: int, rerank_ctx_: int) -> dict[str, int]:
-        """Per-set worst-branch cost at the given RAG contexts."""
-        var_mb = _leaf_costs(embed_ctx_, rerank_ctx_)
-        return {name: set_overhead_mb(expr, var_mb, sets_cfg=raw_sets)
-                for name, expr in chat_sets.items()}
-
-    def _overhead(embed_ctx_: int, rerank_ctx_: int,
-                  extra_mb: int = 0) -> int:
-        """VRAM held by non-chat residents at these RAG contexts.
-
-        In set mode this is the whole non-chat side of the worst branch
-        (RAG pair included), so the solver is given no separate embed/rerank
-        params.  In legacy mode the solver still prices the RAG pair from
-        its params; *extra_mb* carries the declared categories admitted by
-        the legacy pass.
-        """
-        if not raw_sets:
-            return extra_mb
-        return max(_set_costs(embed_ctx_, rerank_ctx_).values(), default=0)
-
-    def _solve(embed_ctx_: int, rerank_ctx_: int,
-               extra_mb: int = 0) -> int:
-        # With sets, the expression tree owns the RAG pair too: passing
-        # their params as well would charge them twice.
-        set_mode = bool(raw_sets)
-        return solve_matrix_ctx(
-            vram_total_mb=vram_total,
-            spare_mb=spare_mb,
-            chat_models=chat_params,
-            embed_params=None if set_mode else embed_params,
-            rerank_params=None if set_mode else rerank_params,
-            embed_ctx=0 if set_mode else embed_ctx_,
-            rerank_ctx=0 if set_mode else rerank_ctx_,
-            baseline_mb=baseline_mb,
-            fixed_overhead_mb=_overhead(embed_ctx_, rerank_ctx_, extra_mb),
-            memory_margin=memory_margin,
-        )
-
-    # 1. Baseline.
-    chat_ctx = _solve(embed_ctx, rerank_ctx)
-    if chat_sets:
-        costs = _set_costs(embed_ctx, rerank_ctx)
-        worst = max(costs, key=costs.get)
-        logger.info(
-            "matrix: budget follows sets — worst %r reserves %d MB "
-            "(chat_ctx=%d, %d set(s))",
-            worst, costs[worst], chat_ctx, len(chat_sets))
-
-    # 2. emb/rerank squeeze: when chat falls below the tools threshold, the
-    #    RAG models yield context (down to coload_min_ctx) to buy it back.
-    squeeze = False
-    if chat_ctx < knobs.tools_min_ctx:
-        sq_embed = min(embed_ctx, knobs.coload_min_ctx)
-        sq_rerank = min(rerank_ctx, knobs.coload_min_ctx)
-        if (sq_embed, sq_rerank) != (embed_ctx, rerank_ctx):
-            sq_ctx = _solve(sq_embed, sq_rerank)
-            gain = sq_ctx - chat_ctx
-            if gain >= knobs.ctx_gain_min:
-                logger.info(
-                    "matrix: squeeze adopted (embed/rerank -> %d/%d, "
-                    "chat %d -> %d, gain %d)",
-                    sq_embed, sq_rerank, chat_ctx, sq_ctx, gain)
-                chat_ctx, embed_ctx, rerank_ctx = sq_ctx, sq_embed, sq_rerank
-                squeeze = True
-            else:
-                logger.info(
-                    "matrix: squeeze rejected (gain %d < ctx_gain_min %d)",
-                    gain, knobs.ctx_gain_min)
-
-    # 3. Legacy mode (no routing sets): declared categories are reserved
-    #    one at a time; one that does not fit is reported and left
-    #    unreserved.  With sets, a category is already inside the set cost
-    #    tree above — adding it again would double-charge and hide the
-    #    alternatives.  The floor keeps tools_min_ctx for a tools chat model
-    #    that still has it, otherwise min_chat_ctx.
-    if not raw_sets:
-        any_tools = any(
-            "tools" in [c.lower() for c in m.capabilities]
-            for m, *_ in chat_params)
-        floor = (knobs.tools_min_ctx
-                 if any_tools and chat_ctx >= knobs.tools_min_ctx
-                 else knobs.min_chat_ctx)
-        used = 0
-        for name, m in fixed_categories:
-            oh = _coload_overhead(m, fit_bin, profiles, knobs, tasks,
-                                  llama_args, ctx=ctx_by_cat.get(name))
-            if oh is None:
-                logger.warning("matrix: category %r (%s) skipped: cannot "
-                               "size it", name, m.stem)
-                continue
-            ctx = _solve(embed_ctx, rerank_ctx, used + oh)
-            if ctx < floor:
-                logger.warning(
-                    "matrix: category %r (%s) does not fit below the chat "
-                    "floor %d; not reserved", name, m.stem, floor)
-                continue
-            used += oh
-            chat_ctx = ctx
-            logger.info("matrix: category %r (%s) reserved (%d MB, "
-                        "chat_ctx=%d)", name, m.stem, oh, ctx)
-    return MatrixSolve(
-        chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
-        squeeze=squeeze,
-    )
-
-
-def _coload_overhead(
-    m: Model, fit_bin: str, profiles: Profiles, knobs: MatrixKnobs,
-    tasks: TaskCatalogue | None = None, llama_args: str = "",
-    ctx: int | None = None,
-) -> int | None:
-    """Fixed VRAM overhead (MB) of a declared category / co-load candidate.
-
-    Uses the backend's effective static params (weights + fixed compute; the
-    KV terms are 0 for these backends) at *ctx* (default: the model's design
-    context, or the role's RAG cap — see :func:`resident_ctx`).  Overheads
-    that are *estimated* rather than measured or pinned carry
-    ``estimate_headroom`` so a bad guess errs toward reserving more.
-    """
-    if m.on_cpu:
-        return 0
-    # An operator-pinned vram_mb is authoritative — no headroom.
-    pinned = m.frontmatter.get("vram_mb") is not None
-    cache_type = m.cache_type_for(profiles.default_cache_type)
-    fp = m.vram.fit_params_static(fit_bin, cache_type=cache_type,
-                                  llama_args=measurement_args(profiles, m,
-                                                              llama_args))
-    measured = pinned or (fp is not None
-                          and fp.source in ("llama-server", "vllm-estimate"))
-    quad = m.vram.effective_static(fit_bin, cache_type=cache_type,
-                                   llama_args=measurement_args(profiles, m,
-                                                               llama_args))
-    if quad is None:
-        return None
-    model_mib, kv_factor, slot_mib, compute_mib = quad
-    # These backends have zero KV terms; nonzero factors would mean a
-    # context-driven model wrongly landed in the pool — charge design ctx.
-    service_ctx = resident_ctx(m, tasks) if ctx is None else ctx
-    overhead = model_mib + compute_mib + int(
-        kv_factor * service_ctx + slot_mib)
-    if not measured:
-        overhead = int(overhead * knobs.estimate_headroom)
-    return overhead
 
 
 # ── Emission ──────────────────────────────────────────────────────────────
@@ -3107,22 +2308,25 @@ def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
 
     ``capacities`` is what llama-swap enforces; it must carry the same
     measurement margin the solve used or the router can admit an overcommit.
-    A size-1 pool per scheduling role makes "one live serving per role" a
+    A size-1 pool per scheduling role makes "one served entry per role" a
     capacity constraint, so the requested model evicts its siblings without
     any set vocabulary.
     """
     caps: dict[str, int] = {}
+    estimate = max(1, int(model.size_mb or 0) + HOST_PROCESS_MIB)
     if model.on_cpu:
         if variant.mem_ram_mib is not None and "ram" in pools:
             caps["ram"] = max(1, int(round(
                 variant.mem_ram_mib * (1.0 + memory_margin))))
+        elif "ram" in pools:
+            caps["ram"] = min(pools["ram"], estimate)
     else:
         vram = variant.mem_vram_mib
         if vram is None:
-            # Unmeasured: reserve the whole pool so the router can only run
-            # it alone. A guessed floor could over-admit and OOM.
+            # Unmeasured: the file size plus the process floor. Flagged and
+            # admitted on a guess; the operator supplies derived: terms.
             if "default" in pools:
-                caps["default"] = pools["default"]
+                caps["default"] = min(pools["default"], estimate)
         elif vram and "default" in pools:
             caps["default"] = max(1, int(round(
                 vram * (1.0 + memory_margin))))
@@ -3130,6 +2334,8 @@ def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
                 and "ram" in pools:
             caps["ram"] = max(1, int(round(
                 variant.mem_ram_mib * (1.0 + memory_margin))))
+        elif "ram" in pools:
+            caps["ram"] = min(pools["ram"], HOST_PROCESS_MIB)
     role = model.role
     if role in pools:
         caps[role] = 1
@@ -3155,6 +2361,7 @@ def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
 def emit_config(models: list[Model], plan: dict,
                 profiles: Profiles, template_vars: dict, *,
                 capacity_pools: dict[str, int] | None = None,
+                matrix_sets: dict[str, str] | None = None,
                 drive_mbps: int = 100,
                 pp_tps: float = 1000.0,
                 memory_margin: float = _MEMORY_MARGIN,
@@ -3284,7 +2491,8 @@ def emit_config(models: list[Model], plan: dict,
             ids_by_stem.setdefault(model.stem, []).append(entry_id)
 
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
-                           capacity_pools=dict(capacity_pools or {}))
+                           capacity_pools=dict(capacity_pools or {}),
+                           matrix_sets=matrix_sets)
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -3307,9 +2515,11 @@ class EmittedConfig(dict):
     """
 
     def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
-                 capacity_pools: dict[str, int] | None = None, **kwargs):
+                 capacity_pools: dict[str, int] | None = None,
+                 matrix_sets: dict[str, str] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
+        self.matrix_sets: dict[str, str] = matrix_sets or {}
         # Capacity-router pool limits (gpu default, host ram, one size-1
         # pool per scheduling role). Emitted under routing.router.settings.
         self.capacity_pools: dict[str, int] = capacity_pools or {}
@@ -3396,10 +2606,6 @@ def build_config(
     spare: str | None = None,
     max_context: int | None = None,
     matrix_cfg: dict | None = None,
-    embed_model: Model | None = None,
-    rerank_model: Model | None = None,
-    fixed_categories: list[tuple[str, Model]] | None = None,
-    category_ctx: dict[str, int] | None = None,
     baseline_mb: int = 0,
     min_context: int = _MIN_AGENTIC_CTX,
     min_context_explicit: bool = False,
@@ -3422,12 +2628,7 @@ def build_config(
         vram_total: Total VRAM in MB
         spare: Global spare VRAM string (overridden by profile.spare if present)
         max_context: Hard cap on context length
-        matrix_cfg: Matrix configuration for embed/rerank context solving
-        embed_model: Embedding model (if matrix configured)
-        rerank_model: Reranking model (if matrix configured)
-        fixed_categories: Declared matrix categories beyond the RAG pair
-            (name, model), e.g. tts/stt — reserved as fixed-overhead
-            residents alongside chat and RAG (matrix categories).
+        matrix_cfg: Matrix configuration: the authored sets price the roles
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
@@ -3452,9 +2653,7 @@ def build_config(
         # itself. Passing the resolved MiB would be re-parsed as GB.
         spare=spare,
         max_context=max_context,
-        matrix_cfg=matrix_cfg, embed_model=embed_model,
-        rerank_model=rerank_model, fixed_categories=fixed_categories,
-        category_ctx=category_ctx,
+        matrix_cfg=matrix_cfg,
         baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
         memory_margin=memory_margin,
@@ -3465,6 +2664,7 @@ def build_config(
     plan = planner.plan()
     config = emit_config(supported, plan, profiles, template_vars,
                          capacity_pools=planner.capacity_pools,
+                         matrix_sets=planner.matrix_sets_approved,
                          drive_mbps=drive_mbps, pp_tps=pp_tps,
                          memory_margin=memory_margin,
                          task_ttl=_task_ttl(profiles))

@@ -574,7 +574,7 @@ def test_snapshot_auto_detect_several_nested_models_errors(tmp_path):
 
 def test_task_device_places_the_model_on_the_host(tmp_path):
     # Validates: SPEC.md, 'Tasks': a task's device: is a placement
-    # requirement; s2t declares cpu, so its models are host-resident.
+    # requirement; s2t declares cpu, so its models run on the host.
     from llama_packer.discover import discover
     from llama_packer.scope import ScopeStack
     from llama_packer.tasks import TaskCatalogue

@@ -178,7 +178,7 @@ Sampling and placement are in `profiles.yaml`. Copy [`profiles.yaml.example`](pr
 | `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
-| `matrix` | sizing knobs and `categories` (model picks, default `emb`/`rnk`; e.g. add `tts`/`stt`) |
+| `matrix` | sizing knobs and `sets` (role labels or model ids) |
 | `capacity` | `pp_tps` / `drive_mbps` for derived `evict_cost` |
 
 Profiles overlay `defaults` and emit `filters.setParamsByID`; sidecar `modes:` / `allow_profiles:` replace or filter them per-model. See [SPEC → profiles.yaml](SPEC.md#profilesyaml) for the full table.

@@ -40,8 +40,8 @@ def test_progress_noop_under_pytest():
 
 
 def test_active_bar_routes_logs_through_console(monkeypatch):
-    # Pins an implementation contract; no requirement states it: while the bar is live, log records print above it, and the previous handlers come back on stop.
-    """While the bar is live, log records render through the bar's rich
+    # Pins an implementation contract; no requirement states it: while the bar is shown, log records print above it, and the previous handlers come back on stop.
+    """While the bar is shown, log records render through the bar's rich
     console (which prints them ABOVE the bar) and the previous handlers are
     restored on stop."""
     pytest.importorskip("rich")          # the bar is a no-op without it

@@ -10,8 +10,8 @@ import pytest
 
 from llama_packer.consts import _RESERVE_VIDEO
 from llama_packer.profiles import Profiles
-from conftest import entry_for, fake_tasks, only_entry, entry_id, tasks_section
-from llama_packer.writer import MatrixKnobs, Planner, emit_config, _solve_matrix_context, _has_chat_slot
+from conftest import fake_tasks, only_entry, tasks_section
+from llama_packer.writer import MatrixKnobs, Planner, emit_config
 
 TVARS = {"llama_bin": "/opt/llama-server"}
 
@@ -152,7 +152,7 @@ def test_profiles_groups_by_cache_type(make_model):
 
 
 def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path):
-    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys are in the mmproj block.
     """view_for() rebuilds VramBudget per view: a measurement failure
     flagged on the companion-on view's budget must still surface as
     estimate_error metadata — the re-check reads the solving budget."""
@@ -168,12 +168,11 @@ def test_plan_unestimable_flag_on_companion_view(make_model, profiles, tmp_path)
 
 
 def test_profiles_rag_parallel_pinned_to_one(make_model, profiles, caplog):
-    # Validates: SPEC.md, 'Residents': residents always serve single-slot: a declared parallel: on a resident is ignored
+    # Validates: docs/allocation.md, 'One serving per role': a role runs one
+    # serving, so an embeddings role's declared parallel: is ignored.
     """Embed/rerank serve single-slot: a declared parallel is ignored with
-    a once-per-model note — resident parallelism must never shrink the
-    main chat context it serves."""
-    import logging
-
+    a once-per-model note — their parallelism must never shrink the main
+    chat context they serve."""
     emb = make_model("emb", role="embeddings", parallel=8)
     (key, _), = profiles.groups_for(emb, vram_total=48000).items()
     assert key[0] == 1
@@ -221,54 +220,6 @@ def test_bounded_ctx_clamps_design_then_cli(make_model, profiles):
 
 
 FP_PARAMS = (1000.0, 0.5, 0.0, 100.0)
-
-
-def test_solve_matrix_excludes_roles_cpu_and_threads_drop_stems(
-        make_model, profiles, monkeypatch):
-    from llama_packer import writer
-
-    chat_a = make_model("chat_a", role="chat")
-    chat_b = make_model("chat_b", role="chat")
-    embed = make_model("e", role="embeddings")
-    cpu_chat = make_model("cpu", device="cpu")
-
-    seen = {}
-
-    def fake_effective_static(fit_bin, cache_type="q8_0",
-                              design_ctx=None, include_mmproj=True, **kw):
-        seen[include_mmproj] = seen.get(include_mmproj, 0) + 1
-        return FP_PARAMS
-
-    def fake_fit_params_static(fit_bin, cache_type="q8_0", **kw):
-        return SimpleNamespace(model_mib=FP_PARAMS[0],
-                               kv_per_token_mib=FP_PARAMS[1],
-                               slot_mib=FP_PARAMS[2],
-                               compute_mib=FP_PARAMS[3], source="fit-params")
-
-    for m in (chat_a, chat_b, embed):
-        m.vram.effective_static = fake_effective_static
-        m.vram.fit_params_static = fake_fit_params_static
-
-    captured = {}
-
-    def fake_solver(**kwargs):
-        captured.update(kwargs)
-        return 24576
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
-
-    result = _solve_matrix_context(
-        [chat_a, chat_b, embed, cpu_chat], embed, embed,
-        fit_bin="unused", vram_total=48 * 1024, spare="1G",
-        profiles=profiles, baseline_mb=0, drop_stems={"chat_b"},
-    )
-    assert result is not None
-    assert result.chat_ctx == 24576
-    # Only the two real chat models enter the shared budget;
-    # chat_b's mmproj is omitted via drop_stems.
-    assert seen == {True: 1, False: 1}
-    assert len(captured["chat_models"]) == 2
-    assert captured["embed_params"] == FP_PARAMS
 
 
 # ── matrix knobs ──────────────────────────────────────────────────────────
@@ -451,9 +402,9 @@ def test_plan_vram_note_with_baseline_above_floor(make_model, profiles):
 
 def test_plan_no_vram_note_when_served_equals_design(make_model, profiles):
     # Validates: SPEC.md, 'VRAM gating and reservation notes': an equal-to-design solve stays silent
-    """vram_squeezed can fire against the matrix chat_ctx target while the
-    final clamp lands on the model's own context_length — equality must not
-    produce a 'serving at N of N' note."""
+    """vram_squeezed can fire while the final clamp lands on the model's
+    own context_length — equality must not produce a 'serving at N of N'
+    note."""
     m = make_model("eq", context_length=32768)
     _fake_vram(m, (100, 0.01, 10))
 
@@ -585,374 +536,40 @@ def _fake_vram(m, params):
         compute_mib=compute, source="fit-params")
 
 
-# ── routing sets are the budget contract ──────────────────────────────────
+# ── a fixed-overhead serving's context ────────────────────────────────────
 
-def _pinned(m, mb):
-    m.vram.effective_static = lambda *a, **k: (mb, 0.0, 0.0, 0)
-    m.vram.fit_params_static = lambda *a, **k: None
-    return m
-
-
-def test_role_label_set_is_a_chat_set():
-    # A set written with role labels is the syntax the router emits; the
-    # solve must recognize it as a chat-capable set.
-    assert _has_chat_slot("chat & s2t", chat_roles=frozenset({"chat"}))
-    assert not _has_chat_slot("s2t & t2s", chat_roles=frozenset({"chat"}))
-    assert _has_chat_slot("s2t | chat", chat_roles=frozenset({"chat"}))
-
-
-def test_role_label_set_reserves_the_worst_branch(profiles, caplog):
-    # The chat solve reserves the most expensive model a named role can
-    # contribute, not just the selected RAG pair.
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    small = _pinned(make("small", role="s2t", vram_mb=640,
-                         context_length=8192), 640)
-    big = _pinned(make("big", role="s2t", vram_mb=3000,
-                       context_length=8192), 3000)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        _solve_matrix_context(
-            [chat, embed, rerank, small, big], embed, rerank,
-            fit_bin="unused", vram_total=24 * 1024, spare=None,
-            profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
-            routing_sets={"voice": "chat & s2t"})
-    assert any("budget follows sets" in r.message
-               and "'voice'" in r.message
-               and "reserves 3000 MB" in r.message
-               for r in caplog.records)
-
-
-def test_literal_model_id_in_set_is_priced(profiles, caplog):
-    # A set may name one model by the id llama-swap publishes; it must be
-    # priced like a role, not treated as an unknown zero-cost leaf.
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    z = _pinned(make("Zerank-2", role="rerank", vram_mb=3000,
-                     context_length=8192), 3000)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        _solve_matrix_context(
-            [chat, embed, rerank, z], embed, rerank, fit_bin="unused",
-            vram_total=24 * 1024, spare=None, profiles=profiles,
-            knobs=MatrixKnobs(min_chat_ctx=8192),
-            routing_sets={"ragz": "chat & zerank-2"})
-    assert any("reserves 3000 MB" in r.message for r in caplog.records)
-
-
-def test_cpu_role_in_a_set_costs_nothing(profiles, caplog):
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    s2t = make("s2t", role="s2t", device="cpu", context_length=8192)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        _solve_matrix_context(
-            [chat, embed, rerank, s2t], embed, rerank, fit_bin="unused",
-            vram_total=24 * 1024, spare=None, profiles=profiles,
-            knobs=MatrixKnobs(min_chat_ctx=8192),
-            routing_sets={"voice": "chat & s2t"})
-    assert any("reserves 0 MB" in r.message for r in caplog.records)
-
-
-def test_role_not_in_any_set_costs_nothing(profiles, caplog):
-    # A role no chat set names can only run alone, so it must not shrink
-    # the chat solve.
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    tts = _pinned(make("t", role="t2s", vram_mb=1200,
-                       context_length=8192), 1200)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        _solve_matrix_context(
-            [chat, embed, rerank, tts], embed, rerank, fit_bin="unused",
-            vram_total=24 * 1024, spare=None, profiles=profiles,
-            knobs=MatrixKnobs(min_chat_ctx=8192),
-            routing_sets={"rag": "chat"})
-    assert any("reserves 0 MB" in r.message for r in caplog.records)
-
-
-def test_category_named_by_its_role_is_in_a_set(profiles, caplog):
-    # `stt` is a category; the set names its role.  That is a reference,
-    # and must not be reported as "in no set".
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    stt = _pinned(make("parakeet", role="s2t", vram_mb=1900,
-                       context_length=8192), 1900)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        _solve_matrix_context(
-            [chat, embed, rerank, stt], embed, rerank, fit_bin="unused",
-            vram_total=24 * 1024, spare=None, profiles=profiles,
-            knobs=MatrixKnobs(min_chat_ctx=8192),
-            fixed_categories=[("stt", stt)],
-            routing_sets={"voice": "chat & s2t"})
-    assert not any("in no set" in r.message for r in caplog.records)
-
-
-def test_category_ctx_caps_at_one_seam(profiles):
+def test_served_ctx_caps_the_task_context(profiles):
     # Validates: docs/plans/requirement-trace.md, requirement #92
     # ctx is a cap honoured by the served context and never a floor.
     from llama_packer.tasks import TaskCatalogue
-    from llama_packer.writer import resident_ctx
+    from llama_packer.writer import served_ctx
     tasks = TaskCatalogue.from_cfg({
         "embeddings": {"endpoint": "openai.embeddings", "max_context": 8192}})
     m = make("stt2", role="s2t", context_length=32768, device="cpu")
-    assert resident_ctx(m, tasks, 2048) == 2048
-    assert resident_ctx(m, tasks, 65536) == 32768
+    assert served_ctx(m, tasks, 2048) == 2048
+    assert served_ctx(m, tasks, 65536) == 32768
     emb = make("emb2", role="embeddings", context_length=65536,
                tasks=["embeddings"])
-    assert resident_ctx(emb, tasks) == 8192
-    assert resident_ctx(emb, tasks, 1024) == 1024
-    assert resident_ctx(emb, tasks, 999999) == 8192
+    assert served_ctx(emb, tasks) == 8192
+    assert served_ctx(emb, tasks, 1024) == 1024
+    assert served_ctx(emb, tasks, 999999) == 8192
     chat = make("chat2", role="chat", context_length=65536, tasks=["chat"])
-    assert resident_ctx(chat, tasks) == 65536
+    assert served_ctx(chat, tasks) == 65536
 
 
-def test_host_unit_refusal_drops_a_category_that_cannot_fit_alone(
-        profiles, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #70
-    # Each fixed CPU category is judged on its own quad against what is
-    # free after the committed pair: the one that fits still emits an id
-    # and commits to the ledger, the one that does not is refused outright.
-    from llama_packer import writer
-    chat = make("chat", role="chat")
-    emb = make("e", role="embeddings", context_length=32768)
-    rnk = make("r", role="rerank", context_length=32768)
-    tts = make("t", role="t2s", context_length=32768, device="cpu")
-    music = make("muz", role="s2t", context_length=32768, device="cpu")
-    _fake_vram(chat, (1000, 0.5, 100))
-    for m in (emb, rnk):
-        _fake_vram(m, (100, 0.01, 0))
-    _fake_vram(tts, (1000, 0.0, 0))
-    _fake_vram(music, (9000, 0.0, 0))
-    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
-    planner = writer.Planner(
-        [chat, emb, rnk, tts, music], profiles, fit_bin="unused",
-        vram_total=64 * 1024, matrix_cfg={"sets": {}},
-        embed_model=emb, rerank_model=rnk,
-        fixed_categories=[("tts", tts), ("stt", music)],
-        host_pool_mb=5000)
-    plan = planner.plan()
-    assert planner.host_unit_refused_vars == frozenset({"stt"})
-    assert "t" in plan and "muz" not in plan
-
-
-def test_resident_options_branch_alternatives_not_co_resident():
-    # judged per and-branch: an alternation never reports same-role
-    # co-residency, only a genuine conjunction does.
-    from llama_packer.writer import _resident_options
-    assert sorted(map(sorted, _resident_options(
-        "three | (two & one)"))) == [["one", "two"], ["three"]]
-    assert sorted(map(sorted, _resident_options(
-        "a & (b | c)"))) == [["a", "b"], ["a", "c"]]
-
-
-def _bucket(stem, mb, role="s2t"):
-    """A fixed-overhead category with an authoritative pinned size."""
-    m = make(stem, role=role, backend="whisper-server", vram_mb=mb,
-             context_length=8192)
-    m.vram.effective_static = lambda *a, **k: (mb, 0.0, 0.0, 0)
-    m.vram.fit_params_static = lambda *a, **k: None
-    return m
-
-
-def _solve_sets(profiles, cats, sets, vram_total=32 * 1024):
-    chat = make("chat", role="chat", context_length=262144)
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    return _solve_matrix_context(
-        [chat, embed, rerank], embed, rerank, fit_bin="unused",
-        vram_total=vram_total, spare=None, profiles=profiles,
-        knobs=MatrixKnobs(min_chat_ctx=8192), fixed_categories=cats,
-        routing_sets=sets)
-
-
-def test_solve_matrix_reserves_worst_set_not_category_union(profiles):
-    # charged the worst branch of the most expensive chat set, not the sum of
-    # every declared category.  (three | (two & one)) costs max(4000, 3000).
-    cats = [("one", _bucket("one", 1000)),
-            ("two", _bucket("two", 2000)),
-            ("three", _bucket("three", 4000))]
-    composed = _solve_sets(profiles, cats, {
-        "rag": "chat & emb & rnk",
-        "combo": "chat & (three | (two & one))"})
-    only_three = _solve_sets(profiles, cats, {
-        "combo": "chat & three"})
-    union = _solve_sets(profiles, cats, {
-        "all": "chat & emb & rnk & one & two & three"})
-    assert composed is not None and only_three is not None and union is not None
-    assert composed.chat_ctx == only_three.chat_ctx
-    assert composed.chat_ctx > union.chat_ctx
-
-
-def test_solve_matrix_prices_a_nested_and_branch(profiles):
-    # costs two + three when that branch is larger, so a nested group is never
-    # priced as an unknown var worth 0.
-    cats = [("one", _bucket("one", 1000)),
-            ("two", _bucket("two", 2000)),
-            ("three", _bucket("three", 4000))]
-    nested = _solve_sets(profiles, cats,
-                         {"s": "chat & (one | (two & three))"})
-    flat = _solve_sets(profiles, cats,
-                       {"s": "chat & (two & three)"})
-    assert nested is not None and flat is not None
-    assert nested.chat_ctx == flat.chat_ctx
-
-
-def test_solve_matrix_unreferenced_category_reserves_nothing(profiles, caplog):
-    # names can only run alone, so it must not shrink the chat solve.
-    cats = [("three", _bucket("three", 4000))]
-    sets = {"rag": "chat & emb & rnk"}
-    with caplog.at_level("INFO"):
-        referenced = _solve_sets(profiles, [], sets)
-        unreferenced = _solve_sets(profiles, cats, sets)
-    assert referenced is not None and unreferenced is not None
-    assert unreferenced.chat_ctx == referenced.chat_ctx
-    assert any("in no set" in r.message for r in caplog.records)
-
-
-def test_resident_cost_detail_names_the_terms(profiles):
+def test_fixed_cost_detail_names_the_terms(profiles):
     # Validates: docs/plans/requirement-trace.md, requirement #87
     # prints is the same quad the budget charges, broken into its terms.
-    from llama_packer.writer import resident_cost_detail
+    from llama_packer.writer import fixed_cost_detail
     m = make("jina", role="embeddings", context_length=4096)
     m.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
         model_mib=466, kv_per_token_mib=238 / 4096, slot_mib=0.0,
         compute_mib=346, source="fit-params")
-    total, detail = resident_cost_detail(
+    total, detail = fixed_cost_detail(
         m, fit_bin="unused", cache_type="q8_0", profiles=profiles,
         llama_args="", ctx=4096)
     assert total == 1050
     assert detail == "466 weights + 346 compute + 238 kv @4096"
-
-
-def test_role_in_a_set_is_reserved_other_roles_are_not(profiles, caplog):
-    # A role named in a chat set is a resident the solve must afford; a role
-    # no set names can only run alone and costs nothing.
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    s2t = _pinned(make("s2t", role="s2t", vram_mb=640,
-                       context_length=8192), 640)
-    img = _pinned(make("img", role="image", vram_mb=40000,
-                       context_length=8192), 40000)
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        _solve_matrix_context(
-            [chat, embed, rerank, s2t, img], embed, rerank,
-            fit_bin="unused", vram_total=24 * 1024, spare=None,
-            profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
-            routing_sets={"voice": "chat & s2t"})
-    assert any("reserves 640 MB" in r.message for r in caplog.records)
-
-
-def test_set_budget_is_not_gated_by_a_chat_floor(profiles, caplog):
-    # The set is the contract: if it permits a resident, the solve reserves
-    # it even when that squeezes chat.  There is no "does not fit below the
-    # floor, not reserved" pass in set mode.
-    chat = make("chat", role="chat", capabilities=["tools"])
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    img = _pinned(make("img", role="image", vram_mb=20000,
-                       context_length=8192), 20000)
-    _fake_vram(chat, (8000, 1.0, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        result = _solve_matrix_context(
-            [chat, embed, rerank, img], embed, rerank, fit_bin="unused",
-            vram_total=24 * 1024, spare=None, profiles=profiles,
-            knobs=MatrixKnobs(tools_min_ctx=20000),
-            routing_sets={"combo": "chat & image"})
-    assert result is not None
-    assert not any("not reserved" in r.message for r in caplog.records)
-
-
-def test_solve_matrix_reads_block_tokens_from_on_view(
-        tmp_path, make_model, profiles, monkeypatch):
-    # image_max_tokens living only in the mmproj block must still reserve
-    # the image floor in the matrix solve (read via the companion-on view).
-    from llama_packer import writer
-    (tmp_path / "v-mmproj.gguf").write_bytes(b"x" * 1024)
-    m = make_model("v", mmproj={"file": "v-mmproj.gguf",
-                                "capabilities": ["image"],
-                                "image_max_tokens": 9000})
-    assert m.image_max_tokens is None  # base frontmatter: no floor visible
-    e = make_model("e", role="embeddings", context_length=8192)
-    r = make_model("r", role="rerank", context_length=8192)
-    _fake_vram(m.view_for(True), (8000, 0.4, 500))
-    _fake_vram(e, (500, 0.1, 100))
-    _fake_vram(r, (500, 0.1, 100))
-    captured = {}
-
-    def fake_solver(**kwargs):
-        captured.update(kwargs)
-        return 8192
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
-    result = _solve_matrix_context(
-        [m, e, r], e, r, fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
-        routing_sets={"rag": "chat & embeddings & rerank"},
-    )
-    assert result is not None
-    floors = {mod.stem: floor for mod, _, _, _, _, _, floor
-              in captured["chat_models"]}
-    assert floors == {"v": 9000}
-
-
-def test_solve_matrix_squeeze_adopted(profiles):
-    from llama_packer.tasks import TaskCatalogue
-    tasks = TaskCatalogue.from_cfg({
-        "embeddings": {"endpoint": "openai.embeddings",
-                       "max_context": 32768},
-        "rerank": {"endpoint": "openai.rerank", "max_context": 32768},
-    })
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=32768,
-                 tasks=["embeddings"])
-    rerank = make("r", role="rerank", context_length=32768, tasks=["rerank"])
-    _fake_vram(chat, (4000, 1.0, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.5, 100))
-    baseline = _solve_matrix_context(
-        [chat, embed, rerank], embed, rerank,
-        fit_bin="unused", vram_total=64 * 1024, spare=None,
-        profiles=profiles, tasks=tasks,
-        knobs=MatrixKnobs(ctx_gain_min=10 ** 9),
-        routing_sets={"rag": "chat & embeddings & rerank"},
-    )
-    result = _solve_matrix_context(
-        [chat, embed, rerank], embed, rerank,
-        fit_bin="unused", vram_total=64 * 1024, spare=None,
-        profiles=profiles, tasks=tasks,
-        routing_sets={"rag": "chat & embeddings & rerank"},
-    )
-    assert baseline is not None and result is not None
-    assert baseline.squeeze is False
-    assert result.squeeze is True
-    assert (result.embed_ctx, result.rerank_ctx) == (20480, 20480)
-    assert result.chat_ctx > baseline.chat_ctx
 
 
 def make(stem, **fm):
@@ -971,56 +588,13 @@ def make(stem, **fm):
 # ── plan(): demotion, squeeze clamp, coload flags ─────────────────────────
 
 
-def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
-    # Validates: SPEC.md, 'Output Format': the matrix result is threaded into the emitted variants
-    chat = make("chat", role="chat", capabilities=["tools"])
-    embed = make("e", role="embeddings", context_length=32768)
-    rerank = make("r", role="rerank", context_length=32768)
-    s2t = make("s2t", role="s2t", vram_mb=640, context_length=8192)
-    _fake_vram(chat, (8000, 1.0, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.5, 100))
-    s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0.0, 0)
-    s2t.vram.fit_params_static = lambda *a, **k: None
-
-    # solve_context: echo the design_ctx the planner proposes, else the model's own.
-    def fake_solve_context(*a, **kw):
-        return kw.get("design_ctx") or 32768
-
-    for m in (chat, embed, rerank, s2t):
-        m.vram.solve_context = fake_solve_context
-
-    planner = Planner([chat, embed, rerank, s2t], profiles, fit_bin="unused",
-                      vram_total=64 * 1024,
-                      matrix_cfg={"min_chat_ctx": 8192,
-                                  "embed_context": 32768,
-                                  "rerank_context": 32768},
-                      embed_model=embed, rerank_model=rerank)
-    plan = planner.plan()
-
-    assert planner.matrix_result is not None
-    # squeeze adopted (chat 22528 -> 32768), RAG entries served at 20480.
-    assert planner.matrix_result.squeeze
-    assert plan["e"][0].ctx_size == 20480
-    assert plan["r"][0].ctx_size == 20480
-    # chat solved below tools_min_ctx (131072) -> demoted.
-    assert plan["chat"][0].tools_demoted is True
-
-    config = emit_config([chat, embed, rerank, s2t], plan, profiles, TVARS)
-    chat_entry = entry_for(config, "chat")
-    assert chat_entry["capabilities"]["tools"] is False
-    assert chat_entry["metadata"]["tools_demoted"] is True
-    assert entry_for(config, "s2t")["metadata"]["ctx_size"] == 8192
-
-
 def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
     """Served at 32768 against a 131072 tools threshold, it must be demoted.
 
-    This asserted the opposite. Demotion keyed off ``self.chat_ctx``, which
-    is None whenever no ``matrix:`` section exists -- the default -- so
-    demotion could never fire, and an entry advertised tool calling an order
-    of magnitude below the window it needs. The verdict now comes from the
-    context this entry actually serves.
+    This asserted the opposite. Demotion keyed off a shared chat context
+    that no ``matrix:`` section supplied, so it could never fire, and an
+    entry advertised tool calling an order of magnitude below the window it
+    needs. The verdict comes from the context this entry actually serves.
 
     Validates: docs/plans/requirement-trace.md #30: tools is demoted on the entry's
     own served context.
@@ -1055,30 +629,6 @@ def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
     assert "tools_demoted" not in only_entry(config)["metadata"]
 
 
-def test_set_resident_estimate_gets_headroom(profiles, caplog):
-    # No pin, no fit-params: the file-size + buffer estimate is padded by
-    # estimate_headroom (1.25x default) so a bad guess errs toward reserving.
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=8192)
-    rerank = make("r", role="rerank", context_length=8192)
-    s2t = make("s2t", role="s2t", backend="whisper-server",
-               context_length=8192)
-    s2t.gguf_path.write_bytes(b"x" * (1024 * 1024))  # 1 MB file
-    _fake_vram(chat, (8000, 0.4, 500))
-    for m in (embed, rerank):
-        _fake_vram(m, (500, 0.1, 100))
-    with caplog.at_level("INFO"):
-        result = _solve_matrix_context(
-            [chat, embed, rerank, s2t], embed, rerank,
-            fit_bin="unused", vram_total=48 * 1024, spare=None,
-            profiles=profiles, knobs=MatrixKnobs(min_chat_ctx=8192),
-            routing_sets={"voice": "chat & s2t"},
-        )
-    assert result is not None
-    # s2t overhead = (1 + 100) * 1.25 = 126 (the set names no RAG pair).
-    assert any("reserves 126 MB" in r.message for r in caplog.records)
-
-
 # ── unestimable models: conservative bound, never a crash ─────────────────
 
 
@@ -1104,105 +654,6 @@ def test_plan_unestimable_chat_floor_and_metadata(make_model, profiles):
     assert meta["ctx_size"] == 16384
 
 
-def test_matrix_unestimable_chat_rides_free(profiles, monkeypatch):
-    # Validates: SPEC.md, 'Remainder': the chat budget is what is left after the residents are charged
-    from llama_packer import writer
-
-    good = make("good", role="chat")
-    bad = make("bad", role="chat")
-    embed = make("e", role="embeddings")
-    for m in (good, embed):
-        _fake_vram(m, (1000, 0.5, 100))
-    bad.vram.effective_static = lambda *a, **k: None
-    bad.vram.fit_params_static = lambda *a, **k: None
-
-    captured = {}
-
-    def fake_solver(**kwargs):
-        captured.update(kwargs)
-        return 8192
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
-
-    planner = Planner([good, bad, embed], profiles, fit_bin="unused",
-                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
-                      embed_model=embed, rerank_model=embed)
-    plan = planner.plan()
-    # The unestimable chat model stays in the shared solve but rides free:
-    # zero quad — no expansion of the set's measured allocation.
-    assert len(captured["chat_models"]) == 2
-    assert captured["chat_models"][1][1:5] == (0, 0.0, 0.0, 0)
-    assert planner.synthetic_quads["bad"] == (0, 0.0, 0.0, 0)
-    assert bad.vram.unestimated_reason is not None
-    # It serves at the shared solved context and is flagged.
-    v = plan["bad"][0]
-    assert v.ctx_size == 8192
-    assert v.estimate_error is not None
-    # The measurable chat model plans normally at the same shared ctx.
-    assert plan["good"][0].ctx_size == 8192
-    assert plan["good"][0].estimate_error is None
-
-
-def test_matrix_unestimable_embed_clamped_and_flagged(profiles, monkeypatch):
-    # Validates: SPEC.md, 'Remainder': a resident that cannot be estimated is clamped to its fixed context and flagged
-    from llama_packer import writer
-
-    from llama_packer.endpoints import EMBEDDINGS, RERANK
-    from llama_packer.profiles import Profiles
-    profiles = Profiles({
-        "defaults": {"cache_type": "q8_0", "parallel": 1},
-        "profiles": {"default": {}},
-        "tasks": {"embeddings": {"endpoint": EMBEDDINGS,
-                                 "max_context": 4096},
-                  "rerank": {"endpoint": RERANK, "max_context": 4096}}})
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", context_length=32768,
-                 tasks=["embeddings"])
-    rerank = make("r", role="rerank", context_length=32768, tasks=["rerank"])
-    _fake_vram(chat, (8000, 0.5, 500))
-    for m in (embed, rerank):
-        m.vram.effective_static = lambda *a, **k: None
-        m.vram.fit_params_static = lambda *a, **k: None
-
-    captured = {}
-
-    def fake_solver(**kwargs):
-        captured.update(kwargs)
-        return 12000
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solver)
-
-    planner = Planner([chat, embed, rerank], profiles, fit_bin="unused",
-                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
-                      embed_model=embed, rerank_model=rerank)
-    plan = planner.plan()
-    # Riders are charged nothing extra (zero quads) and serve at the
-    # configured RAG cap (4096), not their design context.
-    assert captured["embed_params"] == (0, 0.0, 0.0, 0)
-    assert captured["rerank_params"] == (0, 0.0, 0.0, 0)
-    assert captured["embed_ctx"] == 4096
-    assert captured["rerank_ctx"] == 4096
-    assert "e" in planner.synthetic_quads and "r" in planner.synthetic_quads
-    for stem in ("e", "r"):
-        v = plan[stem][0]
-        assert v.ctx_size == 4096
-        assert v.estimate_error is not None
-
-
-def test_solve_matrix_aborts_when_nothing_measurable(profiles):
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings")
-    chat.vram.effective_static = lambda *a, **k: None
-    embed.vram.fit_params_static = lambda *a, **k: None
-    result = _solve_matrix_context(
-        [chat], embed, embed,
-        fit_bin="unused", vram_total=48 * 1024, spare=None,
-        profiles=profiles,
-        routing_sets={"rag": "chat & embeddings & rerank"},
-    )
-    assert result is None
-
-
 def test_planner_skips_text_variant_that_gains_nothing(make_model, profiles,
                                                        tmp_path):
     # A model already at its design cap cannot reclaim context by shedding
@@ -1221,13 +672,6 @@ def test_planner_skips_text_variant_that_gains_nothing(make_model, profiles,
     variants = planner.plan()["vis"]
     assert len(variants) == 1
     assert variants[0].include_mmproj is True
-
-
-def _quiet_logger():
-    import logging
-    log = logging.getLogger("test-vars")
-    log.addHandler(logging.NullHandler())
-    return log
 
 
 # ── solve_rung: most context that fits, vision kept only when free ───────
@@ -1565,19 +1009,20 @@ def test_ties_go_to_more_slots(make_model):
     assert variants[0].parallel == 2, "tie must not fall to parallel 1"
 
 
-# ── residents: fixed context, single slot, charged up front ──────────────
+# ── fixed-overhead roles: fixed context, single slot ─────────────────────
 
 
-def test_resident_rag_is_reserved_at_its_task_context(make_model, profiles):
-    """A resident serves its task's `max_context`, capped by its design
-    context. The number is computable before any chat model is solved.
+def test_served_ctx_uses_the_task_context(make_model, profiles):
+    """A fixed-overhead serving uses its task's `max_context`, capped by its
+    design context. The number is computable before any chat model is
+    solved.
 
-    Validates: SPEC.md, 'VRAM Allocation': each resident serves the context
-    its task declares.
+    Validates: SPEC.md, 'VRAM Allocation': each fixed-overhead serving uses
+    the context its task declares.
     """
     from llama_packer.endpoints import EMBEDDINGS, RERANK
     from llama_packer.tasks import TaskCatalogue
-    from llama_packer.writer import resident_ctx
+    from llama_packer.writer import served_ctx
     tasks = TaskCatalogue.from_cfg({
         "embeddings": {"endpoint": EMBEDDINGS, "max_context": 4096},
         "rerank": {"endpoint": RERANK, "max_context": 6144}})
@@ -1585,20 +1030,20 @@ def test_resident_rag_is_reserved_at_its_task_context(make_model, profiles):
                      tasks=["embeddings"])
     rnk = make_model("r", role="rerank", context_length=8192,
                      tasks=["rerank"])
-    assert resident_ctx(emb, tasks) == 4096
-    assert resident_ctx(rnk, tasks) == 6144
+    assert served_ctx(emb, tasks) == 4096
+    assert served_ctx(rnk, tasks) == 6144
     tight = make_model("t", role="rerank", context_length=2048,
                        tasks=["rerank"])
-    assert resident_ctx(tight, tasks) == 2048
+    assert served_ctx(tight, tasks) == 2048
 
 
-def test_resident_parallelism_is_ignored(make_model, profiles, caplog):
-    """A resident's declared `parallel:` is ignored with a note.
+def test_fixed_role_parallelism_is_ignored(make_model, profiles, caplog):
+    """A fixed-overhead role's declared `parallel:` is ignored with a note.
 
-    Resident slots would come straight out of the chat context, which is the
-    opposite of what a resident is for.
+    Its slots would come straight out of the chat context, which is the
+    opposite of what a fixed-overhead role is for.
 
-    Validates: SPEC.md, 'VRAM Allocation': residents always serve
+    Validates: SPEC.md, 'VRAM Allocation': fixed-overhead roles always serve
     single-slot.
     """
     import logging
@@ -1610,7 +1055,7 @@ def test_resident_parallelism_is_ignored(make_model, profiles, caplog):
     planner._auto_parallel = lambda *a, **k: (1, 4096)
     with caplog.at_level(logging.INFO, logger="llama_packer.writer"):
         variants = planner.plan()["e"]
-    assert [v.parallel for v in variants] == [1], "resident took 8 slots"
+    assert [v.parallel for v in variants] == [1], "fixed role took 8 slots"
 
 
 # ── min_image_megapixels: resolution budget keeps vision ─────────────────
@@ -1670,42 +1115,6 @@ def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
 # ── host budget (`device: cpu`) ───────────────────────────────────────────
 
 
-def test_cpu_resident_charges_host_not_vram(profiles, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #74
-    # the host ledger (VRAM charge stays 0), and two committed quads for one
-    # role are a planner bug.
-    from llama_packer import writer
-    from llama_packer.writer import HostLedger
-
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", device="cpu", context_length=32768)
-    _fake_vram(chat, (1000, 0.5, 100))
-    _fake_vram(embed, (466, 0.057, 346))
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
-    planner = Planner([chat, embed], profiles, fit_bin="unused",
-                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
-                      embed_model=embed, rerank_model=embed,
-                      host_pool_mb=4096)
-    planner.plan()
-    # Charge is the measured CPU quad at the resolved resident context.
-    # Both slots embed+rerank are filled by the same model: two server
-    # processes, two host charges ("one per role", not one per model).
-    ctx = planner.matrix_result.embed_ctx
-    per_slot = 466 + 346 + int(0.057 * ctx)   # residents serve single-slot
-    assert planner.host_ledger.resident_mb() == 2 * per_slot
-    assert planner.host_ledger.available() == 4096 - 2 * per_slot
-    # The VRAM ledger carries nothing for it (decision 5: no double count).
-    assert planner.ledger.residents == []
-
-    # One co-resident per role: committing two quads for one role is a
-    # planner bug, not a pool the packer would overrun.
-    ledger = HostLedger(4096)
-    ledger.add_resident("embed:e", "embeddings", 100)
-    with pytest.raises(AssertionError):
-        ledger.add_resident("embed:e2", "embeddings", 100)
-
-
 def test_cpu_variant_refused_on_small_pool(profiles, caplog):
     # Validates: docs/plans/requirement-trace.md, requirement #70, #75
     # quad exceeds the host pool emits no id and logs the shortfall.
@@ -1747,9 +1156,9 @@ def test_no_host_pool_never_gates(profiles, caplog):
     assert "cpu" in plan
 
 
-def test_host_resident_sizing_lifts_cpu_gate(profiles, monkeypatch):
+def test_host_charge_sizing_lifts_cpu_gate(profiles, monkeypatch):
     # Validates: docs/plans/requirement-trace.md, requirement #74
-    # sizes CPU-resident residents through allow_cpu=True (fit_params_static
+    # sizes CPU-served models through allow_cpu=True (fit_params_static
     # otherwise returns None for a device: cpu model and the charge reads 0).
     m = make("e", role="embeddings", device="cpu", context_length=8192)
     seen = {}
@@ -1766,7 +1175,7 @@ def test_host_resident_sizing_lifts_cpu_gate(profiles, monkeypatch):
     m.vram.fit_params_static = fake_static
     planner = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
                       host_pool_mb=4096)
-    mb = planner._host_resident_mb(m, 4096)
+    mb = planner._host_charge_mb(m, 4096)
     assert seen["allow_cpu"] is True
     assert mb == 100 + 50 + int(0.1 * 4096)
 
@@ -1833,34 +1242,10 @@ def test_gpu_entry_has_no_ttl(profiles):
     assert "ttl" not in entry
 
 
-def test_cpu_fixed_category_resident_charged_host(profiles, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #74
-    # category (rnk2/stt/…) on device: cpu is a resident too and charges the
-    # host pool, one per category.
-    from llama_packer import writer
-
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", device="cpu", context_length=32768)
-    rnk = make("r", role="rerank", device="cpu", context_length=32768)
-    extra = make("z", role="rerank", device="cpu", context_length=32768)
-    _fake_vram(chat, (1000, 0.5, 100))
-    for m in (embed, rnk, extra):
-        _fake_vram(m, (100, 0.01, 50))
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
-    planner = Planner([chat, embed, rnk, extra], profiles, fit_bin="unused",
-                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
-                      embed_model=embed, rerank_model=rnk,
-                      fixed_categories=[("rnk2", extra)],
-                      host_pool_mb=10000)
-    planner.plan()
-    roles = [role for _, role, _ in planner.host_ledger.residents]
-    assert sorted(roles) == ["embed", "rerank", "rnk2"]
-
-
 def test_task_max_context_caps_a_non_chat_entry(make_model):
     # Validates: SPEC.md, 'Tasks': max_context is the served ceiling, so a
-    # resident serves its task's RAG window, not its design context.
+    # fixed-overhead role serves its task's RAG window, not its design
+    # context.
     from llama_packer.endpoints import EMBEDDINGS
     from llama_packer.profiles import Profiles
     profiles = Profiles({
@@ -1884,8 +1269,10 @@ def test_task_max_context_is_per_entry(make_model):
     profiles = Profiles({
         "defaults": {"cache_type": "q8_0", "parallel": 1},
         "profiles": {"default": {}},
-        "tasks": {"coding": {"endpoint": CHAT, "max_context": 131072},
-                  "qa": {"endpoint": CHAT, "max_context": 32768}}})
+        "tasks": {"coding": {"endpoint": CHAT, "min_context": 131072,
+                             "max_context": 131072},
+                  "qa": {"endpoint": CHAT, "min_context": 32768,
+                         "max_context": 32768}}})
     m = make_model("m", role="chat", context_length=262144,
                    tasks=["coding", "qa"])
     planner = Planner([m], profiles, fit_bin="unused",
@@ -1904,14 +1291,6 @@ def test_non_chat_entry_gets_its_task_ttl(make_model):
     assert _entry_task_ttl(m, None, {"embeddings": 3600}) == 3600
 
 
-def test_model_id_in_a_set_is_a_chat_slot():
-    from llama_packer.writer import _has_chat_slot
-    assert _has_chat_slot("Qwen3-27B & embeddings", chat_roles={"chat"},
-                          chat_ids={"qwen3-27b"})
-    assert not _has_chat_slot("s2t & embeddings", chat_roles={"chat"},
-                              chat_ids={"qwen3-27b"})
-
-
 def test_unestimated_chat_respects_task_max_context(make_model):
     # The ceiling holds for an unestimated serving too.
     from llama_packer.endpoints import CHAT
@@ -1926,3 +1305,51 @@ def test_unestimated_chat_respects_task_max_context(make_model):
                       vram_total=48 * 1024)
     variants = planner.plan()["u"]
     assert [v.ctx_size for v in variants] == [8192]
+
+
+# ── authored matrix sets: approval, rejection, unknown leaves ─────────────
+
+
+def _set_planner(sets, models, profiles):
+    return Planner(models, profiles, fit_bin="unused",
+                   vram_total=48 * 1024, matrix_cfg={"sets": sets},
+                   min_context=4096)
+
+
+def test_matrix_set_prices_the_roles(profiles):
+    # Validates: docs/allocation.md, 'The auction': a declared set's roles
+    # are priced and the chat role's budget stays inside its pool.
+    chat = make("chat-model", role="chat", context_length=32768)
+    emb = make("emb-model", role="embeddings", context_length=8192)
+    _fake_vram(chat, (4000, 0.5, 500))
+    _fake_vram(emb, (500, 0.0, 100))
+    planner = _set_planner({"rag": "chat & embeddings"}, [chat, emb], profiles)
+    planner.plan()
+    assert "rag" in planner.matrix_sets_approved
+    budget = planner.role_budget[("chat", "default")]
+    assert 0 < budget <= planner.capacity_pools["default"]
+
+
+def test_matrix_set_whose_floor_exceeds_the_pool_is_dropped(profiles):
+    # Validates: docs/allocation.md, 'Floor': a set that cannot fit is
+    # dropped whole and logged, while a set that fits still prices.
+    chat = make("chat-model", role="chat", context_length=32768)
+    emb = make("emb-model", role="embeddings", context_length=8192)
+    _fake_vram(chat, (4000, 0.5, 500))
+    _fake_vram(emb, (50000, 0.0, 100))
+    planner = _set_planner({"rag": "chat & embeddings", "solo": "chat"},
+                           [chat, emb], profiles)
+    planner.plan()
+    assert "solo" in planner.matrix_sets_approved
+    assert "rag" not in planner.matrix_sets_approved
+    assert "rag" in planner.matrix_sets_rejected
+
+
+def test_matrix_set_unknown_literal_is_an_error(profiles):
+    # Validates: docs/allocation.md, 'Set members': an id that emitted no
+    # entry is an error, not a silent prune.
+    chat = make("chat-model", role="chat", context_length=32768)
+    _fake_vram(chat, (4000, 0.5, 500))
+    planner = _set_planner({"rag": "chat & nope"}, [chat], profiles)
+    with pytest.raises(ValueError, match="not a role"):
+        planner.plan()

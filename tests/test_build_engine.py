@@ -4,7 +4,7 @@
 A source build has three ways to go wrong that a download cannot: it can
 target the wrong GPU architecture (the binary compiles and sees nothing), it
 can produce a tree without the binary in it, and it can fail halfway through
-and leave the live symlink pointing at the broken result. Every test here is
+and leave the deployed symlink pointing at the broken result. Every test here is
 about one of those three.
 
 The build itself is never run: ``cmake`` and a compiler are not the thing under
@@ -194,7 +194,7 @@ def test_a_build_for_the_wrong_arch_is_refused(tmp_path):
 
     A binary compiled without an offload binary for the target arch starts,
     answers /health, and then reports that it has no device — in every
-    service request. Promoting that to the live symlink would trade a working
+    service request. Promoting that to the deployed symlink would trade a working
     engine for a broken one on the strength of a successful compile.
     """
     binary = make_binary(tmp_path / "srv", 'echo "  CPU0: CPU"')
@@ -278,7 +278,7 @@ def test_a_failed_build_leaves_the_live_symlink_alone(tmp_path, monkeypatch):
         bld.install_built(bld.AUDIO, install, "v0.9.2", "hip", "gfx1201", 8)
 
     assert not (install / "audiocpp_server").is_symlink(), \
-        "the live engine must survive a failed build"
+        "the deployed engine must survive a failed build"
     assert (install / "audiocpp_server").read_text().endswith(
         "the engine that works\n")
     assert (install / "audiocpp_server-src-v0.9.2-hip-gfx1201.build.log").is_file()

@@ -31,15 +31,13 @@ from llama_packer.utils import (
     _detect_drive_speed,
 )
 from llama_packer import roles
-from llama_packer.endpoints import EMBEDDINGS, RERANK
 from llama_packer.consts import (
     _MIN_AGENTIC_CTX, _MEMORY_MARGIN, _RESERVE_SYSTEM, _RESERVE_VIDEO,
     VLLM_DEFAULT_IMAGE, VLLM_DEFAULT_BIN, VLLM_DEFAULT_DOCKER_ARGS,
     VLLM_DEFAULT_CONTAINER_PORT, VLLM_DEFAULT_GPU_MEM_UTIL,
 )
 from llama_packer.writer import (
-    build_config, write_yaml, dump_yaml, EmittedConfig,
-    MatrixKnobs, resident_cost_detail, resident_ctx)
+    build_config, write_yaml, dump_yaml, EmittedConfig)
 from llama_packer.progress import PackerProgress
 from llama_packer.backends import (SD_BACKENDS, VLLM_BACKENDS,
                                    validate_backend_names)
@@ -167,7 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--baseline", help="Compositor/desktop VRAM already in use. Replaces the fixed 1024 MiB "
                                           "compositor portion when larger, so reserve = 1024 + max(1024, baseline); "
                                           "values <=1024 are a no-op. Use --spare for extra tenants/headroom instead. "
-                                          "(default: 0; live auto-detection is disabled so the packer's own resident model "
+                                          "(default: 0; auto-detection is disabled so the packer's own model "
                                           "servers are not counted against the budget).")
     parser.add_argument("--unified-system-mb", help="System memory reserved for the OS on unified-memory hosts "
                                           "(GB10/DGX Spark, Apple Silicon): suffixed (8G, 4096m) or bare MB. "
@@ -259,100 +257,11 @@ def _apply_env_subst(config: EmittedConfig, sub, raw_paths: list[str]) -> Emitte
     return config
 
 
-def _select_model(models: list, type_name: str, selector: str | None, logger,
-                  *, cost=None, endpoint: str | None = None) -> "Model | None":
-    """Pick a model of *type_name*: an endpoint, or (without *endpoint*) a role label.
-
-    With no selector, a `device: cpu` candidate wins — the tag is the
-    operator's explicit "this one stays warm in host RAM" choice, and it
-    must not lose to the size default. Among the eligible candidates the
-    pick is the **cheapest measured serving at the role's ctx** (`cost`),
-    because that is the number the resident costs the chat budget; file
-    size is only the fallback when nothing can be measured. A selector
-    substring overrides both: returns the single model whose id/name/stem
-    contains it; errors if the match is not exactly one.
-    """
-    cands = [m for m in models
-             if (m.serves_endpoint(endpoint) if endpoint else m.role == type_name)]
-    if not cands:
-        return None
-    if selector:
-        hits = [
-            m for m in cands
-            if (selector in m.stem
-                or selector in str(m.frontmatter.get("name", ""))
-                or selector in m.template_id)
-        ]
-        if len(hits) != 1:
-            fatal("selector %r matched %d %s models (need exactly 1): %s",
-                  selector, len(hits), type_name,
-                  [h.stem for h in hits])
-        # Price the quality choice: the operator should see what the
-        # pinned model costs the budget.
-        if cost is not None and logger is not None:
-            mb = cost(hits[0])
-            if mb is not None:
-                logger.info("%s: selector %r → %s (%d MiB resident)",
-                            type_name, selector, hits[0].stem, mb)
-        return hits[0]
-    cpu = [m for m in cands if getattr(m, "on_cpu", False)]
-    pool = cpu or cands
-    if cost is not None:
-        priced = []
-        for m in pool:
-            mb = cost(m)
-            if mb is not None:
-                priced.append((m, mb))
-        if priced:
-            if logger is not None:
-                logger.info(
-                    "%s: cheapest resident wins — %s",
-                    type_name,
-                    ", ".join(f"{m.stem}={mb} MiB"
-                              for m, mb in sorted(priced, key=lambda t: t[1])))
-            return min(priced, key=lambda t: t[1])[0]
-    return min(pool, key=lambda m: m.vram_mb)
-
-
-def _selection_reason(model, measured_mb: int | None = None,
-                      by_selector: bool = False,
-                      detail: str | None = None) -> str:
-    """Why the resident pick went to *model* — logged beside its name.
-
-    *detail* spells out the measured terms, so two residents that happen
-    to cost the same can be seen to be the same shape (weights + compute +
-    KV) rather than a suspicious repeat.
-    """
-    suffix = f" = {detail}" if detail else ""
-    if by_selector:
-        return ("selector" if measured_mb is None
-                else f"selector, {measured_mb} MiB resident{suffix}")
-    if measured_mb is not None:
-        return f"cheapest measured resident, {measured_mb} MiB{suffix}"
-    if getattr(model, "on_cpu", False):
-        return "device: cpu — explicit placement"
-    return f"smallest footprint {model.vram_mb} MiB"
-
-
-def _resolve_matrix(profiles_cfg: dict, models: list, args, logger, *,
-                    llama_bin: str, fit_bin: str,
-                    llama_args: str = "") -> tuple:
-    """Resolve the matrix, measuring with ``llama-fit-params``.
-
-    ``--fit-print`` belongs to the sibling fit binary; handing it to
-    ``llama-server`` fails with ``invalid argument`` and loses the whole
-    measurement.  Keeping the choice here makes the call site testable.
-    """
-    return _detect_matrix(profiles_cfg, models, args, logger,
-                          fit_bin=fit_bin or llama_bin,
-                          llama_args=llama_args)
-
-
-def _detect_matrix(profiles_cfg: dict, models: list, args, logger,
-                   *, fit_bin: str = "", llama_args: str = "") -> tuple:
+def _detect_matrix(profiles_cfg: dict) -> dict | None:
     """Return the matrix section. Role labels and model ids price it; there
     is no RAG pair and no category pick."""
-    return profiles_cfg.get("matrix"), None, None, {}, (), {}
+    return profiles_cfg.get("matrix")
+
 
 def validate_matrix_sets(profiles_cfg: dict) -> str | None:
     """Why ``matrix.sets`` is unusable, or None when it is sound."""
@@ -390,9 +299,14 @@ def _expand_matrix_sets(sets: dict, role_by_stem: dict,
         return f"({text})"
 
     role_names = set(roles.names())
-    known = set(role_by_stem)
-    for ids in entry_ids_by_stem.values():
+    known = set(entry_ids_by_stem)
+    by_prefix: dict[str, list[str]] = {}
+    for stem, ids in entry_ids_by_stem.items():
         known.update(ids)
+        by_prefix.setdefault(stem.lower(), []).extend(ids)
+        for entry_id in ids:
+            by_prefix.setdefault(entry_id.split(".", 1)[0].lower(),
+                                 []).append(entry_id)
 
     def render(expr: str, stack: tuple[str, ...] = ()) -> str:
         expr = _strip_parens(expr)
@@ -423,6 +337,11 @@ def _expand_matrix_sets(sets: dict, role_by_stem: dict,
             return ""
         if atom in known:
             return atom
+        low = atom.lower()
+        for key, ids in by_prefix.items():
+            if low == key or low.startswith(key + "."):
+                return (ids[0] if len(ids) == 1
+                        else "(" + " | ".join(ids) + ")")
         raise ValueError(f"{atom!r} is not a role, model stem, or entry id")
 
     expanded = {}
@@ -605,12 +524,12 @@ def main(argv: list[str] | None = None) -> None:
         body["spare"] = value
 
 
+    problems = check_profiles(profiles_cfg)
+    for problem in problems:
+        logger.error("profiles.yaml: %s", problem)
+    if problems:
+        sys.exit(1)
     if args.check:
-        problems = check_profiles(profiles_cfg)
-        for problem in problems:
-            logger.error("profiles.yaml: %s", problem)
-        if problems:
-            sys.exit(1)
         logger.info("profiles.yaml: OK (%s)", profiles_path)
         return
     roles.configure(profiles_cfg)
@@ -911,13 +830,7 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("vllm gpu-memory-utilization: %s (derived from budget)",
                     template_vars["gpu_mem_util"])
 
-    # Detect matrix configuration before build_config.  Measure with the
-    # sibling llama-fit-params binary: --fit-print is not a llama-server flag.
-    (matrix_cfg, embed_model, rerank_model, matrix_categories,
-     matrix_fixed, matrix_ctx) = _resolve_matrix(
-        profiles_cfg, models, args, logger,
-        llama_bin=llama_bin, fit_bin=fit_bin,
-        llama_args=template_vars["llama_args"])
+    matrix_cfg = _detect_matrix(profiles_cfg)
 
     # ── Degenerate-budget refusal ──
     # --spare/--baseline ate the whole card (e.g. --spare 31G on 32G):
@@ -965,9 +878,7 @@ def main(argv: list[str] | None = None) -> None:
         config = build_config(
             models, Profiles(profiles_cfg), template_vars, fit_bin, gpu.vram_mb,
             spare=args.spare, max_context=max_ctx,
-            matrix_cfg=matrix_cfg, embed_model=embed_model, rerank_model=rerank_model,
-            fixed_categories=matrix_fixed,
-            category_ctx=matrix_ctx,
+            matrix_cfg=matrix_cfg,
             baseline_mb=gpu.baseline_mb,
             min_context=min_ctx if min_ctx is not None else _MIN_AGENTIC_CTX,
             min_context_explicit=min_ctx is not None,
@@ -1031,7 +942,7 @@ def main(argv: list[str] | None = None) -> None:
     # ── Routing section ──
     # The input selects the router: declared sets mean matrix, nothing means
     # capacity. llama-swap's matrix is a permission list, not a preload.
-    sets = (profiles_cfg.get("matrix") or {}).get("sets") or {}
+    sets = getattr(config, "matrix_sets", None) or {}
     role_by_stem = {m.stem: m.role for m in models}
     try:
         expanded = _expand_matrix_sets(sets, role_by_stem,

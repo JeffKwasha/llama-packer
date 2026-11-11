@@ -150,7 +150,7 @@ class LlamaServerBackend(BaseBackend):
             "--cache-type-v", cache_type,
         ]
         # llama-server defaults --n-gpu-layers to "auto" (offload all);
-        # only pin "0" for CPU-resident models.
+        # only pin "0" for CPU-served models.
         if model.on_cpu:
             flags += ["--n-gpu-layers", "0"]
 

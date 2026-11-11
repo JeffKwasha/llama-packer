@@ -36,7 +36,7 @@ either way it should not be used in a commit message until it is.
 | **`D`** (`slot_mib`) | Fixed cost per parallel slot: SWA ring buffers plus slot overhead. | `vram.py` |
 | **slot** | One concurrent conversation. `parallel` is how many a model serves at once. | `parallel:` |
 | **budget** (`VramBudget`) | The object that answers "what fits", from either measured coefficients or a pin. | `vram.py` |
-| **set solve** | The pack-time context solve inside one set: one budget, floors first, then the auction. Authored sets drive matrix mode; generated sets size capacity mode. | `solve_matrix_ctx`, SPEC §Capacity routing |
+| **set solve** | The pack-time context solve inside one set: one budget, floors first, then the auction. Authored sets drive matrix mode; capacity sizes each model alone until generation lands. | `Planner._role_budgets`, `allocation.auction` |
 | **loaded together** | Allowed at the same time because the capacities fit every pool. A role still runs one serving at a time. | SPEC §Capacity routing |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
 | **`ttl`** | Idle lifetime: top-level default 3600 s, overridden by a role, task, or sidecar `ttl:`. `0` disables idle unload. | SPEC §TTL |
@@ -65,9 +65,9 @@ either way it should not be used in a commit message until it is.
 | **rung** | One point on the ladder: a set of capabilities deliberately given up, plus the `(ctx, parallel)` the budget affords there. | `writer.py:Rung` |
 | **the ladder** (`shed_levels`) | The rungs to try for one category: one per prefix of its `sacrifice:` order, minus anything `require:`/`keep:` protects. | `writer.py:shed_levels` |
 | **solve_rung** | Picks the rung: the one buying the most context, tie-broken toward keeping capabilities. `None` when the category cannot be met at all, and no entry is emitted. | `writer.py:solve_rung` |
-| **`sacrifice`** | A *preference* order for what to give up first, not a cost order — shedding may buy nothing, which is why every rung is tried rather than one fixed walk. | `UsageDemand.sacrifice` |
-| **require** | A capability the category will not be without. Gates existence: a model lacking it does not satisfy the category. | `UsageDemand.require` |
-| **keep** | Don't drop what this model has, but a model without it still qualifies. The difference from `require` is why `coding` can keep its draft without excluding every model that has none. | `UsageDemand.keep` |
+| **`sacrifice`** | A *preference* order for what to give up first, not a cost order — shedding may buy nothing, which is why every rung is tried rather than one fixed walk. | `Task.sacrifice` |
+| **require** | A capability the category will not be without. Gates existence: a model lacking it does not satisfy the category. | `Task.require` |
+| **keep** | Don't drop what this model has, but a model without it still qualifies. The difference from `require` is why `coding` can keep its draft without excluding every model that has none. | `Task.keep` |
 | **shed: (profiles)** | Order for capabilities a category does not name. Config, not code, so what "unnamed" means is the operator's call. | `Profiles.shed_order` |
 | **mmproj** | The vision projector. Shedding it makes a model text-only and frees its VRAM. | llama-server |
 | **MTP** | Multi-token prediction draft model. Roughly doubles generation speed and is the costly thing to lose, so it sits late in the sacrifice order. | SPEC "MTP Speculative Decoding" |
@@ -82,7 +82,7 @@ is the endpoint contract a model can serve (`coding`, `embeddings`). A
 | Term | Means | Code |
 |---|---|---|
 | **task catalogue** | The declared set of task ids: endpoint, intent, demand. An id outside it is not a task. | `profiles.yaml tasks:`, validated by `tasks.py` |
-| **share** | A role's request weight in each set's auction: `N%` (relative, may exceed 100), `fill` (100), `min` (0, accept nothing), or `0` (0, accept what remains). Parsed and validated; the auction is not applied yet. | `roles.py`, `docs/roles-tasks-routing.md` |
+| **share** | A role's request weight in each set's auction: `N%` (relative, may exceed 100), `fill` (100), `min` (0, accept nothing), or `0` (0, accept what remains). Applied per set; the role's limit is the minimum offer. | `roles.py`, `docs/roles-tasks-routing.md` |
 | **floor** | The memory a serving needs at its task's `min_context` and `min_parallel`. A role's floor is the maximum floor of its models. Derived, never configured. | `solve`, `docs/roles-tasks-routing.md` |
 | **demand** | One task's minimum serving (`min_context`, `min_parallel`, `require`, `keep`, `sacrifice`). | `tasks.Task` |
 | **`min_context`** | The context a task requires. A model that cannot serve it at any rung emits nothing for that task. | profiles `tasks:` |

@@ -279,43 +279,40 @@ Implemented:
 
 - `roles:` is data. The code loads the default roles and replaces them from
   `profiles.yaml`. Role names are not hardcoded.
-- `dir`, `share`, `device` are parsed. Two roles may not own overlapping
-  trees.
+- `dir`, `share`, `device`, and `ttl` are parsed. Two roles may not own
+  overlapping trees.
 - A role owns its trees with `dir`; discovery assigns every model from the
   owning tree. `dirs:` is retired and errors, the built-in directory table is
   gone, and `--extra-dirs` warns and is ignored.
 - A model that resolves to no role, or a sidecar `role:` naming an undefined
   role, stops the run (`DiscoveryError`).
 - `tasks:` no longer takes `role:`. A task's `device:` places every model
-  that serves it when the sidecar declares none (conflicting task devices
-  warn and leave placement alone); `max_context` is the serving ceiling.
-  `role:` inside a task warns and is ignored for old files.
+  that serves it when the sidecar declares none; `max_context` is the
+  serving ceiling. `min_context > max_context` is a check error.
 - Sidecar `role:` is valid and overrides the tree's role.
 - A role has no behaviour: a model's declared tasks name the endpoint, and
   the endpoint selects engine flags, discovery guards and solve paths.
 - Retired role keys (`kind`, `min`, `preferred`, `cap`, `weight`, `exclusive`,
-  `persistent`) warn and are ignored.
-- The router follows the input: `matrix.sets:` present → matrix, absent →
-  capacity. `routing.use` is retired and errors; the group router is gone.
-- `matrix.sets:` expands role labels to the entries serving them; a role
-  with no entries is removed from the expression and the set keeps the rest.
-- The chat solve prices a set by its worst branch.
-- `__CHAT_VARS__` / `__COLOAD_VARS__` are retired and rejected; the
-  opportunistic co-load pass is gone.
+  `persistent`, `fill`, and the old per-role count key) warn and are ignored.
+- `share` takes `N%`, `fill`, `min`, or `0`. Each set is priced on its own;
+  the role's budget is the minimum offer across its sets.
+- A role's floor is the maximum floor of its models. A set's floor follows
+  its expression; `+set` inlines; unknown leaves and `+auto:orphans` are
+  fatal.
+- The per-model solve uses the role budget; the fallback is the bare model
+  id with no endpoint, at the smallest reachable task floor.
+- TTL: top-level `ttl` (default 3600), role, task, sidecar; the most
+  specific wins. The emitted key is `globalTTL`.
+- Capacity mode sizes each model alone and warns when `matrix.sets:` is
+  absent. `pools.<id>.spare` and `--spare-pool` set a pool's spare.
+- One solve: the role budgets from the authored sets. There is no category pick and no fixed pair.
 
 Not implemented yet:
 
-- `share` values and the auction. The solver still uses the global spare.
-- Role floor as the maximum model floor; set floor by expression; set
-  feasibility.
-- The tuple memory model: two fields (`vram`, `ram`), not one per pool.
-  `cpu` is not first.
-- Generated sets for capacity mode.
-- A top-level `ttl` and a role `ttl`; only task and sidecar TTL exist.
-- Per-pool `spare` from the CLI; `reserve_extra` and `pins` are still
-  accepted.
-- The retired set-category selector is still accepted by the shared solve.
-- The fallback entry is still priced as a chat task.
-- `min_context` as a required task value with a top-level default.
-- The old `fill:` key and the old per-role count key are still accepted; the
-  parser does not retire them yet.
+- Multi-device role floors. A role with models on several devices reserves
+  its floor on each; splitting the role is the current answer.
+- A CPU model is not solved down to its `ram` allocation. The host ledger is
+  the remaining gate.
+- Capacity set generation. Until it is designed, each model is its own set.
+- Per-card pool emission and unified memory. The cost tuple can express them;
+  the emitter uses `default` and `ram`.

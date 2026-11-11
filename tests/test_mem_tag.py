@@ -105,7 +105,7 @@ def test_entry_description_gets_tag(make_model):
 
 
 def test_entry_cpu_description_ram_only(make_model):
-    # Validates: SPEC.md, 'Output Format': a CPU-resident entry is tagged with RAM only.
+    # Validates: SPEC.md, 'Output Format': a CPU-served entry is tagged with RAM only.
     _, entry = _entry(
         make_model,
         device="cpu",
@@ -243,15 +243,15 @@ def test_planner_mem_numbers_and_tag(make_model, tmp_path):
     v = variants[0]
     # TOTAL attributable: weights + compute + ctx KV + slots.
     assert v.mem_vram_mib == (1 + 20 + 0.001 * 8192 + 10)
-    assert v.mem_ram_mib == 1.0
+    assert v.mem_ram_mib == 128.0
 
     config = emit_config([m], {"m": variants}, _profiles(), TVARS)
     desc = entry_for(config, "m")["description"]
-    assert desc.endswith("[VRAM 39MB RAM 1MB]")
+    assert desc.endswith("[VRAM 39MB RAM 128MB]")
 
 
 def test_planner_cpu_model_ram_only_tag(make_model):
-    # Validates: SPEC.md, 'Output Format': a CPU-resident model is sized in RAM and carries no VRAM number.
+    # Validates: SPEC.md, 'Output Format': a CPU-served model is sized in RAM and carries no VRAM number.
     m = make_model("c", device="cpu", parallel=1, context_length=32768)
     quad = (5000, 0.5, 100, 500)
     _scripted(m, 32768, {True: quad, False: quad})

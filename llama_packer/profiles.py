@@ -209,20 +209,24 @@ def check_profiles(cfg: dict) -> list[str]:
         problems.append("routing: retired; remove it (matrix.sets selects "
                         "the router)")
 
-    top_min = cfg.get("min_context")
-    if top_min is not None and (isinstance(top_min, bool)
-                                or not isinstance(top_min, int)
-                                or top_min < 0):
+    top_raw = cfg.get("min_context")
+    top_min = (_MIN_AGENTIC_CTX if top_raw is None
+               else utils.parse_ctx_size(str(top_raw)))
+    if top_raw is not None and (top_min is None or top_min < 0):
         problems.append("min_context: must be a non-negative integer")
-    top_min = top_min if isinstance(top_min, int) else _MIN_AGENTIC_CTX
     for name, body in tasks.items():
         if not isinstance(body, dict):
             continue
-        mn = body.get("min_context", top_min)
-        mx = body.get("max_context")
+        mn_raw = body.get("min_context")
+        mx_raw = body.get("max_context")
+        mn = (top_min if mn_raw is None
+              else utils.parse_ctx_size(str(mn_raw)))
+        mx = (None if mx_raw is None
+              else utils.parse_ctx_size(str(mx_raw)))
         if mn is not None and mx is not None and mn > mx:
             problems.append(
-                f"tasks.{name}: min_context {mn} exceeds max_context {mx}")
+                f"tasks.{name}: min_context {mn_raw or top_raw} exceeds "
+                f"max_context {mx_raw}")
 
     pools = _check_mapping(problems, "pools", cfg.get("pools"))
     for name, spec in pools.items():
@@ -353,7 +357,9 @@ class Profiles:
             if not isinstance(spec, dict):
                 logger.warning("pools: %r is not a mapping; ignoring", pid)
                 continue
-            pools[str(pid)] = {
+            key = {"gpu0": "default", "system": "ram"}.get(str(pid),
+                                                           str(pid))
+            pools[key] = {
                 "vram": spec.get("vram"),
                 "spare": spec.get("spare"),
             }
@@ -397,8 +403,8 @@ class Profiles:
         ``defaults`` is returned.
 
         Embed/rerank always serve single-slot: their parallel is pinned to 1
-        (declared values are ignored with a note) — a resident's parallelism
-        must never buy context away from the main chat it serves.
+        (declared values are ignored with a note) — a fixed-overhead role's
+        parallelism must never buy context away from the main chat it serves.
         """
         rag_role = model.serves_endpoint(EMBEDDINGS) or \
             model.serves_endpoint(RERANK)
@@ -430,15 +436,16 @@ class Profiles:
 
 
 # Embed/rerank serve single-slot: their parallel is a chat knob, never a
-# resident one — a note once per model when a declaration is ignored.
+# fixed-overhead one — a note once per model when a declaration is ignored.
 _rag_parallel_warned: set[str] = set()
 
 
 def _rag_parallel(model, declared: int) -> int:
     """Pin an embeddings/rerank model to parallel 1.
 
-    Resident parallelism must never buy context away from the main chat it
-    serves ("main chat slightly better" beats "embed/rerank parallel > 1").
+    A fixed-overhead role's parallelism must never buy context away from the
+    main chat it serves ("main chat slightly better" beats "embed/rerank
+    parallel > 1").
     A declared parallel > 1 is ignored with a once-per-model note.
     """
     if declared == 1:
@@ -447,8 +454,8 @@ def _rag_parallel(model, declared: int) -> int:
         _rag_parallel_warned.add(model.stem)
         logger.warning(
             "%s: embed/rerank serve single-slot — parallel %d ignored "
-            "(resident parallelism must not shrink the main chat context "
-            "it serves)", model.stem, declared)
+            "(fixed-overhead parallelism must not shrink the main chat "
+            "context it serves)", model.stem, declared)
     return 1
 
 

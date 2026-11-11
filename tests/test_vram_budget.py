@@ -1,5 +1,5 @@
 # tests/test_vram_budget.py
-"""solve_context and solve_matrix_ctx budget math under the affine VRAM law:
+"""solve_context budget math under the affine VRAM law:
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 
@@ -20,7 +20,7 @@ from llama_packer import gpu_state, vram
 from llama_packer.consts import _MIN_CTX_SIZE
 from llama_packer.vram import (FitParams, parse_device_buffers,
                                parse_fit_log, parse_host_buffers,
-                               parse_spill_mib, solve_matrix_ctx)
+                               parse_spill_mib)
 
 
 # ── serve-shaped log parsing ──────────────────────────────────────────────
@@ -216,8 +216,8 @@ def test_host_measurement_does_not_leak_into_vram_pricing(make_model,
                                                          tmp_path):
     # Validates: docs/plans/requirement-trace.md, requirement #74
     # measurement (allow_cpu=True, the host ledger) caches the same quad; a
-    # VRAM-priced call must still see None, or the CPU resident is charged to
-    # the chat solve after all.
+    # VRAM-priced call must still see None, or the CPU-served model is charged
+    # to the chat solve after all.
     stub = _stub_fit_run(tmp_path)
     model = make_model("a", device="cpu", context_length=8192)
     model.vram.remeasure = False
@@ -340,7 +340,7 @@ exec sleep 30
 @pytest.fixture
 def guard_env(tmp_path, monkeypatch):
     """Clear pre-flight, tmp cache dir, fast stall window."""
-    monkeypatch.setattr(vram.gpu_state, "llama_residents", lambda: [])
+    monkeypatch.setattr(vram.gpu_state, "llama_processes", lambda: [])
     monkeypatch.setattr(vram, "_MEASURE_STALL_S", 1)
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     return tmp_path / "cache"
@@ -370,9 +370,9 @@ def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
     assert entry["outcome"] == "spill"
 
 
-def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
-                                                     monkeypatch):
-    monkeypatch.setattr(vram.gpu_state, "llama_residents",
+def test_run_measure_server_refused_beside_processes(make_model, tmp_path,
+                                                    monkeypatch):
+    monkeypatch.setattr(vram.gpu_state, "llama_processes",
                         lambda: ["123 jk /x/llama-server -m y"])
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     model = make_model("a")
@@ -381,7 +381,7 @@ def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
         str(tmp_path / "never-spawned"), "q8_0", 8192, 1, "") is None
     entry = json.loads((tmp_path / "cache" / "measure-journal.jsonl")
                        .read_text().splitlines()[-1])
-    assert entry["outcome"] == "refused-residents"
+    assert entry["outcome"] == "refused-processes"
 
 
 def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
@@ -590,9 +590,9 @@ def test_solve_context_memory_margin_shrinks_ctx(make_model):
     assert margined == 16384
 
 
-def test_solve_context_cpu_resident_returns_design(make_model):
+def test_solve_context_cpu_served_returns_design(make_model):
     """
-    Validates: SPEC.md, 'VRAM Allocation': a CPU-resident model costs no VRAM, so its
+    Validates: SPEC.md, 'VRAM Allocation': a CPU-served model costs no VRAM, so its
     context is its design maximum.
     """
     model = make_model("e", device="cpu", context_length=8192)
@@ -758,7 +758,7 @@ def test_solve_context_image_floor_raises_ctx(make_model, tmp_path):
     # A declared image budget plus the output reserve must fit the solved
     # context: the ctx is raised from the rounded-down value to the floor
     # when affordable.
-    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys are in the mmproj block.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
@@ -771,7 +771,7 @@ def test_solve_context_image_floor_raises_ctx(make_model, tmp_path):
 
 
 def test_solve_context_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
-    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys are in the mmproj block.
     import logging
 
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
@@ -906,76 +906,6 @@ def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog)
     assert any("vision is not required" in r.message for r in caplog.records)
 
 
-# ── solve_matrix_ctx ──────────────────────────────────────────────────────
-
-
-def test_solve_matrix_ctx_basic(make_model):
-    chat = make_model("chat", context_length=32768)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768,
-        spare_mb=0,
-        chat_models=[(chat, 8000, 0.4, 0.0, 500, 1, 0)],
-        embed_params=(500, 0.1, 0.0, 100),
-        rerank_params=None,
-        embed_ctx=8192,
-        rerank_ctx=0,
-    )
-    # available = 30720; embed overhead = 500+100+0.1*8192 = 1419
-    # remaining_for_chat = 29301; chat_budget = 29301-8000-500 = 20801
-    # ctx = 20801/0.4 = 52002 -> round 49152 -> min(arch 32768) = 32768
-    assert ctx == 32768
-
-
-def test_solve_matrix_ctx_no_chat_models():
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0, chat_models=[],
-        embed_params=None, rerank_params=None,
-    )
-    assert ctx == _MIN_CTX_SIZE
-
-
-def test_solve_matrix_ctx_exhausted_budget(make_model):
-    chat = make_model("chat", context_length=32768)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0,
-        chat_models=[(chat, 40000, 0.4, 0.0, 0, 1, 0)],
-        embed_params=None, rerank_params=None,
-    )
-    # chat_budget = 30720 - 40000 < 0 -> skipped -> best_ctx 0 -> MIN_CTX
-    assert ctx == _MIN_CTX_SIZE
-
-
-def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
-    """An unestimable rider (zero-cost placeholder, kv_factor 0) rides the
-    measurable models' solve — its native max must not inflate the shared
-    chat context (which would suppress tools demotion fleet-wide and serve
-    the unverified model at a context nothing bounded)."""
-    measurable = make_model("m", context_length=131072)
-    rider = make_model("rider", context_length=262144)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0,
-        chat_models=[
-            (measurable, 8000, 0.2, 0.0, 500, 1, 0),
-            (rider, 0, 0.0, 0.0, 0, 1, 0),
-        ],
-        embed_params=None, rerank_params=None,
-    )
-    # rider excluded: budget = 30720 - 8500 = 22220 -> 111100 -> round to
-    # 106496 -> min(arch 131072); NOT the rider's native 262144.
-    assert ctx == 106496
-
-
-def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
-    rider = make_model("rider", context_length=262144)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0,
-        chat_models=[(rider, 0, 0.0, 0.0, 0, 1, 0)],
-        embed_params=None, rerank_params=None,
-    )
-    # Nothing measurable bounds the solve -> the floor.
-    assert ctx == _MIN_CTX_SIZE
-
-
 # ── _measure_affine_trio: the (C, C/2) derivation ─────────────────────────
 
 
@@ -1035,21 +965,6 @@ def test_design_context_sub4k_text_warns(make_model, caplog):
         assert e.design_context == 2048
     assert not [r for r in caplog.records if "sub-4k" in r.message
                 and "emb" in r.message]
-
-
-def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
-    chat = make_model("chat", context_length=32768)
-    chat_models = [(chat, 8000, 0.2, 0.0, 500, 1, 0)]
-    # available = 14336; budget = 5836 -> 29180 -> round 24576
-    assert solve_matrix_ctx(
-        vram_total_mb=16384, spare_mb=0, chat_models=chat_models,
-        embed_params=None, rerank_params=None,
-    ) == 24576
-    # 2000 MB of co-loads: budget = 3836 -> 19180 -> round 16384
-    assert solve_matrix_ctx(
-        vram_total_mb=16384, spare_mb=0, chat_models=chat_models,
-        embed_params=None, rerank_params=None, fixed_overhead_mb=2000,
-    ) == 16384
 
 
 # ── fixed-overhead backends ───────────────────────────────────────────────

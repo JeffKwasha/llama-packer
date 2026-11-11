@@ -394,7 +394,7 @@ def test_agentic_floor_default_unchanged():
 def test_pools_cfg_parsing():
     p = Profiles({"defaults": {}, "profiles": {},
                   "pools": {"gpu0": {"vram": "24G", "spare": "2G"}}})
-    spec = p.pools_cfg["gpu0"]
+    spec = p.pools_cfg["default"]
     assert spec["vram"] == "24G"
     assert spec["spare"] == "2G"
     assert Profiles({"defaults": {}}).pools_cfg == {}
@@ -540,11 +540,11 @@ def test_multi_category_takes_the_heaviest():
     assert resolve_min_ctx(view, category_floor=133120) == 133120
 
 
-def test_cpu_resident_chat_gets_no_auto_parallel(make_model):
+def test_cpu_served_chat_gets_no_auto_parallel(make_model):
     """Host-RAM KV lives in an arena no VRAM ledger budgets.
 
     solve_context returns the design context regardless of the slot count for a
-    CPU-resident model, so every candidate looks equally affordable and the
+    CPU-served model, so every candidate looks equally affordable and the
     score reduces to p**power — walking straight to the cap. Eight slots on
     a model declared for one is an 8x KV over-commit nothing accounts for.
 

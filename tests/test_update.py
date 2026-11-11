@@ -248,7 +248,7 @@ def test_update_cpp_symlinks_accepts_plain_build(tmp_path):
 
 
 def test_update_swap_symlinks_repoints_but_skips_primary(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the live one and is reached through a stable name
+    # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the current one and is reached through a stable name
     make_binary(tmp_path / "llama-swap-v262", "stub")
     os.symlink("llama-swap-v261", tmp_path / "llama-swap")
     os.symlink("llama-swap-v261", tmp_path / "rollback")
@@ -580,7 +580,7 @@ def test_swap_install_prunes_old_unreferenced_binaries(tmp_path, monkeypatch):
 
 
 def test_installed_swap_version_parses_v_number(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the live one and is reached through a stable name
+    # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the current one and is reached through a stable name
     binary = make_binary(
         tmp_path / "llama-swap", "version: v262 (079c35a), built at 2026-10-03\n"
     )
@@ -589,7 +589,7 @@ def test_installed_swap_version_parses_v_number(tmp_path):
 
 
 def test_installed_swap_version_zero_from_unparseable(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the live one and is reached through a stable name
+    # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the current one and is reached through a stable name
     binary = make_binary(tmp_path / "llama-swap", "no version here\n")
     assert upd.installed_llama_swap_version(binary) == 0
 

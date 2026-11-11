@@ -50,7 +50,7 @@ deltas are not a sufficient validator.
 Use the repo's own supported calibration path instead: `--probe-memory lfm2`
 sweeps a (ctx, parallel) grid live and fits the affine law, which separates
 weights / KV / slot terms from this noise by construction. It requires a quiet
-GPU (no `llama_residents()`, no immich VRAM), so it is a deliberate
+GPU (no `llama_processes()`, no immich VRAM), so it is a deliberate
 foreground task rather than something to run alongside other work.
 
 The useful Phase 0 conclusions are the two tooling facts above plus the single

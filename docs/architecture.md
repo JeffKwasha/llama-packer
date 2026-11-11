@@ -27,7 +27,7 @@ main()                                        (__main__.py — thin orchestratio
 | `Model` | `model.py` | Sidecar aggregate: frontmatter accessors, companion resolution (mmproj/MTP), design context, pass-through metadata. One instance per servable model |
 | `ScopeStack` | `scope.py` | The single select-and-set engine for sidecar data: folds `models.yaml` defaults outermost→innermost, applies override rules last-match-wins per key, finalizes backend inference + path refs |
 | `Profiles` | `profiles.py` | The profiles.yaml mapping as a typed view: fleet defaults (`cache_type`, `parallel`, spare), `allow_profiles` gating, expression resolution (`base * N`), per-model variant grouping |
-| `Planner` | `writer.py` | Every *context decision*: per-category rung search, shared context solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
+| `Planner` | `writer.py` | Every *context decision*: per-task rung search, role-budget auction, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx, optional `vram_note` (over-budget squeeze tag for the description) |
 | `emit_config` | `writer.py` | Pure rendering: plans → entry dicts. Zero VRAM contact, zero I/O |
 | `_filter_supported` | `writer.py` | **The** validation boundary: backend format/task compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
@@ -46,7 +46,7 @@ runtime: we choose the fields, llama-swap acts on them.
 | decision | our output | who acts |
 |---|---|---|
 | which entries exist | `models:` (`cmd`, `metadata`, `capabilities`, `name`) | llama-swap serves them |
-| when an idle entry unloads | `ttl:` per entry, top-level `ttl:` (seconds; `0` disables idle unload) | llama-swap's idle timer |
+| when an idle entry unloads | `ttl:` per entry, top-level `globalTTL` from the operator's `ttl` (seconds; `0` disables idle unload) | llama-swap's idle timer |
 | which entries may be wanted together | `routing.router.settings.capacity` (`pools`, per-entry `capacities`, `evict_cost`) | llama-swap's capacity router |
 | what memory each serving claims | `capacities:` on each model | llama-swap, at request time |
 | what memory the packer budgets | pack-time arithmetic only | nobody at runtime |
@@ -217,6 +217,6 @@ plain data — see `tests/test_planner.py`.
 - [backends/](backends/) — one doc per engine: formats/endpoints, command shape, config keys, VRAM
 - [transports/](transports/) — host / docker / podman: launch wrapping, path translation, lifecycle
 - [SPEC.md](../SPEC.md) — behavioral contract (discovery, fit-params
-  estimate, measurement shape, shared context solve, auto-parallel, batch/ubatch
+  estimate, measurement shape, role budget, auto-parallel, batch/ubatch
   keys, and what deleting a `derived:` block costs)
   (seconds of header-only work — never a server, never a probe).

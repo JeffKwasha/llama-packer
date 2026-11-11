@@ -1,7 +1,7 @@
 # tests/test_utils_paths.py
 """Contract tests for filesystem/version helpers in utils.
 
-Design parts: SPEC.md, 'llama.cpp Build Selection' — the tools/ layout (engines live
+Design parts: SPEC.md, 'llama.cpp Build Selection' — the tools/ layout (engines sit
 in <run dir>/tools), the build-number resolution, and the drive-speed
 classification that bounds a load-time estimate.
 """

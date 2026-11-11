@@ -288,7 +288,7 @@ Choosing them:
 
 `image`/`s2t`/`t2s` engines are opt-in via profiles.yaml (a role with the
 matching `dir:` + `backends:`). Floors (`min_context`, `min_parallel`,
-`require`, `keep`, `sacrifice`) and `parallel_power` live in the
+`require`, `keep`, `sacrifice`) and `parallel_power` are in the
 `profiles.yaml` task declaration, not in the sidecar. See the `llama-packer`
 project's `SPEC.md` for the full map.
 
@@ -321,7 +321,7 @@ chat_template: {hf_repo: peculiar-ragdoll/Qwen-Sharp-Chat-Templates,
 ## Fleet-level overrides
 
 Per-directory and global overrides — `chat_template`, `chat_template_kwargs`,
-`context_length`, and sampling params — live in a directory `models.yaml` and
+`context_length`, and sampling params are in a directory `models.yaml` and
 `profiles.yaml`, not in the sidecar. See the project `SPEC.md`.
 
 ## Other fields

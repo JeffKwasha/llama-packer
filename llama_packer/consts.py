@@ -88,7 +88,7 @@ _MEASURE_CTX_CAP = 65536
 _MEASURE_TIMEOUT_S = 900
 _MEASURE_STALL_S = 120
 
-# Host-resident KV/RS (Vulkan_Host pool) above this (MiB) rejects a
+# Host-side KV/RS (Vulkan_Host pool) above this (MiB) rejects a
 # measurement point: the pool did not fit device memory (GPU busy or
 # model too large) — the 2026-09-07 Dirk GTT spill signature.
 _KV_SPILL_TOLERANCE_MIB = 8.0

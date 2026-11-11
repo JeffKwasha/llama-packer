@@ -146,11 +146,12 @@ family-dependent constant (`_AUDIO_CPP_COMPUTE_MB`, default 1024 MB), so
 
 ## Matrix
 
-Declare audio as co-load categories ([`matrix:`](../../profiles.yaml.example)):
+Declare audio as co-load sets ([`matrix:`](../../profiles.yaml.example)):
 
 ```yaml
 matrix:
-  categories: {tts: {role: t2s}, stt: {role: s2t}}
+  sets:
+    voice: "t2s & s2t"
   sets:
     rag:   "chat & embeddings & rerank"
     voice: "chat & s2t"
@@ -159,7 +160,7 @@ matrix:
 
 A set names roles (or literal entry ids); the chat solve reserves the most
 expensive model each named role can contribute. `tts` and `stt` are separate
-categories because switching between them forces a reload. A task
+sets because switching between them forces a reload. A task
 with `device: cpu` (the audio-cpp default here) places its models on the host,
 so they cost RAM rather than VRAM.
 

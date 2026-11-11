@@ -1,5 +1,5 @@
 # tests/test_gpu_state.py
-"""Measurement-window guardrails: resident detection, process-group kill,
+"""Measurement-window guardrails: llama-process detection, process-group kill,
 single-flight lock, journal — the 2026-09-07 contamination post-mortem."""
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ def cache(tmp_path, monkeypatch):
     return root
 
 
-# ── resident pre-flight ───────────────────────────────────────────────────
+# ── llama-process pre-flight ──────────────────────────────────────────────
 
-def test_llama_residents_matches(monkeypatch):
+def test_llama_processes_matches(monkeypatch):
     out = subprocess.CompletedProcess([], 0, stdout="\n".join([
         "  101 jk /opt/llama/bin/llama-server -m /models/x.gguf",
         "  102 jk /bin/sh -c llama-swap -f /etc/llama-swap.yaml",
@@ -36,9 +36,9 @@ def test_llama_residents_matches(monkeypatch):
         "  106 jk bash -c 'echo llama-server'",
     ]), stderr="")
     monkeypatch.setattr(gpu_state.subprocess, "run", lambda *a, **k: out)
-    residents = gpu_state.llama_residents()
-    assert len(residents) == 3
-    assert residents[0].startswith("101 ")
+    found = gpu_state.llama_processes()
+    assert len(found) == 3
+    assert found[0].startswith("101 ")
 
 
 # ── process-group kill ────────────────────────────────────────────────────

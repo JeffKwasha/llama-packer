@@ -67,7 +67,7 @@ def pick_family_representatives(
 ) -> dict[str, Model]:
     """One measurable GGUF model per architecture family.
 
-    Only real local ``.gguf`` files with a readable arch qualify (CPU-resident
+    Only real local ``.gguf`` files with a readable arch qualify (CPU-served
     models are never VRAM-sized; error models carry no usable file).  When
     *only_archs* is given, just those families are considered.  Preference
     order per family: fast-storage models first (when *is_fast* says a
@@ -347,7 +347,7 @@ def run_probe(
 
     The only place llama-server is ever started — normal packer runs use
     the fast fit-params estimate plus the corrections this probe writes.
-    Refuses to start beside a resident llama process (measurement
+    Refuses to start beside a running llama process (measurement
     validity is the whole point) and runs single-flight under the
     measurement lock; every serve run is journaled by
     ``VramBudget._run_measure_server``.  Each witness measures (and stamps
@@ -355,10 +355,10 @@ def run_probe(
     (:func:`writer.measurement_args`); *profiles* supplies the fleet tier.
     """
     from llama_packer.writer import measurement_args
-    residents = gpu_state.llama_residents()
-    if residents:
-        return ("probe: refusing to measure — llama processes resident:\n  "
-                + "\n  ".join(residents[:5]))
+    running = gpu_state.llama_processes()
+    if running:
+        return ("probe: refusing to measure — llama processes already "
+                "running:\n  " + "\n  ".join(running[:5]))
     with gpu_state.measurement_lock("probe"):
         reps = pick_family_representatives(models, only_archs, is_fast)
         if not reps:

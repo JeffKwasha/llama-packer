@@ -51,7 +51,7 @@ Also emits:
 1. **`_filter_supported()`** — the validation boundary (backend format/role,
    reasoning flags, cache-type knowability); runs before any VRAM work.
 2. **`Planner.plan()`** — context decisions per (model, category): vision rung,
-   pre-pass, shared context solve, profile grouping, bounded-context clamp.
+   pre-pass, role-budget auction, profile grouping, bounded-context clamp.
    Returns `Variant` values.
 3. **`emit_config()`** — pure rendering of plans into llama-swap entry dicts.
 
@@ -70,7 +70,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Sizing knobs (context caps, `auto_parallel*`, `parallel_power`, shared-solve floors) and `categories` model picks | [VRAM Allocation](#vram-allocation) |
+| `matrix` | Sizing knobs and the authored `sets` | [VRAM Allocation](#vram-allocation) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
@@ -257,7 +257,7 @@ Semantics:
 - **max**: large images are downscaled to this token ceiling — the control for bounding KV cost and prompt size. Diminishing quality returns beyond ~4k tokens.
 - **Static-resolution archs** (Gemma 3/4, SigLIP: fixed resize, ~256 tokens/image) ignore both flags; declaring them there logs a one-time warning and skips emission, as does declaring them on a model with no mmproj companion.
 
-VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`solve_context` raises the rounded-down context to that floor; the shared solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
+VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`solve_context` raises the rounded-down context to that floor; the role solve warns when a model's floor exceeds its budget). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
 
 ### Context calculation formula
 
@@ -304,7 +304,7 @@ decided per category, by `solve_rung` walking the category's `sacrifice:` order:
 
 There is no companion entry and no vision-less twin. A model emits **one entry
 per satisfiable category**, and vision is a property of that entry rather than a
-second serving alongside it. Two entries for one model is two categories in
+second serving alongside it. Two entries for one model is two tasks in
 sidecars — a `coding` entry and a `coding-vision` one, the latter declaring
 `require: [vision]` — not a hardcoded pairing.
 
@@ -1222,7 +1222,7 @@ A model with `role: t2s` (text-to-speech) or `role: s2t` (ASR) is served
 through the native **audio.cpp** engine (`audiocpp_server`). The full contract
 — roles, sidecar keys (`audio_cpp: {family, task, options, voice, voice_ref}`),
 profiles.yaml keys (`audio_cpp: {bin, backend, device, …}`), the emitted
-`sh -c` heredoc, classification, VRAM and matrix categories — lives in
+`sh -c` heredoc, classification, VRAM and role allocation — lives in
 [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md).
 
 ```yaml
