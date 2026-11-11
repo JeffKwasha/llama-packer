@@ -230,8 +230,10 @@ the whole pool on a guess.
 
 ## Fallback model_id
 
-Every model gets a bare `<stem>` entry in its role, priced at the model's
-floor. A model_id that is in no role is an error and emits nothing.
+Every model gets a bare `<stem>` entry in its role, with no endpoint. It is
+priced at the smallest declared task floor the model's design context can
+reach, or the minimum useful context when none is reachable. A model_id that
+is in no role is an error and emits nothing.
 
 ## Gone
 

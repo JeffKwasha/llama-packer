@@ -636,7 +636,8 @@ def test_fallback_is_a_bare_minimum_category():
     """
     from types import SimpleNamespace
 
-    fb = fallback_task(SimpleNamespace(tasks_resolved=()))
+    fb = fallback_task(SimpleNamespace(
+        tasks_resolved=(), design_context=32768))
     assert fb.id == ""
     assert fb.min_context == 4096
     assert fb.min_parallel == 1

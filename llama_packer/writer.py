@@ -857,8 +857,9 @@ def fallback_task(model: Model,
     smallest floor among the model's tasks, so the alias never claims a
     larger serving than the model already declares.
     """
+    design = model.design_context
     mins = [task.min_context for task in (model.tasks_resolved or ())
-            if task.min_context]
+            if task.min_context and task.min_context <= design]
     return Task("", "", min_context=min(mins) if mins else empty_min,
                 min_parallel=1, require=frozenset(), sacrifice=())
 

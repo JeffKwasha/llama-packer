@@ -149,7 +149,8 @@ future work; the tuple already expresses them.
 
 ## Allocation
 
-The full algebra lives in [allocation.md](allocation.md). In short:
+The full algebra lives in [allocation.md](allocation.md). The fallback is the
+bare model id with no endpoint in its role. In short:
 
 - A serving's floor comes from its task's `min_context` and `min_parallel`,
   through the measured memory law.
