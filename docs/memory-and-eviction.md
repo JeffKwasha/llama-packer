@@ -50,8 +50,8 @@ score = sqrt(ctx / task_min_context) * slots ** parallel_power
 
 A serving's floor is the memory it needs at its task's `min_context` and
 `min_parallel`, through the measured memory law. The context is priced at the
-first emitted step (8192 tokens) at or above `min_context`. A role's floor is the
-maximum floor of all models in the role.
+first emitted step (a multiple of 4096) at or above `min_context`. A role's
+floor is the maximum floor of all models in the role.
 
 A set's floor follows its expression, component-wise:
 

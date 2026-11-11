@@ -50,8 +50,8 @@ floor = weights + companions + compute
 ```
 
 as a `Memory` tuple. `min_context` is priced at the first emitted context
-step (4096, then multiples of 8192) at or above it, because the solve never
-emits below a task floor. A model with several tasks has one floor per task.
+step (a multiple of 4096) at or above it, because the solve never emits
+below a task floor. A model with several tasks has one floor per task.
 
 **A role's floor is the maximum floor of all the models in the role**, per
 pool. A role runs one serving at a time, so its budget is the largest serving

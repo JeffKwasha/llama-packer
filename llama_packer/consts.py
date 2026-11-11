@@ -15,7 +15,7 @@ import re
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 _DEFAULT_CONTEXT_LENGTH = 32768
-_CTX_ROUND_TO = 8192
+_CTX_ROUND_TO = 4096
 _MIN_CTX_SIZE = 4096
 
 # Room reserved, in tokens, for the model to answer once it has seen an

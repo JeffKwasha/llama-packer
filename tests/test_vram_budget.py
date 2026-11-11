@@ -585,9 +585,9 @@ def test_solve_context_memory_margin_shrinks_ctx(make_model):
     plain = model.vram.solve_context(65536, fit_bin="unused", memory_margin=0.0)
     margined = model.vram.solve_context(65536, fit_bin="unused", memory_margin=0.01)
     # available = 63520 (plain) vs 63520/1.01 = 62891.1 (margined)
-    # plain: remaining 12520 -> 25040 -> 24576; margined: 11891 -> 23782 -> 16384
+    # plain: remaining 12520 -> 25040 -> 24576; margined: 11891 -> 23782 -> 20480
     assert plain == 24576
-    assert margined == 16384
+    assert margined == 20480
 
 
 # ── unestimable fallback (no estimate source works) ──────────────────────
@@ -992,7 +992,7 @@ def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
 
     The ceiling was only applied in the design-fits branch, so the same model
     and sidecar produced two different answers depending on which branch the
-    budget happened to select: 32768 when it fit, 98304 when VRAM forced the
+    budget happened to select: 32768 when it fit, a smaller value when VRAM forced the
     squeeze. SPEC spells out both clamps, and the caller cannot recover it --
     _bounded_ctx passes design_context, which prefers the GGUF header over
     the sidecar.

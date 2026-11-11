@@ -507,7 +507,7 @@ def test_auto_parallel_vllm_reaches_higher_cap(make_model, profiles):
     _fake_vram(llama_m, (1000, 0.5, 100))
     planner = Planner([llama_m], no_pin, fit_bin="unused",
                       vram_total=48 * 1024, min_context=4096)
-    assert planner.plan()["al"][0].parallel == 8
+    assert planner.plan()["al"][0].parallel == 7
 
 
 def test_matrix_knobs_invalid_values_warn_and_default(caplog):
@@ -1143,7 +1143,7 @@ def test_min_share_serves_a_floor_between_rounding_steps(profiles):
                           "min_context": 100000}}}),
         fit_bin="unused", vram_total=64 * 1024)
     variants = planner.plan()["emb"]
-    assert variants[0].ctx_size == 106496
+    assert variants[0].ctx_size == 102400
 
 def test_capacity_budget_is_net_of_spare(profiles):
     # Validates: docs/allocation.md, 'Routers': a role budget is already net
