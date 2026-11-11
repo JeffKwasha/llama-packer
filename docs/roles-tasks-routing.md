@@ -78,7 +78,7 @@ tasks:
   spot:
     endpoint: openai.chat.completions
     device: 0                # auto | cpu | GPU index
-    min_context: 32k         # optional; top-level min_context is the default
+    min_context: 32k         # optional; design-derived when omitted
     max_context: 64k         # optional ceiling
     min_parallel: 2
     require: [vision]

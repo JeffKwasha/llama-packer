@@ -532,11 +532,8 @@ def test_multi_category_takes_the_heaviest():
 
 
 def test_cpu_served_chat_prices_slots_in_its_host_allocation(make_model):
-    """CPU slots charge the host budget, so auto-parallel can pick two.
-
-    Validates: docs/allocation.md, 'The auction': every model solves its
-    context and parallel inside its role's allocation in its pool.
-    """
+    # Validates: docs/allocation.md, 'The auction': every model solves its
+    # context and parallel inside its role's allocation in its pool.
     from llama_packer.profiles import Profiles as _P
     model = make_model("cpu-chat", role="chat", device="cpu",
                        context_length=262144, tasks=["chat"])

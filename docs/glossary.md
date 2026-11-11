@@ -56,7 +56,7 @@ either way it should not be used in a commit message until it is.
 | Term | Means | Code |
 |---|---|---|
 | **host pool** | The host RAM the budget may spend: `min(sys_free, cgroup_free)`, each term logged with the arm (`declared`/`sysctl`/`fallback-25%`/`skipped-cgroup`) that chose it. | `hardware.py:HostProfile` |
-| **host budget** | A role's `ram` allocation: `floor + share × (available − floor)`, with `fill` taking the pool split among fills. Host-placed models solve their context inside it, like GPU models inside `default`. | `_role_budgets`, `VramBudget.solve_context` |
+| **host budget** | A role's `ram` allocation: `floor + share × (available − floor)`, with `fill` taking the remainder above the floors, split among fills. Host-placed models solve their context inside it, like GPU models inside `default`. | `_role_budgets`, `VramBudget.solve_context` |
 
 ## The capability ladder
 

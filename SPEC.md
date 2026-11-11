@@ -357,7 +357,7 @@ no idle-unload CLI flag.
 
 ### Tasks (`tasks:`)
 
-The top-level `min_context` is the default floor for tasks that do not declare one; it cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, and the demand that work needs. A task that omits `min_context` uses an explicitly set top-level value; with none set, the hard emit floor (4096) applies. `min_context > max_context` is an error that stops the run before a config is written. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids. A task whose endpoint is not in that set is warned about and dropped:
+The top-level `min_context`, when set, is the default floor for tasks that do not declare one; it cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, and the demand that work needs. A task that omits `min_context` uses the design-derived cascade: the model's explicit `min_context`, a pinned `--max-context`, `tools_min_ctx` for tool callers, then half the design context. An explicitly set top-level `min_context` overrides the last two. `min_context > max_context` is an error that stops the run before a config is written. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids. A task whose endpoint is not in that set is warned about and dropped:
 
 ```yaml
 tasks:

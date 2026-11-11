@@ -35,8 +35,10 @@ score = sqrt(ctx / task_min_context) * slots ** parallel_power
 ```
 
 - Context below the task floor is rejected. `min_context` comes from the
-  task, else an explicitly set top-level `min_context`, else the hard emit
-  floor (4096).
+  task, else the design-derived cascade: the model's explicit
+  `min_context`, a pinned `--max-context`, `tools_min_ctx` for tool callers,
+  then half the design context. An explicitly set top-level `min_context`
+  overrides the last two.
 - `auto_parallel: false` disables the value function; `parallel:` pins a
   slot count.
 - An entry whose endpoint keeps no KV cache serves one slot at the task's

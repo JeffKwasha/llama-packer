@@ -1159,9 +1159,8 @@ def test_capacity_budget_is_net_of_spare(profiles):
     m.vram.solve_context = fake
     for flag in (True, False):
         m.view_for(flag).vram.solve_context = fake
-    profiles = _P({"defaults": {"cache_type": "q8_0"},
-                   "profiles": {"default": {}},
-                   "pools": {"default": {"spare": "1G"}}})
+    profiles = _P({"defaults": {"cache_type": "q8_0", "spare": "1G"},
+                   "profiles": {"default": {}}})
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024)
     planner.plan()
     from llama_packer.vram import _RESERVE_SYSTEM, _RESERVE_VIDEO
@@ -1175,23 +1174,35 @@ def test_capacity_fill_splits_the_pool_above_the_floors(profiles):
     from llama_packer import allocation, roles
     try:
         roles.configure({"roles": {"a": {"share": "fill"},
-                                   "b": {"share": "fill"}}})
+                                   "b": {"share": "fill"},
+                                   "c": {"share": "min"}}})
         a = make("a", role="a", context_length=32768)
         b = make("b", role="b", context_length=32768)
+        c = make("c", role="c", context_length=32768)
         _fake_vram(a, (1000, 0.1, 0))
         _fake_vram(b, (500, 0.1, 0))
-        planner = Planner([a, b], profiles, fit_bin="unused",
+        _fake_vram(c, (800, 0.1, 0))
+        planner = Planner([a, b, c], profiles, fit_bin="unused",
                           vram_total=48 * 1024)
         budget = planner._role_budgets()
         fa, fb = budget[("a", "default")], budget[("b", "default")]
+        fc = budget[("c", "default")]
         cap = planner.capacity_pools["default"]
         floor = allocation.floor_mb
-        qa, qb = (1000, 0.1, 0, 0), (500, 0.1, 0, 0)
-        assert fa + fb <= cap
-        assert fa - fb == (floor(qa, planner.min_context, 1,
-                                 planner.memory_margin)
-                           - floor(qb, planner.min_context, 1,
-                                   planner.memory_margin))
+
+        def role_floor(model, quad):
+            ctx = planner._task_floor(model.view_for(True),
+                                      model.tasks_resolved[0])
+            return floor(quad, ctx, 1, planner.memory_margin)
+
+        ka = role_floor(a, (1000, 0.1, 0, 0))
+        kb = role_floor(b, (500, 0.1, 0, 0))
+        kc = role_floor(c, (800, 0.1, 0, 0))
+        slack = cap - ka - kb - kc
+        assert fc == kc
+        assert fa == ka + slack // 2
+        assert fb == kb + slack // 2
+        assert fa + fb + fc <= cap
     finally:
         roles.configure(None)
 
@@ -1199,11 +1210,14 @@ def test_capacity_fill_splits_the_pool_above_the_floors(profiles):
 def test_cpu_model_emits_nothing_without_a_host_pool(profiles):
     # Validates: docs/allocation.md, 'Routers': a CPU serving charges ram;
     # with no host pool there is no allocation to solve inside.
-    m = make("cpu", role="chat", device="cpu")
-    _fake_vram(m, (466, 0.057, 346))
-    plan = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
-                   host_pool_mb=0).plan()
+    measured = make("cpu", role="chat", device="cpu")
+    _fake_vram(measured, (466, 0.057, 346))
+    unmeasured = make("ucpu", role="chat", device="cpu")
+    unmeasured.vram.unestimated_reason = "no estimate"
+    plan = Planner([measured, unmeasured], profiles, fit_bin="unused",
+                   vram_total=64 * 1024, host_pool_mb=0).plan()
     assert "cpu" not in plan
+    assert "ucpu" not in plan
 
 def test_no_host_pool_never_gates(profiles, caplog):
     # Validates: docs/plans/requirement-trace.md, requirement #76

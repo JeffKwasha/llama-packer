@@ -49,9 +49,9 @@ floor = weights + companions + compute
         + slot × min_parallel
 ```
 
-as a `Memory` tuple. `min_context` is priced at the first emitted context step
-(8192 tokens) at or above it, because the solve never emits below a task
-floor. A model with several tasks has one floor per task.
+as a `Memory` tuple. `min_context` is priced at the first emitted context
+step (4096, then multiples of 8192) at or above it, because the solve never
+emits below a task floor. A model with several tasks has one floor per task.
 
 **A role's floor is the maximum floor of all the models in the role**, per
 pool. A role runs one serving at a time, so its budget is the largest serving
@@ -229,8 +229,10 @@ the whole pool on a guess.
 ## Task contract
 
 - A task's `min_context` overrides the top-level value. A task that omits
-  it uses an explicit top-level `min_context`; with none set, the hard
-  emit floor (4096) applies.
+  it falls back to the design-derived cascade: the model's explicit
+  `min_context`, a pinned `--max-context`, `tools_min_ctx` for tool callers,
+  then half the design context. An explicitly set top-level `min_context`
+  overrides the last two.
 - `min_context > max_context` is an error: the run stops and no config is
   written.
 - Declared tasks on one model that do not share one endpoint are an error.

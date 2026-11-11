@@ -1400,10 +1400,7 @@ class Planner:
                 include_draft="draft" not in shed,
                 design_ctx=design_ctx, context_length=context_length,
                 profile=profile)
-            task_floor = (demand.min_context
-                          or (self.min_context if self.min_context_explicit
-                              else _MIN_CTX_SIZE))
-            if ctx <= 0 or ctx < task_floor:
+            if ctx <= 0 or ctx < self._task_floor(view, demand):
                 continue
             over = getattr(view.vram, "over_budget_reason", None)
             if over is not None:
@@ -1440,6 +1437,15 @@ class Planner:
         return (view.serves_endpoint(CHAT)
                 and ctx < self.knobs.tools_min_ctx
                 and "tools" in [c.lower() for c in view.capabilities])
+
+    def _task_floor(self, view, demand: Task) -> int:
+        floor = resolve_min_ctx(
+            view, pin_ctx=self._serving_pin(view),
+            tools_min_ctx=self.knobs.tools_min_ctx,
+            fallback_min_ctx=self.min_context,
+            fallback_explicit=self.min_context_explicit,
+            category_floor=demand.min_context or None)
+        return max(demand.min_context or 0, floor)
 
     def _serving_pin(self, view) -> int | None:
         """Explicitly pinned serving ctx, or None.
@@ -1609,7 +1615,7 @@ class Planner:
                 allow_cpu=True)
             if quad is None:
                 tasks = m.tasks_resolved or ()
-                min_ctx = (max(task.min_context or self.min_context
+                min_ctx = (max(self._task_floor(view, task)
                                for task in tasks)
                            if tasks else _MIN_CTX_SIZE)
                 est = max(HOST_PROCESS_MIB, int(m.size_mb or 0)
@@ -1635,20 +1641,16 @@ class Planner:
             best = 0
             best_task = None
             for task in demands:
-                min_ctx = (task.min_context
-                           or (self.min_context
-                               if self.min_context_explicit
-                               else _MIN_CTX_SIZE))
+                min_ctx = self._task_floor(view, task)
                 if min_ctx > m.design_context:
                     logger.info(
                         "%s task %r min_context %d is above the design "
                         "context %d; the task is unservable", m.stem,
                         task.id or "fallback", min_ctx, m.design_context)
                     continue
-                served_floor = max(
-                    _MIN_CTX_SIZE,
-                    ((min_ctx + _CTX_ROUND_TO - 1)
-                     // _CTX_ROUND_TO) * _CTX_ROUND_TO)
+                served_floor = (_MIN_CTX_SIZE if min_ctx <= _MIN_CTX_SIZE
+                                else ((min_ctx + _CTX_ROUND_TO - 1)
+                                      // _CTX_ROUND_TO) * _CTX_ROUND_TO)
                 need = allocation.floor_mb(
                     quad, served_floor, task.min_parallel or 1,
                     self.memory_margin)
@@ -2032,15 +2034,7 @@ class Planner:
                                         model.stem, demand.id or "fallback",
                                         ", ".join(sorted(demand.require)))
                             continue
-                        floor = resolve_min_ctx(
-                            view, pin_ctx=pin_ctx,
-                            tools_min_ctx=self.knobs.tools_min_ctx,
-                            fallback_min_ctx=self.min_context,
-                            fallback_explicit=self.min_context_explicit,
-                            category_floor=(demand.min_context
-                                            or (self.min_context
-                                                if self.min_context_explicit
-                                                else None)))
+                        floor = self._task_floor(view, demand)
                         rung = self.solve_rung(
                             model, demand, parallel=parallel,
                             cache_type=cache_type, spare_mb=spare_eff,
@@ -2144,9 +2138,6 @@ class Planner:
                                  if serve_view.on_cpu else None)
                     host_charge = mem[1] if host_free is not None else None
                     if (host_charge is not None and host_charge > host_free):
-                        # The solve already sized the context inside the
-                        # role's ram budget; this is the safety net for a
-                        # quad that still outgrows the pool.
                         logger.info(
                             "%s: %s over_budget_reason: host pool — %d MiB "
                             "needed, %d MiB in the pool; entry omitted",
