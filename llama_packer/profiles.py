@@ -62,7 +62,7 @@ _MATRIX_KEYS = {
     "vllm_auto_parallel_max", "estimate_headroom", "auto_parallel",
     "parallel_power",
 }
-_POOL_KEYS = {"vram", "spare", "reserve_extra", "pins"}
+_POOL_KEYS = {"vram", "spare"}
 _CAPACITY_KEYS = {"pp_tps", "drive_mbps"}
 _HARDWARE_KEYS = {
     "vram", "baseline_mb", "unified_system_mb", "gpu_family",
@@ -213,8 +213,6 @@ def check_profiles(cfg: dict) -> list[str]:
     for name, spec in pools.items():
         body = _check_mapping(problems, f"pools.{name}", spec,
                               known=_POOL_KEYS)
-        if "pins" in body:
-            _check_mapping(problems, f"pools.{name}.pins", body["pins"])
 
     _check_mapping(problems, "capacity", cfg.get("capacity"),
                    known=_CAPACITY_KEYS)
@@ -320,16 +318,14 @@ class Profiles:
 
     @property
     def pools_cfg(self) -> dict:
-        """Raw ``pools:`` section: ``{pool_id: {vram, spare, reserve_extra,
-        pins}}`` with non-dict garbage dropped (warned, never fatal).
+        """Raw ``pools:`` section: ``{pool_id: {vram, spare}}`` with
+        non-dict garbage dropped (warned, never fatal).
 
-        Pools are VRAM ledgers keyed by id (``gpu0`` … or ``default``).
-        ``vram:`` declares a pool's size (otherwise the detected total);
-        ``spare:`` overrides the global spare for that pool; ``reserve_extra:``
-        holds unmodelled residents (VM, game, other tenant); ``pins:`` maps a
-        claimant name to an explicit reservation or ``"auto"`` (derived math
-        stays authoritative).  Resolution against pool sizes happens in the
-        ledger (:class:`writer.PoolLedger`), not here.
+        Pools are VRAM ledgers keyed by id (``default``, ``ram``, or a
+        device id). ``vram:`` declares a pool's size (otherwise the detected
+        total); ``spare:`` overrides the global spare for that pool.
+        Resolution against pool sizes happens in the ledger
+        (:class:`writer.PoolLedger`), not here.
         """
         raw = self._cfg.get("pools")
         if raw is None:
@@ -342,16 +338,9 @@ class Profiles:
             if not isinstance(spec, dict):
                 logger.warning("pools: %r is not a mapping; ignoring", pid)
                 continue
-            pins = spec.get("pins") or {}
-            if not isinstance(pins, dict):
-                logger.warning("pools: %r pins is not a mapping; ignoring",
-                               pid)
-                pins = {}
             pools[str(pid)] = {
                 "vram": spec.get("vram"),
                 "spare": spec.get("spare"),
-                "reserve_extra": spec.get("reserve_extra"),
-                "pins": {str(k): v for k, v in pins.items()},
             }
         return pools
 

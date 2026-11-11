@@ -196,6 +196,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--audio-cpp-backend", help="audio.cpp runtime backend "
                         "(cuda|vulkan|cpu|metal|hip; overrides profiles.yaml audio_cpp.backend; "
                         "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")
+    parser.add_argument("--spare-pool", action="append", default=[],
+                        metavar="POOL=MiB",
+                        help="Per-pool spare, repeatable; gpu0=1G, ram=2G. "
+                             "Overrides that pool's profiles.yaml spare")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
     return parser.parse_args(argv[1:] if argv else None)
@@ -572,6 +576,19 @@ def main(argv: list[str] | None = None) -> None:
     if not isinstance(profiles_cfg, dict):
         fatal("profiles.yaml: top level must be a mapping, got %s",
               type(profiles_cfg).__name__)
+    for item in args.spare_pool:
+        pool, sep, value = item.partition("=")
+        if not sep or not pool or not value:
+            fatal("--spare-pool: %r is not POOL=MiB", item)
+        pool = {"gpu0": "default", "system": "ram"}.get(pool, pool)
+        pools = profiles_cfg.setdefault("pools", {})
+        if not isinstance(pools, dict):
+            fatal("profiles.yaml: pools must be a mapping")
+        body = pools.setdefault(pool, {})
+        if not isinstance(body, dict):
+            fatal("pools.%s must be a mapping", pool)
+        body["spare"] = value
+
 
     if args.check:
         problems = check_profiles(profiles_cfg)

@@ -1692,7 +1692,7 @@ def test_cpu_resident_charges_host_not_vram(profiles, monkeypatch):
     assert planner.host_ledger.resident_mb() == 2 * per_slot
     assert planner.host_ledger.available() == 4096 - 2 * per_slot
     # The VRAM ledger carries nothing for it (decision 5: no double count).
-    assert planner.ledger.extra_reserve_mb("default") == 0
+    assert planner.ledger.residents == []
 
     # One co-resident per role: committing two quads for one role is a
     # planner bug, not a pool the packer would overrun.
@@ -1852,35 +1852,6 @@ def test_cpu_fixed_category_resident_charged_host(profiles, monkeypatch):
     planner.plan()
     roles = [role for _, role, _ in planner.host_ledger.residents]
     assert sorted(roles) == ["embed", "rerank", "rnk2"]
-
-
-def test_gpu_fixed_category_charges_vram_ledger(profiles, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md, requirement #74
-    # A declared GPU category is a resident too: it charges the VRAM ledger
-    # at the margin the emitted capacity carries, so the chat solve leaves
-    # it room instead of filling the pool.
-    from llama_packer import writer
-
-    chat = make("chat", role="chat")
-    embed = make("e", role="embeddings", device="cpu", context_length=32768)
-    rnk = make("r", role="rerank", device="cpu", context_length=32768)
-    tts = make("t", role="t2s", context_length=32768)
-    _fake_vram(chat, (1000, 0.5, 100))
-    for m in (embed, rnk):
-        _fake_vram(m, (100, 0.01, 50))
-    _fake_vram(tts, (1000, 0.0, 0))
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 8192)
-    planner = Planner([chat, embed, rnk, tts], profiles, fit_bin="unused",
-                      vram_total=64 * 1024, matrix_cfg={"sets": {}},
-                      embed_model=embed, rerank_model=rnk,
-                      fixed_categories=[("tts", tts)],
-                      host_pool_mb=10000)
-    planner.plan()
-    base = writer._coload_overhead(tts, "unused", profiles, planner.knobs)
-    expected = int(round(base * (1.0 + planner.memory_margin)))
-    assert expected > 0
-    assert planner.ledger.extra_reserve_mb("default") == expected
 
 
 def test_task_max_context_caps_a_non_chat_entry(make_model):

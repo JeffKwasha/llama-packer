@@ -197,6 +197,14 @@ def test_detect_matrix_returns_the_section_and_no_pair():
     assert cats == {} and fixed == () and ctx == {}
 
 
+def test_parse_args_spare_pool_is_repeatable():
+    from llama_packer.__main__ import parse_args
+
+    args = parse_args(["prog", "--spare-pool", "gpu0=1G",
+                       "--spare-pool", "ram=2G"])
+    assert args.spare_pool == ["gpu0=1G", "ram=2G"]
+
+
 def test_parse_args_spare_and_baseline():
     from llama_packer.__main__ import parse_args
 

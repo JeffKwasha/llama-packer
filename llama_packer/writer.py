@@ -1236,20 +1236,6 @@ class PoolLedger:
         if mb > 0:
             self.residents.append((label, pool_id, int(mb)))
 
-    def _explicit_pin_mb(self, pool_id: str, raw: object,
-                         claimant: str) -> int:
-        if raw is None:
-            return 0
-        if isinstance(raw, str) and raw.strip().lower() == "auto":
-            return 0  # derived math stays authoritative
-        try:
-            return int(utils.parse_mem_mb(str(raw),
-                                          self.pool_vram_mb(pool_id)))
-        except (TypeError, ValueError, AssertionError):
-            logger.warning("pools: %s pins %s=%r unreadable; ignoring",
-                           pool_id, claimant, raw)
-            return 0
-
     def spare_for(self, pool_id: str, global_spare_mb: int) -> int:
         raw = self.pools_cfg.get(pool_id, {}).get("spare")
         if raw is None:
@@ -1262,23 +1248,6 @@ class PoolLedger:
                            pool_id, raw)
             return global_spare_mb
 
-    def extra_reserve_mb(self, pool_id: str = "default") -> int:
-        """MB to add to the solve's spare for this pool: unmodelled
-        residents, explicit pins, and registered co-residents."""
-        spec = self.pools_cfg.get(pool_id, {})
-        total = 0
-        raw_extra = spec.get("reserve_extra")
-        if raw_extra is not None:
-            try:
-                total += int(utils.parse_mem_mb(str(raw_extra),
-                                                self.pool_vram_mb(pool_id)))
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("pools: %s reserve_extra=%r unreadable; "
-                               "ignoring", pool_id, raw_extra)
-        for claimant, raw in (spec.get("pins") or {}).items():
-            total += self._explicit_pin_mb(pool_id, raw, claimant)
-        total += sum(mb for _, pool, mb in self.residents if pool == pool_id)
-        return total
 
 
 class HostLedger:
@@ -1512,8 +1481,9 @@ class Planner:
         # makes "one live serving per role" a capacity constraint.
         reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
         spare_mb = profiles.global_spare_mb(self.spare, vram_total)
+        default_spare = self.ledger.spare_for("default", spare_mb)
         pools: dict[str, int] = {}
-        gpu_pool = int(vram_total - reserve - spare_mb)
+        gpu_pool = int(vram_total - reserve - default_spare)
         if gpu_pool > 0:
             pools["default"] = gpu_pool
         if host_pool_mb is not None and host_pool_mb > 0:
@@ -2406,8 +2376,6 @@ class Planner:
                 else:
                     spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                     spare_eff = spare_mb
-                    if view.serves_endpoint(CHAT):
-                        spare_eff += self.ledger.extra_reserve_mb(pool_id)
                 # Auto-parallel: unpinned chat models on slot-based backends
                 # get a value-function (parallel, ctx) solve instead of the
                 # group parallel.  Pinned = sidecar/block `parallel:` or any

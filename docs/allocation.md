@@ -21,7 +21,8 @@ available(pool) = physical(pool) − reserve(pool)
   named role or model is future work and must name the device tuple it
   reserves.
 - Pools are independent. Settings and CLI arguments name the pool whose
-  spare they change (`gpu0`, `cpu`, …); today only the GPU spare can be set.
+  spare they change (`default` or its device alias `gpu0`, `ram` or
+  `system`). `--spare-pool POOL=MiB` sets one pool and is repeatable.
 - A serving's cost is a tuple over pools, `cpu` first. The tuple is built
   from the host: `cpu`, then one field per discrete GPU, or one shared field
   for unified memory, plus any fake resource that exists to impose a limit

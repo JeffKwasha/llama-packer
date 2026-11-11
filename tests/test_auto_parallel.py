@@ -393,21 +393,17 @@ def test_agentic_floor_default_unchanged():
 
 def test_pools_cfg_parsing():
     p = Profiles({"defaults": {}, "profiles": {},
-                  "pools": {"gpu0": {"vram": "24G", "spare": "2G",
-                                     "reserve_extra": "8G",
-                                     "pins": {"image": "40G",
-                                              "embeddings": "auto"}}}})
+                  "pools": {"gpu0": {"vram": "24G", "spare": "2G"}}})
     spec = p.pools_cfg["gpu0"]
     assert spec["vram"] == "24G"
-    assert spec["pins"] == {"image": "40G", "embeddings": "auto"}
+    assert spec["spare"] == "2G"
     assert Profiles({"defaults": {}}).pools_cfg == {}
 
 
 def test_pools_cfg_garbage_tolerated(caplog):
     p = Profiles({"defaults": {}, "profiles": {},
-                  "pools": {"gpu0": "huge", "gpu1": {"pins": ["x"]}}})
-    assert p.pools_cfg == {"gpu1": {"vram": None, "spare": None,
-                                   "reserve_extra": None, "pins": {}}}
+                  "pools": {"gpu0": "huge", "gpu1": {"vram": "1G"}}})
+    assert p.pools_cfg == {"gpu1": {"vram": "1G", "spare": None}}
     assert Profiles({"pools": ["x"]}).pools_cfg == {}
 
 
@@ -426,24 +422,11 @@ def test_buckets():
     assert bucket("rerank", "llama-server") == "tiny"
     assert bucket("image", "sd-server") == "huge"
     assert bucket("chat", "llama-server") == "chat"
-    assert PoolLedger(48000).extra_reserve_mb() == 0
-
-
-def test_ledger_extra_reserve_math():
-    from llama_packer.writer import PoolLedger
-    pools = {"default": {"vram": None, "spare": None,
-                         "reserve_extra": "8G",
-                         "pins": {"image": "4G", "embeddings": "auto"}}}
-    ledger = PoolLedger(48 * 1024, pools)
-    ledger.add_resident("rerank:r", 1024)
-    # 8192 (reserve_extra) + 4096 (explicit pin; auto = 0) + 1024 resident
-    assert ledger.extra_reserve_mb() == 8192 + 4096 + 1024
 
 
 def test_ledger_spare_override_and_device_pools():
     from llama_packer.writer import PoolLedger
-    pools = {"gpu1": {"vram": "24G", "spare": "2G",
-                      "reserve_extra": None, "pins": {}}}
+    pools = {"gpu1": {"vram": "24G", "spare": "2G"}}
     ledger = PoolLedger(96 * 1024, pools)
     assert ledger.pool_vram_mb("gpu1") == 24576
     assert ledger.pool_vram_mb("default") == 96 * 1024
@@ -463,20 +446,17 @@ def _planner_with_pools(model, pools):
                    matrix_cfg={"auto_parallel": True})
 
 
-def test_plan_pools_reserve_extra_shrinks_ctx(make_model):
-    # Same model, same fake: the only difference is an 8G unmodelled
-    # resident on the default pool → 8192 MB × 2 tok = 16384 fewer tokens.
-    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
-    def run(pools):
-        m = make_model("ap", backend="llama-server", role="chat",
-                       min_context=4096)
-        del m.frontmatter["context_length"]
-        _scripted_by_parallel(m, {1: 40000, 2: 0})
-        return _planner_with_pools(m, pools).plan()["ap"][0]
-    bare = run({})
-    assert (bare.parallel, bare.ctx_size) == (1, 32768)  # capped by design
-    held = run({"default": {"reserve_extra": "8G"}})
-    assert (held.parallel, held.ctx_size) == (1, 40000 - 16384)
+def test_default_pool_spare_reduces_the_emitted_pool(make_model):
+    from llama_packer.writer import Planner
+
+    m = make_model("ap", backend="llama-server", role="chat",
+                   min_context=4096)
+    bare = Planner([m], Profiles({"defaults": {}}), fit_bin="unused",
+                   vram_total=48 * 1024).capacity_pools["default"]
+    held = Planner([m], Profiles({"pools": {"default": {"spare": "4G"}}}),
+                   fit_bin="unused", vram_total=48 * 1024
+                   ).capacity_pools["default"]
+    assert bare - held == 4096
 
 
 def test_plan_pools_spare_override_applies(make_model):
