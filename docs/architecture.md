@@ -34,7 +34,7 @@ main()                                        (__main__.py — thin orchestratio
 | Backends (engines) | `backends/`, `backends/base.py` | The serving engines (llama.cpp, vLLM, sd.cpp, whisper.cpp, audio.cpp): formats and the endpoints they serve, argv construction (`build_cmd`), and the resource requirements needed to launch them (`host_requires`/`container_requires`). Each renders a resolved `Model` into a `cmd` |
 | Transports | `backends/transport.py` | How an engine's process is launched: `host`, or a container runtime (`docker`, `podman`). Owns host→container path translation, mounts, container env, GPU device flags and lifecycle (`stop_cmd`/`unload_timeout`). One `ContainerTransport(runtime)` serves both docker and podman |
 | Registry binding | `backends/__init__.py` | Materialises one `BoundBackend` per valid (engine, transport) pair; engines declare which transports they support. Names: bare engine for host, `<engine>-<transport>` otherwise. Inference order: engines in declaration order, transports host > podman > docker; a container pair is only inferred when its runtime is on `PATH`. Selection: sidecar/override `backend:` > format/role inference gated by configured resources |
-| `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `calc_ctx`, matrix solver primitives |
+| `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `solve_context`, matrix solver primitives |
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
@@ -172,7 +172,7 @@ compatibility is checked once in `_filter_supported` before any budgeting.
 
 | Invariant | Home |
 |-----------|------|
-| Context clamp order: VRAM solve → min(max trained context) → min(`--max-context`) | `Planner._bounded_ctx` — the only package-level `calc_ctx` call site |
+| Context clamp order: VRAM solve → min(max trained context) → min(`--max-context`) | `Planner._bounded_ctx` — the only package-level `solve_context` call site |
 | Spare precedence: profile value > CLI `--spare` > 0 | `Profiles.spare_mb` / `global_spare_mb` |
 | Cache precision precedence: sidecar > profile > `q8_0` | `Model.cache_type_for` fed only from `Profiles.default_cache_type` / profile values |
 | Validation happens exactly once, before budgeting | `build_config` composes filter → plan → emit in that order |
@@ -187,7 +187,7 @@ plain data — see `tests/test_planner.py`.
 
 ## Testing seams
 
-- Fake a model's budget directly: `model.vram.calc_ctx = lambda *a, **k: ...`
+- Fake a model's budget directly: `model.vram.solve_context = lambda *a, **k: ...`
   (see `tests/test_planner.py`) — no subprocess mocking needed.
 - Assert emission with literal expected entries: `emit_config` output compares
   equal to hand-written dicts.

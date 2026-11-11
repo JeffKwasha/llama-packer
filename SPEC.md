@@ -257,7 +257,7 @@ Semantics:
 - **max**: large images are downscaled to this token ceiling — the control for bounding KV cost and prompt size. Diminishing quality returns beyond ~4k tokens.
 - **Static-resolution archs** (Gemma 3/4, SigLIP: fixed resize, ~256 tokens/image) ignore both flags; declaring them there logs a one-time warning and skips emission, as does declaring them on a model with no mmproj companion.
 
-VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the shared solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
+VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`solve_context` raises the rounded-down context to that floor; the shared solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
 
 ### Context calculation formula
 
@@ -337,7 +337,7 @@ Anything that *references* an entry must resolve through `entry_ids_by_stem` (st
 
 When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` counterparts) shrinks the budget, the planner degrades visibly instead of emitting entries that OOM at load time:
 
-- **Over-budget means omitted.** `calc_ctx` records `over_budget_reason` when
+- **Over-budget means omitted.** `solve_context` records `over_budget_reason` when
   weights + compute do not fit at any context of a rung (or the reserve/spare
   leaves ≤ 0 available). `solve_rung` skips that rung and tries the next along
   the declared order; if none fits, that **category emits nothing** — and a model

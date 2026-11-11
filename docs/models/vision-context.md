@@ -165,7 +165,7 @@ native-vision model can only use the `image_max_tokens` fallback.
 
 ## VRAM budget formula
 
-The full per-slot context solve in `calc_ctx`:
+The full per-slot context solve in `solve_context`:
 
 ```
 available    = (vram_total - reserve - spare) / (1 + margin)

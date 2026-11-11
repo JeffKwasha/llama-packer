@@ -32,7 +32,7 @@ MUTATIONS = {
     "test_fallback_keeps_capability_until_the_minimum_forces_it": ("llama_packer/writer.py", "                return best\n"),
     "test_require_gates_existence": ("llama_packer/writer.py", "def can_meet(self, model, demand"),
     "test_sidecar_ceiling_binds_in_the_squeeze_branch": ("llama_packer/vram.py", "    def _sidecar_ceiling(self) -> int | None:"),
-    "test_calc_ctx_image_floor_native_vision": ("llama_packer/vram.py", "            image = self.model.image_max_tokens\n"),
+    "test_solve_context_image_floor_native_vision": ("llama_packer/vram.py", "            image = self.model.image_max_tokens\n"),
     "test_min_image_megapixels_converts_through_geometry": ("llama_packer/model.py", "        return round(mp * _PIXELS_PER_MEGAPIXEL / geo.pixels_per_token)\n"),
     "test_min_image_megapixels_floor_includes_output_reserve": ("llama_packer/vram.py", "        return image + self.model.image_output_reserve_tokens\n"),
     "test_min_image_megapixels_ignored_on_non_proportional": ("llama_packer/model.py", "        if geo is None or not geo.proportional:\n"),

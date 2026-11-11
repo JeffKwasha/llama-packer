@@ -76,12 +76,12 @@ GiB observed) — a significant error factor.
 
 - `serve-corrections.yaml` schema: add `err_mib` and `err_rel` per row
   (measured at the target context by the probe).
-- `llama_packer/vram.py::calc_ctx` (line 1283): fold `err_bound` into the
+- ``VramBudget.solve_context`: fold `err_bound` into the
   reserve:
   `available = (vram_total - reserve - err_bound - spare) / (1 + memory_margin)`.
 - **Why:** sizing to the exact budget with a 5-8% error factor guarantees
   over-admission.
-- **Effect:** `calc_ctx` returns a context that fits *including* the measured
+- **Effect:** `solve_context` returns a context that fits *including* the measured
   error.
 
 ### C5 — Per-entry "significant error factor" test

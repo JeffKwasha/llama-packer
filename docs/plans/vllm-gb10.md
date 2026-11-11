@@ -104,7 +104,7 @@ safetensors, so the GGUF fallback is a last resort.
 - **vLLM memory estimator** (`llama_packer/vllm_estimate.py`) — `vllm-memory-estimator`
   (optional, Python API) produces `model_mib`/`ctx_factor`/`compute_mib` for vLLM models,
   falling back to the local `.safetensors` header estimate, feeding the existing
-  `FitParams`/`calc_ctx`/`solve_matrix_ctx` pipeline unchanged. `--gpu-memory-utilization`
+  `FitParams`/`solve_context`/`solve_matrix_ctx` pipeline unchanged. `--gpu-memory-utilization`
   is derived from the same reserve/spare budget llama.cpp uses.
 - **Direct binary mode** — `backend: vllm` emits `vllm serve` (no docker); `vllm-docker`
   stays selectable. Binary resolved via `--vllm-server` > `vllm.bin` > `vllm` on PATH.

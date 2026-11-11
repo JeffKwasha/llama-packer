@@ -46,7 +46,7 @@ and every one of them carries a `Validates:` citation.
 | # | Requirement | Test |
 |---|---|---|
 | 19 | `context_length:` is a ceiling, applied in **both** solve branches | `test_sidecar_ceiling_binds_in_the_squeeze_branch`, `test_sidecar_ceiling_is_a_min_not_a_fixed_cap` |
-| 20 | Native vision (no mmproj file) still gets the image floor | `test_calc_ctx_image_floor_native_vision` |
+| 20 | Native vision (no mmproj file) still gets the image floor | `test_solve_context_image_floor_native_vision` |
 | 21 | Only `--max-context` pins; `context_length:` is never a floor | `test_serving_pin_ignores_the_design_max`, `test_explicit_max_context_still_pins_and_floors`, `test_design_max_is_a_ceiling_not_a_floor` |
 | 22 | A declared category outranks the tools heuristic | `test_category_floor_beats_the_tools_heuristic` |
 | 23 | `min_context:` and `--max-context` outrank a category | `test_category_floor_never_overrides_the_operator` |
@@ -76,9 +76,9 @@ and every one of them carries a `Validates:` citation.
 
 | # | Requirement | Test |
 |---|---|---|
-| 35 | No emitted entry may need more VRAM than exists | `test_calc_ctx_never_reports_a_context_it_cannot_afford`, `test_overallocation_guard_catches_an_injected_violation` |
+| 35 | No emitted entry may need more VRAM than exists | `test_solve_context_never_reports_a_context_it_cannot_afford`, `test_overallocation_guard_catches_an_injected_violation` |
 | 36 | The guard stays quiet and drops nothing on a sane plan | `test_overallocation_guard_is_quiet_when_the_plan_is_sane` |
-| 37 | A CPU-resident model gets no free slots | `test_cpu_resident_chat_gets_no_auto_parallel` (planned) — covered today by `test_calc_ctx_cpu_resident_returns_design` |
+| 37 | A CPU-resident model gets no free slots | `test_cpu_resident_chat_gets_no_auto_parallel` (planned) — covered today by `test_solve_context_cpu_resident_returns_design` |
 | 38 | `tools` is demoted on the entry's **own** served context | `test_plan_demotes_tools_below_the_threshold_without_a_matrix`, `test_plan_keeps_tools_when_the_context_clears_the_threshold` |
 
 ## Allocation

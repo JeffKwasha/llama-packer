@@ -71,7 +71,7 @@ None of these constants have a documented basis (no "measured on X" or
 - llama.cpp: main FitParams + companion additions (mmproj, draft).
 - MTP draft folded only if `main.source != "llama-server"`.
 
-## calc_ctx (context solving)
+## solve_context (context solving)
 
 1. CPU-resident models: return design context (no VRAM bound).
 2. Reserve = `_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)`.
@@ -88,7 +88,7 @@ None of these constants have a documented basis (no "measured on X" or
 
 - `_design_ctx`: GGUF architectural max > sidecar context_length > default.
 - `_sidecar_ceiling`: sidecar `context_length` only (operator decision).
-- `calc_ctx` uses design for the "does it fit" check, capped by sidecar_ceiling
+- `solve_context` uses design for the "does it fit" check, capped by sidecar_ceiling
   for the final value.
 
 ## Measurement shape and reuse
