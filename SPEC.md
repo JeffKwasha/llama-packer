@@ -42,7 +42,7 @@ Also emits:
 - **`macros:`** — top-level block mapping each `${VAR}` path macro to its absolute directory (see [Path Macros](#path-macros-macros-block-and-configenv)).
 - **`includeAliasesInList: true`** — presents the `${MODEL_ID}:<mode>`/`${MODEL_ID}:<profile>` aliases in `/v1/models` (llama-swap default is `false`).
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
-- **`ttl`** — top-level idle-unload lifetime, default 3600 seconds. A role, task, or sidecar `ttl:` overrides it; `0` disables idle unload (see [TTL](#ttl)).
+- **`globalTTL`** — llama-swap's top-level idle-unload lifetime. The operator writes `ttl` in `profiles.yaml`; a top-level `ttl` is not a llama-swap key, so the packer emits `globalTTL`. A role, task, or sidecar `ttl:` overrides it; `0` disables idle unload (see [TTL](#ttl)).
 
 ### Writer module
 
@@ -465,9 +465,9 @@ models:
     evict_cost: <seconds>
 ```
 
-- Sizes come from generated sets. The packer builds ephemeral sets from the
-  role floors and runs the same auction. The generated sets are reported in a
-  comment. Their generation rule is still open.
+- Set generation is not designed yet. Until it is, every model is its own
+  single-model set, so capacity sizes each model alone. Serious fleets author
+  `matrix.sets:`.
 - Any combination whose summed capacities fit every pool may coexist.
 - One size-1 pool per role makes one serving per role. Requesting another
   model of the role evicts the current one.
@@ -606,8 +606,9 @@ model_id remains. A role that loses every model emits nothing and warns once.
 
 Per-entry `ttl` resolves sidecar > task > role > top-level `ttl`. The
 top-level default is 3600. `0` disables idle unload; otherwise the most
-specific declared value wins. TTL and capacity are independent: TTL yields
-time, capacity bounds memory.
+specific declared value wins. The emitted top-level key is `globalTTL`,
+llama-swap's name; the operator writes `ttl` in `profiles.yaml`. TTL and
+capacity are independent: TTL yields time, capacity bounds memory.
 
 ### What `parallel_power` actually controls
 

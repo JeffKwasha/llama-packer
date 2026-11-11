@@ -65,6 +65,12 @@ placed. The simple rule: **drop the whole set and log an error**. The older
 rule drops the role that brings the pool back under `available`; the simple
 rule is preferred until the role-drop order is specified.
 
+A role holding models on different pools contributes its floor to each
+field, even though only one model runs. That over-reserves. Splitting the
+role is the current answer; a placement-aware role floor is future work.
+Warn when a role with `share: min`, `share: 0`, or a weight below 25 has a
+floor that dominates its set. A large weight is expected to use the pool.
+
 ## Set members
 
 A set is an expression of role labels and model ids using `&`, `|`, `()`,
@@ -74,8 +80,10 @@ A set is an expression of role labels and model ids using `&`, `|`, `()`,
   a role is confined to running alone.
 - A role label expands to its entries. A role with no entries is removed from
   the expression; an all-empty set is dropped with a warning.
-- A literal model id that emitted no entry is a dangling leaf; it is pruned
-  with a warning.
+- A literal model id resolves to a stem, else to an exact published id. If
+  it matches two different entries, error. An id that emitted no entry is an
+  error, not a silent prune.
+- `+auto:orphans` cannot be priced, so it is an error.
 - A set contains at most one serving per role.
 
 ## The auction
@@ -121,6 +129,10 @@ has memory left. Recompute that set: fix the role at its allocation,
 subtract it, and renormalise the rest of the auction among the remaining
 requesters by the same weights. Repeat until no offer changes.
 
+Accept in ascending floor order, then alphabetically on a tie. Roles accept
+first; the models inside a role follow the same order. The order makes the
+fixed point deterministic.
+
 Example — set `A & B` with auction 15 GiB, `A` at 60 and `B` at 90:
 
 ```
@@ -162,20 +174,27 @@ evicts the current one.
 | `matrix.sets:` absent or empty | capacity |
 
 Capacity uses the same algebra with sets generated from the role floors. The
-emitted config is pools plus per-entry capacities; the generated sets are
-reported in a comment. **Once generated, an ephemeral set is identical to a
-declared one**: same floor, same auction, same reallocation. Only its origin
-differs. The generation rule is not yet recorded and must not be guessed.
+emitted config is pools plus per-entry capacities. **Once generated, an
+ephemeral set is identical to a declared one**: same floor, same auction,
+same reallocation. Only its origin differs.
+
+Set generation is not designed yet. Until it is, every model is its own
+single-model set, so capacity sizes each model alone. Serious fleets author
+matrix sets.
 
 Sets never preload. On a request for X, llama-swap picks a set containing X,
 evicts what is outside it, and starts only X. Subsets are permitted.
 
 ## TTL
 
-- Top-level `ttl`, default 3600.
+- Top-level `ttl` in `profiles.yaml`, default 3600.
 - A role's `ttl` overrides the top-level default.
 - A task's or sidecar's `ttl` overrides the role.
 - `ttl: 0` disables idle unload. TTL never reserves memory.
+
+The emitted config uses llama-swap's `globalTTL`. A top-level `ttl` is
+ignored by llama-swap (probed with a bad type: it passes), so the rename is
+on the operator side only until upstream accepts the name.
 
 There is no idle-unload CLI flag.
 

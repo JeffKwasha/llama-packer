@@ -283,10 +283,10 @@ matrix:
 
 `sets:` is not a separate router switch. Writing it makes the config matrix;
 leaving it out makes it capacity. Each set is its own budget, sized by the
-auction in [allocation.md](allocation.md). Capacity uses generated sets with
-the same algebra and emits pools plus capacities. Matrix never preloads: it
-evicts to the cheapest set containing the requested model and starts only
-that model.
+auction in [allocation.md](allocation.md). Capacity has no set generation
+yet, so every model is its own set and is sized alone. Matrix never
+preloads: it evicts to the cheapest set containing the requested model and
+starts only that model.
 
 ### `pools`
 

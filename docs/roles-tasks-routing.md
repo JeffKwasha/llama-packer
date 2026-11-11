@@ -173,10 +173,10 @@ The packer emits pools and per-entry `capacities`. llama-swap loads the
 requested model if it fits every pool, evicting by `evict_cost` when it does
 not. Any combination that fits is allowed.
 
-Sizes come from **generated sets**: the packer builds ephemeral sets from the
-role floors and runs the same auction. The generated sets are reported in a
-comment. Once generated they are identical to authored sets; only their
-origin differs. The generation rule is not recorded yet.
+Set generation is not designed yet. Until it is, every model is its own
+single-model set, so capacity sizes each model alone. Serious fleets author
+`matrix.sets:`. Once generated, an ephemeral set is identical to an authored
+one; only its origin differs.
 
 ### Matrix
 
