@@ -1,7 +1,8 @@
 # Memory-allocation description tags — v1 (shipped) + future plan
 
-Status: **v1 implemented** on branch `description` (tag reports the decided
-allocation verbatim in every emitted `config.yaml` description). This doc
+Status: **v1 implemented** (merged to `main`, 2026-10-17) — the tag reports
+the decided allocation verbatim in every emitted `config.yaml` description.
+This doc
 records the v1 contract and plans the deferred variations: split
 allocations (`+` spill), disk-resident weights (`SSD`), measured host RAM,
 and MoE partial offload.

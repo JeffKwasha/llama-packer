@@ -8,4 +8,4 @@
 - [plans/vllm-gb10.md](plans/vllm-gb10.md) — vLLM / DGX Spark design and progress
 - [plans/comfyui-sd.md](plans/comfyui-sd.md) — ComfyUI + stable-diffusion.cpp backend findings (`sd-server` flags, `/comfyui/` endpoint, `compat.ignoreWebsockets`)
 - [plans/matrix-categories.md](plans/matrix-categories.md) — configurable matrix categories (beyond hardcoded `emb`/`rnk`)
-- [vllm-memory-estimator](https://github.com/ashishkamra/vllm-memory-estimator) — CPU-only safetensor memory estimator (planned fit-params analog for vLLM)
+- [vllm-memory-estimator](https://github.com/ashishkamra/vllm-memory-estimator) — CPU-only safetensor memory estimator (the fit-params analog for vLLM; wired through `llama_packer/vllm_estimate.py`)

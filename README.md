@@ -112,7 +112,8 @@ See [SPEC.md](SPEC.md) for the full schema and [docs/architecture.md](docs/archi
 ## Directional modalities
 
 Each entry advertises `capabilities.in` / `capabilities.out` (llama-swap derives
-UI badges from these), driven by `role:` plus declared capabilities:
+UI badges from these), driven by the task's scheduling role plus declared
+capabilities:
 
 | Role | Directory | in → out | Backend | Endpoint |
 |------|-----------|----------|---------|----------|

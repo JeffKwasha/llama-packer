@@ -367,6 +367,8 @@ That tie rule is the whole of "coding drops vision to maximise context, and only
 
 `min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
 
+`parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on an unpinned chat model on a slot-based backend.
+
 ## VRAM Allocation
 
 Two tiers, and only two.
@@ -510,6 +512,9 @@ padded by `estimate_headroom`. Defaults: 128k, 64k, 20k, 4k, 1.25.
 
 The score is `(ctx/floor)^0.5 × slots^B`. The context exponent is fixed; `B`
 is the single knob, and it decides **when to trade context for concurrency.**
+`B` is the fleet default; a task may override it with `parallel_power:` (see
+Tasks), which is the useful scope — what a model is being asked to do decides
+whether its second slot is worth a smaller window.
 
 Slots and context compete for the same KV pool, so doubling the slot count
 costs context in proportion to how expensive that model's slots are. Writing
@@ -625,6 +630,24 @@ If absent, the module-level defaults apply (see `llama_packer/consts.py`).
 
 - **Baked-in:** Draft heads are part of the main GGUF. Set `mtp: true` in frontmatter. No separate file needed.
 - **Companion:** A separate GGUF file containing draft heads. Set `speculative: <filename>` in frontmatter. The file is resolved by fuzzy match in the model directory.
+
+### Single-sequence draft engines
+
+`draft-dflash` and `draft-dspark` (the DFlash/DSpark family, selected with
+`mtp_spec_type:`) draft for **one sequence at a time**. llama.cpp keeps their
+per-sequence hidden-state features in a single buffer, so with two slots
+decoding it hands an out-of-vocabulary draft token to the batch builder and
+aborts (`common_batch::get_sub_batch`, observed on build 11988, commit
+`abb76ab38`) — the server dies mid-request and every client behind it gets a
+502.
+
+An entry solved for more than one slot therefore **omits the speculative
+flags** and reports `mtp_enabled: false`; the draft is served only at
+`parallel: 1`, which a sidecar `parallel:` pin can select. Extra slots win
+because they pay under load: on MiniCPM-V 4.7 1B, four concurrent 192-token
+requests measured 505 tok/s aggregate at four slots (no draft) versus 253 tok/s
+at one slot with DSpark, for a 14 % single-stream cost (216 vs 250 tok/s).
+Draft engines outside this set (e.g. `draft-mtp`) batch across slots normally.
 
 ### Speculative decoding under vLLM
 

@@ -586,7 +586,7 @@ class Model:
         "speculative", "mmproj",
         "mtp", "mtp_spec_type", "mtp_draft_n_max", "mtp_draft_p_min",
         "speculative_config",
-        "role", "allow_profiles", "capabilities",
+        "role", "allow_profiles", "capabilities", "tasks",
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
         "cache_type", "parallel", "min_context",
@@ -608,6 +608,7 @@ class Model:
     # block.
     COMPANION_BLOCK_DENIED: ClassVar[frozenset[str]] = frozenset({
         "name", "model", "ignore", "mmproj", "hf_repo", "backend", "role",
+        "tasks",
     })
 
     # Known pass-through metadata keys (documented in models_AGENTS.md)
@@ -628,6 +629,10 @@ class Model:
                  finder: WeightFinder | None = None):
         self.md_path = md_path
         self.frontmatter = frontmatter
+        #: Keys the sidecar authored (before defaults and rules merge in).
+        #: ``role`` is derived from a task claim during finalize, so the
+        #: authored-key check must not treat the derived value as alien.
+        self.sidecar_keys: frozenset[str] = frozenset(frontmatter)
         self.stem = md_path.stem
         self._hf_home = hf_home  # HF cache root override for hub snapshot resolution
         self._finder = finder or default_finder()

@@ -2609,7 +2609,7 @@ class Planner:
                                 include_mmproj=not shed_vision,
                                 cap_ctx=cap_ctx, floor=floor,
                                 pin_ctx=pin_ctx,
-                                power=0.0 if is_null else None,
+                                power=0.0 if is_null else demand.parallel_power,
                                 min_parallel=demand.min_parallel,
                                 group_parallel=parallel,
                                 profile=group[0][1])

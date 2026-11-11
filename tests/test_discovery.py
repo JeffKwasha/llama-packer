@@ -8,7 +8,7 @@ import logging
 from _gguf import write_gguf
 from llama_packer.model import Model, WeightFinder
 
-from conftest import _hf_tree
+from conftest import _hf_tree, catalogue
 
 
 def _sidecar(name: str) -> str:
@@ -115,6 +115,21 @@ def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
 
     models = Model.from_dir([root], generate_stubs=False)
     assert [m.role for m in models] == ["embeddings"]
+
+
+def test_derived_role_is_not_an_alien_sidecar_key(make_model, caplog):
+    # Validates: SPEC.md, 'Tasks (tasks:)': role is derived from a task claim, so only a role the sidecar actually authored is warned about
+    import logging
+    from llama_packer.discover import _warn_unsupported_values
+    from llama_packer.scope import ScopeStack
+    m = make_model("tk", tasks=["chat"])
+    ScopeStack(avail={"llama_bin": "/opt/llama-server"},
+               tasks=catalogue()).finalize(m)
+    assert m.frontmatter["role"] == "chat"
+    with caplog.at_level(logging.WARNING):
+        _warn_unsupported_values(m, "tk.md", catalogue())
+    assert not [r for r in caplog.records
+                if "role: is not a sidecar key" in r.message]
 
 
 def test_unknown_role_value_warns_with_a_hint(tmp_path, caplog):

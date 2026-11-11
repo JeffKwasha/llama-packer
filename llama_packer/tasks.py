@@ -15,6 +15,7 @@ operator; an undeclared id is not a task.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field, replace
 from typing import Mapping
@@ -43,6 +44,9 @@ class Task:
     require: frozenset[str] = frozenset()
     keep: frozenset[str] = frozenset()
     sacrifice: tuple[str, ...] | None = ()
+    #: Slot exponent B for this task's solve; None falls back to
+    #: ``matrix.parallel_power``.  High buys slots, low keeps context.
+    parallel_power: float | None = None
 
     def satisfied_by(self, ctx: int, parallel: int) -> bool:
         """True when an entry served at (ctx, parallel) meets this demand."""
@@ -130,6 +134,13 @@ def _parse(name: object, spec: object) -> Task | None:
                             "integer; ignoring it", task_id, value)
                 continue
             changes["min_parallel"] = value
+        elif key == "parallel_power":
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or value < 0):
+                log.warning("tasks: %s.parallel_power=%r is not a non-negative "
+                            "number; ignoring it", task_id, value)
+                continue
+            changes["parallel_power"] = float(value)
         elif key in ("require", "keep"):
             if not isinstance(value, (list, tuple)):
                 log.warning("tasks: %s.%s=%r is not a list of capabilities; "

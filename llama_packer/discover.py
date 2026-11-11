@@ -232,7 +232,7 @@ def _warn_unsupported_values(model: Model, label: str, catalogue=None) -> None:
     model on the device exactly as if the key were absent.
     """
     for alien in ("role", "usage"):
-        if alien in model.frontmatter:
+        if alien in model.sidecar_keys:
             logger.warning("%s: %s: is not a sidecar key; declare tasks:",
                            label, alien)
     if catalogue is not None:
@@ -301,6 +301,9 @@ def _build(path: Path, frontmatter: dict, role: str | None, stack: ScopeStack,
         logger.error("failed to load model from %s: %s", path.name, e)
         return
     model.stub = stub
+    # Authored keys only: the directory-derived role and the role finalize
+    # derives from tasks: are builder values, not sidecar typos.
+    model.sidecar_keys = frozenset(frontmatter)
     stack.apply_rules(model)
     model.resolve_companions()
     model.sync_measured_file(write=not stub)

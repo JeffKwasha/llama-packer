@@ -32,11 +32,14 @@ when the plan that produced them is pruned.
   whatever new quads the first measurement would have produced. Diagnose on
   the measurement path (fit-params invocation/flag shape,
   `llama_packer/vram.py`), not the planner.
-  **Evidence, 2026-10-30:** the crash does not reproduce on `llama-b11988`
-  for the named models on any trio shape (`-c` design, `p=2`, `-c` design/2,
-  `--n-gpu-layers 0`, `-ub 512`) — all exit 0. So the cause is
-  binary-version- or argv-shape-specific, and the failing run is the only
-  evidence worth having. A failed run now writes
+  **Evidence, 2026-11-02:** reproduced on `llama-b11988` for all four named
+  models; the artifacts record `error: invalid argument: --fit-print`.
+  Cause: `_detect_matrix` is called with `fit_bin=llama_bin`
+  (`__main__.py:1175`), so `vram.fit_params` launches `llama-server`, which
+  has `--fit` but not `--fit-print`. The flag belongs to the sibling
+  `llama-fit-params` binary, which accepts the same argv and exits 0. The fix
+  is the call site (pass `fit_bin`, not `llama_bin`) plus a regression test.
+  A failed run now writes
   `~/.cache/llama-packer/fit-params-failures/<ts>-<pid>-<model>-<outcome>.log`
   (argv, model facts, binary identity, full stdout/stderr, exit/signal) and
   indexes it with one `mode: fit` journal row; the warning names the

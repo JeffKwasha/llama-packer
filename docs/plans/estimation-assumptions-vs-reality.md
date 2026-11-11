@@ -91,8 +91,9 @@ E. audio.cpp under the service:
    The planner would have estimated ~28.9 GiB. So the planner is optimistic
    by 0.8 GiB for this model — could cause an over-admission.
 
-5. `serve-corrections.yaml` (arch-level corrections) applies even on shape
-   mismatch with a warning. Its shape is separate from the per-model shape.
+5. `serve-corrections.yaml` **no longer applies** — removed by the
+   sound-path plan (Phase 3). The probe persists absolute `FitParams`
+   blocks instead, shape-bound like any other measured block.
 
 ## What was NOT measured
 

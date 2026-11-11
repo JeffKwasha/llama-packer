@@ -328,6 +328,19 @@ def test_audio_keys_are_consumed_fields(make_model, caplog):
     assert not [r for r in caplog.records if "unhandled frontmatter" in r.message]
 
 
+def test_tasks_is_a_consumed_field(make_model, caplog):
+    # Tasks drive scope/task planning; the satisfied subset is emitted as
+    # metadata.tasks per entry, so the raw claim must not warn or pass through
+    # (it would leak onto the fallback entry, which satisfies none of them).
+    # Validates: SPEC.md, 'Model Metadata': a builder-consumed key never reaches the client as metadata.
+    import logging
+    m = make_model("tk", tasks=["chat", "coding"])
+    with caplog.at_level(logging.WARNING):
+        meta = m.pass_through_metadata()
+    assert "tasks" not in meta
+    assert not [r for r in caplog.records if "unhandled frontmatter" in r.message]
+
+
 def test_removed_keys_warn_and_pass_through(make_model, caplog):
     # attention/kv_cache/tool_args/targets/sidecar-spare are accepted but
     # unread: using one warns (fail loud) and the value flows to metadata

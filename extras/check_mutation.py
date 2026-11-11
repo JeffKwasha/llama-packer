@@ -38,7 +38,7 @@ MUTATIONS = {
     "test_serving_pin_ignores_the_design_max": ("llama_packer/writer.py", "        return min(pins) if pins else None\n"),
     "test_duplicate_ids_do_not_move_when_context_moves": ("llama_packer/writer.py", 'tail = ".".join(x for x in (cat_id, flags) if x)'),
     "test_set_admission_is_per_entry_not_per_stem": ("llama_packer/writer.py", "def record_admission(self, model, demand"),
-    "test_fallback_slot_exponent_is_zero": ("llama_packer/writer.py", "power=0.0 if is_null else None,"),
+    "test_fallback_slot_exponent_is_zero": ("llama_packer/writer.py", "power=0.0 if is_null else demand.parallel_power,"),
     "test_capabilities_context_is_served_window": (
         "llama_packer/writer.py", '"context": ctx_size,',
         '"context": context_length,'),
@@ -291,7 +291,7 @@ MUTATIONS = {
         "                for name, expr in chat_sets.items()}"),
     "test_unknown_role_value_warns_with_a_hint": (
         "llama_packer/discover.py",
-        '        if alien in model.frontmatter:',
+        '        if alien in model.sidecar_keys:',
         '        if False:'),
     "test_unknown_device_value_warns": (
         "llama_packer/discover.py",

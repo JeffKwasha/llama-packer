@@ -38,6 +38,50 @@ main()                                        (__main__.py — thin orchestratio
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
+## What we emit, and what llama-swap owns
+
+llama-packer is a config generator. Nothing here controls llama-swap's
+runtime: we choose the fields, llama-swap acts on them.
+
+| decision | our output | who acts |
+|---|---|---|
+| which entries exist | `models:` (`cmd`, `metadata`, `capabilities`, `name`) | llama-swap serves them |
+| when an idle entry unloads | `ttl:` per entry, `globalTTL:` top-level (seconds; `0` disables idle unload) | llama-swap's idle timer |
+| which entries may be wanted together | `routing.router.settings.matrix` (`vars`, `sets`, `evict_costs`) | llama-swap's matrix router |
+| what memory is pre-charged in the budget | pack-time arithmetic only | nobody at runtime |
+
+**`pinned` and `on_demand` are memory-accounting classes, not runtime
+states.** A pinned element is charged before the rest of the budget is
+solved, so the emitted config always leaves room for it. It is not a
+request to keep that entry loaded: an entry with a `ttl` still unloads and
+lazily reloads. An on_demand element is simply not pre-charged; its entry
+is still emitted and llama-swap may load it whenever a request names it.
+Neither class changes the entry's definition or its set membership.
+
+**`sets:` is co-residency vocabulary, not preload.** llama-swap does not
+start a set. The expression says which models may share the card in that
+use case; llama-swap loads/evicts within it under its own policy. We use
+the same expression to price the worst branch in the chat solve.
+
+Example of the emitted form (adapters, `emb`, `rnk`, … are the matrix vars
+from `vars:`):
+
+```yaml
+routing:
+  router:
+    use: matrix
+    settings:
+      matrix:
+        vars: {c1: qwen38-27b-dirk.coding.t, emb: jina-v5-small-retrieval, rnk: qwen3-reranker-0.6b}
+        sets:
+          rag:  (c1 | c2 | …) & emb & rnk
+          ragz: (c1 | c2 | …) & emb & rnk2
+```
+
+`rag` and `ragz` are two use cases that differ only in which model fills
+the rerank element. A request naming a var is routed through the sets that
+contain it.
+
 ## Models, tasks, engines and endpoints
 
 Four nouns, four owners. Keeping them apart is what stops "role" from
@@ -46,7 +90,7 @@ becoming a synonym for "engine" or "placement":
 | noun | answers | owner |
 |---|---|---|
 | **model** | *which weights*, what work they can do, and which engines can load them | the sidecar (`engines:`, `tasks:`, `device:`, `parallel:`, `context_length`, …) |
-| **task** | *what work* is being done | `tasks.py` — the closed catalog (P4) |
+| **task** | *what work* is being done | `tasks.py` — the declared catalog |
 | **endpoint** | *where* that work is served | `endpoints.py` — the one registry |
 | **engine** | *how* the weights are executed | `backends/<engine>.py` (`formats`, `endpoints`, `host_requires`) |
 
@@ -74,9 +118,11 @@ examples that keep near neighbours apart. Adding a task is a contract change
 id warns and is ignored, and "we don't know" is an empty `tasks:`, not an
 invented name.
 
-The six ids that exist today (`chat`, `embeddings`, `rerank`, `image`,
-`s2t`, `t2s`) become catalog entries in P4; until then they live in
-`roles.py` and the sidecar claims them with `role:`.
+The task vocabulary is declared in `profiles.yaml tasks:`; the code owns only
+the contract it is checked against (the endpoint ids and the scheduling
+roles). A sidecar claims its work with `tasks:`; `role:` and `usage:` are
+alien keys that warn and are ignored. The six scheduling roles (`chat`,
+`embeddings`, `rerank`, `image`, `s2t`, `t2s`) remain the fixed contract.
 
 ### An endpoint is standardized
 
@@ -117,20 +163,22 @@ authorship is the drift this design exists to remove.
 
 ### Where the registries live
 
-`roles.py` is the scheduling table: one row per id with the chat-pass flag,
-residency policy, context knob and `device_roles:` eligibility. Every derived
-set (`SERVED_ROLES`, `NON_CHAT_ROLES`, `DEVICE_ROLES`) is read off it; P4
-moves the id list into the task catalog.
+`roles.py` is the scheduling table: one row per scheduling role with the
+chat-pass flag, default residency policy, context knob and `device_roles:`
+eligibility. Every derived set (`SERVED_ROLES`, `NON_CHAT_ROLES`,
+`DEVICE_ROLES`) is read off it. The task vocabulary itself comes from
+`profiles.yaml tasks:`; each declaration names one of these roles.
 
 `endpoints.py` is the other half: the closed set of endpoint ids and the one
 mapping from a task to the endpoint it is served at. An engine declares
 `endpoints`; compatibility is `endpoints.serves(engine.endpoints, task)`, so
-neither side has to learn the other's vocabulary. P3 adds the registry's
-validation API and the doc/code agreement test.
+neither side has to learn the other's vocabulary. The registry's validation
+API and the doc/code agreement test live here (`docs_agree`,
+`test_registry_docs_agree`).
 
-Validation follows the same split: an unsupported *value* of a known sidecar
-key warns at discovery (`role:` against the registry with a near-miss hint,
-`device:` against `cpu`/non-negative index), and format/endpoint
+Validation follows the same split: an alien sidecar key warns at discovery
+(`role:`/`usage:` are not keys — the warning points at `tasks:`), an
+unsupported `device:` warns (`cpu`/non-negative index), and format/endpoint
 compatibility is checked once in `_filter_supported` before any budgeting.
 
 ## Invariants (and their single homes)

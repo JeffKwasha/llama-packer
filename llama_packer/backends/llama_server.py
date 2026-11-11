@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, ClassVar
 from llama_packer.backends.base import BaseBackend
 from llama_packer.endpoints import ENGINE_ENDPOINTS
 from llama_packer import utils
-from llama_packer.consts import _MTP_SPEC_TYPE
+from llama_packer.consts import _MTP_SPEC_TYPE, _SINGLE_SLOT_SPEC_TYPES
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _STATIC_IMAGE_ARCHES = frozenset({"gemma3", "gemma4"})
 _warned_static_arch: set[str] = set()
 _warned_cli_batch: set[str] = set()
+_warned_spec_parallel: set[str] = set()
 
 
 class LlamaServerBackend(BaseBackend):
@@ -74,12 +75,21 @@ class LlamaServerBackend(BaseBackend):
     def default_batch_ubatch(self, role: str) -> tuple[int | None, int | None]:
         return self._ROLE_BATCH.get(role, (None, None))
 
-    def _mtp_args(self, model: "Model") -> tuple[list[str], dict]:
+    def _mtp_args(self, model: "Model", parallel: int = 1) -> tuple[list[str], dict]:
         """Speculative-decoding flags plus metadata contributions."""
         mtp_on, n_max = model._mtp_info()
         if not mtp_on:
             return [], {"mtp_enabled": False}
         spec_type = model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
+        if parallel > 1 and _SINGLE_SLOT_SPEC_TYPES & set(str(spec_type).split(",")):
+            msg = (f"{model.stem}: {spec_type} serves one sequence at a time; "
+                   f"dropping speculative decoding at parallel={parallel} "
+                   f"(llama-server aborts on the first concurrent batch) — "
+                   f"pin 'parallel: 1' to keep the draft")
+            if msg not in _warned_spec_parallel:
+                _warned_spec_parallel.add(msg)
+                logger.warning(msg)
+            return [], {"mtp_enabled": False}
         p_min = model.mtp_draft_p_min
         args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max),
                 "--draft-p-min", str(p_min)]
@@ -173,7 +183,7 @@ class LlamaServerBackend(BaseBackend):
         if model.on_cpu:
             flags += ["--n-gpu-layers", "0"]
 
-        mtp_args, meta = self._mtp_args(model)
+        mtp_args, meta = self._mtp_args(model, parallel)
         flags += mtp_args
 
         if include_mmproj and model.mmproj and model.mmproj.gguf_path:

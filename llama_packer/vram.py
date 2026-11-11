@@ -55,6 +55,7 @@ from llama_packer.consts import (
     _MTP_SPEC_TYPE,
     _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
+    _SINGLE_SLOT_SPEC_TYPES,
     _SD_COMPUTE_MB,
     _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
@@ -810,16 +811,18 @@ class VramBudget:
 
     # ── serve-shaped llama-server measurement ──
 
-    def _mtp_measure_flags(self) -> list[str]:
+    def _mtp_measure_flags(self, parallel: int = 1) -> list[str]:
         """Speculative-decode flags mirroring the serve emission exactly."""
         mtp_on, n_max = self.model._mtp_info()
         if not mtp_on:
             return []
+        spec_type = self.model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
+        if parallel > 1 and _SINGLE_SLOT_SPEC_TYPES & set(str(spec_type).split(",")):
+            return []  # serve drops it at this slot count (llama_server.py)
         companion = self.model.mtp
         if companion is None and self.model.frontmatter.get("speculative"):
             return []  # declared companion missing: serve skips MTP too
-        flags = ["--spec-type",
-                 str(self.model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)),
+        flags = ["--spec-type", str(spec_type),
                  "--spec-draft-n-max", str(n_max)]
         if companion is not None and companion.gguf_path:
             flags += ["--spec-draft-model", str(companion.gguf_path)]
@@ -884,7 +887,7 @@ class VramBudget:
                 cmd += ["--n-gpu-layers", "0"]
         elif not _NGL_SHAPE_RE.search(shape):
             cmd += ["-ngl", "999"]
-        cmd += self._mtp_measure_flags()
+        cmd += self._mtp_measure_flags(parallel)
         cmd += shape.split()
         # Line-buffered stdout even redirected to a file: the stall
         # window reads log growth, and block buffering hides it during
