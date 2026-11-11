@@ -29,6 +29,9 @@ available(pool) = physical(pool) − reserve(pool)
   every number has a name. `cpu` is emitted as `ram`; a single GPU as
   `default`. Detecting unified memory is future work; today the pools are
   discrete.
+- The allocation controls (`min`, `0`, a weight, `fill`) apply to the
+  model's device pool only. The other fields are static charges. The role
+  pool of 1 is a capacity check, not memory to share out.
 - An entry charges every field its serving touches. A pool absent from an
   entry's capacities is zero to that entry.
 
@@ -90,8 +93,12 @@ Every set starts with one budget. Its floors come out first; what remains is
 the set's auction pool:
 
 ```
-auction(set) = available − floor(set)          # component-wise
+auction(set) = available − floor(set)          # one device pool
 ```
+
+The auction runs once per device pool. A role's share applies to the pool
+its model runs on; the other fields are zero for allocation. A GPU model's
+host footprint is static and is not grown by the auction.
 
 Each role in the set carries a request weight and an accept flag from its
 `share:`:

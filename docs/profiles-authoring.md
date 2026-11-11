@@ -529,28 +529,6 @@ Then check the plan itself:
 | `llama-packer --probe-memory` | How much VRAM does a model family take at a context/slot grid? |
 | `extras/bench.py` | What prompt speed and disk speed feed the eviction cost? |
 
-## After a llama-packer update
-
-`extras/update.py` moves binaries; it does not migrate `profiles.yaml`.
-A new packer can retire a key, and the packer reports alien keys while it
-runs. Run the packer, read the warnings, fix the named keys, then re-pack
-for real and validate. Keep a copy of the working `profiles.yaml` before
-editing; the installer only protects the first creation, not later edits.
-
-Retired spellings, and what replaces them:
-
-| old | new |
-|---|---|
-| `matrix.categories:` / `matrix.evict_costs:` | removed; name the model id in a set, or let the role label expand |
-| sidecar `usage:` | sidecar `tasks: [...]`, built from `profiles.yaml tasks:` (`role:` is valid again, as a tree override) |
-| sidecar `backend:` | sidecar `engines: [...]` |
-| role `persistent:` | explicit `ttl:` (sidecar or task) |
-| the old per-role count key, `fill:`, and `kind:` | one serving per role; `share: fill`; behaviour comes from the task endpoint |
-| `pools.<id>.reserve_extra:` / `pins:` | `pools.<id>.spare:` |
-
-Warnings are the migration list. Do not assume an old file is valid because
-the binaries updated cleanly.
-
 ## Deeper reading
 
 - [`SPEC.md`](../SPEC.md) — the contract: every top-level key, VRAM

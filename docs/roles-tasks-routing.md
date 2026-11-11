@@ -155,9 +155,9 @@ The full algebra lives in [allocation.md](allocation.md). In short:
 - A role's floor is the maximum floor of all models in the role.
 - A set's floor follows its expression: `&` sums floors, `|` takes the
   maximum, `+set` inlines a set.
-- `auction(set) = available − floor(set)`. Members request it by `share`
-  weight; a role accepts the minimum offer across the sets it belongs to;
-  squeezed sets renormalise their remainder.
+- `auction(set) = available − floor(set)`, on the model's device pool.
+  Members request it by `share` weight; a role accepts the minimum offer
+  across the sets it belongs to; squeezed sets renormalise their remainder.
 
 A role runs one serving at a time in both routers. In capacity mode every
 role is a pool of value 1 and every entry charges 1. In matrix mode a role

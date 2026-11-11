@@ -1,9 +1,9 @@
 """The allocation algebra: floors, set expressions, and the auction.
 
-The authority is ``docs/allocation.md``. The pool tuple is built from the
-host: ``cpu`` first, then one field per discrete GPU, or one shared field for
-unified memory, plus any fake resource that exists to impose a limit (a role
-pool of 1 is one). This module is pure arithmetic over that tuple.
+The authority is ``docs/allocation.md``. The auction runs on one device pool
+at a time: a role vies for the pool its model runs on (``gpu0``, ``cpu``,
+...). The other fields of the cost tuple are static charges and capacities,
+not memory to be shared out.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ _TOKEN = re.compile(r"[A-Za-z0-9._:-]+|[&|()]")
 class PoolSchema:
     """The host's pool ids, in order, ``cpu`` first.
 
-    ``memory`` is a namedtuple class, so every value names its fields.
+    ``memory`` is a namedtuple class, so every cost names its fields.
     """
 
     def __init__(self, names):
@@ -34,22 +34,6 @@ class PoolSchema:
 
     def zero(self):
         return self.memory(*([0] * len(self.names)))
-
-
-def add(a, b):
-    return type(a)(*(x + y for x, y in zip(a, b)))
-
-
-def maximum(a, b):
-    return type(a)(*(max(x, y) for x, y in zip(a, b)))
-
-
-def subtract(a, b):
-    return type(a)(*(x - y for x, y in zip(a, b)))
-
-
-def add_scaled(a, factor):
-    return type(a)(*(int(x * factor) for x in a))
 
 
 @dataclass(frozen=True)
@@ -129,15 +113,15 @@ def leaves(expr: Expr) -> tuple[str, ...]:
     return leaves(expr.left) + leaves(expr.right)
 
 
-def floor_of(expr: Expr, floors: dict):
+def floor_of(expr: Expr, floors: dict[str, int]) -> int:
     if isinstance(expr, Leaf):
         try:
             return floors[expr.name]
         except KeyError:
             raise KeyError(f"set leaf {expr.name!r} has no floor") from None
     if isinstance(expr, And):
-        return add(floor_of(expr.left, floors), floor_of(expr.right, floors))
-    return maximum(floor_of(expr.left, floors), floor_of(expr.right, floors))
+        return floor_of(expr.left, floors) + floor_of(expr.right, floors)
+    return max(floor_of(expr.left, floors), floor_of(expr.right, floors))
 
 
 def effective_weights(members, weights, fills):
@@ -159,32 +143,30 @@ def effective_weights(members, weights, fills):
     return out
 
 
-def _offer(auction, members, weights, floors, fills, fixed):
+def _offer(budget: int, members, weights, floors, fills, fixed):
     free = [r for r in members if r not in fixed]
     effective = effective_weights(free, weights, fills)
     total = sum(effective.values())
 
-    fixed_used = type(auction)(*([0] * len(auction)))
-    for role, amount in fixed.items():
-        fixed_used = add(fixed_used, subtract(amount, floors[role]))
-    shared = type(auction)(*(
-        max(0, x) for x in subtract(auction, fixed_used)))
+    fixed_used = sum(amount - floors[role]
+                     for role, amount in fixed.items())
+    shared = max(0, budget - fixed_used)
     out = {r: floors[r] for r in members}
     for role, amount in fixed.items():
         out[role] = amount
     if total > 0:
         for role in free:
             if effective[role] > 0:
-                out[role] = add(floors[role], add_scaled(
-                    shared, effective[role] / total))
+                out[role] = floors[role] + int(
+                    shared * effective[role] / total)
     return out
 
 
-def auction(available, sets: dict[str, Expr], floors: dict,
+def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
             weights: dict[str, float], fills: frozenset[str] = frozenset(),
             accepts: frozenset[str] = frozenset()
-            ) -> tuple[dict, dict]:
-    """Allocate ``available`` across roles by the docs/allocation.md auction.
+            ) -> tuple[dict[str, int], dict[str, int]]:
+    """Allocate one pool by the docs/allocation.md auction.
 
     A set is one budget. Floors come out first. Weighted roles divide the
     rest, then `fill` roles take the remainder, then `0` roles take what is
@@ -194,10 +176,10 @@ def auction(available, sets: dict[str, Expr], floors: dict,
     deterministic.
     """
     members = {name: leaves(expr) for name, expr in sets.items()}
-    ceilings = {name: subtract(available, floor_of(expr, floors))
+    ceilings = {name: budget - floor_of(expr, floors)
                 for name, expr in sets.items()}
     for name, ceiling in ceilings.items():
-        if any(x < 0 for x in ceiling):
+        if ceiling < 0:
             raise ValueError(f"set {name!r} floor exceeds available")
 
     def order(roles):
@@ -208,15 +190,14 @@ def auction(available, sets: dict[str, Expr], floors: dict,
     alloc = {}
     for role in {r for rs in members.values() for r in rs}:
         values = [offers[name][role] for name in sets if role in members[name]]
-        alloc[role] = values[0] if len(values) == 1 else type(available)(
-            *(min(v[i] for v in values) for i in range(len(available))))
+        alloc[role] = min(values)
 
     for _ in range(MAX_ROUNDS):
         free = {name: _offer(ceilings[name], order(members[name]), weights,
                              floors, fills, {}) for name in sets}
         fixed = {
             name: {r: alloc[r] for r in members[name]
-                   if alloc[r] != free[name][r]}
+                   if alloc[r] < free[name][r]}
             for name in sets
         }
         offers = {
@@ -228,32 +209,28 @@ def auction(available, sets: dict[str, Expr], floors: dict,
         for role in alloc:
             values = [offers[name][role] for name in sets
                       if role in members[name]]
-            nxt[role] = values[0] if len(values) == 1 else type(available)(
-                *(min(v[i] for v in values) for i in range(len(available))))
+            nxt[role] = min(values)
         if nxt == alloc:
             break
         alloc = nxt
     else:
         raise ValueError("auction did not converge")
 
-    zero = type(available)(*([0] * len(available)))
     unallocated = {}
     for name in sets:
-        used = zero
-        for role in members[name]:
-            used = add(used, subtract(alloc[role], floors[role]))
-        unallocated[name] = subtract(ceilings[name], used)
+        used = sum(alloc[role] - floors[role] for role in members[name])
+        unallocated[name] = ceilings[name] - used
 
     for name in sets:
         idle = [r for r in members[name]
                 if r in accepts and (r in fills
                                      or weights.get(r, 0.0) == 0.0)]
         left = unallocated[name]
-        if not idle or all(x <= 0 for x in left):
+        if not idle or left <= 0:
             continue
-        share = type(available)(*(x // len(idle) for x in left))
+        share = left // len(idle)
         for role in order(idle):
-            alloc[role] = add(alloc[role], share)
-        unallocated[name] = subtract(left, add_scaled(share, len(idle)))
+            alloc[role] += share
+        unallocated[name] = left - share * len(idle)
 
     return alloc, unallocated

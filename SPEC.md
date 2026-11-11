@@ -429,8 +429,12 @@ logged as an error.
 ### The auction
 
 ```
-auction(set) = available − floor(set)
+auction(set) = available − floor(set)          # one device pool
 ```
+
+The auction runs on the pool the model's device names. The other fields of
+the cost tuple are static charges; a role pool of 1 is a capacity check, not
+memory to share out.
 
 Each member requests a share of it by `share:` weight. `N%` requests N,
 `fill` takes what the weighted roles leave below 100, split equally; when

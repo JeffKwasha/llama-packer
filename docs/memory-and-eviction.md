@@ -63,8 +63,11 @@ logged as an error.
 The rest of the set is the auction:
 
 ```
-auction(set) = available − floor(set)
+auction(set) = available − floor(set)          # one device pool
 ```
+
+The auction runs on the pool the model's device names. A GPU model's host
+footprint is a static charge, not memory the share can grow.
 
 Each member requests a share of it, by weight:
 
@@ -100,7 +103,7 @@ charges 1; in matrix mode a role label expands to one of its entries.
 Every entry declares the pools it charges:
 
 - GPU entry: `default` = measured VRAM at its served context, `ram` = its
-  host footprint, plus `1` in its role pool.
+  static host footprint, plus `1` in its role pool.
 - CPU entry: `ram` only, plus `1` in its role pool.
 
 Charges carry the solve's measurement margin (`hardware.memory_margin`,
