@@ -92,9 +92,10 @@ its number. A fill uses what the weighted roles leave below 100, split
 equally; when they leave nothing, the fill weighs 0 and accepts any
 remainder a capped role frees.
 
-Each set is allocated on its own. A role's final allocation is the minimum
-across the sets it belongs to, so adding a set can only lower it. Memory a
-capped role leaves in a set is logged as unallocated, not moved.
+Each set is priced on its own. A role's limit is the minimum across the sets
+it belongs to, so adding a set can only lower it. An offer in one set does
+not change its offer in another; each set logs its own unallocated
+headroom.
 
 A model then solves inside its role's allocation. One role runs one serving
 at a time: in capacity mode every role is a pool of value 1 and every entry

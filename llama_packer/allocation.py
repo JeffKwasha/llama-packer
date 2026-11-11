@@ -193,7 +193,7 @@ def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
 
     unallocated = {}
     for name, roles in members.items():
-        used = sum(alloc[role] - floors[role] for role in roles)
+        used = sum(offers[name][role] - floors[role] for role in roles)
         unallocated[name] = ceilings[name] - used
     return alloc, unallocated
 

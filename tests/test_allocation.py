@@ -36,10 +36,9 @@ def test_auction_splits_by_weight():
     assert left == {"s": 0}
 
 
-def test_a_capped_role_leaves_memory_unallocated():
-    # Validates: docs/allocation.md, 'The auction': each set is allocated
-    # on its own; a role's final size is the minimum across sets. Memory a
-    # capped role leaves is reported, not handed to another role.
+def test_each_set_keeps_its_own_offer_and_the_role_takes_the_minimum():
+    # Validates: docs/allocation.md, 'The auction': each set is priced on
+    # its own; a higher offer in one set changes nothing in another.
     floors = {"a": 0, "b": 0, "c": 10}
     sets = {"one": parse("a & b"), "two": parse("a & c")}
     alloc, left = auction(15, sets, floors, {"a": 60, "b": 0, "c": 0},
@@ -47,7 +46,8 @@ def test_a_capped_role_leaves_memory_unallocated():
     assert alloc["a"] == 5
     assert alloc["b"] == 6
     assert alloc["c"] == 10
-    assert left["one"] == 4
+    assert left["one"] == 0
+    assert left["two"] == 0
 
 
 def test_min_and_zero():

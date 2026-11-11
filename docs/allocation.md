@@ -133,10 +133,11 @@ offer from the sets it is in**, per pool:
 allocation(role) = min over sets containing role of offer(role, set)
 ```
 
-Each set is allocated on its own against the full available pool. A role's
-allocation is the minimum of its offers across the sets it belongs to.
-Adding a set can only lower a role, never raise it. Memory a capped role
-leaves in a set is logged as unallocated, not moved to another role.
+Each set is priced on its own against the full available pool. A role's
+limit is the minimum of its offers across the sets it belongs to. An offer
+in one set does not change its offer in another; a set whose offer is higher
+than the minimum simply has headroom the role cannot use. Adding a set can
+only lower a role. Each set logs its own unallocated headroom.
 
 Accept in ascending floor order, then alphabetically on a tie. Roles accept
 first; the models inside a role follow the same order. The order makes the
@@ -149,8 +150,9 @@ A takes 60% × 10 = 6
 B takes the remaining 4
 ```
 
-`A` also appears in another set that offers only 3, so `A` accepts 3. The
-first set keeps `B` at its own offer and logs the rest as unallocated.
+`A` also appears in another set that offers only 3, so `A`'s limit is 3.
+The first set still prices `B` at its own offer; the higher offer for `A`
+there is unaffected by the second set.
 
 `min` stays at its floor and never accepts. `0` requests nothing but
 accepts memory left after the requesters are placed; when several accepting

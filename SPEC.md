@@ -448,9 +448,10 @@ request(role, set) = weight / Σ weights in set × auction(set)
 allocation(role)   = min over its sets of floor + request
 ```
 
-Each set is allocated on its own. A role's final allocation is the minimum
-across the sets it belongs to, so adding a set can only lower it. Memory a
-capped role leaves in a set is logged at INFO, not moved to another role.
+Each set is priced on its own. A role's limit is the minimum across the
+sets it belongs to, so adding a set can only lower it. An offer in one set
+does not change its offer in another; each set logs its own unallocated
+headroom.
 
 A role runs one serving at a time. In capacity mode every role is a pool of
 value 1 and every entry charges 1; in matrix mode a role label expands to one
