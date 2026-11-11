@@ -197,16 +197,6 @@ def test_detect_matrix_returns_the_section_and_no_pair():
     assert cats == {} and fixed == () and ctx == {}
 
 
-def test_parse_args_idle_unload():
-    from llama_packer.__main__ import parse_args
-
-    args = parse_args(["prog", "--idle-unload", "600"])
-    assert args.idle_unload == 600
-    # Off by default: no globalTTL key is emitted.
-    args = parse_args(["prog"])
-    assert args.idle_unload is None
-
-
 def test_parse_args_spare_and_baseline():
     from llama_packer.__main__ import parse_args
 

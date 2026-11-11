@@ -303,36 +303,28 @@ def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
 #: Default idle lifetime for a host-resident helper with no declared value.
 #: Capacity pools bound RAM; TTL additionally yields to duties llama-swap
 #: cannot see. A chat serving on CPU inherits the global default instead.
-CPU_HELPER_TTL = 3600
-
-
 def resolve_entry_ttl(model: Model, demand: "Task | None",
-                      task_ttl: int | None = None) -> int | None:
+                      task_ttl: int | None = None,
+                      role_ttl: int | None = None) -> int | None:
     """The idle-unload lifetime for one entry, in seconds.
 
-    Declared scopes are sidecar, task and role; the smallest lifetime wins,
-    and ``0`` ("no idle unload") is the strongest keep. With nothing
-    declared, a CPU-resident serving gets :data:`CPU_HELPER_TTL`; a device
-    entry returns None, leaving llama-swap's ``globalTTL`` in force.
+    Most specific wins: sidecar > task > role > top-level ``ttl``. A device
+    entry with nothing declared returns None, so llama-swap's ``globalTTL``
+    applies.
     """
-    declared: list[int] = []
     if "ttl" in getattr(model, "sidecar_keys", ()):
         raw = model.frontmatter.get("ttl")
         if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
             logger.warning("%s: ttl=%r is not a non-negative integer; "
                            "ignored", model.label, raw)
         else:
-            declared.append(raw)
+            return raw
     if demand is not None and demand.ttl is not None:
-        declared.append(demand.ttl)
+        return demand.ttl
     if task_ttl is not None:
-        declared.append(task_ttl)
-    if declared:
-        if any(v == 0 for v in declared):
-            return 0
-        return min(declared)
-    if model.on_cpu:
-        return CPU_HELPER_TTL
+        return task_ttl
+    if role_ttl is not None:
+        return role_ttl
     return None
 
 
@@ -658,9 +650,9 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # Idle unload is a resolved lifetime, not a placement rule.  A declared
-    # sidecar/task value wins (smallest; 0 = never); otherwise a host helper
-    # gets the CPU default and a device entry inherits llama-swap's globalTTL.
+    # Idle unload is a resolved lifetime, not a placement rule.  The most
+    # specific declared value wins; otherwise the entry inherits the
+    # top-level globalTTL.
     if ttl is not None:
         entry["ttl"] = ttl
 
@@ -3292,7 +3284,8 @@ def emit_config(models: list[Model], plan: dict,
                 vram_note=v.vram_note,
                 ttl=resolve_entry_ttl(
                     view, demand,
-                    _entry_task_ttl(view, demand, task_ttl)),
+                    _entry_task_ttl(view, demand, task_ttl),
+                    roles.get(view.role).ttl if roles.get(view.role) else None),
             )
             if capacity_pools:
                 entry.update(_capacity_fields(

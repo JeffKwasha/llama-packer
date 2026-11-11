@@ -53,6 +53,9 @@ class Role:
     #: Where every model of this role runs: ``cpu`` or a GPU index; None
     #: leaves placement to the sidecar/task.  Same vocabulary as sidecars.
     device: str | int | None = None
+    #: Idle-unload lifetime for every serving of the role; None inherits the
+    #: top-level ``ttl``.
+    ttl: int | None = None
 
 
 def _parse_share(value: object) -> Share | None:
@@ -130,7 +133,7 @@ def _parse_one(name: object, spec: object,
         return None, [f"roles.{name}: reserved pool name"]
     if not isinstance(spec, dict):
         return None, [f"roles.{name}: must be a mapping"]
-    known = {"dir", "share", "device"} | RETIRED_KEYS
+    known = {"dir", "share", "device", "ttl"} | RETIRED_KEYS
     problems = [f"roles.{name}: unknown key {key!r}"
                 for key in sorted(set(spec) - known)]
     problems.extend(f"roles.{name}: {key!r} is retired"
@@ -147,7 +150,14 @@ def _parse_one(name: object, spec: object,
         problems.append(f"roles.{name}: device={spec.get('device')!r} is "
                         f"{device_problem}")
         device = None
-    return Role(name=name, dir=dirs, share=share, device=device), problems
+    ttl = spec.get("ttl")
+    if ttl is not None and (isinstance(ttl, bool)
+                            or not isinstance(ttl, int) or ttl < 0):
+        problems.append(f"roles.{name}: ttl={ttl!r} is not a non-negative "
+                        "integer")
+        ttl = None
+    return Role(name=name, dir=dirs, share=share, device=device,
+                ttl=ttl), problems
 
 
 def parse_roles(cfg: dict | None) -> tuple[dict[str, Role], list[str]]:

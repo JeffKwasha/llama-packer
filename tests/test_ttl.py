@@ -1,11 +1,11 @@
-"""TTL resolution: sidecar > task > placement default > global."""
+"""TTL resolution: sidecar > task > role > top-level ``ttl``."""
 
 from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
 
-from llama_packer.writer import CPU_HELPER_TTL, resolve_entry_ttl
+from llama_packer.writer import resolve_entry_ttl
 
 
 def _m(**kw):
@@ -19,62 +19,43 @@ def _task(ttl=None, role="chat"):
     return SimpleNamespace(ttl=ttl, role=role)
 
 
-def test_ttl_sidecar_wins_when_tighter():
-    # Validates: SPEC.md, "TTL": declared lifetimes resolve sidecar > task >
-    # global, and the smallest lifetime wins.
+def test_sidecar_wins_over_task_and_role():
+    # Validates: docs/allocation.md, 'TTL': sidecar > task > role.
     assert resolve_entry_ttl(
         _m(sidecar_keys=frozenset({"ttl"}), frontmatter={"ttl": 1800}),
-        _task(ttl=3600)) == 1800
+        _task(ttl=3600), role_ttl=600) == 1800
 
 
-def test_ttl_task_wins_when_tighter():
-    # Validates: SPEC.md, "TTL": declared lifetimes resolve sidecar > task >
-    # global, and the smallest lifetime wins.
-    assert resolve_entry_ttl(
-        _m(sidecar_keys=frozenset({"ttl"}), frontmatter={"ttl": 7200}),
-        _task(ttl=3600)) == 3600
+def test_task_wins_over_role_even_when_larger():
+    # Validates: docs/allocation.md, 'TTL': the most specific value wins,
+    # not the smallest.
+    assert resolve_entry_ttl(_m(), _task(ttl=7200), role_ttl=600) == 7200
 
 
-def test_ttl_zero_means_never_unload_and_wins():
-    # Validates: SPEC.md, "TTL": ttl 0 disables automatic unloading.
+def test_role_wins_when_nothing_more_specific():
+    assert resolve_entry_ttl(_m(), _task(), role_ttl=600) == 600
+
+
+def test_zero_is_a_value_not_an_absence():
     assert resolve_entry_ttl(
         _m(sidecar_keys=frozenset({"ttl"}), frontmatter={"ttl": 0}),
-        _task(ttl=3600)) == 0
+        _task(ttl=3600), role_ttl=600) == 0
+    assert resolve_entry_ttl(_m(), _task(ttl=0), role_ttl=600) == 0
 
 
-def test_ttl_cpu_helper_defaults_to_host_lifetime():
-    # Validates: SPEC.md, "TTL": an undeclared CPU helper gets the host
-    # default so its RAM is eventually yielded.
-    assert resolve_entry_ttl(
-        _m(on_cpu=True, role="embeddings"),
-        _task(role="embeddings")) == CPU_HELPER_TTL
-
-
-def test_ttl_cpu_serving_gets_cpu_default():
-    # Validates: SPEC.md, "TTL": every CPU-resident serving gets the host
-    # default; chat is not special.
-    assert resolve_entry_ttl(_m(on_cpu=True, role="chat"),
-                             _task(role="chat")) == CPU_HELPER_TTL
-
-
-def test_ttl_device_entry_inherits_global():
-    # Validates: SPEC.md, "TTL": an undeclared device serving inherits
-    # globalTTL (no per-entry ttl is emitted).
+def test_device_entry_with_nothing_declared_inherits_the_top_level():
     assert resolve_entry_ttl(_m(), _task()) is None
 
 
-def test_ttl_role_default_reaches_a_helper_without_a_task_demand():
-    # Validates: SPEC.md, "TTL": a helper planned from its role still gets
-    # the role's declared task lifetime.
-    assert resolve_entry_ttl(_m(on_cpu=True, role="embeddings"), None, 0) == 0
+def test_role_ttl_reaches_a_helper_without_a_task_demand():
+    assert resolve_entry_ttl(_m(on_cpu=True, role="embeddings"), None,
+                             role_ttl=0) == 0
 
 
-def test_ttl_invalid_sidecar_value_warns(caplog):
-    # Validates: SPEC.md, "TTL": a malformed declared lifetime is ignored,
-    # not silently applied.
+def test_invalid_sidecar_value_warns_and_falls_through(caplog):
     with caplog.at_level(logging.WARNING):
         got = resolve_entry_ttl(
             _m(sidecar_keys=frozenset({"ttl"}), frontmatter={"ttl": "soon"}),
-            _task())
-    assert got is None
+            _task(ttl=3600))
+    assert got == 3600
     assert "not a non-negative integer" in caplog.text

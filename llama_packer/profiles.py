@@ -199,6 +199,11 @@ def check_profiles(cfg: dict) -> list[str]:
         if matrix.get(key) is not None:
             problems.append(f"matrix.{key}: retired; set max_context on the "
                             "embeddings/rerank task")
+    ttl = cfg.get("ttl")
+    if ttl is not None and (isinstance(ttl, bool)
+                            or not isinstance(ttl, int) or ttl < 0):
+        problems.append("ttl: must be a non-negative integer")
+
     routing = _check_mapping(problems, "routing", cfg.get("routing"))
     if routing:
         problems.append("routing: retired; remove it (matrix.sets selects "

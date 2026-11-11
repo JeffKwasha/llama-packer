@@ -1807,15 +1807,15 @@ def test_metadata_packing_gpu_entry(profiles):
     assert p["kv_per_token"] == 59769
 
 
-def test_cpu_chat_entry_gets_cpu_default_ttl(profiles):
-    # Validates: SPEC.md, "TTL" -- every CPU-resident serving defaults to
-    # the host lifetime; chat is not special.
+def test_cpu_chat_entry_inherits_the_global_ttl(profiles):
+    # Validates: docs/allocation.md, 'TTL' -- an undeclared serving inherits
+    # the top-level ttl, so no per-entry key is emitted.
     m = make("ttlcpu", role="chat", device="cpu")
     _fake_vram(m, (466, 0.057, 346))
     variants = Planner([m], profiles, fit_bin="unused", vram_total=64 * 1024,
                        host_pool_mb=8192).plan()["ttlcpu"]
     entry = only_entry(emit_config([m], {"ttlcpu": variants}, profiles, TVARS))
-    assert entry["ttl"] == 3600
+    assert "ttl" not in entry
 
 
 def test_gpu_entry_has_no_ttl(profiles):

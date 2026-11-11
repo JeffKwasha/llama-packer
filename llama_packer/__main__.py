@@ -198,10 +198,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "sidecar audio_cpp.backend wins over both; 'auto' probes the GPU vendor)")
     parser.add_argument("--no-macros", action="store_true",
                          help="Disable flag macros (emit fully expanded cmds)")
-    parser.add_argument("--idle-unload", type=int, default=None, metavar="SECONDS",
-                        help="Emit a top-level globalTTL: unload any model after SECONDS "
-                             "of inactivity (llama-swap default: 0 = never). Useful when "
-                             "another program (ComfyUI, a game) needs VRAM on short notice.")
     return parser.parse_args(argv[1:] if argv else None)
 
 
@@ -1023,10 +1019,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Top-level llama-swap settings
     config["healthCheckTimeout"] = hct
-    if args.idle_unload is not None:
-        if args.idle_unload < 0:
-            fatal("--idle-unload must be >= 0 (0 disables idle unloading)")
-        config["globalTTL"] = args.idle_unload
+    config["globalTTL"] = int(profiles_cfg.get("ttl", 3600))
 
     output_path = Path(args.output).absolute()
 
