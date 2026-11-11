@@ -8,6 +8,7 @@ not memory to be shared out.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import namedtuple
 from dataclasses import dataclass
@@ -207,7 +208,7 @@ def floor_mb(quad: tuple[int, float, float, int], min_context: int,
     model_mib, kv, slot, compute = quad
     raw = (model_mib + compute + kv * min_context * min_parallel
            + slot * min_parallel)
-    return int(raw * (1.0 + margin))
+    return math.ceil(raw * (1.0 + margin))
 
 
 def role_floors(entries: dict[str, list[tuple]], margin: float = 0.0

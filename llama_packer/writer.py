@@ -1966,9 +1966,12 @@ class Planner:
         leaf_role: dict[str, str] = {}
         for m in self.models:
             pool = "ram" if m.on_cpu else "default"
-            quad = _static_params(
-                m, self.fit_bin, self.profiles.default_cache_type,
-                measurement_args(self.profiles, m, self.llama_args),
+            view = m.view_for(True)
+            quad = view.vram.effective_static(
+                self.fit_bin, cache_type=self.profiles.default_cache_type,
+                include_mmproj=True,
+                llama_args=measurement_args(self.profiles, view,
+                                            self.llama_args),
                 allow_cpu=True)
             if quad is None:
                 continue
@@ -2301,12 +2304,18 @@ class Planner:
         # pick that per model from a global context threshold, before any
         # category was read -- which is how it came to contradict the
         # category a model actually declared.
-        self.matrix_result = self._solve_matrix(
-            {m.stem for m in self.models
-             if m.mmproj is not None and m.mmproj.gguf_path})
-        if self.matrix_result is not None:
-            self.chat_ctx = self.matrix_result.chat_ctx
         self.role_budget = self._role_budgets()
+        if self.role_budget:
+            # The auction owns the sizing; the old shared solve and its
+            # RAG pair are not used.
+            self.matrix_result = None
+            self.chat_ctx = None
+        else:
+            self.matrix_result = self._solve_matrix(
+                {m.stem for m in self.models
+                 if m.mmproj is not None and m.mmproj.gguf_path})
+            if self.matrix_result is not None:
+                self.chat_ctx = self.matrix_result.chat_ctx
         # Fixed CPU categories are judged before anything commits
         # (requirement #70): one that cannot fit the host pool alone gets
         # no id at all.
@@ -2373,10 +2382,17 @@ class Planner:
                 # and fixed-overhead roles ARE residents; charging them
                 # themselves would double-count.
                 pool_id = self.ledger.pool_id_for(view)
-                spare_mb = self.ledger.spare_for(pool_id, spare_mb)
-                spare_eff = spare_mb
-                if view.serves_endpoint(CHAT):
-                    spare_eff += self.ledger.extra_reserve_mb(pool_id)
+                budget_pool = "ram" if view.on_cpu else "default"
+                budget = self.role_budget.get((model.role, budget_pool))
+                if budget is not None:
+                    reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO,
+                                                    self.baseline_mb)
+                    spare_eff = max(0, self.vram_total - reserve - budget)
+                else:
+                    spare_mb = self.ledger.spare_for(pool_id, spare_mb)
+                    spare_eff = spare_mb
+                    if view.serves_endpoint(CHAT):
+                        spare_eff += self.ledger.extra_reserve_mb(pool_id)
                 # Auto-parallel: unpinned chat models on slot-based backends
                 # get a value-function (parallel, ctx) solve instead of the
                 # group parallel.  Pinned = sidecar/block `parallel:` or any
@@ -2455,7 +2471,8 @@ class Planner:
                         rung = self.solve_rung(
                             model, demand, parallel=parallel,
                             cache_type=cache_type, spare_mb=spare_eff,
-                            design_ctx=self.chat_ctx,
+                            design_ctx=(None if self.role_budget
+                                        else self.chat_ctx),
                             context_length=demand_cap, profile=group[0][1],
                             prefer_capability=is_null)
                         if rung is None:
@@ -2484,7 +2501,8 @@ class Planner:
                                 serve_view, parallel=par,
                                 cache_type=cache_type, spare_mb=spare_eff,
                                 include_mmproj=not shed_vision,
-                                design_ctx=self.chat_ctx,
+                                design_ctx=(None if self.role_budget
+                                            else self.chat_ctx),
                                 context_length=demand_cap,
                                 profile=group[0][1])
                             if ctx < demand.min_context:
