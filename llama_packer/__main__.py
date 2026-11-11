@@ -604,6 +604,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.min_context:
         from llama_packer.utils import parse_context_length
         min_ctx = parse_context_length(args.min_context)
+    if min_ctx is None and profiles_cfg.get("min_context") is not None:
+        from llama_packer.utils import parse_context_length
+        min_ctx = parse_context_length(str(profiles_cfg["min_context"]))
 
     # vLLM resource configuration (CLI > profiles.yaml `vllm:` section >
     # built-in constants).  Resolved *before* discovery so backend inference

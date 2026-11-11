@@ -1287,8 +1287,10 @@ def test_task_max_context_is_per_entry(make_model):
 def test_non_chat_entry_gets_its_task_ttl(make_model):
     from llama_packer.writer import _entry_task_ttl
     m = make_model("e", role="embeddings", tasks=["embeddings"])
-    assert _entry_task_ttl(m, None, {"embeddings": 0}) == 0
-    assert _entry_task_ttl(m, None, {"embeddings": 3600}) == 3600
+    assert _entry_task_ttl(m, None, {"embeddings": 0}) is None
+    demand = m.tasks_resolved[0]
+    assert _entry_task_ttl(m, demand, {"embeddings": 0}) == 0
+    assert _entry_task_ttl(m, demand, {"embeddings": 3600}) == 3600
 
 
 def test_unestimated_chat_respects_task_max_context(make_model):

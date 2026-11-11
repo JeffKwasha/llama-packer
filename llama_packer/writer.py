@@ -336,12 +336,9 @@ def _task_ttl(profiles: Profiles) -> dict[str, int]:
 def _entry_task_ttl(model: Model, demand: "Task | None",
                     task_ttl: dict[str, int] | None) -> int | None:
     """The task-level TTL for one entry: its demand, or the model's tasks."""
-    if not task_ttl:
+    if not task_ttl or demand is None:
         return None
-    if demand is not None:
-        return task_ttl.get(demand.id)
-    declared = [task_ttl[tid] for tid in model.task_ids if tid in task_ttl]
-    return min(declared) if declared else None
+    return task_ttl.get(demand.id)
 
 
 def _build_entry(
@@ -860,11 +857,9 @@ def fallback_task(model: Model,
     tasks = [task for task in (model.tasks_resolved or ())
              if (task.min_context or 0) <= design]
     if tasks:
-        task = min(tasks, key=lambda t: ((t.min_context or empty_min)
-                                         * (t.min_parallel or 1)))
+        task = min(tasks, key=lambda t: (t.min_context or empty_min))
         return Task("", "", min_context=task.min_context or empty_min,
-                    min_parallel=task.min_parallel or 1,
-                    require=frozenset(), sacrifice=())
+                    min_parallel=1, require=frozenset(), sacrifice=())
     return Task("", "", min_context=empty_min, min_parallel=1,
                 require=frozenset(), sacrifice=())
 
@@ -1067,13 +1062,14 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
                     pin_ctx)
             return floor
     if pin_ctx is not None:
-        return pin_ctx
+        return max(pin_ctx, _MIN_CTX_SIZE)
     if category_floor is not None:
-        return category_floor
+        return max(category_floor, _MIN_CTX_SIZE)
     if "tools" in [c.lower() for c in (view.capabilities or [])]:
-        return fallback_min_ctx if fallback_explicit else tools_min_ctx
+        return max(fallback_min_ctx if fallback_explicit
+                   else tools_min_ctx, _MIN_CTX_SIZE)
     if fallback_explicit:
-        return fallback_min_ctx
+        return max(fallback_min_ctx, _MIN_CTX_SIZE)
     return max(int(view.design_context // 2), _MIN_CTX_SIZE)
 
 
@@ -1744,6 +1740,17 @@ class Planner:
                 leaf_role[key] = m.role
                 leaf_role[key.lower()] = m.role
 
+        def role_of_leaf(leaf: str) -> str | None:
+            low = leaf.lower()
+            if low in roles.names():
+                return low
+            if low in leaf_role:
+                return leaf_role[low]
+            for key, role in leaf_role.items():
+                if low.startswith(key + "."):
+                    return role
+            return None
+
         def floor_of_leaf(pool: str, leaf: str) -> int | None:
             leaf = leaf.lower()
             if leaf in roles.names():
@@ -1770,8 +1777,7 @@ class Planner:
             leaves = allocation.leaves(expr)
             seen: dict[str, str] = {}
             for leaf in leaves:
-                role = leaf_role.get(
-                    leaf, leaf if leaf in roles.names() else None)
+                role = role_of_leaf(leaf)
                 if role is None:
                     raise ValueError(
                         f"set {name!r}: {leaf!r} is not a role, model stem, "
@@ -1860,8 +1866,7 @@ class Planner:
             logger.info("matrix: %s auction %s -> %s (floor %d)",
                         pool, sorted(setmap), alloc, available)
             for leaf, mb in alloc.items():
-                role = leaf_role.get(
-                    leaf, leaf if leaf in roles.names() else None)
+                role = role_of_leaf(leaf)
                 if role is None:
                     continue
                 budget[(role, pool)] = min(
@@ -1992,7 +1997,8 @@ class Planner:
                 if budget is not None:
                     reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO,
                                                     self.baseline_mb)
-                    spare_eff = max(0, self.vram_total - reserve - budget)
+                    spare_eff = max(0, self.vram_total - reserve - budget
+                                    + spare_mb)
                 else:
                     spare_mb = self.ledger.spare_for(pool_id, spare_mb)
                     spare_eff = spare_mb
@@ -2355,7 +2361,10 @@ def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
             pp = pp_tps
         if pp and pp > 0:
             cost += variant.ctx_size * max(1, variant.parallel) / pp
-    return {"capacities": caps, "evict_cost": max(0, int(round(cost)))}
+    fields = {"evict_cost": max(0, int(round(cost)))}
+    if caps:
+        fields["capacities"] = caps
+    return fields
 
 
 def emit_config(models: list[Model], plan: dict,
@@ -2443,7 +2452,8 @@ def emit_config(models: list[Model], plan: dict,
         # serving, it is a change of name, and clients treat the name as
         # identity. The context belongs in the display name and in
         # `metadata.ctx_size`, both of which a client re-reads.
-        tail = ".".join(x for x in (cat_id, flags) if x)
+        tail = "" if not cats else ".".join(
+            x for x in (cat_id, flags) if x)
         disp = f" · {cat}" if cat is not None else ""
         disp += f" {ctx_label(ctx)}"          # display only, never the id
         if flags:
@@ -2478,10 +2488,9 @@ def emit_config(models: list[Model], plan: dict,
                     _entry_task_ttl(view, demand, task_ttl),
                     roles.get(view.role).ttl if roles.get(view.role) else None),
             )
-            if capacity_pools:
-                entry.update(_capacity_fields(
-                    view, v, capacity_pools, drive_mbps, pp_tps,
-                    memory_margin))
+            entry.update(_capacity_fields(
+                view, v, capacity_pools or {}, drive_mbps, pp_tps,
+                memory_margin))
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "
@@ -2662,9 +2671,11 @@ def build_config(
         progress_cb=progress_cb,
     )
     plan = planner.plan()
+    matrix_sets = planner.matrix_sets_approved
     config = emit_config(supported, plan, profiles, template_vars,
-                         capacity_pools=planner.capacity_pools,
-                         matrix_sets=planner.matrix_sets_approved,
+                         capacity_pools=(None if matrix_sets
+                                         else planner.capacity_pools),
+                         matrix_sets=matrix_sets,
                          drive_mbps=drive_mbps, pp_tps=pp_tps,
                          memory_margin=memory_margin,
                          task_ttl=_task_ttl(profiles))
