@@ -54,7 +54,8 @@ The schema:
     100.
   - `fill` — the weight the weighted roles leave below 100, split equally;
     0 when they leave nothing, then accepts a remainder a capped role frees.
-  - `min` — request 0, accept nothing; the role stays at its floor.
+  - `min` — request 0, accept nothing; the role stays at its floor. Use it
+    for a role whose memory does not grow with context.
   - `0` — request 0, accept whatever remains unclaimed.
   A role with no `share` accepts but does not request.
 - `device` — `auto`, `cpu`, or a GPU index, exactly the sidecar vocabulary;

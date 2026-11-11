@@ -440,7 +440,8 @@ Each member requests a share of it by `share:` weight. `N%` requests N,
 `fill` takes what the weighted roles leave below 100, split equally; when
 they leave nothing it weighs 0 and accepts a remainder freed by a capped
 role, `min` requests 0 and accepts nothing, `0` requests 0 and accepts what
-remains. Weights are normalised per set.
+remains. Weights are normalised per set. A role whose memory does not grow
+with context uses `min`; its floor is the whole cost.
 
 ```
 request(role, set) = weight / Σ weights in set × auction(set)

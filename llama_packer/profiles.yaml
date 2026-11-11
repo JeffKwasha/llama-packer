@@ -97,19 +97,19 @@ roles:
     share: fill
   embeddings:
     dir: embed
-    share: 5%
+    share: min
   rerank:
     dir: rerank
-    share: 5%
+    share: min
   image:
     dir: img
-    share: 20%
+    share: min
   s2t:
     dir: s2t
-    share: 5%
+    share: min
   t2s:
     dir: t2s
-    share: 5%
+    share: min
 
 tasks:
   chat:

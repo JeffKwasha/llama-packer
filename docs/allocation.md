@@ -29,9 +29,11 @@ available(pool) = physical(pool) − reserve(pool)
   every number has a name. `cpu` is emitted as `ram`; a single GPU as
   `default`. Detecting unified memory is future work; today the pools are
   discrete.
-- The allocation controls (`min`, `0`, a weight, `fill`) apply to the
-  model's device pool only. The other fields are static charges. The role
-  pool of 1 is a capacity check, not memory to share out.
+- The allocation controls (`min`, `0`, a weight, `fill`) apply only on the
+  model's device pool. On every other pool the role is `min`: it pays its
+  static footprint and accepts nothing above it. A GPU model's host floor
+  is at least 128 MiB and does not grow with context. The role pool of 1 is
+  a capacity check, not memory to share out.
 - An entry charges every field its serving touches. A pool absent from an
   entry's capacities is zero to that entry.
 
@@ -150,10 +152,15 @@ B takes the remaining 4
 `A` also appears in another set that offers only 3, so `A` accepts 3. The
 first set recomputes with `A` fixed at 3, and `B` takes the new remainder.
 
-`min` stays at its floor. `0` requests nothing but accepts memory left after
-the requesters are placed; when several accepting roles share one set's
-leftover, it is split equally among them. `fill` is not a weight; it takes
-the remainder.
+`min` stays at its floor and never accepts. `0` requests nothing but
+accepts memory left after the requesters are placed; when several accepting
+roles share one set's leftover, it is split equally among them. `fill` is
+not a weight; it takes the remainder.
+
+A role whose memory does not grow with context uses `share: min`. That is a
+fixed RAG window, or a whisper or diffusion backend whose cost is file size
+plus a fixed buffer. The floor is the whole cost; a share would allocate
+memory the serving cannot use.
 
 Each model then solves its context and parallel inside its role's allocation
 in its pool. Each set logs its unallocated memory at INFO.

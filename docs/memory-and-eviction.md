@@ -66,8 +66,11 @@ The rest of the set is the auction:
 auction(set) = available − floor(set)          # one device pool
 ```
 
-The auction runs on the pool the model's device names. A GPU model's host
-footprint is a static charge, not memory the share can grow.
+The auction runs on the pool the model's device names. On every other pool
+the role is `min`: it pays its static footprint and accepts nothing above
+it. A GPU model's host floor is at least 128 MiB. A role whose memory does
+not grow with context, such as a fixed RAG window or a whisper backend, uses
+`share: min`.
 
 Each member requests a share of it, by weight:
 

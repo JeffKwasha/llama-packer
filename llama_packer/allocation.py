@@ -222,9 +222,9 @@ def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
         unallocated[name] = ceilings[name] - used
 
     for name in sets:
+        effective = effective_weights(members[name], weights, fills)
         idle = [r for r in members[name]
-                if r in accepts and (r in fills
-                                     or weights.get(r, 0.0) == 0.0)]
+                if r in accepts and effective.get(r, 0.0) == 0.0]
         left = unallocated[name]
         if not idle or left <= 0:
             continue

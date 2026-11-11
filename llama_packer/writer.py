@@ -53,6 +53,9 @@ from llama_packer.backends import (
 
 logger = logging.getLogger(__name__)
 
+#: A server process always has a small host footprint.
+HOST_PROCESS_MIB = 128
+
 # llama-server ``--reasoning-format`` modes (see its CLI help).
 _REASONING_FORMATS = frozenset({"none", "deepseek", "deepseek-legacy", "auto"})
 _REASONING_FLAG_KEYS = ("reasoning-format", "reasoning-preserve")
@@ -1958,6 +1961,7 @@ class Planner:
         if not raw:
             return {}
         role_floor: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        role_pools: dict[str, set[str]] = {}
         model_floor: dict[str, tuple[str, int]] = {}
         leaf_role: dict[str, str] = {}
         for m in self.models:
@@ -1993,16 +1997,31 @@ class Planner:
             best = max(feasible)
             role_floor[pool][m.role] = max(
                 role_floor[pool].get(m.role, 0), best)
+            role_pools.setdefault(m.role, set()).add(pool)
+            if not m.on_cpu:
+                files = m.size_mb or 0
+                if m.mmproj is not None and m.mmproj.gguf_path is not None:
+                    files += m.mmproj.size_mb
+                if m.mtp is not None and m.mtp.gguf_path is not None:
+                    files += m.mtp.size_mb
+                host = max(HOST_PROCESS_MIB, int(files - quad[0]))
+                role_floor["ram"][m.role] = max(
+                    role_floor["ram"].get(m.role, 0), host)
+                model_floor[m.stem + "#ram"] = ("ram", host)
             for key in (m.stem, m.template_id):
                 model_floor[key] = (pool, best)
                 leaf_role[key] = m.role
 
         def floor_of_leaf(pool: str, leaf: str) -> int | None:
-            if leaf in role_floor[pool]:
-                return role_floor[pool][leaf]
+            if leaf in roles.names():
+                return role_floor[pool].get(leaf, 0)
             found = model_floor.get(leaf)
             if found is not None and found[0] == pool:
                 return found[1]
+            if found is not None and pool == "ram":
+                host = model_floor.get(leaf + "#ram")
+                if host is not None:
+                    return host[1]
             for key, (key_pool, mb) in model_floor.items():
                 if key_pool == pool and leaf.startswith(key + "."):
                     return mb
@@ -2048,7 +2067,8 @@ class Planner:
             weights, fills, accepts = {}, set(), set()
             for role in set(leaves_by_pool[pool].values()):
                 share = roles.get(role).share if roles.get(role) else None
-                if share is None:
+                if share is None or pool not in role_pools.get(role, set()):
+                    weights[role] = 0.0
                     continue
                 weights[role] = share.weight if share.requests else 0.0
                 if share.kind == "fill":
@@ -2073,6 +2093,8 @@ class Planner:
             except (KeyError, ValueError) as exc:
                 logger.warning("matrix: set auction failed: %s", exc)
                 continue
+            logger.info("matrix: %s auction %s -> %s (floor %d)",
+                        pool, sorted(viable), alloc, available)
             for role, mb in alloc.items():
                 budget[(role, pool)] = mb
             if any(mb > 0 for mb in left.values()):
