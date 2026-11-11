@@ -23,7 +23,7 @@ def profiles():
 
 
 def _scripted_ctx(model, by_mmproj, quad=(100, 0.01, 10, 100)):
-    """Replace calc_ctx with a fake keyed on include_mmproj.
+    """Replace solve_context with a fake keyed on include_mmproj.
 
     Companion-on variants carry their own VRAM budget (bound to the serving
     view), so the fake is installed on the base budget and every view.
@@ -35,11 +35,11 @@ def _scripted_ctx(model, by_mmproj, quad=(100, 0.01, 10, 100)):
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
              design_ctx=None, **kw):
         return by_mmproj[bool(include_mmproj)]
-    model.vram.calc_ctx = fake
+    model.vram.solve_context = fake
     for flag in (True, False):
         view = model.view_for(flag)
         if view is not model:
-            view.vram.calc_ctx = fake
+            view.vram.solve_context = fake
 
     def fake_static(fit_bin, cache_type="q8_0", design_ctx=None,
                     include_mmproj=True, llama_args="", allow_cpu=False):
@@ -59,7 +59,7 @@ def _vision_model(tmp_path, make_model, name):
 
 
 def _gated_ctx(model, by_mmproj):
-    """calc_ctx fake keyed on include_mmproj: (ctx, over_reason, squeezed).
+    """solve_context fake keyed on include_mmproj: (ctx, over_reason, squeezed).
 
     Sets the gating flags on the budget that owns the call so plan()'s
     over-budget / squeeze checks see the per-view verdict.
@@ -76,14 +76,14 @@ def _gated_ctx(model, by_mmproj):
     def fake_static(*a, **k):
         return (100, 0.01, 10, 100)
 
-    model.vram.calc_ctx = make_fake(model.vram, False)
+    model.vram.solve_context = make_fake(model.vram, False)
     model.vram.effective_static = fake_static
     model.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
         model_mib=100, kv_per_token_mib=0.01, slot_mib=10.0,
         compute_mib=100, source="fit-params")
     on = model.view_for(True)
     if on is not model:
-        on.vram.calc_ctx = make_fake(on.vram, True)
+        on.vram.solve_context = make_fake(on.vram, True)
         on.vram.effective_static = fake_static
         on.vram.fit_params_static = model.vram.fit_params_static
     else:
@@ -99,7 +99,7 @@ def _gated_ctx(model, by_mmproj):
             model.vram.over_budget_reason = text_over
             model.vram.vram_squeezed = text_sq
             return text_ctx
-        model.vram.calc_ctx = combo
+        model.vram.solve_context = combo
 
 
 def test_profiles_spare_precedence():
@@ -206,7 +206,7 @@ def test_planner_below_min_keeps_vision_no_warning(make_model, profiles, tmp_pat
 def test_bounded_ctx_clamps_design_then_cli(make_model, profiles):
     # Validates: SPEC.md, 'Context Tiers': VRAM-solved context clamped to the model's max trained context.
     m = make_model("m")  # sidecar context_length 32768
-    m.vram.calc_ctx = lambda *a, **k: 999999
+    m.vram.solve_context = lambda *a, **k: 999999
     planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024,
                       max_context=16384, min_context=0)
     ctx = planner._bounded_ctx(m, parallel=1, cache_type="q8_0", spare_mb=0,
@@ -362,7 +362,7 @@ def test_rejected_slot_count_is_not_logged_as_a_failure(make_model, caplog):
     m = make_model("big")
     _fake_vram(m, (20000, 0.5, 100))
     with caplog.at_level(logging.INFO, logger="llama_packer.vram"):
-        ctx = m.vram.calc_ctx(24576, fit_bin="unused", parallel=4,
+        ctx = m.vram.solve_context(24576, fit_bin="unused", parallel=4,
                               spare_mb=0, include_mmproj=True,
                               baseline_mb=0, cache_type="q8_0",
                               design_ctx=32768)
@@ -460,7 +460,7 @@ def test_plan_no_vram_note_when_served_equals_design(make_model, profiles):
         m.vram.vram_squeezed = True  # spurious: matrix target, not own design
         return 32768
 
-    m.vram.calc_ctx = fake
+    m.vram.solve_context = fake
     planner = Planner([m], profiles, fit_bin="unused",
                       vram_total=48 * 1024, spare="2G")
     variants = planner.plan()["eq"]
@@ -981,12 +981,12 @@ def test_plan_threads_matrix_result_into_variants(profiles, monkeypatch):
     s2t.vram.effective_static = lambda *a, **k: (640, 0.0, 0.0, 0)
     s2t.vram.fit_params_static = lambda *a, **k: None
 
-    # calc_ctx: echo the design_ctx the planner proposes, else the model's own.
-    def fake_calc_ctx(*a, **kw):
+    # solve_context: echo the design_ctx the planner proposes, else the model's own.
+    def fake_solve_context(*a, **kw):
         return kw.get("design_ctx") or 32768
 
     for m in (chat, embed, rerank, s2t):
-        m.vram.calc_ctx = fake_calc_ctx
+        m.vram.solve_context = fake_solve_context
 
     planner = Planner([chat, embed, rerank, s2t], profiles, fit_bin="unused",
                       vram_total=64 * 1024,
@@ -1024,7 +1024,7 @@ def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
     own served context.
     """
     chat = make("chat", role="chat", capabilities=["tools"])
-    chat.vram.calc_ctx = lambda *a, **k: 32768
+    chat.vram.solve_context = lambda *a, **k: 32768
     planner = Planner([chat], profiles, fit_bin="unused", vram_total=64 * 1024)
     plan = planner.plan()
     assert plan["chat"][0].tools_demoted is True
@@ -1041,10 +1041,10 @@ def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
     cannot read as 'always demote'.
     """
     # make() seeds context_length 32768, which would cap the served ctx
-    # below the threshold and demote regardless of what calc_ctx returns.
+    # below the threshold and demote regardless of what solve_context returns.
     chat = make("chat", role="chat", capabilities=["tools"],
                 context_length=262144)
-    chat.vram.calc_ctx = lambda *a, **k: 131072
+    chat.vram.solve_context = lambda *a, **k: 131072
     planner = Planner([chat], profiles, fit_bin="unused", vram_total=64 * 1024)
     plan = planner.plan()
     assert plan["chat"][0].tools_demoted is False

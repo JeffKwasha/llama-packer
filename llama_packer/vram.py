@@ -596,11 +596,11 @@ class VramBudget:
         #: Set when the budget cannot even hold weights + compute (the model
         #: cannot load at any context) — the planner disables the entry.
         #: ``None`` when the budget fits; reset at the top of every
-        #: ``calc_ctx`` call so each solve reports its own budget.
+        #: ``solve_context`` call so each solve reports its own budget.
         self.over_budget_reason: str | None = None
         #: Set when the design context did not fit and the solve fell back to
         #: a smaller context — the planner stamps a description note.
-        #: Reset alongside ``over_budget_reason`` on every ``calc_ctx`` call.
+        #: Reset alongside ``over_budget_reason`` on every ``solve_context`` call.
         self.vram_squeezed: bool = False
 
     # ── saved fit-params from frontmatter ──
@@ -1360,7 +1360,7 @@ class VramBudget:
         # VRAM = weights (file size, 0 when baked into a container image) + a
         # fixed runtime buffer, no KV terms.  These are excluded
         # from the shared chat matrix, so precise factors are irrelevant;
-        # calc_ctx returns design_ctx when kv_per_token_mib==0.
+        # solve_context returns design_ctx when kv_per_token_mib==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Operator-pinned total VRAM (`vram_mb` in the sidecar) is the
             # sizing: it *is* the fixed overhead, no measurement or estimate.
@@ -1431,7 +1431,7 @@ class VramBudget:
 
     # ── context calculation ──
 
-    def calc_ctx(
+    def solve_context(
         self,
         vram_total_mb: int,
         fit_bin: str,

@@ -27,7 +27,7 @@ def _profiles_no_pin():
 
 
 def _scripted_by_parallel(model, by_parallel):
-    """Fake calc_ctx: max affordable ctx keyed on parallel, minus spare.
+    """Fake solve_context: max affordable ctx keyed on parallel, minus spare.
 
     The spare term proves ledger reserves actually reach the budget: every
     MB of spare costs 2 tokens of context in the fake.
@@ -36,11 +36,11 @@ def _scripted_by_parallel(model, by_parallel):
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
              design_ctx=None, **kw):
         return max(0, by_parallel.get(parallel, 0) - spare_mb * 2)
-    model.vram.calc_ctx = fake
+    model.vram.solve_context = fake
     for flag in (True, False):
         view = model.view_for(flag)
         if view is not model:
-            view.vram.calc_ctx = fake
+            view.vram.solve_context = fake
 
 
 def _view(stem="m", **fm):
@@ -299,11 +299,11 @@ def test_plan_floor_unreachable_solves_once(make_model):
         calls.append(parallel)
         return 32768
 
-    m.vram.calc_ctx = fake
+    m.vram.solve_context = fake
     for flag in (True, False):
         view = m.view_for(flag)
         if view is not m:
-            view.vram.calc_ctx = fake
+            view.vram.solve_context = fake
     variants = _planner(m).plan()
     assert "ap" not in variants
     assert calls, "nothing was solved at all"
@@ -563,7 +563,7 @@ def test_multi_category_takes_the_heaviest():
 def test_cpu_resident_chat_gets_no_auto_parallel(make_model):
     """Host-RAM KV lives in an arena no VRAM ledger budgets.
 
-    calc_ctx returns the design context regardless of the slot count for a
+    solve_context returns the design context regardless of the slot count for a
     CPU-resident model, so every candidate looks equally affordable and the
     score reduces to p**power — walking straight to the cap. Eight slots on
     a model declared for one is an 8x KV over-commit nothing accounts for.

@@ -1562,7 +1562,7 @@ class Planner:
         (*context_length*) and the CLI ``--max-context`` cap.  Measured
         under the model's resolved ``-ub`` shape (:func:`measurement_args`);
         *profile* adds the per-profile tier when the solve is group-scoped."""
-        ctx = model.vram.calc_ctx(
+        ctx = model.vram.solve_context(
             self.vram_total,
             fit_bin=self.fit_bin,
             parallel=parallel,
@@ -2386,7 +2386,7 @@ class Planner:
                     and view.serves_endpoint(CHAT)
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
                     # A CPU-resident model's KV pool lives in host RAM, which
-                    # no VRAM ledger sees or budgets, and calc_ctx returns
+                    # no VRAM ledger sees or budgets, and solve_context returns
                     # the design context regardless of the slot count. So
                     # every candidate looks equally affordable and the score
                     # reduces to p**power, which walks straight to the cap:
@@ -2501,7 +2501,7 @@ class Planner:
                         continue
                 ctx_size = serves[0][3]
                 if est_error is None:
-                    # Discovery during this model's own solve: calc_ctx
+                    # Discovery during this model's own solve: solve_context
                     # flagged the model unestimable (no measurement source
                     # worked) — re-plan it at the type floor.  The flag may
                     # sit on the *view's* budget: view_for() rebuilds

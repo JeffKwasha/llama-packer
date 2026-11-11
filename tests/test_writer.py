@@ -217,7 +217,7 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
     bad_vllm = make_model("bad", backend="vllm", context_length=8192)
 
     for m in (llama, bad_vllm):
-        monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 8192)
+        monkeypatch.setattr(m.vram, "solve_context", lambda *a, **k: 8192)
 
     profiles = {
         "defaults": {"cache_type": "q8_0", "parallel": 1},
@@ -237,7 +237,7 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
 
 def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     # The unsupported-model filter must run BEFORE the mmproj VRAM pre-pass:
-    # rejected models must never reach calc_ctx.  The model gets an mmproj
+    # rejected models must never reach solve_context.  The model gets an mmproj
     # companion so the pre-pass would otherwise consult it.
     # Validates: SPEC.md, 'Output Format': Build llama-swap config from list of Model objects. Composes the pipeline.
     from llama_packer.writer import build_config
@@ -246,8 +246,8 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     (bad_vllm.md_path.parent / "bad-mmproj.gguf").write_bytes(b"x")
     bad_vllm.mmproj = bad_vllm  # companion present -> pre-pass engages
     monkeypatch.setattr(
-        bad_vllm.vram, "calc_ctx",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("filtered model reached calc_ctx")),
+        bad_vllm.vram, "solve_context",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("filtered model reached solve_context")),
     )
 
     profiles = {
@@ -270,7 +270,7 @@ def test_build_config_disables_over_budget_model(make_model, monkeypatch):
 
     huge = make_model("huge", backend="llama-server", context_length=8192,
                       base_model="llama3")
-    # 50G weights on a 48G card: remaining < 0 in calc_ctx.
+    # 50G weights on a 48G card: remaining < 0 in solve_context.
     monkeypatch.setattr(
         huge.vram, "effective_static",
         lambda *a, **k: (50000, 0.5, 0.0, 100),
@@ -295,7 +295,7 @@ def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
 
     m = make_model("chat", backend="llama-server", context_length=8192,
                    cache_type="f16")
-    monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 8192)
+    monkeypatch.setattr(m.vram, "solve_context", lambda *a, **k: 8192)
     profiles = {
         "defaults": {"cache_type": "q8_0", "parallel": 1},
         "profiles": {"default": {}},
@@ -588,7 +588,7 @@ def test_overallocation_guard_catches_an_injected_violation(make_model,
     it needs a test that *breaks* the planner deliberately: otherwise it
     passes vacuously forever and protects nothing.
 
-    Here calc_ctx is made to report a comfortable context while the quad
+    Here solve_context is made to report a comfortable context while the quad
     says the model needs more than the card has -- the shape of the bug it
     was written for.
     """
@@ -597,7 +597,7 @@ def test_overallocation_guard_catches_an_injected_violation(make_model,
 
     m = make_model("liar", backend="llama-server", context_length=32768)
     # Reports a fine context for any request...
-    monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 32768)
+    monkeypatch.setattr(m.vram, "solve_context", lambda *a, **k: 32768)
     # ...while the numbers say 90 GB of weights on a 48 GB card.
     monkeypatch.setattr(m.vram, "effective_static",
                         lambda *a, **k: (90000, 0.5, 0.0, 100))

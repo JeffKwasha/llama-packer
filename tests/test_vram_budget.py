@@ -1,5 +1,5 @@
 # tests/test_vram_budget.py
-"""calc_ctx and solve_matrix_ctx budget math under the affine VRAM law:
+"""solve_context and solve_matrix_ctx budget math under the affine VRAM law:
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 
@@ -406,43 +406,43 @@ def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
     assert entry["outcome"] == "exited"
 
 
-# ── calc_ctx ──────────────────────────────────────────────────────────────
+# ── solve_context ──────────────────────────────────────────────────────────────
 
 
-def test_calc_ctx_fits_design(make_model, fit_params_block):
+def test_solve_context_fits_design(make_model, fit_params_block):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("a", **{"derived": fit_params_block})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    ctx = model.vram.solve_context(32768, fit_bin="unused")
     # available = 32768 - 2048 = 30720; remaining = 30720 - 10000 - 1000 = 19720
     # design cost = (0.5*32768 + 0) * 1 = 16384 <= 19720 -> design context
     assert ctx == 32768
 
 
-def test_calc_ctx_scales_down_and_rounds(make_model):
+def test_solve_context_scales_down_and_rounds(make_model):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b", **{"derived": fm})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    ctx = model.vram.solve_context(32768, fit_bin="unused")
     # remaining = 30720 - 26000 = 4720; X = 4720/(0.5*1) = 9440 -> rounded 8192
     assert ctx == 8192
 
 
-def test_calc_ctx_slot_mib_charged_per_slot(make_model):
+def test_solve_context_slot_mib_charged_per_slot(make_model):
     # A nonzero D is charged once per slot: at p=2 the KV pool doubles AND
     # the slot cost doubles, so the affordable per-slot context shrinks.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 300.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b2", **{"derived": fm})
-    p1 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=1)
-    p2 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=2)
+    p1 = model.vram.solve_context(32768, fit_bin="unused", parallel=1)
+    p2 = model.vram.solve_context(32768, fit_bin="unused", parallel=2)
     # p=1: X = (4720 - 300)/0.5 = 8840 -> 8192
     # p=2: X = (4720 - 600)/(0.5*2) = 4120 -> 4096
     assert p1 == 8192
     assert p2 == 4096
 
-def test_calc_ctx_floors_at_min(make_model, caplog):
+def test_solve_context_floors_at_min(make_model, caplog):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     import logging
 
@@ -451,7 +451,7 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
           "source": "llama-server", "shape": ""}
     model = make_model("c", **{"derived": fm})
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=1024)
+        ctx = model.vram.solve_context(32768, fit_bin="unused", spare_mb=1024)
     assert ctx == _MIN_CTX_SIZE
     # The warning must say what the user gets and why: needs vs budget and
     # the verdict (the model cannot load — the planner disables it).
@@ -466,7 +466,7 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
     assert model.vram.vram_squeezed is False
 
 
-def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
+def test_solve_context_never_reports_a_context_it_cannot_afford(make_model,
                                                            caplog):
     """The invariant: an emitted entry must never need more VRAM than exists.
 
@@ -491,14 +491,14 @@ def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
 
     # 24576 - reserve(2048) - weights(20471) - compute(1174) leaves ~883 MiB.
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+        ctx = model.vram.solve_context(24576, fit_bin="unused", spare_mb=0,
                                   parallel=4, design_ctx=202752)
     assert ctx < _MIN_CTX_SIZE, "reported a servable context"
     assert model.vram.over_budget_reason is not None
     assert "below the" in model.vram.over_budget_reason
 
 
-def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
+def test_solve_context_serves_normally_when_the_minimum_is_reachable(make_model):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """One MiB more budget and the same model serves -- so the guard above
     is a threshold, not a blanket refusal."""
@@ -506,16 +506,16 @@ def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
           "slot_mib": 448.87, "compute_mib": 1174, "source": "llama-server",
           "cache_type": "q8_0", "shape": ""}
     model = make_model("roomy", **{"derived": fm})
-    ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+    ctx = model.vram.solve_context(24576, fit_bin="unused", spare_mb=0,
                               parallel=1, design_ctx=202752)
     assert ctx >= 4096
     assert model.vram.over_budget_reason is None
 
 
-def test_calc_ctx_applies_spare(make_model, fit_params_block):
+def test_solve_context_applies_spare(make_model, fit_params_block):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("d", **{"derived": fit_params_block})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=3072)
+    ctx = model.vram.solve_context(32768, fit_bin="unused", spare_mb=3072)
     # available = 32768 - 2048 - 3072 = 27648; remaining = 27648-11000 = 16648
     # design cost = 16384 <= 16648 -> design still fits
     assert ctx == 32768
@@ -524,7 +524,7 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
 # ── over-budget / squeeze gating flags ───────────────────────────────────
 
 
-def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
+def test_solve_context_over_budget_when_available_nonpositive(make_model, caplog):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     import logging
 
@@ -533,14 +533,14 @@ def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
           "source": "llama-server", "shape": ""}
     model = make_model("nb", **{"derived": fm})
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=40000)
+        ctx = model.vram.solve_context(32768, fit_bin="unused", spare_mb=40000)
     assert ctx == _MIN_CTX_SIZE
     assert model.vram.over_budget_reason is not None
     assert "exhausted" in model.vram.over_budget_reason
     assert model.vram.vram_squeezed is False
 
 
-def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
+def test_solve_context_squeezed_flag_when_design_does_not_fit(make_model):
     # Weights fit but the full 32768 design context does not: the solve
     # falls back smaller and flags the squeeze for the description note.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
@@ -548,7 +548,7 @@ def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
           "compute_mib": 100, "cache_type": "q8_0",
           "source": "llama-server", "shape": ""}
     model = make_model("sq", **{"derived": fm})
-    ctx = model.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    ctx = model.vram.solve_context(49152, fit_bin="unused", spare_mb=0)
     # available = 47104; remaining = 47104 - 32100 = 15004
     # design cost = 16384 > 15004 -> squeezed; not over budget.
     assert ctx < 32768
@@ -556,7 +556,7 @@ def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
     assert model.vram.vram_squeezed is True
 
 
-def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
+def test_solve_context_flags_reset_between_calls(make_model, fit_params_block):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """Flags are per-solve: a tight call's verdict must not leak into the
     next call's plan (groups may carry different spare)."""
@@ -564,46 +564,46 @@ def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
         "model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
         "compute_mib": 100, "cache_type": "q8_0",
         "source": "llama-server", "shape": ""}})
-    tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    tight.vram.solve_context(49152, fit_bin="unused", spare_mb=0)
     assert tight.vram.over_budget_reason is not None
 
     # Same budget object, looser effective budget via the fitting block:
     # swap the measured quad for one that fits and the flags must clear.
     tight.vram.effective_static = lambda *a, **k: (
         1000, 0.5, 0.0, 100)
-    ctx = tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    ctx = tight.vram.solve_context(49152, fit_bin="unused", spare_mb=0)
     assert tight.vram.over_budget_reason is None
     assert tight.vram.vram_squeezed is False
     assert ctx >= _MIN_CTX_SIZE
 
 
-def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
+def test_solve_context_memory_margin_shrinks_ctx(make_model):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("mm", **{"derived": fm})
-    plain = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.0)
-    margined = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.01)
+    plain = model.vram.solve_context(65536, fit_bin="unused", memory_margin=0.0)
+    margined = model.vram.solve_context(65536, fit_bin="unused", memory_margin=0.01)
     # available = 63520 (plain) vs 63520/1.01 = 62891.1 (margined)
     # plain: remaining 12520 -> 25040 -> 24576; margined: 11891 -> 23782 -> 16384
     assert plain == 24576
     assert margined == 16384
 
 
-def test_calc_ctx_cpu_resident_returns_design(make_model):
+def test_solve_context_cpu_resident_returns_design(make_model):
     """
     Validates: SPEC.md, 'VRAM Allocation': a CPU-resident model costs no VRAM, so its
     context is its design maximum.
     """
     model = make_model("e", device="cpu", context_length=8192)
-    ctx = model.vram.calc_ctx(1024, fit_bin="unused")
+    ctx = model.vram.solve_context(1024, fit_bin="unused")
     assert ctx == 8192
 
 
 # ── unestimable fallback (no estimate source works) ──────────────────────
 
 
-def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
+def test_solve_context_unestimable_falls_back_to_design(make_model, caplog):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """No measurement source -> design ctx + unestimated flag, never raise."""
     import logging
@@ -611,12 +611,12 @@ def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
     model = make_model("ue", context_length=32768)
     model.vram.effective_static = lambda *a, **k: None
     with caplog.at_level(logging.WARNING, logger="llama_packer.vram"):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+        ctx = model.vram.solve_context(32768, fit_bin="unused")
     assert ctx == 32768
     assert model.vram.unestimated_reason is not None
     assert any("VRAM measurement failed" in r.message for r in caplog.records)
     # The warning is deduped: a repeat solve logs it once.
-    model.vram.calc_ctx(32768, fit_bin="unused")
+    model.vram.solve_context(32768, fit_bin="unused")
     assert sum("VRAM measurement failed" in r.message
                for r in caplog.records) == 1
 
@@ -642,12 +642,12 @@ def test_fit_params_undecodable_output_returns_none(make_model, monkeypatch,
     assert any("fit-params failed" in r.message for r in caplog.records)
 
 
-def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
+def test_solve_context_vllm_no_estimate_returns_design(make_model):
     # vLLM model with no estimator and no local safetensors: graceful fallback.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("f", backend="vllm", hf_repo="org/model",
                        context_length=65536)
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    ctx = model.vram.solve_context(32768, fit_bin="unused")
     assert ctx == 65536
 
 
@@ -754,7 +754,7 @@ def _vision(make_model, tmp_path, stem, fit, **extra):
     return make_model(stem, **fm)
 
 
-def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
+def test_solve_context_image_floor_raises_ctx(make_model, tmp_path):
     # A declared image budget plus the output reserve must fit the solved
     # context: the ctx is raised from the rounded-down value to the floor
     # when affordable.
@@ -763,14 +763,14 @@ def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=7500)
-    ctx = model.view_for(True).vram.calc_ctx(
+    ctx = model.view_for(True).vram.solve_context(
         32768, fit_bin="unused", include_mmproj=True)
     # remaining = 30720 - 26000 - mmproj(0 + 150) = 4570; affordable 9140
     # tokens; rounded ctx 8192 -> raised to 7500 + 1024 reserve = 8524
     assert ctx == 8524
 
 
-def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
+def test_solve_context_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
     # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
     import logging
 
@@ -779,7 +779,7 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
            "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=16384)
     with caplog.at_level(logging.WARNING):
-        ctx = model.view_for(True).vram.calc_ctx(
+        ctx = model.view_for(True).vram.solve_context(
             32768, fit_bin="unused", include_mmproj=True)
     # floor 16384 > affordable 9140: ctx raised to what fits (9140), warning
     assert ctx == 9140
@@ -787,7 +787,7 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
                for r in caplog.records)
 
 
-def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
+def test_solve_context_image_floor_native_vision(make_model, tmp_path):
     """Native vision (no mmproj file) must still get the image floor.
 
     Qwen3-VL / Gemma3 have vision baked into the main weights. image_max_tokens
@@ -799,18 +799,18 @@ def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = make_model("i", **{"derived": fit, "image_max_tokens": 9440})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+    ctx = model.vram.solve_context(32768, fit_bin="unused", include_mmproj=True)
     assert ctx >= 9440
 
 
-def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
+def test_solve_context_text_variant_ignores_image_floor(make_model, tmp_path):
     # The -text variant serves no vision, so the floor must not apply.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9440)
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=False)
+    ctx = model.vram.solve_context(32768, fit_bin="unused", include_mmproj=False)
     assert ctx == 8192
 
 
@@ -1100,11 +1100,11 @@ def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
           "shape": ""}
     model = make_model("pinned", context_length=32768, **{"derived": fm})
 
-    roomy = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+    roomy = model.vram.solve_context(24576, fit_bin="unused", parallel=1,
                                design_ctx=131072)
     assert roomy == 32768
 
-    tight = model.vram.calc_ctx(16384, fit_bin="unused", parallel=1,
+    tight = model.vram.solve_context(16384, fit_bin="unused", parallel=1,
                                design_ctx=131072)
     assert tight <= 32768, f"squeeze ignored the sidecar pin: {tight}"
     assert model.vram.vram_squeezed is True
@@ -1124,7 +1124,7 @@ def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
           "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
           "shape": ""}
     model = make_model("unpinned", context_length=131072, **{"derived": fm})
-    ctx = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+    ctx = model.vram.solve_context(24576, fit_bin="unused", parallel=1,
                               design_ctx=131072)
     assert ctx == 131072
 

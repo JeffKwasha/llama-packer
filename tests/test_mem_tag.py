@@ -194,7 +194,7 @@ def test_entry_vram_note_without_mem_tag_or_description(make_model):
 
 
 def _scripted(model, ctx, quad_by_mmproj, ctx_by_mmproj=None):
-    """Script both solves: ctx via calc_ctx, quads via effective_static.
+    """Script both solves: ctx via solve_context, quads via effective_static.
 
     *ctx_by_mmproj* lets a test give the text-only rung a different (larger,
     as shedding a projection frees VRAM) context than the vision one.
@@ -215,12 +215,12 @@ def _scripted(model, ctx, quad_by_mmproj, ctx_by_mmproj=None):
     ):
         return quad_by_mmproj[bool(include_mmproj)]
 
-    model.vram.calc_ctx = fake_ctx
+    model.vram.solve_context = fake_ctx
     model.vram.effective_static = fake_static
     for flag in (True, False):
         view = model.view_for(flag)
         if view is not model:
-            view.vram.calc_ctx = fake_ctx
+            view.vram.solve_context = fake_ctx
             view.vram.effective_static = fake_static
 
 
