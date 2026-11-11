@@ -29,14 +29,14 @@ class _FakeBackend:
 
 
 def test_engines_vocabulary_is_bare_engine_names():
-    # Validates: docs/plans/requirement-trace.md #95 -- `engines:` names engines, not transport-bound pairs.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     assert ENGINE_NAMES == ("llama-server", "vllm", "sd-server",
                             "whisper-server", "audio-cpp")
     assert "vllm-podman" not in ENGINE_NAMES
 
 
 def test_engines_resolution_honours_declared_order(make_model, monkeypatch):
-    # Validates: docs/plans/requirement-trace.md #95 -- the first declared engine that can serve wins.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     import llama_packer.backends as backends
 
     monkeypatch.setattr(backends, "BACKENDS",
@@ -48,7 +48,7 @@ def test_engines_resolution_honours_declared_order(make_model, monkeypatch):
 
 
 def test_engines_resolution_picks_the_transport(make_model):
-    # Validates: docs/plans/requirement-trace.md #95 -- a declared engine resolves to the registry's transport preference.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     m = make_model("qwen3-32b", hf_repo="org/model")
     m.gguf_path = None
     assert resolve_engines(m, ("vllm",), {"vllm_bin": "vllm"})[0] == "vllm"
@@ -60,16 +60,16 @@ def test_engines_resolution_picks_the_transport(make_model):
 
 
 def test_engines_refusal_names_every_engine(make_model):
-    # Validates: docs/plans/requirement-trace.md #95 -- a declared engine that cannot serve is reported by name and reason.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     m = make_model("flux2-dev", role="image")
     resolved, reasons = resolve_engines(m, ("llama-server",),
                                         {"llama_bin": "/opt/llama-server"})
     assert resolved is None
-    assert "does not serve role 'image'" in reasons["llama-server"]
+    assert "does not serve openai.images.generations" in reasons["llama-server"]
 
 
 def test_engines_finalize_sets_the_backend(make_model):
-    # Validates: docs/plans/requirement-trace.md #95 -- a resolvable declaration becomes the model's backend.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     m = make_model("flux2-dev", role="image", engines=["sd-server"])
     ScopeStack(avail={"sd_bin": "/opt/sd-server"}).finalize(m)
     assert m.backend == "sd-server"
@@ -77,7 +77,7 @@ def test_engines_finalize_sets_the_backend(make_model):
 
 
 def test_engines_finalize_refuses_by_name(make_model):
-    # Validates: docs/plans/requirement-trace.md #95 -- nothing resolvable skips the model with the declared names in the reason.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     m = make_model("qwen3-8b", engines=["sd-server"])
     ScopeStack(avail={"sd_bin": "/opt/sd-server",
                       "llama_bin": "/opt/llama-server"}).finalize(m)
@@ -86,7 +86,7 @@ def test_engines_finalize_refuses_by_name(make_model):
 
 
 def test_engines_wins_over_the_alien_backend_key(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md #96 -- `backend:` warns as alien and `engines:` decides.
+    # Validates: docs/plans/requirement-trace.md, requirement #95, #96
     m = make_model("qwen3-8b", engines=["llama-server"], backend="sd-server")
     ScopeStack(avail={"llama_bin": "/opt/llama-server",
                       "sd_bin": "/opt/sd-server"}).finalize(m)
@@ -95,7 +95,7 @@ def test_engines_wins_over_the_alien_backend_key(make_model, caplog):
 
 
 def test_engines_unknown_name_warns_with_a_hint(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md #95 -- an unknown engine name warns at discovery with a near-miss hint.
+    # Validates: docs/plans/requirement-trace.md, requirement #95
     from llama_packer.discover import _warn_unsupported_values
 
     m = make_model("qwen3-8b", engines=["llama-servr"])
@@ -104,7 +104,7 @@ def test_engines_unknown_name_warns_with_a_hint(make_model, caplog):
 
 
 def test_sidecar_without_engines_is_refused(tmp_path, make_model):
-    # Validates: docs/plans/requirement-trace.md #96 -- an authored sidecar must declare engines:.
+    # Validates: docs/plans/requirement-trace.md, requirement #96
     m = make_model("qwen3-8b")
     (tmp_path / "qwen3-8b.md").write_text("---\nname: qwen3-8b\n---\n")
     m.stub = False
@@ -114,7 +114,7 @@ def test_sidecar_without_engines_is_refused(tmp_path, make_model):
 
 
 def test_orphan_without_engines_still_infers(make_model):
-    # Validates: docs/plans/requirement-trace.md #96 -- a model with no authored sidecar keeps inference.
+    # Validates: docs/plans/requirement-trace.md, requirement #96
     m = make_model("gemma4-12b")
     assert m.stub is True
     ScopeStack(avail={"llama_bin": "/opt/llama-server"}).finalize(m)

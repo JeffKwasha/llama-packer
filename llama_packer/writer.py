@@ -17,30 +17,31 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Container, Iterable, Mapping
+from typing import Callable, Iterable
 
 import yaml
 
 from llama_packer.model import Model
-from llama_packer.vram import solve_matrix_ctx
 from llama_packer.hardware import detect_gpu_env_var
 from llama_packer import utils
-from llama_packer.endpoints import CHAT
+from llama_packer.endpoints import (CHAT, EMBEDDINGS, IMAGES, RERANK,
+                                   SPEECH, TRANSCRIPTIONS)
 from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
 from llama_packer.consts import (
     DEFAULT_SACRIFICE_ORDER,
     KNOWN_CAPABILITIES,
     _DIFFUSION_ARCH_RES,
+    _CTX_ROUND_TO,
     _KV_CACHE_BYTES,
     _LLAMA_CPP_DEFAULT_UBATCH,
     _MEMORY_MARGIN,
     _MIN_AGENTIC_CTX,
     _MIN_CTX_SIZE,
+    _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
-    ESTIMATE_ERROR_REASON,
 )
-from llama_packer import roles
-from llama_packer.profiles import Profiles, parse_spare_mb
+from llama_packer import allocation, roles
+from llama_packer.profiles import Profiles
 from llama_packer.backends import (
     SETTING_KEYS,
     FRAMEWORK_CONSUMED,
@@ -51,13 +52,16 @@ from llama_packer.backends import (
 
 logger = logging.getLogger(__name__)
 
+#: A server process always has a small host footprint.
+HOST_PROCESS_MIB = 128
+
 # llama-server ``--reasoning-format`` modes (see its CLI help).
 _REASONING_FORMATS = frozenset({"none", "deepseek", "deepseek-legacy", "auto"})
 _REASONING_FLAG_KEYS = ("reasoning-format", "reasoning-preserve")
 
 def _model_can_reason(model: Model) -> bool:
     """True when the model is a chat model that advertises reasoning support."""
-    if model.role != "chat":
+    if not model.serves_endpoint(CHAT):
         return False
     return "reasoning" in [c.lower() for c in model.capabilities]
 
@@ -95,8 +99,8 @@ def format_mem_tag(
     entry (weights + companions + context at the served ``(ctx, slots)``)
     — never capped, never re-solved: an impossible-looking ``VRAM 73.0GB``
     on a 32 GB card is printed as decided.  ``vram_mib=None`` is a
-    CPU-resident serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
-    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (disk-resident weights)
+    host-RAM serving (``RAM``-only tag).  ``spill_mib`` (driver-managed
+    overflow, ``VRAM cap + spill``) and ``ssd_mib`` (on-disk weights)
     are reserved grammar for a future allocator that decides a split —
     today's allocator never splits, so callers leave them None.
     """
@@ -157,7 +161,7 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
         if model.gguf_path and model.gguf_path.is_file():
             arch = model.arch
             if arch and any(rx.search(arch) for rx in _DIFFUSION_ARCH_RES):
-                if model.role != "image":
+                if not model.serves_endpoint(IMAGES):
                     logger.error("skipping %s: diffusion arch %r requires role: image (sd-server); "
                                  "move to img/ with dirs:{img:image} or set ignore:true (found role=%r)",
                                  model.stem, arch, model.role)
@@ -295,6 +299,46 @@ def _build_mode_params(model: Model, profiles_group: list[tuple[str, dict]],
     return set_params
 
 
+def resolve_entry_ttl(model: Model, demand: "Task | None",
+                      task_ttl: int | None = None,
+                      role_ttl: int | None = None) -> int | None:
+    """The idle-unload lifetime for one entry, in seconds.
+
+    Most specific wins: sidecar > task > role > top-level ``ttl``. A device
+    entry with nothing declared returns None, so llama-swap's ``globalTTL``
+    applies.
+    """
+    if "ttl" in getattr(model, "sidecar_keys", ()):
+        raw = model.frontmatter.get("ttl")
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            logger.warning("%s: ttl=%r is not a non-negative integer; "
+                           "ignored", model.label, raw)
+        else:
+            return raw
+    if demand is not None and demand.ttl is not None:
+        return demand.ttl
+    if task_ttl is not None:
+        return task_ttl
+    if role_ttl is not None:
+        return role_ttl
+    return None
+
+
+def _task_ttl(profiles: Profiles) -> dict[str, int]:
+    """Per-task TTL defaults, from the task catalogue. ``0`` wins."""
+    return {task.id: task.ttl
+            for task in TaskCatalogue.from_cfg(profiles.tasks_cfg).by_id.values()
+            if task.ttl is not None}
+
+
+def _entry_task_ttl(model: Model, demand: "Task | None",
+                    task_ttl: dict[str, int] | None) -> int | None:
+    """The task-level TTL for one entry: its demand, or the model's tasks."""
+    if not task_ttl or demand is None:
+        return None
+    return task_ttl.get(demand.id)
+
+
 def _build_entry(
     model: Model,
     parallel: int,
@@ -316,6 +360,7 @@ def _build_entry(
     mem_ram_mib: float | None = None,
     kv_per_token_mib: float | None = None,
     vram_note: str | None = None,
+    ttl: int | None = None,
 ) -> tuple[str, dict]:
     """Build a single llama-swap config entry for a model+profile group.
 
@@ -415,17 +460,17 @@ def _build_entry(
     caps_l = [c.lower() for c in model.capabilities]
     arch = str(model.frontmatter.get("architecture") or "").lower()
     is_video_arch = "video" in arch or arch in {"wan", "hunyuan-video", "h3", "mochi", "cosmos"}
-    if model.role == "image":
+    if model.serves_endpoint(IMAGES):
         in_mods = ["text", "image"]
         # architecture or explicit video token decides output modality
         if "video" in caps_l or is_video_arch:
             out_mods = ["video"]
         else:
             out_mods = ["image"]
-    elif model.role == "s2t":
+    elif model.serves_endpoint(TRANSCRIPTIONS):
         in_mods = ["audio"]
         out_mods = ["text"]
-    elif model.role == "t2s":
+    elif model.serves_endpoint(SPEECH):
         in_mods = ["text"]
         out_mods = ["audio"]
     else:
@@ -450,7 +495,8 @@ def _build_entry(
     # companion block, ``model`` is already the base (off) view so block
     # capabilities are absent; this stays as a safety net for unconditional
     # top-level image/video claims.
-    if not include_mmproj and model.role != "image" and model.mmproj and model.mmproj.gguf_path:
+    if (not include_mmproj and not model.serves_endpoint(IMAGES)
+            and model.mmproj and model.mmproj.gguf_path):
         caps = [c for c in model.capabilities if str(c).lower() not in ("image", "video")]
         if "image" in caps_l and "image" in in_mods:
             in_mods.remove("image")
@@ -526,7 +572,7 @@ def _build_entry(
     # number, kept for clients that read it. context_max preserves the
     # trained maximum when the entry is folded below it.
     metadata["ctx_size"] = ctx_size
-    if model.role == "chat":
+    if model.serves_endpoint(CHAT):
         # The served window is the true generation ceiling: llama-server
         # allows a reply up to n_ctx minus the prompt, and clients clamp to
         # the room a prompt leaves. A sidecar may lower it for a model whose
@@ -580,7 +626,8 @@ def _build_entry(
         "in": in_mods,
         "out": out_mods,
         "tools": "tools" in [c.lower() for c in caps],
-        "reranker": "reranker" in caps_l or model.role == "rerank",
+        "reranker": "reranker" in caps_l
+                    or model.serves_endpoint(RERANK),
         "context": ctx_size,
     }
 
@@ -596,12 +643,11 @@ def _build_entry(
     if conc is not None:
         entry["concurrencyLimit"] = conc
 
-    # CPU entries never idle-expire (design decision 12): a host-resident
-    # helper is cheap to keep and expensive to reload (process start +
-    # page-cache warmup), so ttl 0 keeps it up between requests. Device
-    # entries keep the inherited/global ttl.
-    if model.on_cpu:
-        entry["ttl"] = 0
+    # Idle unload is a resolved lifetime, not a placement rule.  The most
+    # specific declared value wins; otherwise the entry inherits the
+    # top-level globalTTL.
+    if ttl is not None:
+        entry["ttl"] = ttl
 
     # Proxied backends (sd-server, whisper-server, audio-cpp) are proxied HTTP
     # services, not llama-swap managed inference — expose the standard proxy
@@ -629,26 +675,11 @@ def _build_entry(
 # ── Planning ──────────────────────────────────────────────────────────────
 
 
-#: Reserved key under which :meth:`Planner.plan` carries the per-set
-#: admission map for the emitter.  ``emit_config`` is a pure function of the
-#: plan dict, so planner state that the emitter needs rides along under a
-#: key no model stem can collide with (NUL is not valid in a stem).
-SET_ADMISSION_KEY = "\x00set_admission"
-HOST_REFUSED_KEY = "\x00host_refused"
-
-
 @dataclass(frozen=True)
 class MatrixKnobs:
     """Tunables of the matrix solve, from the ``matrix:`` config section.
 
-    Context tiers, smallest to largest: ``coload_min_ctx`` (emb/rnk squeeze
-    floor) → ``min_chat_ctx`` (co-load decision floor) → ``tools_min_ctx``
-    (tools advertisement threshold).  ``embed_context`` / ``rerank_context``
-    are RAG caps — the maximum context those residents serve at (default
-    4096, capped by each model's design context); the served value is
-    ``min(rag_cap(role), design_context)`` everywhere, including for
-    unestimable RAG models.  ``ctx_gain_min`` gates the squeeze adoption;
-    ``estimate_headroom`` pads estimated co-load overheads.
+    ``tools_min_ctx`` is the tools advertisement threshold.
     ``auto_parallel`` enables the value-function (ctx, slots) solve for
     unpinned chat models (see :func:`parallel_value`); ``auto_parallel_max``
     caps the slots and ``parallel_power`` is the score's slot exponent.
@@ -662,13 +693,7 @@ class MatrixKnobs:
     the rest).  On llama.cpp backends ``parallel: 0`` is invalid and falls
     back to the fleet default with a warning.
     """
-    min_chat_ctx: int = 65536
     tools_min_ctx: int = 131072
-    coload_min_ctx: int = 20480
-    embed_context: int = 4096
-    rerank_context: int = 4096
-    ctx_gain_min: int = 4096
-    estimate_headroom: float = 1.25
     auto_parallel: bool = True
     auto_parallel_max: int = 8
     vllm_auto_parallel_max: int = 16
@@ -680,9 +705,12 @@ class MatrixKnobs:
         invalid values (a bad knob must not silently break the solve)."""
         cfg = matrix_cfg or {}
         knobs: dict = {}
-        for key in ("min_chat_ctx", "tools_min_ctx", "coload_min_ctx",
-                    "embed_context", "rerank_context", "ctx_gain_min",
-                    "auto_parallel_max", "vllm_auto_parallel_max"):
+        for key in ("embed_context", "rerank_context"):
+            if cfg.get(key) is not None:
+                logger.warning("matrix: %s is retired; set max_context on the "
+                               "embeddings/rerank task instead", key)
+        for key in ("tools_min_ctx", "auto_parallel_max",
+                    "vllm_auto_parallel_max"):
             v = cfg.get(key)
             if v is None:
                 continue
@@ -694,16 +722,6 @@ class MatrixKnobs:
                                "using default", key, v)
                 continue
             knobs[key] = iv
-        v = cfg.get("estimate_headroom")
-        if v is not None:
-            try:
-                fv = float(v)
-                assert fv >= 1.0
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("matrix: estimate_headroom=%r is not a float "
-                               ">= 1.0; using default", v)
-            else:
-                knobs["estimate_headroom"] = fv
         v = cfg.get("auto_parallel")
         if v is not None:
             knobs["auto_parallel"] = _parse_bool_knob("auto_parallel", v)
@@ -718,19 +736,6 @@ class MatrixKnobs:
             else:
                 knobs["parallel_power"] = fv
         return cls(**knobs)
-
-    def rag_cap(self, role: str) -> int:
-        """Configured context cap for a role with a resident context policy.
-
-        The served RAG context is ``min(rag_cap(role), design_context)``
-        everywhere; a role without a knob (and an unknown role) falls back
-        to ``coload_min_ctx``.
-        """
-        knobs = roles.get(role)
-        if knobs is None or knobs.ctx_knob is None:
-            return self.coload_min_ctx
-        return getattr(self, knobs.ctx_knob)
-
 
 def _parse_ctx_size(v: object) -> int | None:
     """Parse a context minimum: a positive int, or a ``128k``/``1M`` string."""
@@ -749,26 +754,6 @@ def _parse_ctx_size(v: object) -> int | None:
         return None
     n = int(v)
     return n if n > 0 else None
-
-
-def _parse_capability_list(v: object) -> tuple[str, ...] | None:
-    """Parse a capability name list into a de-duplicated ordered tuple.
-
-    Order is preserved: ``sacrifice`` is a preference order and the ladder
-    walks it in the order written.
-    """
-    if isinstance(v, str):
-        v = [v]
-    if not isinstance(v, (list, tuple, set)):
-        return None
-    out: list[str] = []
-    for item in v:
-        if not isinstance(item, str):
-            return None
-        name = item.strip().lower()
-        if name and name not in out:
-            out.append(name)
-    return tuple(out)
 
 
 def shed_levels(sacrifice: tuple[str, ...] | None,
@@ -815,11 +800,24 @@ def shed_levels(sacrifice: tuple[str, ...] | None,
 #: gated by the minimum, and the first qualifying rung wins rather than the
 #: one buying the most context (a category wants context; this wants
 #: capability).
-#:
-#: It joins no set. Routing is what categories are for, and this has no name
-#: to route on.
-FALLBACK: "Task" = Task("", CHAT, "chat", min_context=_MIN_CTX_SIZE,
-                        min_parallel=1, require=frozenset(), sacrifice=())
+def fallback_task(model: Model,
+                  empty_min: int = _MIN_CTX_SIZE) -> Task:
+    """The bare ``<stem>`` entry: no endpoint, the cheapest declared task.
+
+    A client may call the model by its bare id. The entry serves it at the
+    smallest floor among the model's tasks, so the alias never claims a
+    larger serving than the model already declares. A task floor above the
+    design context is unreachable and is not a candidate.
+    """
+    design = model.design_context
+    tasks = [task for task in (model.tasks_resolved or ())
+             if (task.min_context or 0) <= design]
+    if tasks:
+        task = min(tasks, key=lambda t: (t.min_context or empty_min))
+        return Task("", "", min_context=task.min_context or empty_min,
+                    min_parallel=1, require=frozenset(), sacrifice=())
+    return Task("", "", min_context=empty_min, min_parallel=1,
+                require=frozenset(), sacrifice=())
 
 
 @dataclass(frozen=True)
@@ -839,25 +837,6 @@ class Rung:
 
 
 
-
-
-CHAT_VARS_PLACEHOLDER = "__CHAT_VARS__"
-COLOAD_VARS_PLACEHOLDER = "__COLOAD_VARS__"
-
-#: Var-name prefix for an opportunistically co-loaded model, by role.  Shared
-#: with the emitter so the planner can cost a set and the router can expand
-#: it from one naming rule.
-COLOAD_VAR_PREFIX = {"s2t": "s2t", "image": "img", "t2s": "t2s"}
-
-
-def coload_var_name(role: str, taken: Container[str]) -> str:
-    """The co-load var name for *role*, numbered off *taken* to avoid a clash."""
-    prefix = COLOAD_VAR_PREFIX.get(role, "coload")
-    name, n = prefix, 1
-    while name in taken:
-        n += 1
-        name = f"{prefix}{n}"
-    return name
 
 
 def _strip_parens(expr: str) -> str:
@@ -897,205 +876,6 @@ def _split_top(expr: str, op: str) -> list[str]:
             cur.append(ch)
     parts.append("".join(cur))
     return [s for s in (_strip_parens(p) for p in parts) if s]
-
-
-def _expr_leaves(expr: str, sets_cfg: Mapping[str, str] | None = None,
-                 _seen: frozenset[str] = frozenset()) -> set[str]:
-    """Every leaf in a set expression, with ``+set`` references expanded.
-
-    The leaves are var names (or model IDs — llama-swap accepts both) plus
-    the two placeholders.  An unknown reference stays as its literal token so
-    callers can report it.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return set()
-    parts = _split_top(expr, "|")
-    if len(parts) == 1:
-        parts = _split_top(expr, "&")
-    if len(parts) > 1:
-        out: set[str] = set()
-        for part in parts:
-            out |= _expr_leaves(part, sets_cfg, _seen)
-        return out
-    atom = expr.strip()
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return _expr_leaves(str(sets_cfg[name]), sets_cfg,
-                                _seen | {name})
-        return {atom}
-    return {atom}
-
-
-def _prune_leaves(expr: str, drops: frozenset[str],
-                  sets_cfg: Mapping[str, str] | None = None,
-                  _seen: frozenset[str] = frozenset()) -> str:
-    """Remove the leaf var(s) in *drops* from a set expression.
-
-    The host-unit refusal pass (requirement 33) deletes CPU categories
-    that cannot fit; the sets naming them must not dangle.  Sets keep
-    their remaining members, and a group whose every member was refused
-    collapses, so `a & (b & c)` prunes `b` into `a & c`, never `a & ()`.
-    An expression that prunes to nothing returns "" — the caller drops
-    the set.  ``+set`` references prune recursively (cycle-guarded),
-    matching :func:`_expr_leaves`; drops are category var names, so a
-    leaf spelled as an entry id is never matched.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return ""
-    for op in ("|", "&"):
-        parts = _split_top(expr, op)
-        if len(parts) > 1:
-            other = "&" if op == "|" else "|"
-            kept = []
-            for part in parts:
-                pruned = _prune_leaves(part, drops, sets_cfg, _seen)
-                if pruned:
-                    # Re-group a part carrying the sibling operator: the
-                    # original parens may have enclosed a refused member
-                    # (`(a | b) & c` pruning `b` must stay `(a) & c`).
-                    kept.append(pruned if other not in pruned
-                                else f"({pruned})")
-            return f" {op} ".join(kept) if kept else ""
-    atom = expr
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return _prune_leaves(str(sets_cfg[name]), drops, sets_cfg,
-                                 _seen | {name})
-        return atom
-    return "" if atom in drops else atom
-
-
-def _cat_stem(fixed_categories: list[tuple[str, "Model"]],
-              name: str) -> str:
-    """The stem a declared category var (or "-") binds, for log lines."""
-    for var, model in fixed_categories:
-        if var == name:
-            return model.stem if model is not None else "-"
-    return "-"
-
-
-def _resident_options(expr: str, sets_cfg: Mapping[str, str] | None = None,
-                      _seen: frozenset[str] = frozenset(),
-                      ) -> list[frozenset[str]]:
-    """Every and-set the expression may hold simultaneously.
-
-    `&` merges members (all live together); `|` branches (one of the
-    alternatives lives) — so an expression yields one option per
-    substitution path, and a role pair co-resides only when an option
-    holds both.  ``three | (two & one)`` yields ``{three}`` and
-    ``{two, one}``: `one` and `three` never ride together.  ``+set``
-    references expand (cycle-guarded), like :func:`_expr_leaves`.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return []
-    for op in ("|", "&"):
-        parts = _split_top(expr, op)
-        if len(parts) > 1:
-            options: list[frozenset[str]] = []
-            for part in parts:
-                sub = _resident_options(part, sets_cfg, _seen)
-                if not sub:
-                    continue
-                if not options:
-                    options = list(sub)
-                elif op == "&":
-                    options = [a | b for a in options for b in sub]
-                else:
-                    options.extend(sub)
-            return options or []
-    atom = expr
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return _resident_options(str(sets_cfg[name]), sets_cfg,
-                                     _seen | {name})
-        return [frozenset({atom})]
-    return [frozenset({atom})]
-
-
-def _has_chat_slot(expr: str, sets_cfg: Mapping[str, str] | None = None) -> bool:
-    """True when the expression allows a chat entry to be resident."""
-    if CHAT_VARS_PLACEHOLDER in expr:
-        return True
-    return any(re.fullmatch(r"c\d+", leaf)
-               for leaf in _expr_leaves(expr, sets_cfg))
-
-
-def set_overhead_mb(expr: str, var_mb: Mapping[str, int],
-                    chat_vars: frozenset[str],
-                    coload_vars: frozenset[str],
-                    sets_cfg: Mapping[str, str] | None = None,
-                    coload_mb: int | None = None,
-                    _seen: frozenset[str] = frozenset()) -> int:
-    """Worst-case co-resident VRAM (MB) a set allows beside chat.
-
-    The expression is a boolean tree: ``&`` means the terms are resident
-    together (sum), ``|`` means one alternative is chosen (max).  Nesting is
-    priced recursively, so ``(3 | (2 & 1))`` costs ``max(3, 2 + 1)`` and
-    ``(1 | (2 & 3))`` costs 5 — the old depth-0 split priced the second as 1.
-
-    ``+set`` references expand against *sets_cfg*.  ``coload_mb`` overrides
-    the cost of ``__COLOAD_VARS__`` when the caller knows the included
-    co-loads (the matrix solve does); otherwise their var costs are summed,
-    because co-loads genuinely stack.
-    """
-    expr = _strip_parens(expr)
-    if not expr:
-        return 0
-    alternatives = _split_top(expr, "|")
-    if len(alternatives) > 1:
-        return max(set_overhead_mb(a, var_mb, chat_vars, coload_vars,
-                                   sets_cfg, coload_mb, _seen)
-                   for a in alternatives)
-    terms = _split_top(expr, "&")
-    if len(terms) > 1:
-        return sum(set_overhead_mb(t, var_mb, chat_vars, coload_vars,
-                                   sets_cfg, coload_mb, _seen)
-                   for t in terms)
-    atom = expr.strip()
-    if atom == CHAT_VARS_PLACEHOLDER or atom in chat_vars \
-            or re.fullmatch(r"c\d+", atom):
-        return 0
-    if atom == COLOAD_VARS_PLACEHOLDER:
-        if coload_mb is not None:
-            return coload_mb
-        return sum(var_mb.get(v, 0) for v in coload_vars)
-    if atom.startswith("+"):
-        name = atom[1:]
-        if sets_cfg and name in sets_cfg and name not in _seen:
-            return set_overhead_mb(str(sets_cfg[name]), var_mb, chat_vars,
-                                   coload_vars, sets_cfg, coload_mb,
-                                   _seen | {name})
-        return 0
-    return var_mb.get(atom, 0)
-
-
-def _probe_at_overhead(planner: "Planner", model: Model,
-                       overhead_mb: int) -> tuple[int, int] | None:
-    """What ``model`` could be served at if *overhead_mb* is spoken for.
-
-    A side probe: the real solve pins a group parallel and honours
-    auto-parallel, neither of which is known yet at admission time, so this
-    asks the plain question "does a single-sequence entry still clear its
-    demand minimums" and lets the real solve refine it afterwards.
-    """
-    view = model.view_for(model.mmproj is not None
-                          and model.mmproj.gguf_path is not None)
-    cache_type = view.cache_type_for(planner.profiles.default_cache_type)
-    try:
-        ctx = planner._bounded_ctx(
-            view, parallel=1, cache_type=cache_type,
-            spare_mb=overhead_mb, include_mmproj=True)
-    except Exception:  # a probe must never break planning
-        return None
-    if ctx <= 0:
-        return None
-    return ctx, 1
 
 
 def ctx_label(ctx: int) -> str:
@@ -1154,7 +934,7 @@ def served_flags(model: "Model", include_mmproj: bool,
     ``model.capabilities`` vocabulary.
     """
     caps = [str(c).lower() for c in model.capabilities]
-    if (not include_mmproj and model.role != "image"
+    if (not include_mmproj and not model.serves_endpoint(IMAGES)
             and model.mmproj and model.mmproj.gguf_path):
         caps = [c for c in caps if c not in ("image", "video")]
     if tools_demoted:
@@ -1238,51 +1018,30 @@ def resolve_min_ctx(view, *, pin_ctx: int | None = None,
                     pin_ctx)
             return floor
     if pin_ctx is not None:
-        return pin_ctx
+        return max(pin_ctx, _MIN_CTX_SIZE)
     if category_floor is not None:
-        return category_floor
+        return max(category_floor, _MIN_CTX_SIZE)
     if "tools" in [c.lower() for c in (view.capabilities or [])]:
-        return fallback_min_ctx if fallback_explicit else tools_min_ctx
+        return max(fallback_min_ctx if fallback_explicit
+                   else tools_min_ctx, _MIN_CTX_SIZE)
     if fallback_explicit:
-        return fallback_min_ctx
+        return max(fallback_min_ctx, _MIN_CTX_SIZE)
     return max(int(view.design_context // 2), _MIN_CTX_SIZE)
 
 
-# Size buckets for resident accounting: footprints bucket by size class, not
-# model type.  Tiny residents (speech, RAG) join every set on their GPU for
-# pocket change; huge residents (diffusion) are chat-scale and tracked as
-# exclusive candidates; chat models evict each other within a set.
-BUCKET_TINY_ROLES = frozenset({"s2t", "t2s", "embeddings", "rerank"})
-BUCKET_HUGE_BACKENDS = frozenset({"sd-server"})
-
-
-def footprint_bucket(model) -> str:
-    """Size bucket of a model for ledger accounting: tiny/huge/chat."""
-    if model.role in BUCKET_TINY_ROLES:
-        return "tiny"
-    if model.role == "image" or model.backend in BUCKET_HUGE_BACKENDS:
-        return "huge"
-    return "chat"
-
-
 class PoolLedger:
-    """One shared VRAM ledger: every claimant charged to a named pool.
+    """One shared VRAM ledger: every pool's declared size and spare.
 
     Single-pool math today (the detected total), keyed by pool id so
     per-GPU attribution slots in later: ``pool_id_for`` maps a model's
     ``device:`` pin to ``gpuN``, unpinned models land on ``default``.  An
-    operator-declared ``pools: <id>: vram:`` overrides the pool size;
-    per-pool ``spare:`` overrides the global spare; ``reserve_extra:`` and
-    explicit ``pins:`` (``"auto"`` = derived math stays authoritative)
-    accumulate into :meth:`extra_reserve_mb`, which callers add to the
-    solve's spare.  Residents (RAG at solved ctx, adopted co-loads) are
-    registered by the planner after the matrix solve.
+    operator-declared ``pools: <id>: vram:`` overrides the pool size and a
+    per-pool ``spare:`` overrides the global spare.
     """
 
     def __init__(self, vram_total_mb: int, pools_cfg: dict | None = None):
         self.vram_total_mb = vram_total_mb
         self.pools_cfg = pools_cfg or {}
-        self.residents: list[tuple[str, str, int]] = []  # (label, pool, mb)
 
     def pool_id_for(self, model) -> str:
         dev = (model.frontmatter or {}).get("device")
@@ -1303,25 +1062,6 @@ class PoolLedger:
                                "total", pool_id, raw)
         return self.vram_total_mb
 
-    def add_resident(self, label: str, mb: int, pool_id: str = "default"
-                     ) -> None:
-        if mb > 0:
-            self.residents.append((label, pool_id, int(mb)))
-
-    def _explicit_pin_mb(self, pool_id: str, raw: object,
-                         claimant: str) -> int:
-        if raw is None:
-            return 0
-        if isinstance(raw, str) and raw.strip().lower() == "auto":
-            return 0  # derived math stays authoritative
-        try:
-            return int(utils.parse_mem_mb(str(raw),
-                                          self.pool_vram_mb(pool_id)))
-        except (TypeError, ValueError, AssertionError):
-            logger.warning("pools: %s pins %s=%r unreadable; ignoring",
-                           pool_id, claimant, raw)
-            return 0
-
     def spare_for(self, pool_id: str, global_spare_mb: int) -> int:
         raw = self.pools_cfg.get(pool_id, {}).get("spare")
         if raw is None:
@@ -1333,79 +1073,6 @@ class PoolLedger:
             logger.warning("pools: %s spare=%r unreadable; using global",
                            pool_id, raw)
             return global_spare_mb
-
-    def extra_reserve_mb(self, pool_id: str = "default") -> int:
-        """MB to add to the solve's spare for this pool: unmodelled
-        residents, explicit pins, and registered co-residents."""
-        spec = self.pools_cfg.get(pool_id, {})
-        total = 0
-        raw_extra = spec.get("reserve_extra")
-        if raw_extra is not None:
-            try:
-                total += int(utils.parse_mem_mb(str(raw_extra),
-                                                self.pool_vram_mb(pool_id)))
-            except (TypeError, ValueError, AssertionError):
-                logger.warning("pools: %s reserve_extra=%r unreadable; "
-                               "ignoring", pool_id, raw_extra)
-        for claimant, raw in (spec.get("pins") or {}).items():
-            total += self._explicit_pin_mb(pool_id, raw, claimant)
-        total += sum(mb for _, pool, mb in self.residents if pool == pool_id)
-        return total
-
-
-class HostLedger:
-    """Sibling of PoolLedger: host-RAM claims by ``device: cpu`` models.
-
-    Committed residents (embed/rerank winners, one per role) are charged
-    at build time; every other CPU-resident entry is judged go/no-go
-    against the pool remaining after them — never solved down, mirror of
-    the VRAM `over_budget` refusal (SPEC.md §Host pool).  ``pool_mb=None``
-    (detection unavailable) means the ledger cannot gate: it logs that
-    once and reports an unbounded pool rather than inventing one.
-    """
-
-    def __init__(self, pool_mb: int | None):
-        self.pool_mb = pool_mb
-        self.residents: list[tuple[str, str, int]] = []  # (label, role, mb)
-        self._roles: set[str] = set()
-
-    def add_resident(self, label: str, role: str, mb: int) -> None:
-        # One co-resident per role (design decision 2): the resident
-        # selection already picks one winner — two quads for one role is
-        # a planner bug, not a pool this ledger would silently book.
-        if role in self._roles:
-            raise AssertionError(
-                f"host ledger: two committed residents for role {role!r} "
-                f"({label!r}, already have one)")
-        self._roles.add(role)
-        if mb > 0:
-            self.residents.append((label, role, int(mb)))
-
-    def resident_mb(self) -> int:
-        return sum(mb for _, _, mb in self.residents)
-
-    def available(self) -> int | None:
-        """Pool remaining after committed residents; None = cannot gate."""
-        if self.pool_mb is None:
-            return None
-        return self.pool_mb - self.resident_mb()
-
-
-@dataclass(frozen=True)
-class MatrixSolve:
-    """Result of the shared matrix solve.
-
-    ``chat_ctx`` is the solved shared chat context.  ``embed_ctx`` /
-    ``rerank_ctx`` are the contexts the RAG models should be served at
-    (design context, or the squeezed value when the squeeze was adopted).
-    ``coloads`` lists opportunistically included non-chat models as
-    (stem, fixed overhead MB) pairs.
-    """
-    chat_ctx: int
-    embed_ctx: int
-    rerank_ctx: int
-    coloads: tuple[tuple[str, int], ...] = ()
-    squeeze: bool = False
 
 
 @dataclass(frozen=True)
@@ -1428,14 +1095,13 @@ class Variant:
     #: also feeds the VRAM measurement shape (see :func:`measurement_args`).
     batch: int | None = None
     ubatch: int | None = None
-    coload: bool = False
     tools_demoted: bool = False
     #: The categories this rung is named for. A rung answers exactly one, so
     #: this is normally a single demand; a tuple only so the emitter can
     #: express "nothing declared" without a second field. Empty for the
     #: fallback entry, which carries no category name in its id.
     task_demands: tuple[Task, ...] = ()
-    #: The category this variant answers, or :data:`FALLBACK` for the null
+    #: The category this variant answers, or the bare fallback task
     #: category. Singular, because a rung exists to serve one category -- which
     #: is what lets one model emit several entries and stay unambiguous.
     category: Task | None = None
@@ -1445,7 +1111,7 @@ class Variant:
     #: Decided TOTAL memory attributable to this serving (weights +
     #: companions + context at the served ctx/slots), in MiB — the numbers
     #: the emitted description tag reports verbatim.  ``mem_vram_mib=None``
-    #: is a CPU-resident serving (RAM-only tag).  Both None when undecided
+    #: is a host-RAM serving (RAM-only tag).  Both None when undecided
     #: (no estimate) — then no tag is emitted.
     mem_vram_mib: float | None = None
     mem_ram_mib: float | None = None
@@ -1462,18 +1128,13 @@ def resolve_batch_ubatch(
     profiles: Profiles, model: Model, profile: dict | None = None,
 ) -> tuple[int | None, int | None]:
     """Resolved ``(batch, ubatch)`` for *model* — sidecar keys > profile
-    keys > fleet ``llama_server: batch:/ubatch:`` > backend role defaults.
-    ``None`` means "nothing configured": the backend renders no flag and the
-    engine's builtin applies.  One resolution site: the rendered command
-    and the VRAM measurement shape both consume these values, so the serve
-    and the estimate can never drift apart on batch flags."""
-    try:
-        backend = get_backend(model.backend)
-        role_defaults = backend.default_batch_ubatch(model.role)
-    except KeyError:
-        role_defaults = (None, None)
+    keys > fleet ``llama_server: batch:/ubatch:``.  ``None`` means "nothing
+    configured": the backend renders no flag and the engine's builtin
+    applies.  One resolution site: the rendered command and the VRAM
+    measurement shape both consume these values, so the serve and the
+    estimate can never drift apart on batch flags."""
     return model.batch_ubatch_for(
-        profile, profiles.llama_server_cfg if profiles else {}, role_defaults)
+        profile, profiles.llama_server_cfg if profiles else {})
 
 
 def measurement_args(
@@ -1482,7 +1143,7 @@ def measurement_args(
 ) -> str:
     """The exact flag string VRAM constants are measured (and shape-stamped)
     under: global args + the CPU device pin when the model is
-    CPU-resident (`--n-gpu-layers 0`, the measurement of the host-side
+    CPU-served (`--n-gpu-layers 0`, the measurement of the host-side
     quads — docs/plans/cpu-residency-budget.md) + the model's effective
     ``-ub``.  ``batch`` is excluded — measured to have no VRAM effect, so
     throughput tuning must not invalidate estimates.
@@ -1505,6 +1166,24 @@ def measurement_args(
     return f"{base} -ub {ubatch}".strip()
 
 
+def _inline_set_refs(raw: dict[str, str]) -> dict[str, str]:
+    """Inline +set references; reject cycles and any other + form."""
+    def resolve(name: str, stack: tuple[str, ...]) -> str:
+        def repl(match):
+            ref = match.group(1)
+            if ref.startswith("auto"):
+                raise ValueError(f"+{ref} cannot be priced; name the roles")
+            if ref not in raw:
+                raise ValueError(f"+{ref} names no set")
+            if ref in stack:
+                raise ValueError(
+                    "set reference cycle: " + " -> ".join(stack + (ref,)))
+            return "(" + resolve(ref, stack + (ref,)) + ")"
+        return re.sub(r"\+([A-Za-z0-9._:-]+)", repl, raw[name])
+
+    return {name: resolve(name, (name,)) for name in raw}
+
+
 class Planner:
     """Turn models + VRAM budget into per-model serving :class:`Variant`s.
 
@@ -1525,10 +1204,6 @@ class Planner:
         spare: str | None = None,
         max_context: int | None = None,
         matrix_cfg: dict | None = None,
-        embed_model: Model | None = None,
-        rerank_model: Model | None = None,
-        fixed_categories: list[tuple[str, Model]] | None = None,
-        category_ctx: dict[str, int] | None = None,
         baseline_mb: int = 0,
         min_context: int = _MIN_AGENTIC_CTX,
         min_context_explicit: bool = False,
@@ -1542,63 +1217,52 @@ class Planner:
         self.fit_bin = fit_bin
         self.llama_args = llama_args
         self.vram_total = vram_total
-        self.spare = spare
+        # A bare int is MiB (already resolved); anything declared is a string
+        # that resolve_spare re-parses. Without this, 64 MiB becomes 64 GiB.
+        self.spare = (spare if isinstance(spare, str) or spare is None
+                      else f"{int(spare)}m")
         self.max_context = max_context
         self.matrix_cfg = matrix_cfg
+        # `matrix.sets` belongs to the emitted router; the solve reads knobs.
         self.knobs = MatrixKnobs.from_cfg(matrix_cfg)
-        self.embed_model = embed_model
-        self.rerank_model = rerank_model
         # Blessed usage categories.  A model may only *tag* itself with one
         # of these; an unblessed tag is warned about and ignored.
         self.tasks = TaskCatalogue.from_cfg(
             getattr(profiles, "tasks_cfg", None))
-        # Per-set co-resident overhead (MB) and the sets a chat model was
-        # admitted to, filled in by _solve_usage_sets.
-        self.set_overheads: dict[str, int] = {}
-        # (model stem, category name) -> the sets that entry may join. Keyed
-        # per category, not per stem: one model's `.coding` and `.aux` entries
-        # are different servings, and whichever was solved first used to speak
-        # for both.
-        self.set_admission: dict[tuple[str, str | None], frozenset[str]] = {}
-        # stem -> the sets this model was charged for, per profile group.
-        # Kept only so the charge and the admission it feeds cannot drift.
-        self._charge_sets: dict[str, list[tuple[frozenset[str], int]]] = {}
-        # Declared matrix categories beyond the RAG pair (e.g. tts/stt):
-        # fixed-overhead residents reserved alongside chat and RAG.
-        self.fixed_categories = fixed_categories or []
-        # Per-category served context (requirement 32): category var name ->
-        # the ctx the operator declared for that model. A cap applied at
-        # one seam (resident_ctx / the category seam in the planner loop),
-        # never a floor.
-        self.category_ctx = category_ctx or {}
-        self._cat_vars_by_stem: dict[str, list[str]] = {}
-        for var, m in self.fixed_categories:
-            if m is not None:
-                self._cat_vars_by_stem.setdefault(m.stem, []).append(var)
-        for var, m in (("emb", embed_model), ("rnk", rerank_model)):
-            if m is not None:
-                self._cat_vars_by_stem.setdefault(m.stem, []).append(var)
-        # Categories refused by the host-unit pass (requirement 33): filled
-        # in by plan(), before _build_ledger judges the fixed categories.
-        self.host_unit_refused_vars: frozenset[str] = frozenset()
-        self.host_unit_refused_stems: frozenset[str] = frozenset()
         self.baseline_mb = baseline_mb
         self.min_context = min_context
         self.min_context_explicit = min_context_explicit
         self.memory_margin = memory_margin
         self.ledger = PoolLedger(vram_total, self.profiles.pools_cfg)
-        self.host_ledger = HostLedger(host_pool_mb)
-        # Stems committed to the host ledger as residents: their serving is
-        # charged once (the unit pass), never re-checked at emission.
-        self.host_ledger_stems: set[str] = set()
-        self.chat_ctx: int | None = None  # matrix-solved shared context, if any
-        self.matrix_result: MatrixSolve | None = None
+        # ``pools.ram.spare`` is the host-pool equivalent of the GPU spare:
+        # keep that much out of both the ledger and the emitted pool.
+        ram_spare = self.profiles.pools_cfg.get("ram", {}).get("spare")
+        if ram_spare is not None and host_pool_mb is not None:
+            host_pool_mb = max(0, host_pool_mb - utils.parse_mem_mb(
+                str(ram_spare), host_pool_mb))
+        self.host_pool_mb = host_pool_mb
+        # Capacity-router pools.  The GPU limit is the same budget the solve
+        # used (total minus reserve and spare); the host limit is the
+        # detected/declared host pool.  One size-1 pool per scheduling role
+        # makes "one served entry per role" a capacity constraint.
+        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
+        spare_mb = profiles.global_spare_mb(self.spare, vram_total)
+        default_spare = self.ledger.spare_for("default", spare_mb)
+        pools: dict[str, int] = {}
+        gpu_pool = int(vram_total - reserve - default_spare)
+        if gpu_pool > 0:
+            pools["default"] = gpu_pool
+        if host_pool_mb is not None and host_pool_mb > 0:
+            pools["ram"] = int(host_pool_mb)
+        for role in roles.names():
+            pools[role] = 1
+        self.capacity_pools = pools
+        # Auction budgets for the authored sets, keyed by (role, pool).
+        self.role_budget: dict[tuple[str, str], int] = {}
+        self.matrix_sets_approved: dict[str, str] = {}
+        self.matrix_sets_rejected: dict[str, str] = {}
         # Optional per-model tick (stem) for the progress bar; None in tests.
         self.progress_cb = progress_cb
-        # Quads synthesized for unestimable matrix participants (stem →
-        # (model_mib, kv_per_token, slot_mib, compute_mib)); see
-        # _solve_matrix_context. Kept for ledger resident charging.
-        self.synthetic_quads: dict[str, tuple[int, float, float, int]] = {}
 
     # ── bounded ctx: the single home of the clamp invariant ──
 
@@ -1619,8 +1283,10 @@ class Planner:
         (*context_length*) and the CLI ``--max-context`` cap.  Measured
         under the model's resolved ``-ub`` shape (:func:`measurement_args`);
         *profile* adds the per-profile tier when the solve is group-scoped."""
-        ctx = model.vram.calc_ctx(
-            self.vram_total,
+        total = (self.host_pool_mb
+                 if model.on_cpu and self.host_pool_mb else self.vram_total)
+        ctx = model.vram.solve_context(
+            total,
             fit_bin=self.fit_bin,
             parallel=parallel,
             spare_mb=spare_mb,
@@ -1642,17 +1308,12 @@ class Planner:
     def _unestimated_ctx(self, view) -> int:
         """Minimum useful context for a model with no VRAM estimate.
 
-        Type-based floor: a matrix chat model follows the shared solved
-        context like every chat (the solve charged exactly that for it);
-        chat without a matrix gets the per-model floor cascade; embeddings
-        and rerank serve at their configured ``embed_context`` /
-        ``rerank_context`` (capped by the trained design context and
-        ``--max-context``).
+        Type-based floor: a fixed-overhead serving uses its task's
+        ``max_context`` (capped by the trained design context and
+        ``--max-context``); chat gets the per-model floor cascade.
         """
-        if view.role in ("embeddings", "rerank"):
-            ctx = min(view.design_context, self.knobs.rag_cap(view.role))
-        elif view.role == "chat" and self.chat_ctx is not None:
-            ctx = self.chat_ctx
+        if view.serves_endpoint(EMBEDDINGS) or view.serves_endpoint(RERANK):
+            ctx = served_ctx(view, self.tasks)
         else:
             ctx = resolve_min_ctx(
                 view, pin_ctx=self._serving_pin(view),
@@ -1660,6 +1321,9 @@ class Planner:
                 fallback_min_ctx=self.min_context,
                 fallback_explicit=self.min_context_explicit)
         cap = view.design_context
+        task_cap = self.tasks.max_context_for(view.task_ids)
+        if task_cap is not None:
+            cap = min(cap, task_cap)
         if self.max_context is not None:
             cap = min(cap, self.max_context)
         return max(_MIN_CTX_SIZE, min(ctx, cap))
@@ -1674,9 +1338,9 @@ class Planner:
         category at all, so no entry may be named for it. ``keep`` only
         forbids shedding.
 
-        This gate used to live in ``met_demands`` and went with it, which left
-        a text-only model free to claim ``require: [vision]`` -- an id that
-        promised a capability the entry did not advertise.
+        This gate used to be in ``met_demands``, which left a text-only
+        model free to claim ``require: [vision]`` -- an id that promised a
+        capability the entry did not advertise.
         """
         have_vision = (model.mmproj is not None
                        and model.mmproj.gguf_path is not None)
@@ -1736,7 +1400,7 @@ class Planner:
                 include_draft="draft" not in shed,
                 design_ctx=design_ctx, context_length=context_length,
                 profile=profile)
-            if ctx <= 0 or ctx < demand.min_context:
+            if ctx <= 0 or ctx < self._task_floor(view, demand):
                 continue
             over = getattr(view.vram, "over_budget_reason", None)
             if over is not None:
@@ -1770,9 +1434,18 @@ class Planner:
         because each entry of a model serves its own context -- a `.coding`
         entry and a `.aux` entry of the same model rarely match.
         """
-        return (view.role == "chat"
+        return (view.serves_endpoint(CHAT)
                 and ctx < self.knobs.tools_min_ctx
                 and "tools" in [c.lower() for c in view.capabilities])
+
+    def _task_floor(self, view, demand: Task) -> int:
+        floor = resolve_min_ctx(
+            view, pin_ctx=self._serving_pin(view),
+            tools_min_ctx=self.knobs.tools_min_ctx,
+            fallback_min_ctx=self.min_context,
+            fallback_explicit=self.min_context_explicit,
+            category_floor=demand.min_context or None)
+        return max(demand.min_context or 0, floor)
 
     def _serving_pin(self, view) -> int | None:
         """Explicitly pinned serving ctx, or None.
@@ -1814,7 +1487,7 @@ class Planner:
         power: float | None = None,
         min_parallel: int = 1,
         profile: dict | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int] | None:
         """Solve (parallel, ctx) for one unpinned chat variant.
 
         Scores ``(ctx/floor)^0.5 × slots^B`` over feasible candidates and
@@ -1822,13 +1495,13 @@ class Planner:
         existing budget path (:meth:`_bounded_ctx`); the score rises with
         ctx, so only the max affordable ctx per slot count is scored.  The
         loop breaks at the first unaffordable slot count (affordability
-        falls as slots rise).  Falls back to today's outcome (group
-        parallel, max affordable ctx) when the floor is unreachable.
+        falls as slots rise).
 
-        *min_parallel* is a soft floor from a usage demand: candidates that
-        meet it win outright, but meeting the context floor takes precedence,
-        because the context is the property the entry id advertises and
-        concurrency is only a throughput preference.
+        ``floor`` (the task's ``min_context``) and ``min_parallel`` are both
+        floors.  No candidate that meets them means no entry for this task —
+        the same rule as an unreachable context.  ``parallel_power`` is the
+        knob that makes the solver try harder for slots; it never lowers a
+        floor.
         """
         power = self.knobs.parallel_power if power is None else power
         # vLLM's continuous batching makes a slot cost KV only (no per-slot
@@ -1840,18 +1513,14 @@ class Planner:
         solved: dict[int, int] = {}
 
         def maxctx(p: int) -> int:
-            # Memoized: the eager fallback and the loop share one solve per
-            # slot count, so an unaffordable p=1 warns once, not twice.
+            # Memoized: the loop shares one solve per slot count.
             if p not in solved:
                 solved[p] = self._bounded_ctx(
                     view, parallel=p, cache_type=cache_type,
                     spare_mb=spare_mb, include_mmproj=include_mmproj,
-                    design_ctx=self.chat_ctx, context_length=cap_ctx,
-                    profile=profile)
+                    context_length=cap_ctx, profile=profile)
             return solved[p]
 
-        fallback = (group_parallel,
-                    min(maxctx(group_parallel), cap_ctx))
         cands: list[tuple[int, int]] = []
         for p in range(1, pmax + 1):
             m = maxctx(p)
@@ -1865,13 +1534,13 @@ class Planner:
             if ctx < floor:
                 continue
             cands.append((p, ctx))
-        # A usage demand's min_parallel is preferred, but never at the cost
-        # of the context floor: the id advertises the context, and a client
-        # that cannot fit its prompt has nothing to gain from a spare slot.
         if min_parallel > 1:
-            preferred = [c for c in cands if c[0] >= min_parallel]
-            if preferred:
-                cands = preferred
+            cands = [c for c in cands if c[0] >= min_parallel]
+        if not cands:
+            logger.info("auto-parallel: %s has no serving at ctx>=%d and "
+                        "slots>=%d; no entry", view.stem, floor,
+                        min_parallel)
+            return None
         # Ties go to *more* slots. With power > 0 a model holding its cap
         # scores strictly higher at every slot count, so it never ties; the
         # flat case is power 0, where slots are worth nothing and the choice
@@ -1883,12 +1552,8 @@ class Planner:
             score = parallel_value(ctx, floor, p, power)
             if best is None or score >= best[0]:
                 best = (score, p, ctx)
-        if best is None:
-            logger.info("auto-parallel: %s floor %d unreachable; keeping "
-                        "parallel=%d", view.stem, floor, group_parallel)
-            return fallback
         _, p_star, ctx_star = best
-        if (p_star, ctx_star) != fallback:
+        if p_star != group_parallel:
             logger.info("auto-parallel: %s parallel=%d ctx=%d (floor %d)",
                         view.stem, p_star, ctx_star, floor)
         return p_star, ctx_star
@@ -1907,7 +1572,8 @@ class Planner:
             return ()
         resolved = resolve_tasks(model.task_ids, self.tasks, logger,
                                  stem=model.stem)
-        demands = tuple(task for task in resolved if task.role == "chat")
+        demands = tuple(task for task in resolved
+                        if task.endpoint == CHAT)
         # A declared resolution budget means vision must actually be served at
         # that size, so it stops being shed-able for this model whatever the
         # category's sacrifice order says. ``keep`` rather than ``require``:
@@ -1919,450 +1585,278 @@ class Planner:
         return demands
 
 
-    def _price_sets(self) -> None:
-        """Cost every chat set by the residents it can hold alongside chat.
+    def _role_budgets(self) -> dict[tuple[str, str], int]:
+        """Price the authored sets, dropping any set that cannot fit."""
+        raw = {str(n): str(e) for n, e in
+               ((self.matrix_cfg or {}).get("sets") or {}).items()}
+        inlined = _inline_set_refs(raw)
+        role_floor: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        role_source: dict[tuple[str, str], tuple[int, str, str]] = {}
+        role_pools: dict[str, set[str]] = {}
+        model_floor: dict[str, tuple[str, int]] = {}
+        leaf_role: dict[str, str] = {}
 
-        Replaces the single fleet-wide ledger charge: an entry has to
-        survive the heaviest set it lands in, and which set that is depends
-        on what the model can actually afford.
-        """
-        if not self.matrix_cfg:
-            return
-        sets_cfg = self.matrix_cfg.get("sets") or {}
-        if not sets_cfg:
-            return
-        by_stem = {m.stem: m for m in self.models}
-        taken: set[str] = set()
-        var_mb: dict[str, int] = {}
+        def model_keys(m):
+            keys = {m.stem, m.template_id,
+                    str(m.frontmatter.get("model_id", "")),
+                    utils.slugify(str(m.frontmatter.get("name", "")))}
+            keys.discard("")
+            return keys
 
-        def overhead(m: Model, name: str | None = None) -> int:
-            # Same pricing the matrix solve used to reserve these, so the
-            # per-set figures and the shared solve cannot disagree.
-            oh = _coload_overhead(m, self.fit_bin, self.profiles, self.knobs,
-                                  self.llama_args,
-                                  ctx=self.category_ctx.get(name))
-            return int(oh or 0)
-
-        def rag_overhead(m: Model, name: str | None = None) -> int:
-            """emb/rnk cost at their *solved* RAG context, as the matrix does.
-
-            The matrix prices these from the same quad formula it feeds
-            solve_matrix_ctx with, at the small solved context — not at
-            design context, and without the co-load headroom.  A
-            per-category ``ctx:`` caps the context (requirement 32).
-            """
-            quad = _static_params(m, self.fit_bin,
-                                  self.profiles.default_cache_type,
-                                  measurement_args(self.profiles, m,
-                                                   self.llama_args))
+        for m in self.models:
+            pool = "ram" if m.on_cpu else "default"
+            role_pools.setdefault(m.role, set()).add(pool)
+            view = m.view_for(True)
+            quad = view.vram.effective_static(
+                self.fit_bin, cache_type=self.profiles.default_cache_type,
+                include_mmproj=True,
+                llama_args=measurement_args(self.profiles, view,
+                                            self.llama_args),
+                allow_cpu=True)
             if quad is None:
-                return 0
-            mib, factor, slots, compute = quad
-            return int(mib + compute + factor * self._rag_ctx(m, name)
-                       + slots)
-
-        # Declared categories: `emb`/`rnk` plus any extra (stt/tts/…).
-        for name, model in (self.fixed_categories or []):
-            if model is None or name in self.host_unit_refused_vars:
+                tasks = m.tasks_resolved or ()
+                min_ctx = (max(self._task_floor(view, task)
+                               for task in tasks)
+                           if tasks else _MIN_CTX_SIZE)
+                est = max(HOST_PROCESS_MIB, int(m.size_mb or 0)
+                          + HOST_PROCESS_MIB + int(0.001 * min_ctx))
+                previous = role_floor[pool].get(m.role, 0)
+                if est > previous:
+                    role_source[(m.role, pool)] = (est, m.stem, "unmeasured")
+                role_floor[pool][m.role] = max(previous, est)
+                if not m.on_cpu:
+                    role_floor["ram"][m.role] = max(
+                        role_floor["ram"].get(m.role, 0), HOST_PROCESS_MIB)
+                for key in model_keys(m):
+                    model_floor[key] = (pool, est)
+                    model_floor[key.lower()] = (pool, est)
+                    if not m.on_cpu:
+                        model_floor[key + "#ram"] = ("ram", HOST_PROCESS_MIB)
+                        model_floor[key.lower() + "#ram"] = (
+                            "ram", HOST_PROCESS_MIB)
+                    leaf_role[key] = m.role
+                    leaf_role[key.lower()] = m.role
                 continue
-            taken.add(name)
-            var_mb[name] = overhead(model, name)
-        for name, model in (("emb", self.embed_model),
-                            ("rnk", self.rerank_model)):
-            if model is not None and name not in taken:
-                taken.add(name)
-                var_mb[name] = rag_overhead(model, name)
-        # Co-loads: the matrix solve already priced them the same way.
-        coload_vars: set[str] = set()
-        for stem, mb in (getattr(self.matrix_result, "coloads", ()) or ()):
-            m = by_stem.get(stem)
-            if m is None:
-                continue
-            name = coload_var_name(m.role, taken)
-            taken.add(name)
-            var_mb[name] = int(mb)
-            coload_vars.add(name)
-
-        for sname, expr in sets_cfg.items():
-            expr = str(expr)
-            if not _has_chat_slot(expr, sets_cfg):
-                continue  # not a chat set
-            self.set_overheads[sname] = set_overhead_mb(
-                expr, var_mb, frozenset(), frozenset(coload_vars),
-                sets_cfg=sets_cfg)
-        if self.set_overheads:
-            logger.info("tasks: per-set co-resident overhead (MB): %s",
-                        ", ".join(f"{k}={v}" for k, v in
-                                  sorted(self.set_overheads.items())))
-
-    def _category_ctx_cap(self, model: Model) -> int | None:
-        """The per-category ``ctx:`` cap for *model*, min over its vars."""
-        caps = [self.category_ctx[v]
-                for v in self._cat_vars_by_stem.get(model.stem, ())
-                if self.category_ctx.get(v) is not None]
-        return min(caps) if caps else None
-
-    def _rag_ctx(self, model: Model, name: str | None = None) -> int:
-        """Served context for a RAG/fixed-overhead category.
-
-        The role keeps its policy (RAG cap, design context); a per-category
-        ``ctx:`` (requirement 32) caps the result for the named category,
-        never floors it.
-        """
-        res = self.matrix_result
-        if res is None:
-            ctx = model.design_context
-        elif model.role == "embeddings":
-            ctx = min(model.design_context, res.embed_ctx)
-        elif model.role == "rerank":
-            ctx = min(model.design_context, res.rerank_ctx)
-        else:
-            ctx = model.design_context
-        if name is not None:
-            cap = self.category_ctx.get(name)
-            if cap is not None:
-                ctx = min(ctx, cap)
-        return ctx
-
-    def _host_unit_refusals(self) -> frozenset[str]:
-        """Judge each chat-capable composition's CPU residents as one unit.
-
-        Requirement 33: the CPU residents a composition holds together (the
-        committed embed/rerank pair plus the fixed CPU categories it names)
-        must fit the pool remaining after the pair — the host analog of the
-        VRAM worst-set contract.  A composition that cannot fit refuses its
-        fixed CPU categories together (all-or-nothing per category: one
-        that another, fitting composition admits survives); the committed
-        pair is never refused (requirement 13 — the ledger exists to carry
-        it), and refusals never invent a budget (requirement 16 — no pool,
-        no gate; a category in no set runs alone, judged solo).
-        """
-        if self.host_ledger.pool_mb is None or self.host_ledger.pool_mb <= 0:
-            return frozenset()
-        res = self.matrix_result
-        if res is None:
-            return frozenset()
-        pair_rent = 0
-        pair_stems: set[str] = set()
-        for model, ctx in ((self.embed_model, res.embed_ctx),
-                           (self.rerank_model, res.rerank_ctx)):
-            if model is None or not model.on_cpu:
-                continue
-            pair_rent += self._host_resident_mb(model, ctx)
-            pair_stems.add(model.stem)
-        available = self.host_ledger.pool_mb - pair_rent
-        cats: dict[str, int] = {}
-        for name, m in self.fixed_categories:
-            if not m.on_cpu or name in pair_stems:
-                continue
-            cats[name] = self._host_resident_mb(m, self._rag_ctx(m, name))
-        raw_sets = {str(n): str(e)
-                    for n, e in (self.matrix_cfg or {}).get("sets",
-                                                            {}).items()}
-        if not raw_sets:
-            # No routing sets: every category runs alone (the section-24
-            # solo rule) — its own quad must fit the pool by itself.
-            refused = {n for n, mb in cats.items() if mb > available}
-            if refused:
-                logger.warning(
-                    "host ledger: no sets — %s exceed(s) the %d MiB free "
-                    "after residents; refused",
-                    ", ".join(f"{n} ({cats[n]} MiB)"
-                              for n in sorted(refused)), available)
-            return frozenset(refused)
-        per_set: dict[str, list[str]] = {}
-        fails: dict[str, tuple[int, int]] = {}
-        for sname, expr in raw_sets.items():
-            if not _has_chat_slot(expr, raw_sets):
-                continue
-            members = sorted(n for n in _expr_leaves(expr, raw_sets)
-                             if n in cats)
-            per_set[sname] = members
-            total = sum(cats[n] for n in members)
-            if available < total:
-                fails[sname] = (total, available - total)
-        if not fails:
-            return frozenset()
-        for sname in sorted(fails):
-            total, over = fails[sname]
-            logger.warning(
-                "host ledger: composition %r cannot fit as a unit: %d MiB "
-                "of CPU residents (%s) but %d MiB free after the committed "
-                "pair — %d MiB short",
-                sname, total, ", ".join(per_set[sname]) or "-",
-                available, -over)
-        refused: set[str] = set()
-        for name, mb in sorted(cats.items()):
-            named = [s for s, ms in per_set.items() if name in ms]
-            if named:
-                if all(s in fails for s in named):
-                    refused.add(name)
-                    logger.warning(
-                        "host ledger: %s (%s) refused as a unit — every "
-                        "composition naming it exceeds the pool",
-                        name, _cat_stem(self.fixed_categories, name))
-            elif mb > available:
-                refused.add(name)
-                logger.warning(
-                    "host ledger: %s (%s) refused — in no set, larger than "
-                    "the %d MiB free after residents (it can only run "
-                    "alone)", name, _cat_stem(self.fixed_categories, name),
-                    available)
-        return frozenset(refused)
-
-    def _coresident_charge(self, model: Model, pool_id: str) -> int:
-        """Co-resident MB to charge *model*'s solve, and record its sets.
-
-        Per the matrix contract an entry must survive the heaviest set it
-        belongs to, so this charges the priciest set the model is admitted
-        to.  When no sets are configured it falls back to the ledger's
-        fleet-wide reserve, so an operator without a ``matrix:`` section
-        sees no change.
-
-        Admission: a model joins a set when, at that set's overhead, it can
-        still meet one of its usage demands.  With no declared demands the
-        model is admitted everywhere it fits, which preserves today's
-        behaviour for untagged models.
-        """
-        base = self.ledger.extra_reserve_mb(pool_id)
-        if not self.set_overheads or model.role != "chat":
-            return base
-        demands = self.demands_for(model)
-        if not demands:
-            # Untagged: keep the previous fleet-wide charge rather than
-            # inventing a per-set answer the operator never asked for.
-            return base
-
-        worst = 0
-        admitted: set[str] = set()
-        for sname, oh in sorted(self.set_overheads.items()):
-            probe = _probe_at_overhead(self, model, oh)
-            if probe is None:
-                continue
-            ctx, parallel = probe
-            if any(d.satisfied_by(ctx, parallel) for d in demands):
-                admitted.add(sname)
-                worst = max(worst, oh)
-        if not admitted:
-            # Meets nothing anywhere: charge the heaviest set so the entry
-            # is sized for the worst thing it could be asked to share with,
-            # and let the caller drop it from every set.
-            worst = max(self.set_overheads.values())
-            admitted = set(self.set_overheads)
-        # This function only *charges* the solve now. Which sets an entry
-        # may join is decided later, per category, on the serving that was
-        # actually resolved -- see record_admission.
-        self._charge_sets.setdefault(model.stem, []).append(
-            (frozenset(admitted), max(base, worst)))
-        logger.info(
-            "tasks: %s co-resident charge %d MB (sets: %s)",
-            model.stem, max(base, worst),
-            ", ".join(sorted(admitted)) or "none")
-        return max(base, worst)
-
-    def record_admission(self, model, demand, ctx: int, parallel: int) -> None:
-        """Which sets this one *category's entry* may join.
-
-        Keyed by (stem, category) and judged on the resolved (ctx, parallel),
-        because that is the serving llama-swap would hold beside the set's
-        residents. Keying by stem alone let one category's entry ride on
-        another's verdict -- a `.coding` entry sized for 204800 and a `.aux`
-        entry sized for 81920 were treated as the same model, so whichever
-        was solved first spoke for both.
-
-        The fallback entry joins no set: routing is what categories are for,
-        and it has no name to route on.
-        """
-        if demand is FALLBACK:
-            self.set_admission[(model.stem, None)] = frozenset()
-            return
-        admitted = {sname
-                    for sname, oh in self.set_overheads.items()
-                    if self._serves_beside(model, demand, oh, parallel)}
-        if not admitted:
-            # Meets the category nowhere beside a resident. It still serves
-            # standalone -- as its own entry, outside every set.
-            logger.info("tasks: %s.%s joins no set: it cannot hold its "
-                        "%d-token minimum beside any resident",
-                        model.stem, demand.id, demand.min_context)
-        else:
-            logger.info("tasks: %s.%s admitted to %s",
-                        model.stem, demand.id, ", ".join(sorted(admitted)))
-        self.set_admission[(model.stem, demand.id)] = frozenset(admitted)
-
-    def _serves_beside(self, model, demand, overhead_mb: int,
-                       parallel: int) -> bool:
-        """Whether this entry still clears its demand beside ``overhead_mb``.
-
-        The probe is single-sequence by design -- it answers "does one
-        sequence still fit with that much spoken for" -- so its slot count is
-        not the entry's. Testing ``satisfied_by`` against the probe's 1 would
-        refuse every category asking for 2 slots, so the slot half of the
-        requirement is checked against the serving that was actually
-        resolved, and only the context half against the probe.
-        """
-        probe = _probe_at_overhead(self, model, overhead_mb)
-        if probe is None:
-            return False
-        ctx, _ = probe
-        return (ctx >= demand.min_context
-                and max(1, parallel) >= demand.min_parallel)
-
-    def _solve_matrix(self, drop_stems: set[str]) -> MatrixSolve | None:
-        """Shared chat context when a matrix section is configured."""
-        if not (self.matrix_cfg and self.embed_model and self.rerank_model):
-            return None
-        synthetic: dict[str, tuple[int, float, float, int]] = {}
-        result = _solve_matrix_context(
-            self.models, self.embed_model, self.rerank_model,
-            self.fit_bin, self.vram_total, self.spare, self.profiles,
-            baseline_mb=self.baseline_mb, drop_stems=drop_stems,
-            knobs=self.knobs, memory_margin=self.memory_margin,
-            llama_args=self.llama_args, synthetic=synthetic,
-            fixed_categories=self.fixed_categories,
-            category_ctx=self.category_ctx,
-            coload_sets=self.matrix_cfg.get("sets"),
-        )
-        self.synthetic_quads = synthetic
-        # Flag the synthesized models so plan() serves them at their
-        # minimum useful context and emission marks them unestimated.
-        for stem in synthetic:
-            for m in self.models:
-                if m.stem == stem:
-                    m.vram.unestimated_reason = ESTIMATE_ERROR_REASON
-                    break
-        if result is not None:
-            logger.info("matrix: solved chat_ctx=%d (squeeze=%s, coloads=%s)",
-                        result.chat_ctx, result.squeeze,
-                        [s for s, _ in result.coloads])
-        return result
-
-    def _build_ledger(self) -> PoolLedger:
-        """Shared VRAM ledger from the matrix result + ``pools:`` overrides.
-
-        Residents = RAG models at their solved contexts plus adopted
-        co-loads (the models actually served alongside chat), each charged
-        to its device pool with its size bucket logged.  Per-model chat
-        solves add this pool's extra reserve to their spare so slots can't
-        OOM co-residents.
-        """
-        ledger = PoolLedger(self.vram_total,
-                            self.profiles.pools_cfg)
-        if self.host_ledger.pool_mb is None:
-            # Cannot gate what cannot be read — say so once, loudly.
-            logger.info("host ledger: no pool detected and none declared — "
-                        "device: cpu models are ungated "
-                        "(profiles.yaml hardware: host keys)")
-        res = self.matrix_result
-        if res is not None:
-            for model, ctx, label in ((self.embed_model, res.embed_ctx,
-                                       "embed"),
-                                      (self.rerank_model, res.rerank_ctx,
-                                       "rerank")):
-                if model is None:
-                    continue
-                if model.on_cpu:
-                    # A CPU resident charges host RAM, not VRAM (decision 5).
-                    mb = self._host_resident_mb(model, ctx)
-                    # The co-residency role is the matrix slot, not the
-                    # frontmatter role: the resident selection picks one
-                    # winner per slot.
-                    self.host_ledger.add_resident(
-                        f"{label}:{model.stem}", label, mb)
-                    self.host_ledger_stems.add(model.stem)
-                    logger.info("host ledger: %s resident %s (%d MiB of "
-                                "%s pool, ctx %d)", label, model.stem, mb,
-                                self.host_ledger.pool_mb, ctx)
-                    continue
-                mb = self._resident_overhead(model, ctx)
-                pool = ledger.pool_id_for(model)
-                ledger.add_resident(f"{label}:{model.stem}", mb, pool)
-                logger.info("ledger: %s resident %s (%s bucket, pool %s%s)",
-                            label, model.stem, footprint_bucket(model), pool,
-                            " — no reserve (unestimated)"
-                            if model.stem in self.synthetic_quads else "")
-            # Declared fixed categories (stt/tts/rnk2/…) are residents too:
-            # a CPU one charges the host pool, one per category, at the
-            # same served context the planner prices them at.  Without
-            # this, a role-wide device_roles switch moves a 3 GiB rerank
-            # variant off VRAM and nothing accounts for it in RAM.
-            for name, model in (self.fixed_categories or []):
-                if model is None or not model.on_cpu:
-                    continue
-                if name in self.host_unit_refused_vars:
+            demands = m.tasks_resolved or ()
+            best = 0
+            best_task = None
+            for task in demands:
+                min_ctx = self._task_floor(view, task)
+                if min_ctx > m.design_context:
                     logger.info(
-                        "host ledger: %s (%s) refused as a unit; nothing "
-                        "committed and no id is emitted", name, model.stem)
+                        "%s task %r min_context %d is above the design "
+                        "context %d; the task is unservable", m.stem,
+                        task.id or "fallback", min_ctx, m.design_context)
                     continue
-                ctx = self._rag_ctx(model, name)
-                mb = self._host_resident_mb(model, ctx)
-                self.host_ledger.add_resident(f"{name}:{model.stem}", name, mb)
-                self.host_ledger_stems.add(model.stem)
-                logger.info("host ledger: %s resident %s (%d MiB of %s pool, "
-                            "ctx %d)", name, model.stem, mb,
-                            self.host_ledger.pool_mb, ctx)
-            by_stem = {m.stem: m for m in self.models}
-            for stem, mb in res.coloads:
-                m = by_stem.get(stem)
-                pool = ledger.pool_id_for(m) if m is not None else "default"
-                ledger.add_resident(f"coload:{stem}", mb, pool)
-                logger.info("ledger: co-load resident %s (%s bucket, pool "
-                            "%s)", stem,
-                            footprint_bucket(m) if m is not None else "?",
-                            pool)
-        return ledger
+                served_floor = (_MIN_CTX_SIZE if min_ctx <= _MIN_CTX_SIZE
+                                else ((min_ctx + _CTX_ROUND_TO - 1)
+                                      // _CTX_ROUND_TO) * _CTX_ROUND_TO)
+                need = allocation.floor_mb(
+                    quad, served_floor, task.min_parallel or 1,
+                    self.memory_margin)
+                if need > best:
+                    best, best_task = need, task
+            if best == 0:
+                best = allocation.floor_mb(
+                    quad, _MIN_CTX_SIZE, 1, self.memory_margin)
+            previous = role_floor[pool].get(m.role, 0)
+            if best > previous:
+                role_source[(m.role, pool)] = (
+                    best, m.stem, best_task.id if best_task else "")
+            role_floor[pool][m.role] = max(previous, best)
+            if not m.on_cpu:
+                files = m.size_mb or 0
+                if m.mmproj is not None and m.mmproj.gguf_path is not None:
+                    files += m.mmproj.size_mb
+                if m.mtp is not None and m.mtp.gguf_path is not None:
+                    files += m.mtp.size_mb
+                host = max(HOST_PROCESS_MIB, int(files - quad[0]))
+                role_floor["ram"][m.role] = max(
+                    role_floor["ram"].get(m.role, 0), host)
+                for key in model_keys(m):
+                    model_floor[key + "#ram"] = ("ram", host)
+                    model_floor[key.lower() + "#ram"] = ("ram", host)
+            for key in model_keys(m):
+                model_floor[key] = (pool, best)
+                model_floor[key.lower()] = (pool, best)
+                leaf_role[key] = m.role
+                leaf_role[key.lower()] = m.role
 
-    def _resident_overhead(self, model, ctx: int) -> int:
-        """VRAM (MB) of a resident model at its served context, 0 on error."""
-        if model is None or model.on_cpu:
-            return 0
-        try:
-            parallel = model.parallel_for(self.profiles.default_parallel)
-            mb = resident_cost_mb(
-                model, fit_bin=self.fit_bin,
-                cache_type=self.profiles.default_cache_type,
-                profiles=self.profiles, llama_args=self.llama_args,
-                ctx=ctx, parallel=parallel, allow_cpu=True)
-            if mb is None:
-                # Unestimable resident: charged 0 — the no-expansion rider
-                # policy (see _solve_matrix_context).
-                quad = self.synthetic_quads.get(model.stem)
-                if quad is None:
-                    return 0
-                mb = _quad_cost_mb(quad, ctx, parallel)
-            return mb
-        except Exception as e:  # keep planning alive; matrix already solved
-            logger.warning("ledger: cannot size resident %s (%s)",
-                           model.stem, e)
-            return 0
+        def role_of_leaf(leaf: str) -> str | None:
+            low = leaf.lower()
+            if low in roles.names():
+                return low
+            if low in leaf_role:
+                return leaf_role[low]
+            for key, role in leaf_role.items():
+                if low.startswith(key + "."):
+                    return role
+            return None
 
-    def _host_resident_mb(self, model, ctx: int) -> int:
-        """Host-RAM (MiB) of a CPU-resident resident at its served ctx.
+        def floor_of_leaf(pool: str, leaf: str) -> int | None:
+            leaf = leaf.lower()
+            if leaf in roles.names():
+                return role_floor[pool].get(leaf, 0)
+            found = model_floor.get(leaf)
+            if found is not None and pool == "ram":
+                host = model_floor.get(leaf + "#ram")
+                if host is not None and found[0] == "default":
+                    return host[1]
+            if found is not None and found[0] == pool:
+                return found[1]
+            for key, (key_pool, mb) in model_floor.items():
+                if key_pool == pool and leaf.startswith(key + "."):
+                    return mb
+            return None
 
-        The same estimator the VRAM charge uses (requirement 11), single-
-        slot (residents never take declared parallel), 0 on shader — a
-        resident that cannot be measured is a rider charged nothing (the
-        matrix solve's no-expansion rule).
-        """
-        if getattr(self.host_ledger, "pool_mb", None) is None \
-                or self.host_ledger.pool_mb <= 0:
-            return 0
-        try:
-            mb = resident_cost_mb(
-                model, fit_bin=self.fit_bin,
-                cache_type=self.profiles.default_cache_type,
-                profiles=self.profiles, llama_args=self.llama_args,
-                ctx=ctx, allow_cpu=True)
-            if mb is None:
-                quad = self.synthetic_quads.get(model.stem)
-                if quad is None:
-                    return 0
-                mb = _quad_cost_mb(quad, ctx)
-            return mb
-        except Exception as e:  # keep planning alive; matrix already solved
-            logger.warning("host ledger: cannot size resident %s (%s)",
-                           model.stem, e)
-            return 0
+        if not raw:
+            fills: dict[str, int] = {}
+            for role, pools in role_pools.items():
+                share = roles.get(role).share if roles.get(role) else None
+                if share is not None and share.kind == "fill":
+                    for pool in pools:
+                        fills[pool] = fills.get(pool, 0) + 1
+            budget: dict[tuple[str, str], int] = {}
+            for role, pools in role_pools.items():
+                share = roles.get(role).share if roles.get(role) else None
+                if share is None:
+                    continue
+                for pool in pools:
+                    cap = self.capacity_pools.get(pool, 0)
+                    if not cap:
+                        continue
+                    floor = role_floor[pool].get(role, 0)
+                    if floor > cap:
+                        label = "host pool" if pool == "ram" else "GPU pool"
+                        logger.warning(
+                            "capacity: role %r floor %d MiB exceeds the %s "
+                            "%d; no entry", role, floor, label, cap)
+                        budget[(role, pool)] = 0
+                        continue
+                    if share.kind == "fill":
+                        slack = max(0, cap - sum(role_floor[pool].values()))
+                        alloc = floor + slack // max(1, fills.get(pool, 1))
+                    elif share.kind == "weight":
+                        alloc = min(cap, floor + int(
+                            (cap - floor) * share.weight / 100.0))
+                    else:
+                        alloc = floor
+                    budget[(role, pool)] = alloc
+            logger.info("capacity: budgets %s",
+                        ", ".join(f"{r}/{p}={mb}"
+                                  for (r, p), mb in sorted(budget.items())))
+            return budget
+        approved: dict[str, str] = {}
+        rejected: dict[str, str] = {}
+        for name, text in inlined.items():
+            try:
+                expr = allocation.parse(text)
+            except ValueError as exc:
+                raise ValueError(f"set {name!r}: {exc}") from None
+            leaves = allocation.leaves(expr)
+            seen: dict[str, str] = {}
+            for leaf in leaves:
+                role = role_of_leaf(leaf)
+                if role is None:
+                    raise ValueError(
+                        f"set {name!r}: {leaf!r} is not a role, model stem, "
+                        "or entry id")
+                if role in seen:
+                    raise ValueError(
+                        f"set {name!r}: role {role!r} appears twice")
+                seen[role] = leaf
+            bad = False
+            for pool in ("default", "ram"):
+                table = {}
+                for leaf in leaves:
+                    mb = floor_of_leaf(pool, leaf)
+                    if mb is None:
+                        raise ValueError(
+                            f"set {name!r}: {leaf!r} has no {pool} floor")
+                    table[leaf] = mb
+                need = allocation.floor_of(expr, table)
+                cap = self.capacity_pools.get(pool, 0)
+                if cap and need > cap:
+                    logger.error(
+                        "matrix: set %r floor %d MiB exceeds %s %d; dropped",
+                        name, need, pool, cap)
+                    bad = True
+            if bad:
+                rejected[name] = inlined[name]
+                continue
+            approved[name] = inlined[name]
+        if not approved:
+            raise ValueError("matrix.sets: no set fits the available pools")
+        self.matrix_sets_approved = dict(approved)
+        self.matrix_sets_rejected = dict(rejected)
+
+        by_pool: dict[str, dict[str, allocation.Expr]] = {}
+        floors: dict[str, dict[str, int]] = {"default": {}, "ram": {}}
+        leaves_by_pool: dict[str, dict[str, str]] = {"default": {}, "ram": {}}
+        for name, text in approved.items():
+            expr = allocation.parse(text)
+            for pool in ("default", "ram"):
+                table = {leaf: floor_of_leaf(pool, leaf)
+                         for leaf in allocation.leaves(expr)}
+                by_pool.setdefault(pool, {})[name] = expr
+                floors[pool].update(table)
+                for leaf in allocation.leaves(expr):
+                    leaves_by_pool[pool][leaf] = leaf_role.get(
+                        leaf, leaf if leaf in roles.names() else "")
+
+        for (role, pool), (mb, stem, task) in sorted(role_source.items()):
+            share = roles.get(role).share if roles.get(role) else None
+            if share is None:
+                continue
+            low = share.kind in ("min", "zero") or (
+                share.kind == "weight" and share.weight < 25)
+            cap = self.capacity_pools.get(pool, 0)
+            if low and cap and mb > cap / 10:
+                logger.warning(
+                    "matrix: role %r floor %d MiB on %s (share %s) is set by "
+                    "%s/%s; that role cannot grow, so split it if the floor "
+                    "is not intended", role, mb, pool, share.kind, stem,
+                    task or "fallback")
+        logger.info("matrix: role floors %s",
+                    {p: dict(sorted(v.items())) for p, v in role_floor.items()
+                     if v})
+        budget: dict[tuple[str, str], int] = {}
+        for pool, setmap in by_pool.items():
+            available = self.capacity_pools.get(pool)
+            if not available:
+                continue
+            weights, fills, accepts = {}, set(), set()
+            for leaf, role in leaves_by_pool[pool].items():
+                share = roles.get(role).share if role else None
+                if share is None or pool not in role_pools.get(role, set()):
+                    weights[leaf] = 0.0
+                    continue
+                weights[leaf] = share.weight if share.requests else 0.0
+                if share.kind == "fill":
+                    fills.add(leaf)
+                if share.accepts:
+                    accepts.add(leaf)
+            try:
+                alloc, left = allocation.auction(
+                    available, setmap, floors[pool], weights,
+                    frozenset(fills), frozenset(accepts))
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"set auction failed: {exc}") from None
+            logger.info("matrix: %s auction %s -> %s (floor %d)",
+                        pool, sorted(setmap), alloc, available)
+            for leaf, mb in alloc.items():
+                role = role_of_leaf(leaf)
+                if role is None:
+                    continue
+                budget[(role, pool)] = min(
+                    budget.get((role, pool), mb), mb)
+            if any(mb > 0 for mb in left.values()):
+                logger.info("matrix: auction leaves %s", left)
+        if budget:
+            logger.info("matrix: auction budgets %s",
+                        ", ".join(f"{r}/{p}={mb}"
+                                  for (r, p), mb in sorted(budget.items())))
+        return budget
 
     def _variant_memory(
         self,
@@ -2381,7 +1875,7 @@ class Planner:
         weights + folded companions + context — exactly what the emitted
         description tag reports verbatim (no capping, no re-solving).
         ``kv_per_token_mib`` is the affine ``c`` — None for fixed-overhead
-        backends.  CPU-resident servings return ``(None, ram_mib, …)``
+        backends.  CPU-served servings return ``(None, ram_mib, …)``
         (host-RAM constants via ``allow_cpu`` — never used for VRAM sizing).
         ``(None, None, None)`` when undecidable (no estimate source worked).
         ``parallel <= 0`` (uncapped vLLM) is priced single-seq, matching its
@@ -2408,90 +1902,42 @@ class Planner:
             files_mb += view.mmproj.size_mb
         if view.mtp is not None and view.mtp.gguf_path is not None:
             files_mb += view.mtp.size_mb
-        return (float(total), max(0.0, float(files_mb - model_mib)),
+        return (float(total),
+                max(float(HOST_PROCESS_MIB), float(files_mb - model_mib)),
                 float(kv_factor))
 
     def plan(self) -> dict[str, list[Variant]]:
         """Plan serving variants for every model, keyed by stem.
 
-        Order matters: the mmproj drop decision runs first (its result feeds
-        the matrix solve), then per-model variants are grouped by profile.
-        The matrix result threads through everywhere: the solved chat context
-        clamps chat entries, an adopted emb/rnk squeeze clamps the RAG
-        entries' contexts, tools are demoted on chat entries solved below
-        ``tools_min_ctx``, and included co-loads are flagged so the emitter
-        can expose them for matrix-var construction.
+        Order matters: the authored sets are priced first (their role
+        budgets feed the per-model solve), then variants are grouped by
+        profile. Tools are demoted on chat entries solved below
+        ``tools_min_ctx``.
         """
-        # The shared budget assumes every projector is shed, which holds for
-        # the categories that drop vision and leaves one that keeps its
-        # projector to decide in its own rung. `_mmproj_drop_pass` used to
-        # pick that per model from a global context threshold, before any
-        # category was read -- which is how it came to contradict the
-        # category a model actually declared.
-        self.matrix_result = self._solve_matrix(
-            {m.stem for m in self.models
-             if m.mmproj is not None and m.mmproj.gguf_path})
-        if self.matrix_result is not None:
-            self.chat_ctx = self.matrix_result.chat_ctx
-        coload_stems = ({s for s, _ in self.matrix_result.coloads}
-                        if self.matrix_result else set())
-        # Host compositions are judged as units before anything commits
-        # (requirement 33): the fixed CPU categories of a composition that
-        # does not fit refuse together, before the ledger sees them.
-        self.host_unit_refused_vars = self._host_unit_refusals()
-        self.host_unit_refused_stems = frozenset(
-            m.stem for name, m in self.fixed_categories
-            if name in self.host_unit_refused_vars and m is not None)
-        # Shared ledger: matrix residents + pools: overrides.  Per-model
-        # chat solves charge this pool's extra reserve to their spare.
-        self.ledger = self._build_ledger()
-        # Per-set co-resident costs, so a chat entry can be sized for the
-        # heaviest set it actually lands in rather than one fleet-wide
-        # figure.  Needs the matrix result, so it runs after the solve.
-        self._price_sets()
+        if not ((self.matrix_cfg or {}).get("sets")):
+            logger.warning(
+                "capacity: no matrix.sets; pricing each role's share. "
+                "Author matrix.sets for cross-role co-residency.")
+        self.role_budget = self._role_budgets()
+        # Shared ledger: pools: overrides.  Per-model chat solves charge
+        # this pool's extra reserve to their spare.
+        self.ledger = PoolLedger(self.vram_total, self.profiles.pools_cfg)
 
-        # values are Variant lists, except the reserved admission key
         plan: dict = {}
         n_models = len(self.models)
         for i, model in enumerate(self.models, 1):
             logger.info("planning %d/%d: %s", i, n_models, model.stem)
             model.image_budget_warnings()
-            if model.stem in self.host_unit_refused_stems:
-                # Refused with its composition (requirement 33): no id may
-                # claim it, so no variants are built at all.
-                logger.info("host ledger: %s belongs to a refused unit; "
-                            "entry omitted", model.stem)
-                if self.progress_cb is not None:
-                    self.progress_cb(model.stem)
-                continue
             include_mmproj = True   # per-category now; see solve_rung
             view = model.view_for(include_mmproj)
-            on_view = model.view_for(True)
             context_length = view.design_context
             # Unestimable model: no measurement source worked. Serve at the
-            # minimum useful context (type-based floor) — the matrix solve
-            # carries it with no extra reserve — and mark every entry for
-            # client-facing metadata.  The flag may sit on either budget:
-            # view_for() rebuilds VramBudget per view (mmproj models carry
-            # a separate companion-on budget that runs its own solves).
+            # minimum useful context (type-based floor) and mark every entry
+            # for client-facing metadata.  The flag may sit on either
+            # budget: view_for() rebuilds VramBudget per view (mmproj models
+            # carry a separate companion-on budget that runs its own solves).
             est_error = getattr(model.vram, "unestimated_reason", None) \
                 or getattr(view.vram, "unestimated_reason", None)
-            # Squeeze: an adopted emb/rnk squeeze is realized by clamping the
-            # RAG entry's served context (the emit is what frees the VRAM).
-            if view.role == "embeddings" and self.matrix_result:
-                context_length = min(context_length,
-                                     self.matrix_result.embed_ctx)
-            elif view.role == "rerank" and self.matrix_result:
-                context_length = min(context_length,
-                                     self.matrix_result.rerank_ctx)
-            # Per-serving, decided from the context this entry will actually
-            # serve -- not from the fleet's matrix target. The old test keyed
-            # off self.chat_ctx, which is (a) None whenever no matrix: section
-            # exists (the default), so demotion could never fire at all, and
-            # (b) the fleet-wide goal rather than this entry's own ctx, so a
-            # model that squeezed below the threshold kept advertising tools.
-            is_coload = model.stem in coload_stems
-
             groups = self.profiles.groups_for(view, self.vram_total, self.spare)
             variants: list[Variant] = []
             for (parallel, cache_type, spare_mb, batch, ubatch), group in groups.items():
@@ -2500,44 +1946,40 @@ class Planner:
                 include_mmproj = True   # per-category now; see solve_rung
                 view = model.view_for(include_mmproj)
                 context_length = view.design_context
-                if view.role == "embeddings" and self.matrix_result:
-                    context_length = min(context_length,
-                                         self.matrix_result.embed_ctx)
-                elif view.role == "rerank" and self.matrix_result:
-                    context_length = min(context_length,
-                                         self.matrix_result.rerank_ctx)
-                cap = self._category_ctx_cap(model)
-                if cap is not None and cap < context_length:
-                    context_length = cap
-                # Ledger charge: this pool's extra reserve (pools: overrides
-                # + co-residents) joins the spare for chat solves only — RAG
-                # and fixed-overhead roles ARE residents; charging them
-                # themselves would double-count.
+                if (view.on_cpu and self.host_pool_mb is not None
+                        and self.host_pool_mb <= 0):
+                    logger.warning("%s: no host pool; no entry", model.stem)
+                    continue
+                # A role with an auction budget solves inside it; otherwise
+                # the pool's declared spare is the reserve.
                 pool_id = self.ledger.pool_id_for(view)
-                spare_mb = self.ledger.spare_for(pool_id, spare_mb)
-                spare_eff = spare_mb
-                if view.role == "chat":
-                    # Co-residents are charged per set, not fleet-wide: the
-                    # ledger's single figure under-reserves every model that
-                    # can also land in a heavier set (ragz's Zerank alone is
-                    # 5764 MB more than rag's co-residents).
-                    spare_eff += self._coresident_charge(model, pool_id)
+                budget_pool = "ram" if view.on_cpu else "default"
+                budget = self.role_budget.get((model.role, budget_pool))
+                if budget is not None:
+                    if budget <= 0:
+                        logger.warning(
+                            "%s: role %r has no budget on %s; no entry",
+                            model.stem, model.role, budget_pool)
+                        continue
+                    # The budget is already net of the pool spare.
+                    if view.on_cpu:
+                        host = self.host_pool_mb or self.vram_total
+                        spare_eff = max(0, host - budget)
+                    else:
+                        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO,
+                                                        self.baseline_mb)
+                        spare_eff = max(0, self.vram_total - reserve - budget)
+                else:
+                    spare_mb = self.ledger.spare_for(pool_id, spare_mb)
+                    spare_eff = spare_mb
                 # Auto-parallel: unpinned chat models on slot-based backends
                 # get a value-function (parallel, ctx) solve instead of the
                 # group parallel.  Pinned = sidecar/block `parallel:` or any
                 # profile in the group declaring `parallel`.
                 auto = (
                     self.knobs.auto_parallel
-                    and view.role == "chat"
+                    and view.serves_endpoint(CHAT)
                     and view.backend in ("llama-server", "vllm", "vllm-docker")
-                    # A CPU-resident model's KV pool lives in host RAM, which
-                    # no VRAM ledger sees or budgets, and calc_ctx returns
-                    # the design context regardless of the slot count. So
-                    # every candidate looks equally affordable and the score
-                    # reduces to p**power, which walks straight to the cap:
-                    # 8 slots on a model declared for one is an 8x KV
-                    # over-commit in an arena nothing accounts for.
-                    and not getattr(view, "on_cpu", False)
                     and "parallel" not in (view.frontmatter or {})
                     and not any("parallel" in resolved
                                 for _, resolved in group))
@@ -2564,17 +2006,25 @@ class Planner:
                 # its own (shed, ctx, parallel) against the same budget -- so
                 # a `.coding` entry and a `.aux` entry for one model are
                 # entitled to different sizes, which is the point.
+                fallback = fallback_task(model)
                 if est_error is not None:
                     ctx_size = self._unestimated_ctx(view)
-                    serves = [(FALLBACK, view, parallel, ctx_size)]
+                    serves = [(fallback, view, parallel, ctx_size)]
                 else:
                     serves = []
                     pin_ctx = self._serving_pin(view)
                     cap_ctx = context_length
                     if self.max_context is not None:
                         cap_ctx = min(cap_ctx, self.max_context)
-                    for demand in (*self.demands_for(model), FALLBACK):
-                        is_null = demand is FALLBACK
+                    task_cap = self.tasks.max_context_for(model.task_ids)
+                    for demand in (*self.demands_for(model), fallback):
+                        is_null = demand is fallback
+                        demand_cap = cap_ctx
+                        if is_null:
+                            if task_cap is not None:
+                                demand_cap = min(demand_cap, task_cap)
+                        elif demand.max_context is not None:
+                            demand_cap = min(demand_cap, demand.max_context)
                         if not self.can_meet(model, demand):
                             # require gates existence: a model without the
                             # capability does not satisfy the category, so
@@ -2584,17 +2034,11 @@ class Planner:
                                         model.stem, demand.id or "fallback",
                                         ", ".join(sorted(demand.require)))
                             continue
-                        floor = resolve_min_ctx(
-                            view, pin_ctx=pin_ctx,
-                            tools_min_ctx=self.knobs.tools_min_ctx,
-                            fallback_min_ctx=self.min_context,
-                            fallback_explicit=self.min_context_explicit,
-                            category_floor=demand.min_context)
+                        floor = self._task_floor(view, demand)
                         rung = self.solve_rung(
                             model, demand, parallel=parallel,
                             cache_type=cache_type, spare_mb=spare_eff,
-                            design_ctx=self.chat_ctx,
-                            context_length=cap_ctx, profile=group[0][1],
+                            context_length=demand_cap, profile=group[0][1],
                             prefer_capability=is_null)
                         if rung is None:
                             # Cannot be served at any rung: no id may claim it.
@@ -2603,39 +2047,44 @@ class Planner:
                         shed_vision = "vision" in rung.shed
                         serve_view = model.view_for(not shed_vision)
                         if auto:
-                            par, ctx = self._auto_parallel(
+                            solved = self._auto_parallel(
                                 serve_view, cache_type=cache_type,
                                 spare_mb=spare_eff,
                                 include_mmproj=not shed_vision,
-                                cap_ctx=cap_ctx, floor=floor,
+                                cap_ctx=demand_cap, floor=floor,
                                 pin_ctx=pin_ctx,
                                 power=0.0 if is_null else demand.parallel_power,
                                 min_parallel=demand.min_parallel,
                                 group_parallel=parallel,
                                 profile=group[0][1])
+                            if solved is None:
+                                continue
+                            par, ctx = solved
                         else:
                             par = parallel
                             ctx = self._bounded_ctx(
                                 serve_view, parallel=par,
                                 cache_type=cache_type, spare_mb=spare_eff,
                                 include_mmproj=not shed_vision,
-                                design_ctx=self.chat_ctx,
-                                context_length=cap_ctx,
+                                context_length=demand_cap,
                                 profile=group[0][1])
                             if ctx < demand.min_context:
                                 continue
-                        # Admission is judged on the serving just resolved,
-                        # per category -- not on a probe taken before the
-                        # solve, and not shared across the model's other
-                        # categories.
-                        if view.role == "chat":
-                            self.record_admission(model, demand, ctx, par)
+                            if par < demand.min_parallel and not uncapped:
+                                logger.info(
+                                    "%s: pinned parallel=%d is below the %s "
+                                    "min_parallel=%d; no entry", model.stem,
+                                    par, demand.id or "fallback",
+                                    demand.min_parallel)
+                                continue
                         serves.append((demand, serve_view, par, ctx))
                     if not serves:
+                        logger.info("%s: no serving at the role budget; "
+                                    "entry omitted", model.stem)
                         continue
                 ctx_size = serves[0][3]
                 if est_error is None:
-                    # Discovery during this model's own solve: calc_ctx
+                    # Discovery during this model's own solve: solve_context
                     # flagged the model unestimable (no measurement source
                     # worked) — re-plan it at the type floor.  The flag may
                     # sit on the *view's* budget: view_for() rebuilds
@@ -2650,16 +2099,14 @@ class Planner:
                         # invalidated; rebuild it so the emitted entry does
                         # not carry an estimated context while claiming to be
                         # unestimated.
-                        serves = [(FALLBACK, view, group_parallel, ctx_size)]
+                        serves = [(fallback, view, group_parallel, ctx_size)]
 
                 # Squeeze note: the budget could not afford the design
                 # context and an explicit reservation (--spare/--baseline)
                 # is what pushed it over — stamp the entry description.
-                # Gate on the user-declared spare (pool-adjusted, before
-                # co-resident charges) or a baseline above the fixed floor;
-                # and only when the served ctx is actually below design
-                # (the matrix chat_ctx target can squeeze without landing
-                # under the model's own context_length).
+                # Gate on the user-declared spare (pool-adjusted, before the
+                # pool's extra reserve) or a baseline above the fixed floor;
+                # and only when the served ctx is actually below design.
                 vram_note: str | None = None
                 if (est_error is None
                         and getattr(view.vram, "vram_squeezed", False)
@@ -2678,7 +2125,7 @@ class Planner:
                 for demand, serve_view, serve_par, serve_ctx in serves:
                     shed_vision = serve_view is not view
                     demoted = self._tools_demoted(serve_view, serve_ctx)
-                    task_demands = () if demand is FALLBACK else (demand,)
+                    task_demands = () if demand is fallback else (demand,)
                     if est_error is not None:
                         mem = (None, None, None)
                     else:
@@ -2687,26 +2134,15 @@ class Planner:
                             include_mmproj=not shed_vision,
                             ctx_size=serve_ctx, parallel=serve_par,
                             profile=group[0][1])
-                    host_free = self.host_ledger.available() \
-                        if serve_view.on_cpu else None
-                    # A committed resident's serving is not re-charged: the
-                    # unit pass already admitted (or refused) that stem's
-                    # whole quad — counting it again here would always
-                    # refuse a resident on a pool sized to hold only it.
-                    host_extra = mem[1] if (host_free is not None
-                                            and serve_view.stem
-                                            not in self.host_ledger_stems
-                                            ) else None
-                    if (host_extra is not None and host_extra > host_free):
-                        # Go/no-go on the host pool: the CPU-resident quad
-                        # does not fit after committed residents. No id may
-                        # claim it and there is no solve-down (requirement 12) —
-                        # the operator picks a smaller sidecar or a bigger box.
+                    host_free = (self.host_pool_mb
+                                 if serve_view.on_cpu else None)
+                    host_charge = mem[1] if host_free is not None else None
+                    if (host_charge is not None and host_charge > host_free):
                         logger.info(
                             "%s: %s over_budget_reason: host pool — %d MiB "
-                            "needed, %d MiB free after residents; entry "
-                            "omitted", serve_view.stem,
-                            demand.id or "fallback", int(mem[1]), host_free)
+                            "needed, %d MiB in the pool; entry omitted",
+                            serve_view.stem, demand.id or "fallback",
+                            int(mem[1]), host_free)
                         continue
                     variants.append(Variant(
                         parallel=(0 if uncapped else serve_par),
@@ -2714,7 +2150,6 @@ class Planner:
                         profiles_group=group, ctx_size=serve_ctx,
                         include_mmproj=not shed_vision,
                         batch=batch, ubatch=ubatch,
-                        coload=is_coload,
                         tools_demoted=demoted, task_demands=task_demands,
                         category=demand,
                         estimate_error=est_error,
@@ -2726,11 +2161,6 @@ class Planner:
                 plan[model.stem] = variants
             if self.progress_cb is not None:
                 self.progress_cb(model.stem)
-        # The admission map is planner state, not a variant, but the emitter
-        # is a pure function of `plan` — so it rides along under a key no
-        # stem can collide with, and is popped by the caller.
-        plan[SET_ADMISSION_KEY] = dict(self.set_admission)
-        plan[HOST_REFUSED_KEY] = sorted(self.host_unit_refused_vars)
         return plan
 
 
@@ -2739,8 +2169,8 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
                    allow_cpu: bool = False,
                    ) -> tuple[int, float, float, int] | None:
     """(model_mib, kv_per_token_mib, slot_mib, compute_mib) quad, or None
-    when unmeasurable.  ``allow_cpu`` lifts the CPU-resident gate — the
-    host ledger sizes `device: cpu` quads through the same gate."""
+    when unmeasurable.  ``allow_cpu`` lifts the CPU gate — a `device: cpu`
+    quad is measured under `-ngl 0`."""
     fp = model.vram.fit_params_static(fit_bin, cache_type=cache_type,
                                       llama_args=llama_args,
                                       allow_cpu=allow_cpu)
@@ -2749,522 +2179,94 @@ def _static_params(model: Model, fit_bin: str, cache_type: str,
     return (fp.model_mib, fp.kv_per_token_mib, fp.slot_mib, fp.compute_mib)
 
 
-def _quad_cost_mb(quad: tuple[int, float, float, int], ctx: int,
-                  parallel: int = 1) -> int:
-    """Affine serving cost (MiB) of one measured quad at (ctx, parallel)."""
-    mib, kv_factor, slot_mib, compute = quad
-    return int(mib + compute + kv_factor * ctx * parallel
-               + slot_mib * parallel)
+def served_ctx(model: Model, tasks: TaskCatalogue | None = None,
+               ctx_override: int | None = None) -> int:
+    """The context a fixed-overhead serving is served at — the use-case size.
 
-
-def resident_quad(model: Model, *, fit_bin: str, cache_type: str,
-                  profiles, llama_args: str, allow_cpu: bool = False,
-                  ) -> tuple[int, float, float, int] | None:
-    """The measured quad behind :func:`resident_cost_mb`, or None.
-
-    Exposed separately so the resident-selection log can name the terms —
-    two models with the same total cost are not a bug if their weights, KV
-    and compute terms match.
+    The cap is the tightest ``max_context`` among the model's tasks (for
+    embeddings/rerank that is the RAG window); a model whose tasks declare
+    none serves its design context.  ``ctx_override`` caps it further.  It
+    is always a cap, never a floor.
     """
-    return _static_params(model, fit_bin, cache_type,
-                          measurement_args(profiles, model, llama_args),
-                          allow_cpu=allow_cpu)
-
-
-def resident_cost_mb(model: Model, *, fit_bin: str, cache_type: str,
-                     profiles, llama_args: str, ctx: int,
-                     parallel: int = 1, allow_cpu: bool = False) -> int | None:
-    """Measured serving cost (MiB) of one resident at its served context.
-
-    The one estimator behind resident *selection*, the VRAM resident
-    charge and the host resident charge: the same affine quad family
-    (shape-stamped, so a `device: cpu` model measures under `-ngl 0`),
-    priced at the same context.  None when nothing can size it — callers
-    treat that as "not a candidate for a cost comparison", never as 0.
-    """
-    quad = resident_quad(model, fit_bin=fit_bin, cache_type=cache_type,
-                         profiles=profiles, llama_args=llama_args,
-                         allow_cpu=allow_cpu)
-    if quad is None:
-        return None
-    return _quad_cost_mb(quad, ctx, parallel)
-
-
-def resident_cost_detail(model: Model, *, fit_bin: str, cache_type: str,
-                         profiles, llama_args: str, ctx: int,
-                         allow_cpu: bool = False) -> tuple[int, str] | None:
-    """(total MiB, term breakdown) for one resident, or None.
-
-    The breakdown exists so two residents that both cost 1050 MiB can be
-    seen to be the same *shape* — same weights, same compute buffer, same
-    KV/token — rather than a repeated number masking a bug.
-    """
-    quad = resident_quad(model, fit_bin=fit_bin, cache_type=cache_type,
-                         profiles=profiles, llama_args=llama_args,
-                         allow_cpu=allow_cpu)
-    if quad is None:
-        return None
-    mib, kv_factor, slot_mib, compute = quad
-    total = _quad_cost_mb(quad, ctx)
-    kv_mb = int(kv_factor * ctx + slot_mib)
-    return total, (f"{mib} weights + {compute} compute + {kv_mb} kv "
-                   f"@{ctx}")
-
-
-def resident_ctx(model: Model, knobs: MatrixKnobs,
-                 ctx_override: int | None = None) -> int:
-    """The context a resident role is served at — the use-case size.
-
-    Embedding and rerank residents serve their configured RAG cap (a client
-    chunks to fit); everything else serves its declared design context.
-    A per-category ``ctx:`` (portion 2) caps that further: the operator's
-    declaration is the served context for the model, every consumer prices
-    and serves it identically, and it is still a cap — never a floor — so
-    a squeezed or design-limited serving cannot exceed it.
-    """
-    ctx = (model.design_context if model.role not in (
-        "embeddings", "rerank") else min(model.design_context,
-                                         knobs.rag_cap(model.role)))
+    cap = tasks.max_context_for(model.task_ids) if tasks else None
+    ctx = (model.design_context if cap is None
+           else min(model.design_context, cap))
     if ctx_override is not None:
         ctx = min(ctx, ctx_override)
     return ctx
 
 
-def _sets_reference_coloads(sets_cfg: dict | None) -> bool:
-    """True when any routing set can actually co-locate a co-load with chat.
-
-    The opportunistic co-load pass reserves each candidate's VRAM against
-    *every* chat solve, on the premise that llama-swap will hold it
-    alongside the chat model.  That only happens if some set expression
-    references the ``__COLOAD_VARS__`` placeholder — the sole way a
-    co-load's var reaches a set.  A co-load with no set referencing it is
-    evicted independently, so its reservation buys nothing and only
-    shrinks context (observed 2026-09-26: two unreferenced ASR co-loads
-    charged 4725 MB and collapsed a 27B's context from 188416 to 32768).
-    Such models belong in ``__CHAT_VARS__`` instead — alternatives that
-    evict chat rather than co-residents that shrink it.
-    """
-    return any("__COLOAD_VARS__" in str(expr)
-               for expr in (sets_cfg or {}).values())
-
-
-def _solve_matrix_context(
-    chat_models: list[Model],
-    embed_model: Model,
-    rerank_model: Model,
-    fit_bin: str,
-    vram_total: int,
-    spare: str | None,
-    profiles: Profiles,
-    baseline_mb: int = 0,
-    drop_stems: set[str] | None = None,
-    knobs: MatrixKnobs | None = None,
-    memory_margin: float = _MEMORY_MARGIN,
-    llama_args: str = "",
-    synthetic: dict[str, tuple[int, float, float, int]] | None = None,
-    fixed_categories: list[tuple[str, Model]] | None = None,
-    category_ctx: dict[str, int] | None = None,
-    coload_sets: dict | None = None,
-) -> MatrixSolve | None:
-    """Solve the shared VRAM budget for chat context plus co-loads.
-
-    Runs the affine measurement once per model to get static constants, then
-    solves:
-        available = Σ(chat_weight + chat_kv*slots*chat_ctx + slots*chat_slot)
-                  + (embed_weight + embed_kv*embed_ctx + embed_slot)
-                  + (rerank_weight + rerank_kv*rerank_ctx + rerank_slot)
-
-    Three passes, in order:
-
-    1. *Baseline*: embed/rerank at their configured context (``rag_cap``
-       capped by design context) → ``chat_ctx₀``.
-    2. *Squeeze* (§2b): when ``chat_ctx₀`` is below ``tools_min_ctx``, re-solve
-       with embed/rerank contexts clamped to ``coload_min_ctx``; adopt only
-       when the gain reaches ``ctx_gain_min``.
-    3. *Opportunistic co-loads* (§2): enabled ``s2t``/``image`` models not on
-       the GPU pool's excluded list, smallest fixed overhead first, are
-       included while the chat solve stays at or above the floor
-       (``tools_min_ctx`` when a tools chat model can keep it, else
-       ``min_chat_ctx``).  Estimated candidates carry ``estimate_headroom``.
-       Skipped entirely when no routing set references
-       ``__COLOAD_VARS__`` (*coload_sets*): a co-load nothing can
-       co-locate is never resident with chat, so reserving for it would
-       only cost context.
-
-    Unestimable participants (every estimate source failed) stay in the
-    solve with a zero-cost placeholder — charged nothing extra — served at
-    their minimum useful context, assumed to fit within the set's measured
-    allocation. Synthesized stems are reported through ``synthetic`` (stem
-    → quad) so the planner can flag the models and charge the ledger the
-    same numbers.
-
-    Returns the :class:`MatrixSolve` (chat context, adopted RAG contexts,
-    included co-loads) or None on failure.
-    """
-    knobs = knobs or MatrixKnobs()
-    spare_mb = parse_spare_mb(spare, vram_total)
-
-    drop_stems = drop_stems or set()
-    fixed_categories = fixed_categories or []
-
-    # Get static params for chat models (companion VRAM folded in).
-    # Two-phase: measure everything first, then give models with no
-    # estimate a zero-cost placeholder — the rider stays in the set at its
-    # minimum useful context and is assumed to fit the measured allocation
-    # without expanding it (no extra reserve).
-    chat_params: list[tuple[Model, int, float, float, int, int, int]] = []
-    chat_meta: list[tuple[Model, int, int, tuple[int, float, float, int] | None]] = []
-    real_quads: list[tuple[int, float, float, int]] = []
-    for m in chat_models:
-        # Embed/rerank/image/s2t models are handled outside the shared chat
-        # budget (fixed overhead / separate pool). Including a 40 GB
-        # diffusion model would collapse the chat budget, so exclude it.
-        if m.role in utils.NON_CHAT_ROLES or m.on_cpu:
-            continue
-        # Overlay keys (cache_type/parallel/context_length/image_max_tokens)
-        # live in the block and are only visible on the companion-on view.
-        on = m.view_for(m.stem not in drop_stems)
-        cache_type = on.cache_type_for(profiles.default_cache_type)
-        parallel = on.parallel_for(profiles.default_parallel)
-        if parallel <= 0:
-            # Uncapped vLLM: the shared solve is single-seq safe (its own
-            # emission solves ctx for one max-length sequence).  On
-            # llama.cpp backends 0 is invalid — warn, use the default.
-            if on.backend in VLLM_BACKENDS:
-                parallel = 1
-            else:
-                logger.warning("%s: parallel %d is invalid; using default",
-                               on.stem, profiles.default_parallel)
-                parallel = profiles.default_parallel
-        img_floor = 0
-        if (m.stem not in drop_stems and m.mmproj and m.mmproj.gguf_path
-                and on.image_max_tokens):
-            img_floor = on.image_max_tokens
-        fp = on.vram.effective_static(fit_bin, cache_type=cache_type,
-                                      include_mmproj=m.stem not in drop_stems,
-                                      llama_args=measurement_args(profiles, m,
-                                                                  llama_args))
-        if fp is not None:
-            real_quads.append(fp)
-        chat_meta.append((m, parallel, img_floor, fp))
-
-    # Get static params for embed/rerank. CPU-resident models cost 0 VRAM.
-    embed_params = None
-    if not embed_model.on_cpu:
-        embed_params = _static_params(embed_model, fit_bin,
-                                      profiles.default_cache_type,
-                                      measurement_args(profiles, embed_model,
-                                                       llama_args))
-    rerank_params = None
-    if not rerank_model.on_cpu:
-        rerank_params = _static_params(rerank_model, fit_bin,
-                                       profiles.default_cache_type,
-                                       measurement_args(profiles, rerank_model,
-                                                        llama_args))
-    for quad in (embed_params, rerank_params):
-        if quad is not None:
-            real_quads.append(quad)
-
-    if not chat_meta:
-        # No chat participants: the shared solve has nothing to solve.
-        return None
-    if not real_quads:
-        logger.warning("matrix: no measurable model to bound unestimated "
-                       "participants; aborting shared solve")
-        return None
-
-    def _with_bound(quad: tuple[int, float, float, int] | None,
-                    stem: str) -> tuple[int, float, float, int]:
-        """Measured quad, or a zero-cost placeholder for an unestimable one.
-
-        Policy: the rider stays in the set at its minimum useful context and
-        is assumed to fit within the set's measured allocation — it does not
-        expand it (no extra reserve). Runtime OOM on such a rider is the
-        accepted risk; the entry is flagged ``estimated: false``.
-        """
-        if quad is not None:
-            return quad
-        if synthetic is not None:
-            synthetic[stem] = (0, 0.0, 0.0, 0)
-        logger.warning(
-            "matrix: %s has no VRAM estimate; serving it in the set at its "
-            "minimum useful context with no extra reserve (assumed to fit "
-            "the measured allocation)", stem)
-        return (0, 0.0, 0.0, 0)
-
-    for m, parallel, img_floor, fp in chat_meta:
-        quad = _with_bound(fp, m.stem)
-        chat_params.append((m, quad[0], quad[1], quad[2], quad[3],
-                            parallel, img_floor))
-
-    if embed_params is None and not embed_model.on_cpu:
-        embed_params = _with_bound(None, embed_model.stem)
-    if rerank_params is None and not rerank_model.on_cpu:
-        rerank_params = _with_bound(None, rerank_model.stem)
-
-    # Reserve for embed/rerank at their configured context (the
-    # ``embed_context`` / ``rerank_context`` knobs), capped by the model's
-    # declared context (sidecar context_length > GGUF architectural max) —
-    # a 32k reranker costs ~4x the KV of an 8k one and must be budgeted as
-    # declared.  Unestimable RAG residents ride free (zero-cost placeholder,
-    # like unestimable chat riders) and are served at the same configured
-    # context — the operator's contract, accepted unverified.
-    ctx_by_cat = category_ctx or {}
-    embed_ctx = resident_ctx(embed_model, knobs, ctx_by_cat.get("emb"))
-    rerank_ctx = resident_ctx(rerank_model, knobs, ctx_by_cat.get("rnk"))
-
-    # The routing sets are the budget contract (design decision 13): a set
-    # expression says which models are allowed to be resident together, so
-    # the chat solve reserves the most expensive *branch* any chat-capable
-    # set allows — not the sum of every category the operator declared.
-    # ``(3 | (2 & 1))`` costs 3; ``(1 | (2 & 3))`` costs 5.  A category no
-    # chat set names reserves nothing, because llama-swap can never hold it
-    # beside chat ("a model in no set can only run alone").
-    raw_sets = {str(n): str(e) for n, e in (coload_sets or {}).items()}
-    chat_sets = {n: e for n, e in raw_sets.items()
-                 if _has_chat_slot(e, raw_sets)}
-    fixed_mb: dict[str, int] = {}
-    for name, m in fixed_categories:
-        if m.on_cpu:
-            mb = 0
-        else:
-            mb = _coload_overhead(m, fit_bin, profiles, knobs, llama_args,
-                                  ctx=ctx_by_cat.get(name))
-            if mb is None:
-                logger.warning("matrix: category %r (%s) cannot be sized; "
-                               "charged 0", name, m.stem)
-                mb = 0
-        fixed_mb[name] = mb
-        fixed_mb.setdefault(m.stem, mb)
-    if raw_sets:
-        leaves: set[str] = set()
-        for expr in raw_sets.values():
-            leaves |= _expr_leaves(expr, raw_sets)
-        for name, m in fixed_categories:
-            if name not in leaves and m.stem not in leaves:
-                logger.info(
-                    "matrix: category %r (%s) is in no set; it can only "
-                    "run alone, so no VRAM is reserved for it",
-                    name, m.stem)
-
-    def _set_costs(embed_ctx_: int, rerank_ctx_: int,
-                   coload_mb: int = 0) -> dict[str, int]:
-        """Per-set worst-branch cost at the given RAG contexts."""
-        var_mb = dict(fixed_mb)
-        emb_mb = (_quad_cost_mb(embed_params, embed_ctx_)
-                  if embed_params is not None else 0)
-        rnk_mb = (_quad_cost_mb(rerank_params, rerank_ctx_)
-                  if rerank_params is not None else 0)
-        var_mb["emb"] = emb_mb
-        var_mb["rnk"] = rnk_mb
-        # llama-swap accepts a model id as a leaf just as it accepts a var.
-        if embed_model is not None:
-            var_mb[embed_model.stem] = emb_mb
-        if rerank_model is not None:
-            var_mb[rerank_model.stem] = rnk_mb
-        return {name: set_overhead_mb(expr, var_mb, frozenset(), frozenset(),
-                                      sets_cfg=raw_sets, coload_mb=coload_mb)
-                for name, expr in chat_sets.items()}
-
-    def _overhead(embed_ctx_: int, rerank_ctx_: int,
-                  extra_mb: int = 0) -> int:
-        """VRAM held by non-chat residents at these RAG contexts.
-
-        In set mode this is the whole non-chat side of the worst branch
-        (RAG pair included), so the solver is given no separate embed/rerank
-        params.  In legacy mode the solver still prices the RAG pair from
-        its params; *extra_mb* carries the declared categories and co-loads
-        the caller admits.
-        """
-        if not raw_sets:
-            return extra_mb
-        return max(_set_costs(embed_ctx_, rerank_ctx_, extra_mb).values(),
-                   default=0)
-
-    def _solve(embed_ctx_: int, rerank_ctx_: int,
-               extra_mb: int = 0) -> int:
-        # With sets, the expression tree owns the RAG pair too: passing
-        # their params as well would charge them twice.
-        set_mode = bool(raw_sets)
-        return solve_matrix_ctx(
-            vram_total_mb=vram_total,
-            spare_mb=spare_mb,
-            chat_models=chat_params,
-            embed_params=None if set_mode else embed_params,
-            rerank_params=None if set_mode else rerank_params,
-            embed_ctx=0 if set_mode else embed_ctx_,
-            rerank_ctx=0 if set_mode else rerank_ctx_,
-            baseline_mb=baseline_mb,
-            fixed_overhead_mb=_overhead(embed_ctx_, rerank_ctx_, extra_mb),
-            memory_margin=memory_margin,
-        )
-
-    # 1. Baseline.
-    chat_ctx = _solve(embed_ctx, rerank_ctx)
-    if chat_sets:
-        costs = _set_costs(embed_ctx, rerank_ctx)
-        worst = max(costs, key=costs.get)
-        logger.info(
-            "matrix: budget follows sets — worst %r reserves %d MB "
-            "(chat_ctx=%d, %d set(s))",
-            worst, costs[worst], chat_ctx, len(chat_sets))
-
-    # 2. emb/rerank squeeze: when chat falls below the tools threshold, the
-    #    RAG models yield context (down to coload_min_ctx) to buy it back.
-    squeeze = False
-    if chat_ctx < knobs.tools_min_ctx:
-        sq_embed = min(embed_ctx, knobs.coload_min_ctx)
-        sq_rerank = min(rerank_ctx, knobs.coload_min_ctx)
-        if (sq_embed, sq_rerank) != (embed_ctx, rerank_ctx):
-            sq_ctx = _solve(sq_embed, sq_rerank)
-            gain = sq_ctx - chat_ctx
-            if gain >= knobs.ctx_gain_min:
-                logger.info(
-                    "matrix: squeeze adopted (embed/rerank -> %d/%d, "
-                    "chat %d -> %d, gain %d)",
-                    sq_embed, sq_rerank, chat_ctx, sq_ctx, gain)
-                chat_ctx, embed_ctx, rerank_ctx = sq_ctx, sq_embed, sq_rerank
-                squeeze = True
-            else:
-                logger.info(
-                    "matrix: squeeze rejected (gain %d < ctx_gain_min %d)",
-                    gain, knobs.ctx_gain_min)
-
-    # 3. Opportunistic co-loads: enabled s2t/image models, smallest first.
-    #    Floor: keep tools_min_ctx for a tools chat model that still has it;
-    #    otherwise min_chat_ctx.  (When the baseline is already below the
-    #    tools threshold, tools are demoted downstream and the floor is the
-    #    co-load floor.)
-    any_tools = any(
-        "tools" in [c.lower() for c in m.capabilities]
-        for m, *_ in chat_params)
-    floor = knobs.tools_min_ctx if (any_tools and chat_ctx >= knobs.tools_min_ctx) \
-        else knobs.min_chat_ctx
-    coloads: list[tuple[str, int]] = []
-    if chat_ctx >= floor:
-        declared_stems = {m.stem for _, m in fixed_categories}
-        used = 0
-
-        def _admit(oh: int, stem: str, declared: bool) -> int | None:
-            """Admit *oh* MB more if chat stays at/above the floor."""
-            nonlocal used
-            ctx = _solve(embed_ctx, rerank_ctx, used + oh)
-            if ctx < floor:
-                return None
-            used += oh
-            if not declared:
-                coloads.append((stem, oh))
-            return ctx
-
-        # 3a. Legacy mode (no routing sets): declared categories are
-        #     reserved first, one at a time; one that does not fit is
-        #     reported and left unreserved.  With sets, categories are
-        #     already inside the set cost tree above — adding them again
-        #     would double-charge and hide the alternatives.
-        if not raw_sets:
-            for name, m in fixed_categories:
-                oh = _coload_overhead(m, fit_bin, profiles, knobs,
-                                      llama_args,
-                                      ctx=ctx_by_cat.get(name))
-                if oh is None:
-                    logger.warning(
-                        "matrix: category %r (%s) skipped: cannot size it",
-                        name, m.stem)
-                    continue
-                ctx = _admit(oh, m.stem, declared=True)
-                if ctx is None:
-                    logger.warning(
-                        "matrix: category %r (%s) does not fit below the "
-                        "chat floor %d; not reserved", name, m.stem, floor)
-                else:
-                    logger.info(
-                        "matrix: category %r (%s) reserved (%d MB, "
-                        "chat_ctx=%d)", name, m.stem, oh, ctx)
-
-        # 3b. Opportunistic co-loads: s2t/image models that are *not* already
-        #     a declared category, smallest fixed overhead first.
-        #     Gated on some set referencing __COLOAD_VARS__: reserving a
-        #     co-load nothing can co-locate charges every chat solve for
-        #     residency that never happens.  Models too big to live beside
-        #     chat belong in __CHAT_VARS__ (they evict chat instead).
-        if not _sets_reference_coloads(coload_sets):
-            logger.info(
-                "matrix: no routing set references __COLOAD_VARS__; "
-                "skipping opportunistic co-loads (they cannot be "
-                "co-located with chat, so reserving their VRAM would only "
-                "shrink context — put them in __CHAT_VARS__ to have them "
-                "evict chat instead)")
-        else:
-            overheads: list[tuple[int, str, Model]] = []
-            for m in chat_models:
-                if m.role not in ("s2t", "image") or m.stem in declared_stems:
-                    continue
-                oh = _coload_overhead(m, fit_bin, profiles, knobs,
-                                      llama_args)
-                if oh is None:
-                    logger.warning("matrix: co-load %s skipped: cannot size it",
-                                   m.stem)
-                    continue
-                overheads.append((oh, m.stem, m))
-            for oh, stem, m in sorted(overheads, key=lambda t: t[0]):
-                ctx = _admit(oh, stem, declared=False)
-                if ctx is None:
-                    logger.warning(
-                        "matrix: co-load %s skipped: would drop chat ctx below "
-                        "the floor %d", stem, floor)
-                else:
-                    logger.info(
-                        "matrix: co-load %s included (%d MB, chat_ctx=%d)",
-                        stem, oh, ctx)
-    return MatrixSolve(
-        chat_ctx=chat_ctx, embed_ctx=embed_ctx, rerank_ctx=rerank_ctx,
-        coloads=tuple(coloads), squeeze=squeeze,
-    )
-
-
-def _coload_overhead(
-    m: Model, fit_bin: str, profiles: Profiles, knobs: MatrixKnobs,
-    llama_args: str = "", ctx: int | None = None,
-) -> int | None:
-    """Fixed VRAM overhead (MB) of a declared category / co-load candidate.
-
-    Uses the backend's effective static params (weights + fixed compute; the
-    KV terms are 0 for these backends) at *ctx* (default: the model's design
-    context, or the role's RAG cap — see :func:`resident_ctx`).  Overheads
-    that are *estimated* rather than measured or pinned carry
-    ``estimate_headroom`` so a bad guess errs toward reserving more.
-    """
-    if m.on_cpu:
-        return 0
-    # An operator-pinned vram_mb is authoritative — no headroom.
-    pinned = m.frontmatter.get("vram_mb") is not None
-    cache_type = m.cache_type_for(profiles.default_cache_type)
-    fp = m.vram.fit_params_static(fit_bin, cache_type=cache_type,
-                                  llama_args=measurement_args(profiles, m,
-                                                              llama_args))
-    measured = pinned or (fp is not None
-                          and fp.source in ("llama-server", "vllm-estimate"))
-    quad = m.vram.effective_static(fit_bin, cache_type=cache_type,
-                                   llama_args=measurement_args(profiles, m,
-                                                               llama_args))
-    if quad is None:
-        return None
-    model_mib, kv_factor, slot_mib, compute_mib = quad
-    # These backends have zero KV terms; nonzero factors would mean a
-    # context-driven model wrongly landed in the pool — charge design ctx.
-    service_ctx = resident_ctx(m, knobs) if ctx is None else ctx
-    overhead = model_mib + compute_mib + int(
-        kv_factor * service_ctx + slot_mib)
-    if not measured:
-        overhead = int(overhead * knobs.estimate_headroom)
-    return overhead
-
-
 # ── Emission ──────────────────────────────────────────────────────────────
 
 
+def _capacity_fields(model: Model, variant: "Variant", pools: dict[str, int],
+                     drive_mbps: int, pp_tps: float,
+                     memory_margin: float) -> dict:
+    """Capacity-router fields for one entry: pools it charges, eviction cost.
+
+    ``capacities`` is what llama-swap enforces; it must carry the same
+    measurement margin the solve used or the router can admit an overcommit.
+    A size-1 pool per scheduling role makes "one served entry per role" a
+    capacity constraint, so the requested model evicts its siblings without
+    any set vocabulary.
+    """
+    caps: dict[str, int] = {}
+    estimate = max(1, int(model.size_mb or 0) + HOST_PROCESS_MIB)
+    if model.on_cpu:
+        if variant.mem_ram_mib is not None and "ram" in pools:
+            caps["ram"] = max(1, int(round(
+                variant.mem_ram_mib * (1.0 + memory_margin))))
+        elif "ram" in pools:
+            caps["ram"] = min(pools["ram"], estimate)
+    else:
+        vram = variant.mem_vram_mib
+        if vram is None:
+            # Unmeasured: the file size plus the process floor. Flagged and
+            # admitted on a guess; the operator supplies derived: terms.
+            if "default" in pools:
+                caps["default"] = min(pools["default"], estimate)
+        elif vram and "default" in pools:
+            caps["default"] = max(1, int(round(
+                vram * (1.0 + memory_margin))))
+        if variant.mem_ram_mib and variant.mem_ram_mib > 0 \
+                and "ram" in pools:
+            caps["ram"] = max(1, int(round(
+                variant.mem_ram_mib * (1.0 + memory_margin))))
+        elif "ram" in pools:
+            caps["ram"] = min(pools["ram"], HOST_PROCESS_MIB)
+    role = model.role
+    if role in pools:
+        caps[role] = 1
+
+    cost = 0.0
+    size_mb = float(model.size_mb or 0)
+    if size_mb > 0 and drive_mbps > 0:
+        cost += size_mb / drive_mbps
+    if model.serves_endpoint(CHAT):
+        pp = None
+        if "pp_tps" in getattr(model, "sidecar_keys", ()):
+            try:
+                pp = float(model.frontmatter.get("pp_tps"))
+            except (TypeError, ValueError):
+                pp = None
+        if pp is None:
+            pp = pp_tps
+        if pp and pp > 0:
+            cost += variant.ctx_size * max(1, variant.parallel) / pp
+    fields = {"evict_cost": max(0, int(round(cost)))}
+    if caps:
+        fields["capacities"] = caps
+    return fields
+
+
 def emit_config(models: list[Model], plan: dict,
-                profiles: Profiles, template_vars: dict) -> EmittedConfig:
+                profiles: Profiles, template_vars: dict, *,
+                capacity_pools: dict[str, int] | None = None,
+                matrix_sets: dict[str, str] | None = None,
+                drive_mbps: int = 100,
+                pp_tps: float = 1000.0,
+                memory_margin: float = _MEMORY_MARGIN,
+                task_ttl: dict[str, int] | None = None) -> EmittedConfig:
     """Render planned :class:`Variant`s into the llama-swap config dict.
 
     Pure transformation — no VRAM math, no I/O. Each variant becomes one
@@ -3288,12 +2290,9 @@ def emit_config(models: list[Model], plan: dict,
     :class:`EmittedConfig` whose ``entry_ids_by_stem`` maps each model stem to
     the ids it produced.
     """
-    catalogue = TaskCatalogue.from_cfg(getattr(profiles, "tasks_cfg", None))
     entries: dict[str, dict] = {}
     owner: dict[str, str] = {}  # entry id → model stem (collision detection)
     ids_by_stem: dict[str, list[str]] = {}
-    category_of: dict[str, str | None] = {}
-    coload_stems: set[str] = set()
     # Per-model tails already used: two profile groups (e.g. different
     # cache_type) can land on the same category+flags, and they still need
     # distinct ids.  The first keeps the stable name; later duplicates append
@@ -3344,7 +2343,8 @@ def emit_config(models: list[Model], plan: dict,
         # serving, it is a change of name, and clients treat the name as
         # identity. The context belongs in the display name and in
         # `metadata.ctx_size`, both of which a client re-reads.
-        tail = ".".join(x for x in (cat_id, flags) if x)
+        tail = "" if not cats else ".".join(
+            x for x in (cat_id, flags) if x)
         disp = f" · {cat}" if cat is not None else ""
         disp += f" {ctx_label(ctx)}"          # display only, never the id
         if flags:
@@ -3355,13 +2355,12 @@ def emit_config(models: list[Model], plan: dict,
         for v in plan.get(model.stem, []):
             view = model.view_for(v.include_mmproj)
             context_length = view.design_context
-            if v.coload:
-                coload_stems.add(model.stem)
             flags = served_flags(view, v.include_mmproj, v.tools_demoted)
             tail, disp = id_and_suffix(v, v.ctx_size, flags)
             tail = unique_tail(model.stem, tail,
                                 f"{v.cache_type}"
                                 f"{'-vis' if v.include_mmproj else ''}")
+            demand = v.task_demands[0] if v.task_demands else None
             entry_id, entry = _build_entry(
                 view, v.parallel, v.cache_type, v.profiles_group,
                 profiles.defaults, template_vars, context_length, v.ctx_size,
@@ -3375,7 +2374,14 @@ def emit_config(models: list[Model], plan: dict,
                 mem_vram_mib=v.mem_vram_mib, mem_ram_mib=v.mem_ram_mib,
                 kv_per_token_mib=v.kv_per_token_mib,
                 vram_note=v.vram_note,
+                ttl=resolve_entry_ttl(
+                    view, demand,
+                    _entry_task_ttl(view, demand, task_ttl),
+                    roles.get(view.role).ttl if roles.get(view.role) else None),
             )
+            entry.update(_capacity_fields(
+                view, v, capacity_pools or {}, drive_mbps, pp_tps,
+                memory_margin))
             if entry_id in entries:
                 raise ValueError(
                     f"duplicate entry id {entry_id!r}: model {model.stem!r} "
@@ -3383,15 +2389,10 @@ def emit_config(models: list[Model], plan: dict,
             entries[entry_id] = entry
             owner[entry_id] = model.stem
             ids_by_stem.setdefault(model.stem, []).append(entry_id)
-            category_of[entry_id] = (v.category.id if v.category else None)
 
-    set_admission = plan.pop(SET_ADMISSION_KEY, {}) or {}
-    host_refused = tuple(sorted(plan.pop(HOST_REFUSED_KEY, ()) or ()))
     config = EmittedConfig(entry_ids_by_stem=ids_by_stem,
-                           coload_stems=sorted(coload_stems),
-                           set_admission=set_admission,
-                           entry_category=category_of,
-                           host_unit_refused=host_refused)
+                           capacity_pools=dict(capacity_pools or {}),
+                           matrix_sets=matrix_sets)
     config["models"] = {
         eid: entries[eid]
         for eid in sorted(entries, key=lambda e: (e.count("."), e))
@@ -3410,34 +2411,18 @@ class EmittedConfig(dict):
     ``EmittedConfig.plain()`` before dumping — a dict subclass would otherwise
     emit a ``!!python/object`` tag); carries ``entry_ids_by_stem`` so callers
     (e.g. matrix-var construction) can map a model to the entry ids it
-    actually produced instead of re-deriving id naming conventions, and
-    ``coload_stems`` — the opportunistically included non-chat models (see
-    ``MatrixSolve``) — for the same purpose.
+    actually produced instead of re-deriving id naming conventions.
     """
 
     def __init__(self, *args, entry_ids_by_stem: dict[str, list[str]] | None = None,
-                 coload_stems: list[str] | None = None,
-                 set_admission: dict | None = None,
-                 entry_category: dict[str, str | None] | None = None,
-                 set_overheads: dict[str, int] | None = None,
-                 host_unit_refused: tuple[str, ...] = (), **kwargs):
+                 capacity_pools: dict[str, int] | None = None,
+                 matrix_sets: dict[str, str] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.entry_ids_by_stem: dict[str, list[str]] = entry_ids_by_stem or {}
-        self.coload_stems: list[str] = coload_stems or []
-        # entry id -> the category it serves (None for the fallback). Carried
-        # because the id names the category, so it is the emitter that knows.
-        self.entry_category: dict[str, str | None] = entry_category or {}
-        # (model stem, category) -> the chat sets that entry may join.
-        self.set_admission: dict[tuple[str, str | None], frozenset[str]] = (
-            set_admission or {})
-        # category var names refused by the host-unit pass (requirement 33).
-        # The emitter dropped their stems; the caller prunes the vectors
-        # and set leaves that named them.
-        self.host_unit_refused: tuple[str, ...] = host_unit_refused
-        # set name -> MiB allocated to that set's co-resident models (emb/rnk
-        # and any fixed categories).  Emitted as a comment above each `sets:`
-        # entry so the config documents its own memory split.
-        self.set_overheads: dict[str, int] = set_overheads or {}
+        self.matrix_sets: dict[str, str] = matrix_sets or {}
+        # Capacity-router pool limits (gpu default, host ram, one size-1
+        # pool per scheduling role). Emitted under routing.router.settings.
+        self.capacity_pools: dict[str, int] = capacity_pools or {}
 
     def plain(self) -> dict:
         return dict(self)
@@ -3521,15 +2506,13 @@ def build_config(
     spare: str | None = None,
     max_context: int | None = None,
     matrix_cfg: dict | None = None,
-    embed_model: Model | None = None,
-    rerank_model: Model | None = None,
-    fixed_categories: list[tuple[str, Model]] | None = None,
-    category_ctx: dict[str, int] | None = None,
     baseline_mb: int = 0,
     min_context: int = _MIN_AGENTIC_CTX,
     min_context_explicit: bool = False,
     memory_margin: float = _MEMORY_MARGIN,
     host_pool_mb: int | None = None,
+    drive_mbps: int = 100,
+    pp_tps: float = 1000.0,
     progress_cb=None,
 ) -> EmittedConfig:
     """Build llama-swap config from list of Model objects.
@@ -3545,12 +2528,7 @@ def build_config(
         vram_total: Total VRAM in MB
         spare: Global spare VRAM string (overridden by profile.spare if present)
         max_context: Hard cap on context length
-        matrix_cfg: Matrix configuration for embed/rerank context solving
-        embed_model: Embedding model (if matrix configured)
-        rerank_model: Reranking model (if matrix configured)
-        fixed_categories: Declared matrix categories beyond the RAG pair
-            (name, model), e.g. tts/stt — reserved as fixed-overhead
-            residents alongside chat and RAG (matrix categories).
+        matrix_cfg: Matrix configuration: the authored sets price the roles
         baseline_mb: Driver/compositor VRAM already in use (added to reserve)
         min_context: Minimum useful context for chat models. When a chat model
             with an mmproj companion cannot reach this WITH vision, the vision
@@ -3571,10 +2549,11 @@ def build_config(
 
     planner = Planner(
         supported, profiles, fit_bin, vram_total,
-        spare=spare, max_context=max_context,
-        matrix_cfg=matrix_cfg, embed_model=embed_model,
-        rerank_model=rerank_model, fixed_categories=fixed_categories,
-        category_ctx=category_ctx,
+        # Keep the raw value: Planner resolves ``defaults.spare``/``--spare``
+        # itself. Passing the resolved MiB would be re-parsed as GB.
+        spare=spare,
+        max_context=max_context,
+        matrix_cfg=matrix_cfg,
         baseline_mb=baseline_mb,
         min_context=min_context, min_context_explicit=min_context_explicit,
         memory_margin=memory_margin,
@@ -3583,9 +2562,15 @@ def build_config(
         progress_cb=progress_cb,
     )
     plan = planner.plan()
-    config = emit_config(supported, plan, profiles, template_vars)
+    matrix_sets = planner.matrix_sets_approved
+    config = emit_config(supported, plan, profiles, template_vars,
+                         capacity_pools=(None if matrix_sets
+                                         else planner.capacity_pools),
+                         matrix_sets=matrix_sets,
+                         drive_mbps=drive_mbps, pp_tps=pp_tps,
+                         memory_margin=memory_margin,
+                         task_ttl=_task_ttl(profiles))
     _verify_no_overallocation(config, plan, supported, planner)
-    config.set_overheads = dict(planner.set_overheads)
     return config
 
 
@@ -3609,66 +2594,14 @@ def _literal_str_representer(dumper, data):
 _LiteralDumper.add_representer(str, _literal_str_representer)
 
 
-def annotate_set_memory(yaml_text: str, set_overheads: Mapping[str, int],
-                        ) -> str:
-    """Insert a ``# <set>: N MiB`` comment above each matrix set.
-
-    PyYAML cannot emit comments, so the already-serialized text is walked:
-    only direct children of the ``sets:`` mapping are annotated (matched by
-    indentation), so a model id or var that happens to share a set's name is
-    never touched.  No-op when there are no priced sets.
-    """
-    if not set_overheads:
-        return yaml_text
-    lines = yaml_text.splitlines()
-    out: list[str] = []
-    in_sets = False
-    sets_indent = -1
-    for line in lines:
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        if stripped == "sets:":
-            in_sets = True
-            sets_indent = indent
-            out.append(line)
-            continue
-        if in_sets:
-            if stripped and indent <= sets_indent:
-                in_sets = False
-            elif stripped and ":" in stripped:
-                key = stripped.split(":", 1)[0].strip().strip("\"'")
-                mb = set_overheads.get(key)
-                if mb is not None:
-                    pad = " " * indent
-                    out.append(f"{pad}# {key}: {mb} MiB allocated to its "
-                               f"co-resident models ({mb / 1024:.2f} GiB)")
-        out.append(line)
-    text = "\n".join(out)
-    return text + "\n" if yaml_text.endswith("\n") else text
-
-
-def dump_yaml(payload: dict, set_overheads: Mapping[str, int] | None = None,
-              ) -> str:
-    """Serialize *payload* to a YAML string, preserving embedded newlines.
-
-    When *set_overheads* is given, each matrix set gains a comment recording
-    the VRAM allocated to its co-resident models.
-    """
-    text = yaml.dump(payload, default_flow_style=False, sort_keys=False,
+def dump_yaml(payload: dict) -> str:
+    """Serialize *payload* to a YAML string, preserving embedded newlines."""
+    return yaml.dump(payload, default_flow_style=False, sort_keys=False,
                      allow_unicode=True, Dumper=_LiteralDumper)
-    return annotate_set_memory(text, set_overheads or {})
 
 
-def write_yaml(config: dict, path: Path | str,
-               set_overheads: Mapping[str, int] | None = None) -> None:
-    """Write config to YAML file.
-
-    *set_overheads* defaults to ``config.set_overheads`` when *config* is an
-    :class:`EmittedConfig`, so callers get the matrix-set memory comments
-    without threading the planner result through by hand.
-    """
-    if set_overheads is None:
-        set_overheads = getattr(config, "set_overheads", None)
+def write_yaml(config: dict, path: Path | str) -> None:
+    """Write config to YAML file."""
     payload = config.plain() if isinstance(config, EmittedConfig) else config
     with open(path, "w") as f:
-        f.write(dump_yaml(payload, set_overheads))
+        f.write(dump_yaml(payload))

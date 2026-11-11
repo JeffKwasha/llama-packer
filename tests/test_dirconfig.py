@@ -15,7 +15,7 @@ import pytest
 
 from llama_packer.model import Model
 from llama_packer.scope import ScopeStack
-from llama_packer.utils import load_dir_config, validate_dir_roles
+from llama_packer.utils import load_dir_config
 
 from conftest import make_model  # noqa: F401  (fixture via pytest, direct import for emit test)
 
@@ -170,22 +170,13 @@ def test_defaults_and_rules_both_support_mmproj_false(tmp_path):
     assert by_stem["r"].mmproj is None
 
 
-# ── validate_dir_roles ─────────────────────────────────────────────────────
-
-def test_validate_dir_roles():
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a directory role must be a known one.
-    assert validate_dir_roles({"ocr": "chat"}) is None
-    err = validate_dir_roles({"ocr": "vision"})
-    assert err and "unknown role" in err
-
-
 # ── Entry-id collision detection ───────────────────────────────────────────
 
 def test_emit_config_duplicate_id_raises(make_model):
     # Validates: SPEC.md, 'Entry ids name the task, not the solve': two
     # sidecars that slug to the same id are a duplicate, and the run
     # stops.
-    from llama_packer.writer import emit_config, Planner
+    from llama_packer.writer import emit_config
 
     # template_id is slug of sidecar stem (not name). Two different stems that
     # slug to the same id are "my model" and "my-model" -> both "my-model".
@@ -195,9 +186,6 @@ def test_emit_config_duplicate_id_raises(make_model):
     class P:
         pass
 
-    plan = Planner.__new__(Planner)  # not used: empty plans per model
-    plan.chat_ctx = None
-    plans = {m.stem: [] for m in (a, b)}
     # Build entries directly through emit_config with one variant each.
     from llama_packer.writer import Variant
     v = Variant(parallel=1, cache_type="q8_0", spare_mb=0,

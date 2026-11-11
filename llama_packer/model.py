@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, ClassVar
 import yaml
 
 from llama_packer import ggufmeta, utils
+from llama_packer.endpoints import CHAT
 from llama_packer.consts import (
     _DEFAULT_CONTEXT_LENGTH,
     _DEFAULT_IMAGE_OUTPUT_RESERVE,
@@ -60,7 +61,7 @@ def _ref_name(ref) -> str:
 _CL_RE = re.compile(r"^context_limit_\d+G$")
 
 # The single dynamically generated sidecar branch. Machine-measured values
-# (fit-params VRAM numbers, file intrinsics) live here and only here;
+# (fit-params VRAM numbers, file intrinsics) are defined here and only here;
 # everything else in the sidecar is authored. ``fit-params`` is the legacy
 # name, still read as a fallback but never written.
 MEASURED_KEY = "derived"
@@ -321,6 +322,8 @@ class Model:
     _stat_sig: tuple[int, int] | None = None  # (size, mtime_ns) at registration
     _file: Model | None = None  # canonical file delegate (self when sidecar-less)
     _header: object = None  # lazy parsed header (subclass fills on demand)
+    #: Tasks the sidecar declares, resolved by discovery before companions.
+    tasks_resolved: tuple = ()
 
     # Global registry: claimed weight files → owning Model. The key is the
     # weight's realpath (and dev:ino for hardlinks) so a sidecar with an
@@ -589,7 +592,7 @@ class Model:
         "role", "allow_profiles", "capabilities", "tasks",
         "ignore", "device", "concurrency", "derived", "fit-params", "measured", "vllm_image",
         "modes", "default_mode", "reasoning-format", "reasoning-preserve",
-        "cache_type", "parallel", "min_context",
+        "cache_type", "parallel", "min_context", "pp_tps", "ttl",
         "usage", "allow_mtp_shed",
         "image_min_tokens", "image_max_tokens",
         "min_image_megapixels", "image_output_reserve",
@@ -799,7 +802,7 @@ class Model:
             # mmproj_stripped (stem without 'mmproj.*' + quant/version) must be
             # prefix of model stem.
             # Rerank/embeddings (and image/s2t/t2s) never auto-attach vision.
-            if self.hf_repo and self.role not in utils.NON_CHAT_ROLES:
+            if self.hf_repo and not self.serves_endpoint(CHAT):
                 snap, _ = self._finder.snapshot_files(
                     self.hf_repo, self._hf_home)
                 # Auto only when model is inside its snapshot directory
@@ -966,8 +969,6 @@ class Model:
         models_dirs,
         *,
         generate_stubs: bool = True,
-        extra_dirs: list[str] | None = None,
-        dir_roles: dict | None = None,
         hf_home=None,
         stack=None,
     ) -> list[Model]:
@@ -982,8 +983,7 @@ class Model:
         """
         from llama_packer.discover import discover
         return discover(models_dirs, stack=stack,
-                        generate_stubs=generate_stubs, extra_dirs=extra_dirs,
-                        dir_roles=dir_roles, hf_home=hf_home)
+                        generate_stubs=generate_stubs, hf_home=hf_home)
 
     @property
     def vram(self) -> VramBudget:
@@ -1028,7 +1028,7 @@ class Model:
             ctx = int(self.frontmatter.get(
                 "context_length", _DEFAULT_CONTEXT_LENGTH
             ))
-        if ctx < _MIN_CTX_SIZE and self.role == "chat" \
+        if ctx < _MIN_CTX_SIZE and self.serves_endpoint(CHAT) \
                 and self.stem not in _warned_sub4k:
             _warned_sub4k.add(self.stem)
             logger.warning(
@@ -1403,11 +1403,10 @@ class Model:
         self,
         profile: dict | None,
         fleet: dict | None,
-        role_defaults: tuple[int | None, int | None],
     ) -> tuple[int | None, int | None]:
         """Resolved ``(batch, ubatch)`` for the serve command and the VRAM
         measurement shape — sidecar ``batch:``/``ubatch:`` > profile keys >
-        fleet ``llama_server: batch:/ubatch:`` > role defaults.  Each half
+        fleet ``llama_server: batch:/ubatch:``.  Each half
         resolves independently.  ``None`` means "nothing configured": the
         backend renders no flag and the engine's own builtin applies.  A
         malformed value is warned about and falls through to the next tier
@@ -1437,12 +1436,12 @@ class Model:
         fleet = fleet or {}
         batch = tier(fm.get("batch"),
                      tier(profile.get("batch"),
-                          tier(fleet.get("batch"), role_defaults[0], "batch"),
+                          tier(fleet.get("batch"), None, "batch"),
                           "batch"),
                      "batch")
         ubatch = tier(fm.get("ubatch"),
                       tier(profile.get("ubatch"),
-                           tier(fleet.get("ubatch"), role_defaults[1], "ubatch"),
+                           tier(fleet.get("ubatch"), None, "ubatch"),
                            "ubatch"),
                       "ubatch")
         return batch, ubatch
@@ -1514,14 +1513,14 @@ class Model:
             return dm
         return next(iter(modes))
 
+    def serves_endpoint(self, endpoint: str) -> bool:
+        """True when any declared task is served at *endpoint*."""
+        return any(getattr(t, "endpoint", None) == endpoint
+                   for t in self.tasks_resolved)
+
     @property
     def role(self) -> str:
-        """The scheduling role this model's tasks imply.
-
-        Falls back to the role discovery injected from the directory (or a
-        legacy ``role:`` key) for a model that declares no tasks. Defaults to
-        ``chat``.
-        """
+        """The role discovery assigned: its owning tree, or a sidecar ``role:``."""
         return str(self.frontmatter.get("role") or "chat")
 
     @property
@@ -1619,24 +1618,17 @@ class Model:
 
     @property
     def on_cpu(self) -> bool:
-        """True when the model is CPU-resident (`device: cpu` in frontmatter)."""
-        return str(self.frontmatter.get("device", "")).strip().lower() == "cpu"
+        """True when the model is served on the CPU (`device: cpu`)."""
+        return utils.parse_device(self.frontmatter.get("device"))[0] == "cpu"
 
     @property
     def device(self) -> int | None:
         """Explicit GPU device index (for multi-GPU pinning), if declared.
 
-        Returns None for CPU-resident models (`device: cpu`).
+        Returns None for CPU-served models (`device: cpu`).
         """
-        if self.on_cpu:
-            return None
-        v = self.frontmatter.get("device")
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
+        value = utils.parse_device(self.frontmatter.get("device"))[0]
+        return value if isinstance(value, int) else None
 
     @property
     def concurrency(self) -> int | None:
@@ -1682,8 +1674,8 @@ class Model:
     def view_for(self, include_mmproj: bool) -> Model:
         """Frontmatter view for a serving variant.
 
-        The companion-off variant is this model itself: overlay keys live
-        only inside the mmproj block, so the base frontmatter already
+        The companion-off variant is this model itself: overlay keys are
+        found only inside the mmproj block, so the base frontmatter already
         describes serving without the companion.  The companion-on variant
         is a cached shallow copy with the block merged over the frontmatter
         (single merge rule); resolved files are shared, the VRAM budget is

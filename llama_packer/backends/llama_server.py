@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from llama_packer.backends.base import BaseBackend
 from llama_packer.endpoints import ENGINE_ENDPOINTS
+from llama_packer import endpoints as eps
 from llama_packer import utils
 from llama_packer.consts import _MTP_SPEC_TYPE, _SINGLE_SLOT_SPEC_TYPES
 
@@ -36,44 +37,12 @@ class LlamaServerBackend(BaseBackend):
     })
     host_requires = frozenset({"llama_bin"})
 
-    # Per-role server-mode flags, appended after the shared core arguments.
-    # The batch half is first-class planning (``batch:``/``ubatch:``; see
-    # :meth:`default_batch_ubatch`): ``-ub`` sets the per-pass
-    # activation/logits buffer (~6 MiB per token on Vulkan, dominated by the
-    # vocab-sized logits rows) — -ub 4096 cost ~2.9 GiB of compute buffer per
-    # model where 512 costs ~0.3 GiB with no measurable throughput difference
-    # (2026-09-08).
-    _ROLE_FLAGS = {
-        "embeddings": "--embedding --embd-normalize 2",
-        "rerank": "--rerank --pooling rank",
+    # Server-mode flags, appended after the shared core arguments and chosen
+    # by the endpoint the entry serves, not by a role label.
+    _ENDPOINT_FLAGS = {
+        eps.EMBEDDINGS: "--embedding --embd-normalize 2",
+        eps.RERANK: "--rerank --pooling rank",
     }
-
-    # (batch, ubatch) per role when nothing is configured.  ``None`` renders
-    # nothing, so llama.cpp's own builtin stands (verified against the local
-    # build: ``-b`` 2048, ``-ub`` 512) and a future upstream default change
-    # is picked up for free.
-    #
-    # embed/rerank no longer pin a batch depth, because the value they pinned
-    # was never in effect.  llama-server forces ``n_batch = n_ubatch`` when
-    # embeddings are enabled, logging
-    #
-    #     embeddings enabled with n_batch (4096) > n_ubatch (512)
-    #     setting n_batch = n_ubatch = 512 to avoid assertion failure
-    #
-    # so a declared 4096 is silently replaced by the ubatch before a single
-    # token is processed: 4096 was a number in the config and nothing else.
-    # The physical batch is the one that decides embedding throughput, and
-    # that is ``ubatch`` — pinned fleet-wide in profiles.yaml, and measured
-    # (llama-bench, this host): 512 doubles prompt throughput over 256 and
-    # 1024 adds nothing.
-    _ROLE_BATCH: dict[str, tuple[int | None, int | None]] = {
-        "chat": (None, None),
-        "embeddings": (None, None),
-        "rerank": (None, None),
-    }
-
-    def default_batch_ubatch(self, role: str) -> tuple[int | None, int | None]:
-        return self._ROLE_BATCH.get(role, (None, None))
 
     def _mtp_args(self, model: "Model", parallel: int = 1) -> tuple[list[str], dict]:
         """Speculative-decoding flags plus metadata contributions."""
@@ -153,7 +122,9 @@ class LlamaServerBackend(BaseBackend):
         # which is why cli_args -b/-ub is warned about).  Each half renders
         # independently and only when set: an unset key means "use llama.cpp's
         # own default", so the flag is left off the command entirely.
-        role_flags = self._ROLE_FLAGS.get(model.role, "")
+        role_flags = " ".join(
+            flag for ep, flag in self._ENDPOINT_FLAGS.items()
+            if model.serves_endpoint(ep))
         if batch is not None:
             role_flags += f" -b {batch}"
         if ubatch is not None:
@@ -179,7 +150,7 @@ class LlamaServerBackend(BaseBackend):
             "--cache-type-v", cache_type,
         ]
         # llama-server defaults --n-gpu-layers to "auto" (offload all);
-        # only pin "0" for CPU-resident models.
+        # only pin "0" for CPU-served models.
         if model.on_cpu:
             flags += ["--n-gpu-layers", "0"]
 
@@ -200,7 +171,7 @@ class LlamaServerBackend(BaseBackend):
             flags += ["--lora", ",".join(str(l) for l in loras)]
 
         # Reasoning flags are only meaningful for chat models.
-        if model.role == "chat":
+        if model.serves_endpoint(eps.CHAT):
             rf = model.reasoning_format
             if rf is not None:
                 flags += ["--reasoning-format", rf]

@@ -1,9 +1,22 @@
 # Plan: CPU-residency budget — a host-RAM pool for `device: cpu` models
 
-Status: **shipped** — portions 1–2 in PR #4 (2026-10-30); portion 3 moved to
-[`tasks-and-endpoints.md`](tasks-and-endpoints.md). Recorded 2026-10-23.
-Related: `docs/plans/memory-allocation-tags.md` (§3 measured host
-RAM — this plan is its minimal form), `docs/plans/opportunistic-coload.md`
+Status: **shipped** — portions 1–2 landed 2026-10-30; portion 3 was
+superseded by capacity routing. Recorded 2026-10-23.
+**Amended 2026-11-07:** the "never evicted, `ttl: 0`, joined every chat set"
+rule is retired. CPU models charge the capacity `ram` pool and are evicted
+under pressure like any other resident; a non-chat helper defaults to
+`ttl: 3600`. See `SPEC.md` §Host pool / §Capacity routing.
+`matrix.sets` now selects matrix mode (SPEC §Capacity routing); capacity
+prices each role directly. The set composition section and the host-ledger
+unit judgement below are history:
+each fixed CPU category is judged on its own quad against what is free
+after the committed pair (requirement #70).
+**Amended 2026-11-11:** `HostLedger` is retired. A CPU model now solves its
+context down inside its role's `ram` allocation — `floor + share ×
+(available − floor)` — exactly like a GPU model inside `default`; the
+go/no-go passages below are history. See `docs/allocation.md` §Capacity.
+Related: the retired memory-tag plan (§3 measured host RAM — this plan is
+its minimal form), `docs/plans/opportunistic-coload.md`
 (CPU-resident coload at 0 GPU cost, today's rule),
 [`roadmap.md`](roadmap.md) (followers and open defects this plan produced),
 `SPEC.md` §VRAM Allocation, `llama_packer/{vram,hardware,writer,model}.py`.
@@ -11,9 +24,9 @@ RAM — this plan is its minimal form), `docs/plans/opportunistic-coload.md`
 ## Problem
 
 The planner's budget is VRAM-only. A sidecar `model.md` may declare
-`device: cpu` (`model.py:1602`), and the current treatment is "not VRAM's
+`device: cpu`, and the current treatment is "not VRAM's
 problem": excluded from every VRAM solve, charged 0 by
-`_resident_overhead` (`writer.py:2130`), sized to design context. Nothing
+`_resident_overhead`, sized to design context. Nothing
 checks *whether host RAM can actually hold it*. The operator's existing
 statement is only `MemoryMax` on llama-swap.service — a cgroup fuse, not a
 planner decision. Goal: the class of sidecars the tool serves — `device: cpu`
@@ -25,7 +38,7 @@ path).
 
 1. **No automatic CPU anywhere.** `device: cpu` frontmatter is the only
    gate; no profile-level master switch, no solver descent to full CPU, no
-   fallback auto-offload. (`model.py`, `vram.py:898` honor the explicit gate
+   fallback auto-offload. (`model.py`, `vram.py` honor the explicit gate
    already; nothing else may set it.)
 2. **One co-resident per role** (STT, TTS, embed, rerank): sized variants of
    the same role must never co-reside; the resident winner per role is
@@ -190,13 +203,12 @@ residents, and the GPU side is free either way.
 
 ### Portions
 
-Portions 1–2 shipped in PR #4: recursive set pricing and the canonical CPU
+Portions 1–2 shipped: recursive set pricing and the canonical CPU
 pin, then composition validation, per-category `ctx:` and host-ledger unit
 judgement. Their requirements are citable in
 [`requirement-trace.md`](requirement-trace.md); the rules they produced are
-in `SPEC.md` §VRAM Allocation. Portion 3 (solver generalisation) moved to
-[`tasks-and-endpoints.md`](tasks-and-endpoints.md) D12 — the solver consumes
-that branch's vocabulary, so generalising it here would be rewritten.
+in `SPEC.md` §VRAM Allocation. Portion 3 (solver generalisation) is superseded by the capacity router;
+the solver consumes the current vocabulary (SPEC.md §Capacity routing).
 
 ## Host pool equation
 
@@ -256,7 +268,7 @@ the `--n-gpu-layers 0` pin rides the `shape` stamp, so a sidecar
 `device:` flip invalidates the block by shape (a device flip re-measures
 for the other budget) instead of needing a parallel host block family.
 Nothing second-guesses the measurement: tag/report rules per
-`memory-allocation-tags.md` v1 contract apply verbatim.
+the v1 memory-tag contract applies verbatim (SPEC.md §Metadata).
 
 `llama-fit-params` acceptance of extra flags (`llama_args` passthrough
 in `fit_params`) is already sufficient for both shapes — no new tool;
@@ -457,7 +469,7 @@ branch 2).
 
 ## `metadata.packing` (client-visible facts; branch-1/2 shared site)
 
-One structured dict emitted by `_build_entry` (`writer.py:440-545`) for every
+One structured dict emitted by `_build_entry` for every
 entry; only facts that were *decided* at pack time:
 
 ```yaml
@@ -538,5 +550,5 @@ probe), vLLM host offload, and unified-memory pools (GB10).
 
 Moved to [`roadmap.md`](roadmap.md) §Open defects: the `fit-params crashed
 (exit 1)` first-measurement warnings (with the 2026-10-30 evidence), and the
-PR #4 body's stale vocabulary section, which `tasks-and-endpoints.md`
-supersedes.
+the retired vocabulary section; SPEC.md and docs/architecture.md are
+the current contract.

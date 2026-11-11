@@ -1,7 +1,7 @@
 # tests/test_utils_paths.py
 """Contract tests for filesystem/version helpers in utils.
 
-Design parts: SPEC.md, 'llama.cpp Build Selection' — the tools/ layout (engines live
+Design parts: SPEC.md, 'llama.cpp Build Selection' — the tools/ layout (engines sit
 in <run dir>/tools), the build-number resolution, and the drive-speed
 classification that bounds a load-time estimate.
 """
@@ -128,7 +128,6 @@ def test_find_bin_dir_latest_with_no_builds_exits(tmp_path, monkeypatch):
 # ── get_model_size_mb ─────────────────────────────────────────────────────
 
 def test_get_model_size_mb_rounds_down(tmp_path):
-    # Validates: docs/plans/memory-allocation-tags.md, 'v1 contract (shipped)': the size is whole MiB, rounded down.
     f = tmp_path / "m.bin"
     f.write_bytes(b"x" * (2 * 1024 * 1024 + 5))
     assert utils.get_model_size_mb(str(f)) == 2

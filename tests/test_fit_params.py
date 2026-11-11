@@ -116,7 +116,6 @@ def test_to_dict_records_shape():
 
 
 def test_vram_mib_affine_prediction():
-    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': the law is model + compute + c*pool + p*D, with the pool per slot times slots.
     fp = FitParams(18114, 0.0332, 150.0, 505, "llama-server", "q8_0")
     # The law: model + compute + c*pool + p*D, pool = per-slot * slots.
     assert fp.vram_mib(ctx_per_slot=32768, parallel=8) == int(
@@ -128,7 +127,6 @@ def test_vram_mib_affine_prediction():
 # ── invariant (shape-independent) terms ────────────────────────────────────
 
 def test_invariant_from_dict_ignores_shape():
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': saved_for(cache_type, shape) rejects blocks whose shape differs
     block = make_block(shape="--flash-attn on -ub 512", source="fit-estimate")
     assert FitParams.invariant_from_dict(block, "q8_0") == (
         10000, 0.5, 0.0, "fit-estimate")
@@ -164,7 +162,6 @@ def test_from_dict_still_rejects_shape_mismatch():
 # ── weight term from the GGUF header ────────────────────────────────────────
 
 def test_weight_mib_prefers_tensor_bytes(make_model):
-    # Validates: docs/plans/vram-estimation-target-context-plan.md, 'C3 — Fix the weight term at the source (highest leverage)': the header's own tensor footprint wins; the estimate is the floor
     model = make_model("w", context_length=32768)
     write_gguf(model.gguf_path, tensor_names=["w.weight"],
                tensor_shape=(2048, 1024))
@@ -176,7 +173,6 @@ def test_weight_mib_prefers_tensor_bytes(make_model):
 
 def test_fit_params_static_reuses_invariant_on_shape_change(
         make_model, monkeypatch):
-    # Validates: docs/plans/vram-estimation-target-context-plan.md, 'C7 — Split shape-invariant from shape-dependent constants': the shape-invariant constants are split from the shape-dependent ones
     model = make_model(
         "c7", context_length=32768,
         derived={
@@ -201,7 +197,6 @@ def test_fit_params_static_reuses_invariant_on_shape_change(
 
 def test_fit_params_static_shape_change_without_invariant(
         make_model, monkeypatch):
-    # Validates: docs/plans/vram-estimation-target-context-plan.md, 'C7 — Split shape-invariant from shape-dependent constants': the shape-invariant constants are split from the shape-dependent ones
     model = make_model(
         "c7b", context_length=32768,
         derived={

@@ -4,7 +4,7 @@ Background VRAM usage varies on a timescale of **days**, not minutes, and it
 is asymmetric: loading a model file takes minutes (platter read) and a
 browser/desktop footprint drifts up over hours, but release is fast and the
 result then hangs at a plateau for a long time.  A short sample therefore
-cannot separate the always-resident *base* (driver + compositor + scanout)
+cannot separate the always-present *base* (driver + compositor + scanout)
 from the *variable* envelope the operator must cover with ``--spare`` — and a
 fast cadence would not help, because the peaks are long-lived.
 

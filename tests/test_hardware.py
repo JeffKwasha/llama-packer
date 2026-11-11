@@ -50,7 +50,7 @@ def _proc_fixture(monkeypatch, tmp_path, *, zoneinfo=_ZONEINFO,
 
 
 def test_pressure_zone_from_zoneinfo(monkeypatch, tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #7 -- sysctl arm: per-zone high sum, min_free_kbytes floor.
+    # Validates: docs/plans/requirement-trace.md, requirement #71
     """The zone `high` sum feeds the sysctl arm, raised to the
     min_free_kbytes floor when the watermark sum is lower."""
     # 300 kB of high-watermarks < the 1024 kB floor → the floor wins.
@@ -69,7 +69,7 @@ def test_pressure_zone_from_zoneinfo(monkeypatch, tmp_path, caplog):
 
 
 def test_pressure_zone_fallback_is_logged(monkeypatch, tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #7 -- missing/zeroed zoneinfo falls back to 25% of total, logged.
+    # Validates: docs/plans/requirement-trace.md, requirement #71
     """unreadable zoneinfo is the declared fallback trigger: 25% of total,
     and the log names the arm — a silent fallback is a bug."""
     _proc_fixture(monkeypatch, tmp_path, zoneinfo="no zones here\n")
@@ -81,7 +81,7 @@ def test_pressure_zone_fallback_is_logged(monkeypatch, tmp_path, caplog):
 
 
 def test_pressure_zone_override_asserted(monkeypatch, tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md #7 -- hardware.host_pressure: sysctl | 25% | <abs>.
+    # Validates: docs/plans/requirement-trace.md, requirement #71
     _proc_fixture(monkeypatch, tmp_path)
     hp = HostProfile.detect(yaml_hw={"host_pressure": "4G"})
     assert hp.pressure_zone_mb == 4096
@@ -93,7 +93,7 @@ def test_pressure_zone_override_asserted(monkeypatch, tmp_path):
 
 
 def test_host_pool_mixed_terms(monkeypatch, tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md #10 -- host_pool = min(sys_free, cgroup_free).
+    # Validates: docs/plans/requirement-trace.md, requirement #72, #73
     """Both terms bind: the pool is the smaller of sys_free and the
     service cgroup headroom."""
     _proc_fixture(monkeypatch, tmp_path)
@@ -112,7 +112,7 @@ def test_host_pool_mixed_terms(monkeypatch, tmp_path):
 
 
 def test_host_pool_overrides_arm(monkeypatch, tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md #10 -- hardware.host_pool: auto | <abs> | <frac>%.
+    # Validates: docs/plans/requirement-trace.md, requirement #72
     _proc_fixture(monkeypatch, tmp_path)
     hp = HostProfile.detect(yaml_hw={"host_pool": "16G"})
     assert hp.pool_mb == 16 * 1024
@@ -124,7 +124,7 @@ def test_host_pool_overrides_arm(monkeypatch, tmp_path):
 
 
 def test_cgroup_missing_service_skips_term(monkeypatch, tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #9 -- no service cgroup skips the term with a warning.
+    # Validates: docs/plans/requirement-trace.md, requirement #73
     _proc_fixture(monkeypatch, tmp_path)
     with caplog.at_level("WARNING"):
         hp = HostProfile.detect(stable=False)
@@ -135,7 +135,7 @@ def test_cgroup_missing_service_skips_term(monkeypatch, tmp_path, caplog):
 
 
 def test_host_pool_clamps_to_zero(monkeypatch, tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md #10 -- an infeasible read clamps the pool to 0, never invents.
+    # Validates: docs/plans/requirement-trace.md, requirement #70
     """sys_free may go negative (requirement 8); the POOL is where the
     floor lives — a squeezed box plans no CPU models rather than a
     negative budget."""

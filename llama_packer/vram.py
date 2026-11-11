@@ -1,8 +1,7 @@
 """VRAM budget calculation: affine memory measurement, context sizing, and
 matrix solving.
 
-The VRAM law (validated across families; see llama_packer.memory_probe
-and docs/plans/auto-parallel.md):
+The VRAM law (validated across families; see llama_packer.memory_probe):
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 
@@ -113,20 +112,20 @@ _BREAKDOWN_RE = re.compile(r"\| memory breakdown \[MiB\] \|")
 
 
 def _is_device_buffer(dev: str) -> bool:
-    """True when *dev* names device-resident memory (not host-visible)."""
+    """True when *dev* names device memory (not host-visible)."""
     return not (dev.endswith("_Host") or dev.startswith("CPU")
                 or "Mapped" in dev)
 
 
 def parse_device_buffers(log_text: str) -> dict[str, float]:
-    """Sum device-resident buffer lines of a llama-server ``-lv 5`` log.
+    """Sum device-memory buffer lines of a llama-server ``-lv 5`` log.
 
     Returns MiB per component: ``weights`` (max across load passes — the
     final pass reports real numbers, earlier fit-projection passes may
     print 0 under on-demand loading), ``kv``, ``rs``, ``compute`` and
     ``output`` (sums across every context the process created: the main
     context plus the MTP draft context when one is built).  Host-visible
-    buffers (``Vulkan_Host``, ``CPU_Mapped``) are excluded: they live in
+    buffers (``Vulkan_Host``, ``CPU_Mapped``) are excluded: they sit in
     GTT/system RAM, not VRAM — see :func:`parse_spill_mib` for when that
     exclusion makes a measurement invalid.
     """
@@ -353,7 +352,7 @@ def _wait_ready(
 _SHAPE_SOURCES = frozenset({"llama-server", "fit-estimate", "fit-params"})
 
 #: Serve-device pin inside a measurement shape: ``measurement_args`` stamps
-#: it for CPU-resident models, so a device flip (sidecar edit) invalidates
+#: it for CPU-served models, so a device flip (sidecar edit) invalidates
 #: the persisted block by shape instead of reusing the other budget's quads.
 _NGL_SHAPE_RE = re.compile(r"--n-gpu-layers|-ngl\b")
 
@@ -597,11 +596,11 @@ class VramBudget:
         #: Set when the budget cannot even hold weights + compute (the model
         #: cannot load at any context) — the planner disables the entry.
         #: ``None`` when the budget fits; reset at the top of every
-        #: ``calc_ctx`` call so each solve reports its own budget.
+        #: ``solve_context`` call so each solve reports its own budget.
         self.over_budget_reason: str | None = None
         #: Set when the design context did not fit and the solve fell back to
         #: a smaller context — the planner stamps a description note.
-        #: Reset alongside ``over_budget_reason`` on every ``calc_ctx`` call.
+        #: Reset alongside ``over_budget_reason`` on every ``solve_context`` call.
         self.vram_squeezed: bool = False
 
     # ── saved fit-params from frontmatter ──
@@ -848,7 +847,7 @@ class VramBudget:
         below would reject every such run as host-KV spill.
 
         Guardrails (2026-09-07 contamination post-mortem): the pre-flight
-        refuses to measure beside a resident llama process; the child
+        refuses to measure beside a running llama process; the child
         runs in its own process group and dies on every exit path; a hung
         load is abandoned at the stall window, not the full timeout; and
         a run whose weights/KV/RS spilled to host-visible memory is
@@ -863,13 +862,13 @@ class VramBudget:
 
         if self.model.gguf_path is None:
             return None
-        residents = gpu_state.llama_residents()
-        if residents:
+        running = gpu_state.llama_processes()
+        if running:
             self._warn_once(
-                "VRAM measurement refused for %s — llama processes "
-                "resident: %s", self.model.stem, "; ".join(residents[:3]))
+                "VRAM measurement refused for %s — llama processes already "
+                "running: %s", self.model.stem, "; ".join(running[:3]))
             gpu_state.journal({"mode": "serve", "model": self.model.stem,
-                               "outcome": "refused-residents"})
+                               "outcome": "refused-processes"})
             return None
 
         cmd = [
@@ -1112,20 +1111,20 @@ class VramBudget:
         shape-bound, so a profiles/batch-key change re-measures instead of
         reusing stale compute terms.  ``remeasure`` (CLI ``--remeasure``)
         skips the saved-block path entirely.  ``allow_cpu`` measures
-        CPU-resident models too (their constants describe host RAM, used
+        CPU-served models too (their constants describe host RAM, used
         for the emitted memory tag — never for VRAM sizing); without it
-        CPU-resident models return None as before.
+        CPU-served models return None as before.
         """
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Fixed-overhead backends are sized from file size + a fixed
-            # buffer (effective_static); CPU-resident models are not
+            # buffer (effective_static); CPU-served models are not
             # VRAM-bound.  Neither has meaningful FitParams.
             return None
         if getattr(self.model, "on_cpu", False) and not allow_cpu:
-            # CPU-resident models are not VRAM-bound (see allow_cpu).  This
+            # CPU-served models are not VRAM-bound (see allow_cpu).  This
             # guard must precede the cache read: a host-RAM measurement
-            # (allow_cpu=True, the host ledger) caches the same quad, and
-            # returning it here would charge a CPU resident VRAM again.
+            # (allow_cpu=True, the CPU budget) caches the same quad, and
+            # returning it here would charge a CPU-served model VRAM again.
             return None
         shape = (llama_args or "").strip()
         if (cache_type, shape) in self._static_cache:
@@ -1346,7 +1345,7 @@ class VramBudget:
         serve-shaped measurement — those blocks are measured with the
         draft running and already carry it.  ``allow_cpu`` is passed
         through to :meth:`fit_params_static` (host-RAM constants for the
-        emitted memory tag on CPU-resident models).
+        emitted memory tag on CPU-served models).
 
         *include_draft* is the ladder's ``draft`` axis: a category may keep
         an MTP companion or give it up to buy context. A draft baked into
@@ -1361,7 +1360,7 @@ class VramBudget:
         # VRAM = weights (file size, 0 when baked into a container image) + a
         # fixed runtime buffer, no KV terms.  These are excluded
         # from the shared chat matrix, so precise factors are irrelevant;
-        # calc_ctx returns design_ctx when kv_per_token_mib==0.
+        # solve_context returns design_ctx when kv_per_token_mib==0.
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Operator-pinned total VRAM (`vram_mb` in the sidecar) is the
             # sizing: it *is* the fixed overhead, no measurement or estimate.
@@ -1432,7 +1431,7 @@ class VramBudget:
 
     # ── context calculation ──
 
-    def calc_ctx(
+    def solve_context(
         self,
         vram_total_mb: int,
         fit_bin: str,
@@ -1461,18 +1460,13 @@ class VramBudget:
         measurement residual).  ``llama_args`` are the profiles global
         server flags the measurement mirrors (flash attention, batch).
         """
-        # CPU-resident models (--n-gpu-layers 0) are not VRAM-bound, so size
-        # them to their own architectural/sidecar context limit rather than the
-        # (possibly tiny) GPU budget, which would otherwise shrink them.
-        if self.model.on_cpu:
-            return self._design_ctx()
-
         # Each solve reports its own budget: clear the gating flags so a
         # tight group's verdict does not leak into a looser group's plan.
         self.over_budget_reason = None
         self.vram_squeezed = False
 
-        reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
+        reserve = (0 if self.model.on_cpu
+                   else _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb))
         available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
 
         if available <= 0:
@@ -1489,7 +1483,7 @@ class VramBudget:
         static = self.effective_static(
             fit_bin, cache_type=cache_type,
             design_ctx=design, include_mmproj=include_mmproj,
-            include_draft=include_draft,
+            include_draft=include_draft, allow_cpu=True,
             llama_args=llama_args,
         )
 
@@ -1557,8 +1551,10 @@ class VramBudget:
                 f"weights + {parallel} slot(s) leave {int(remaining)} MiB, "
                 f"which buys {max_ctx} context tokens — below the "
                 f"{_MIN_CTX_SIZE} minimum")
-            logger.warning("%s: cannot serve — %s", self.model.stem,
-                           self.over_budget_reason)
+            # One rejected slot count, not a verdict on the model: the
+            # planner may still find a feasible one. The caller reports the
+            # model only when no candidate fits.
+            logger.info("%s: %s", self.model.stem, self.over_budget_reason)
             return 0
         ctx = (max_ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
         ctx = max(ctx, _MIN_CTX_SIZE)
@@ -1666,108 +1662,3 @@ class VramBudget:
         writes the dynamic ``derived:`` branch.
         """
         self.model.persist_measured(params.to_dict())
-
-
-# ── Module-level: matrix context solver ──────────────────────────────────
-
-
-def solve_matrix_ctx(
-    vram_total_mb: int,
-    spare_mb: int,
-    chat_models: list[tuple[Model, int, float, float, int, int, int]],
-    embed_params: tuple[int, float, float, int] | None,
-    rerank_params: tuple[int, float, float, int] | None,
-    embed_ctx: int = 0,
-    rerank_ctx: int = 0,
-    baseline_mb: int = 0,
-    fixed_overhead_mb: int = 0,
-    memory_margin: float = 0.0,
-) -> int:
-    """Solve the shared per-slot chat context under the affine VRAM law.
-
-    The VRAM budget for a co-resident group sharing one per-slot context X:
-
-        available = Σ_i (model_i + compute_i + c_i*(p_i*X) + p_i*D_i)
-                  + (embed_weight + embed_factor*embed_ctx + embed_slots)
-                  + (rerank_weight + rerank_factor*rerank_ctx + rerank_slots)
-
-    Args:
-        vram_total_mb: Total VRAM in MB
-        spare_mb: Reserved VRAM in MB
-        chat_models: List of (model, model_mib, kv_per_token_mib, slot_mib,
-            compute_mib, parallel, image_floor_tokens) — the floor being
-            ``image_max_tokens`` per slot for served vision, 0 otherwise
-        embed_params: (model_mib, kv_per_token_mib, slot_mib, compute_mib)
-            for embedder (runs at its own parallel count)
-        rerank_params: same, for reranker
-        embed_ctx: Requested per-slot context for embedding model
-        rerank_ctx: Requested per-slot context for reranking model
-        baseline_mb: Driver/compositor VRAM already in use (added to the reserve)
-        fixed_overhead_mb: Extra fixed VRAM held by opportunistic co-loads
-            (subtracted from the chat budget before solving)
-        memory_margin: Fraction inflated against every measured term
-
-    Returns:
-        Maximum shared per-slot chat context in tokens (rounded to
-        _CTX_ROUND_TO)
-    """
-    reserve = _RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)
-    available = (vram_total_mb - reserve - spare_mb) / (1.0 + memory_margin)
-
-    embed_overhead = 0
-    if embed_params and embed_ctx > 0:
-        e_mib, e_factor, e_slots, e_compute = embed_params
-        embed_overhead = e_mib + e_compute \
-            + int(e_factor * embed_ctx + e_slots)
-
-    rerank_overhead = 0
-    if rerank_params and rerank_ctx > 0:
-        r_mib, r_factor, r_slots, r_compute = rerank_params
-        rerank_overhead = r_mib + r_compute \
-            + int(r_factor * rerank_ctx + r_slots)
-
-    remaining_for_chat = available - embed_overhead - rerank_overhead \
-        - fixed_overhead_mb
-    if remaining_for_chat <= 0:
-        return _MIN_CTX_SIZE
-
-    best_ctx = 0
-    for model, model_mib, kv_factor, slot_mib, compute_mib, parallel, \
-            img_floor in chat_models:
-        if kv_factor <= 0:
-            # Unestimable rider (zero-cost placeholder): it rides whatever
-            # the measurable models afford and must not set the shared bar
-            # — its native max would inflate chat_ctx for everyone (and
-            # suppress tools demotion). The planner serves it at its type
-            # floor and flags the entry unverified.
-            continue
-        chat_budget = remaining_for_chat - model_mib - compute_mib
-        if chat_budget <= 0:
-            continue
-        ctx = int((chat_budget - slot_mib * parallel)
-                  / (kv_factor * parallel))
-        if ctx < _MIN_CTX_SIZE:
-            # Skip rather than clamp up. This loop keeps the *maximum* over
-            # chat models, so one model clamped to a context it cannot afford
-            # would raise the shared bar for every other chat model, pushing
-            # them into their own squeeze. They are alternatives that evict
-            # each other; the shared context is what the fleet can actually
-            # afford, never what the most desperate participant wishes for.
-            logger.warning(
-                "matrix: %s skipped — weights + %d slot(s) leave %d MiB, "
-                "below the %d-token minimum", model.stem, parallel,
-                int(chat_budget), _MIN_CTX_SIZE)
-            continue
-        # The image token floor is raise-to-fit only when it was already
-        # affordable; a larger floor cannot buy VRAM it doesn't have.
-        if img_floor > ctx:
-            logger.warning(
-                "matrix: %s image_max_tokens budget %d per slot exceeds "
-                "the solved chat ctx %d; large images may not fit",
-                model.stem, img_floor, ctx)
-        ctx = (ctx // _CTX_ROUND_TO) * _CTX_ROUND_TO
-        arch_max = model.design_context
-        ctx = min(ctx, arch_max)
-        best_ctx = max(best_ctx, ctx)
-
-    return best_ctx if best_ctx > 0 else _MIN_CTX_SIZE

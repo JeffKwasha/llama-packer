@@ -20,9 +20,9 @@ Features:
 - want all Qwen3.5+ models to use the sharp chat template? 3 lines in models.yaml
 - Add low-temperature `coding` aliases to every model? 2 lines in profiles.yaml
 - Want 'text-only' variants that skip mmproj to maximize context or parallel? Automatic.
-- budget a couple GB of VRAM so embedding and rerank can be resident for RAG? Automatic — the matrix squeezes chat context to keep them loaded instead of evicted.
+- budget a couple GB of VRAM so embedding and rerank can stay loaded for RAG? Automatic — the capacity budget charges them to host RAM or a small VRAM slice, so chat keeps its context.
 - pick some models to use `q8_0` KV cache for longer context? YES
-- ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. `--idle-unload SECONDS` additionally emits `globalTTL` so llama-swap releases VRAM after idle.
+- ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. The top-level `ttl` additionally lets llama-swap release VRAM after idle.
 
 
 ## Quickstart ("It's alive")
@@ -48,8 +48,8 @@ you get a warning saying so. Copy `profiles.yaml.example` to `profiles.yaml`
 next (see [Profiles](#profiles-profilesyaml)) to start tuning.
 
 For development, `uv pip install -e .`. To pin an older tree, clone with
-`--branch v0.3.0`, or install without cloning via
-`uv pip install git+https://github.com/JeffKwasha/llama-packer.git@v0.3.0`.
+`--branch <release tag>`, or install without cloning via
+`uv pip install git+https://github.com/JeffKwasha/llama-packer.git@<release tag>`.
 There is no PyPI package — `uvx llama-packer` will not resolve; use the
 clone-and-`uv run` path above.
 
@@ -91,12 +91,12 @@ Now you have capabilities, context windows, MTP support where available.
 mv profiles.yaml.example profiles.yaml
 
 - **Aliases.** Give one model several names — `instruct`, `coding`, `thinking` — each with its own sampling parameters, switched per-request with no reload. Declared once in the sidecar's `modes:` (or generated from `profiles.yaml`); emitted as `filters.setParamsByID` overrides.
-- **A packed matrix.** Keep small models (embedders, rerankers, a quick draft model) loaded simultaneously alongside your main chat model, with VRAM budgeted across all of them so nothing OOMs. Each gets its own context sized to what actually fits.
-- **Auto-parallel.** Unpinned chat models automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
+- **Capacity-budgeted co-loading.** Keep small models (embedders, rerankers, a quick draft model) loaded alongside your main chat model. Every serving declares its VRAM/host-RAM capacity, llama-swap evicts the cheapest one when a pool is full, and a size-1 role pool keeps one model per role loaded.
+- **Auto-parallel.** Chat models without a `parallel:` pin automatically get the (context, slots) pair that scores best under leftover VRAM — more simultaneous chats instead of one stretched window. On by default; `matrix: auto_parallel: false` disables it fleet-wide, a sidecar `parallel:` pin opts one model out.
 - **Fleet-wide rewrites in a few lines.** Retarget every Qwen3.5+ model at a new chat template, or put all KV caches on `q8_0` — as override rules in `profiles.yaml`, not per-model edits.
 - **Standard discovery.** Model info flows straight off the running server, so you never hand-edit your client config when you add a model. A maintained discovery plugin works against the config unchanged.
 - **mmproj variants.** A vision model can be served two ways: with its mmproj for image input, and as a vision-less variant that drops the projection to reclaim VRAM for a much larger context (plus a vision companion entry keeping image input available at reduced context). The `i`/`v` capability flags on the id tell them apart; the exact context is in the display name and metadata.
-- **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. `--idle-unload SECONDS` emits `globalTTL` so llama-swap unloads idle models.
+- **Graceful degradation under reservation.** Re-pack with `--spare`/`--baseline` when another program holds VRAM: models whose weights no longer fit any context are dropped from the config (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and entries squeezed below their design context say so in their description. A reservation that eats the whole card refuses to overwrite the existing config. The top-level `ttl` lets llama-swap unload idle models.
 
 
 ## What it does
@@ -112,7 +112,7 @@ See [SPEC.md](SPEC.md) for the full schema and [docs/architecture.md](docs/archi
 ## Directional modalities
 
 Each entry advertises `capabilities.in` / `capabilities.out` (llama-swap derives
-UI badges from these), driven by the task's scheduling role plus declared
+UI badges from these), driven by the task's endpoint plus declared
 capabilities:
 
 | Role | Directory | in → out | Backend | Endpoint |
@@ -168,17 +168,18 @@ Unknown keys pass as `metadata` informing clients with descriptive fields (see [
 
 ### Profiles (`profiles.yaml`)
 
-Sampling and placement live in `profiles.yaml`. Copy [`profiles.yaml.example`](profiles.yaml.example) to `profiles.yaml` (gitignored) — it has one brief commented example per category. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present. All `profiles.yaml` keys are builder-consumed (unknown keys ignored), in contrast to sidecar frontmatter above.
+Sampling and placement are in `profiles.yaml`. Copy [`profiles.yaml.example`](profiles.yaml.example) to `profiles.yaml` (gitignored) — it has one brief commented example per category. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present. All `profiles.yaml` keys are builder-consumed (unknown keys ignored), in contrast to sidecar frontmatter above.
 
 | Category | Brief example |
 |---|---|
 | `defaults` / `profiles` | `temperature`, `top_p`, `cache_type`, `parallel`, `spare` (+ `base * N` expressions, `description` docs-only) |
-| `models_dirs` / `dirs` / `hf_home` | discovery roots & dir→role map (`it2t: chat`) |
+| `models_dirs` / `roles.<name>.dir` / `hf_home` | discovery roots & tree→role ownership |
 | `backends` / `vllm` | enable list (`llama-server`, `vllm-podman`, `vllm-docker`), `image`/`bin`/`container_args` (legacy `docker_args`) |
 | `llama_server` / `vllm` / `sd` / `whisper` `args:` | fleet-wide server flags (e.g. `llama_server: {args: "--flash-attn on -b 512 -ub 512"}`) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb` |
 | `overrides` | `when: {base_model: 'qwen3'}` → `backend`/`chat_template`/`loras`/`reasoning-*` |
-| `matrix` | co-resident `categories` (default `emb`/`rnk`; e.g. add `tts`/`stt`), sets via `__CHAT_VARS__` |
+| `matrix` | sizing knobs and `sets` (role labels or model ids) |
+| `capacity` | `pp_tps` / `drive_mbps` for derived `evict_cost` |
 
 Profiles overlay `defaults` and emit `filters.setParamsByID`; sidecar `modes:` / `allow_profiles:` replace or filter them per-model. See [SPEC → profiles.yaml](SPEC.md#profilesyaml) for the full table.
 
@@ -207,7 +208,7 @@ python -m llama_packer --probe-memory qwen35 gemma4 --models-dir ~/models
 ```
 
 **Requirements:**
-- No resident `llama` processes (the probe refuses otherwise)
+- No running `llama` processes (the probe refuses otherwise)
 - GPU visible as device 0 (run from a normal shell, not under the hardened
   systemd unit)
 - Enough VRAM for `(design, 2)` points at the cap context
@@ -224,9 +225,66 @@ near-instantly is the point of the block: it is invalidated only by a file
 change (size/mtime) or a serve-flag change (the compute term re-measures via
 one `llama-fit-params` run).
 
-For an unattended nightly calibration, wrap it in a script that checks
-`gpu_state.llama_residents()` is empty, then fires `--probe-memory`. The
-probe itself refuses to start beside a resident process.
+For an unattended nightly calibration, wrap it in a script that checks no `llama` process is running, then fires
+`--probe-memory`. The probe itself refuses to start beside a running
+process.
+
+## Agent skill: authoring `profiles.yaml`
+
+[`docs/profiles-authoring.md`](docs/profiles-authoring.md) is a self-contained
+guide (with OpenCode skill frontmatter) covering discovery, `tasks:`,
+sampling profiles, CPU/GPU placement, matrix sizing, capacity routing, pools,
+TTL, updates, and the `--check`/dry-run/validate loop.
+
+The repo itself does not contain an `.opencode/` tree; the file is a normal
+document. To expose it to OpenCode on your machine, copy or symlink it into
+the global skills directory under the ID you want:
+
+```sh
+mkdir -p ~/.config/opencode/skills
+ln -s "$PWD/docs/profiles-authoring.md" \
+      ~/.config/opencode/skills/profiles-authoring.md
+# or: cp docs/profiles-authoring.md ~/.config/opencode/skills/profiles-authoring.md
+```
+
+A flat `~/.config/opencode/skills/<id>.md` is a skill whose ID is the file
+name. For a project-local install, symlink it into that project's
+`.opencode/skills/` instead:
+
+```sh
+mkdir -p .opencode/skills
+ln -s "$PWD/docs/profiles-authoring.md" .opencode/skills/profiles-authoring.md
+```
+
+For a whole directory of skills, add it to `skills` in `opencode.json(c)`;
+relative paths resolve from the active working directory:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": ["./team-skills", "~/shared/opencode-skills"]
+}
+```
+
+**Installed deployments.** `extras/install.py` creates `<run-dir>/profiles.yaml`
+from the bundled default when it is absent (never overwriting an existing
+one) and places this guide at
+`<run-dir>/.opencode/skills/profiles-authoring/SKILL.md`, owned by the
+service account. Pass `--no-agent-guide` to skip the guide. An agent started
+in the run directory then discovers it; see
+[docs/install.md](docs/install.md#profilesyaml-is-yours) for editing and
+re-packing.
+
+For an existing install without the guide, copy it in:
+
+```sh
+mkdir -p <run-dir>/.opencode/skills/profiles-authoring
+cp docs/profiles-authoring.md \
+   <run-dir>/.opencode/skills/profiles-authoring/SKILL.md
+```
+
+OpenCode reloads skills on save; no restart is needed. Load it with
+`@profiles-authoring` or let the model pick it from the description.
 
 ## See also
 
@@ -236,6 +294,9 @@ probe itself refuses to start beside a resident process.
 - [docs/install.md](docs/install.md) — systemd deployment from a run directory ([extras/install.py](extras/install.py))
 - [docs/backends/](docs/backends/) — per-engine notes: llama-server, vLLM, sd-server, whisper-server, audio-cpp
 - [profiles.yaml.example](profiles.yaml.example) — commented starter for `profiles.yaml`; [llama_packer/profiles.yaml](llama_packer/profiles.yaml) is the bundled fallback
+- [docs/profiles-authoring.md](docs/profiles-authoring.md) — agent-facing guide for authoring and validating `profiles.yaml`
+- [docs/memory-and-eviction.md](docs/memory-and-eviction.md) — VRAM/RAM budgets, co-residency reservations, eviction cost, TTL
+- [docs/llama-swap.md](docs/llama-swap.md) — llama-swap capabilities mapped to the `profiles.yaml`/sidecar input that provides each
 
 ## Limitations
 
@@ -251,8 +312,8 @@ probe itself refuses to start beside a resident process.
 - Support multi-image/tensor-parallel vLLM provisioning
 - Enrich `throughput_factor` with measured server log data (offline parsing)
 - Chip-specific VRAM sizing rules behind the (currently inert) `gpu-family` hook
-- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as `role: image` with `dirs: {img: image}` and `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [docs/backends/sd-server.md](docs/backends/sd-server.md) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
-- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as `role: s2t` with `dirs: {s2t: s2t}` and `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
-- Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as `role: t2s` / `role: s2t` with `dirs: {t2s: t2s, s2t: s2t}` and `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
+- Image generation via `sd-server` (stable-diffusion.cpp) — **available** as a role owning `img/` (`role: image`, `dir: img`) with `backends: [sd-server]` (opt-in; fixed VRAM overhead, `proxy`/`checkEndpoint: /`); see [docs/backends/sd-server.md](docs/backends/sd-server.md) and [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md)
+- Speech-to-text via `whisper-server` (whisper.cpp) — **available** as a role owning `s2t/` (`role: s2t`, `dir: s2t`) with `backends: [whisper-server]` (opt-in; GGML `.bin` models with authored same-stem sidecars; fixed VRAM overhead); see [docs/backends/whisper-server.md](docs/backends/whisper-server.md)
+- Text-to-speech / speech-to-text via `audio-cpp` (audio.cpp) — **available** as roles owning `t2s/` and `s2t/` with `backends: [audio-cpp]` (opt-in; sidecar `audio_cpp: {family, task}`; fixed VRAM overhead; replaces the retired kokoro backend); see [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md)
 - ComfyUI (`comfyui-boot`) remains future work — see [docs/plans/comfyui-sd.md](docs/plans/comfyui-sd.md) for `comfyui-boot` syntax findings (`/comfyui/` + `compat.ignoreWebsockets`, unified image)
-- Configurable matrix categories — **available**: declare co-resident classes beyond `emb`/`rnk` (e.g. `tts`/`stt`) and reference them in `sets:`; see [SPEC → Matrix Context Solving](SPEC.md#matrix-context-solving)
+- Capacity routing — **available**: the packer emits llama-swap pools (VRAM, host RAM, one per role), per-model `capacities`, and derived `evict_cost`. `matrix.sets:` switches to the matrix engine. See [SPEC → Capacity routing](SPEC.md#capacity-routing)

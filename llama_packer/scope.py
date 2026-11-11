@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import logging
 
-from llama_packer import endpoints, utils
+from llama_packer import roles, utils
+from llama_packer.tasks import TaskCatalogue, resolve_tasks
 from llama_packer.backends import BACKENDS, infer_backend, resolve_engines
 from llama_packer.overrides import (
     compile_rule_list,
@@ -65,7 +66,7 @@ class ScopeStack:
         self.allowed = allowed
         #: Declared tasks (profiles.yaml ``tasks:``); finalize() reads the
         #: scheduling role a sidecar's task list implies.
-        self.tasks = tasks
+        self.tasks = tasks if tasks is not None else TaskCatalogue.default()
 
     # ── scoping ──
 
@@ -142,6 +143,54 @@ class ScopeStack:
 
     # ── post-merge finalization ──
 
+    def annotate_tasks(self, model) -> None:
+        """Resolve the model's declared tasks before companions are built."""
+        model.tasks_resolved = (
+            resolve_tasks(model.task_ids, self.tasks, logger, stem=model.stem)
+            if self.tasks else ())
+
+    def _apply_placement(self, model) -> None:
+        """Place a model from its role and the tasks it serves.
+
+        Precedence: an explicit sidecar ``device:`` wins; otherwise a task's
+        ``device:`` requirement, then the role's ``device:`` policy.  All
+        three use :func:`llama_packer.utils.parse_device`: ``cpu`` or a GPU
+        index; unset means "no explicit placement".
+        """
+        if model.frontmatter.get("device") is not None:
+            side, _ = utils.parse_device(model.frontmatter.get("device"))
+            catalogue = self.tasks
+            declared = {t.device for t in ((catalogue.get(tid) if catalogue
+                                           else None)
+                                          for tid in model.task_ids)
+                        if t is not None and t.device is not None}
+            if len(declared) == 1:
+                wanted = next(iter(declared))
+                if wanted != side:
+                    logger.warning(
+                        "%s: sidecar device %s wins over the task's %s",
+                        model.stem, side if side is not None else "auto",
+                        wanted)
+            return
+        devices = {t.device for t in model.tasks_resolved
+                   if t.device is not None}
+        if len(devices) > 1:
+            logger.warning("%s: tasks disagree on placement (%s); leaving "
+                           "the device unset", model.stem,
+                           ", ".join(sorted(map(str, devices))))
+            return
+        task_device = next(iter(devices), None)
+        spec = roles.get(model.role)
+        role_device = spec.device if spec is not None else None
+        if (task_device is not None and role_device is not None
+                and task_device != role_device):
+            logger.warning(
+                "%s: task requires device %s but role %r is %s; using %s",
+                model.stem, task_device, model.role, role_device, task_device)
+        chosen = task_device if task_device is not None else role_device
+        if chosen is not None:
+            model.frontmatter["device"] = chosen
+
     def finalize(self, model) -> None:
         """Backend selection/inference + external file resolution for *model*.
 
@@ -151,14 +200,6 @@ class ScopeStack:
         ``model._override_error`` (already logged) for the writer to skip.
         """
         errors: list[str] = []
-        if model.task_ids:
-            role = self.tasks.role_of(model.task_ids) if self.tasks else None
-            if role is None:
-                errors.append(
-                    f"tasks: {', '.join(model.task_ids)} do not share one "
-                    "scheduling role")
-            else:
-                model.frontmatter["role"] = role
         engines = model.engines
         backend_name = model.frontmatter.get("backend")
         if backend_name is not None:
@@ -194,9 +235,9 @@ class ScopeStack:
                 fmt = (model.gguf_path.suffix.lower() if model.gguf_path
                        else "hf_repo" if model.hf_repo else "none")
                 reason = f"No backend supports {model_file} in {model.md_path} (role {model.role}, format {fmt!r})"
+                needed = {t.endpoint for t in model.tasks_resolved}
                 covered = [b for b in BACKENDS.values()
-                           if fmt in b.formats
-                           and endpoints.serves(b.endpoints, model.role)]
+                           if fmt in b.formats and needed <= b.endpoints]
                 if covered and not any(b.is_available(self.avail or {}) for b in covered):
                     logger.warning("%s — install the binary or pass "
                                    "--llama-server <path>", reason)
@@ -204,6 +245,7 @@ class ScopeStack:
                     logger.info("%s", reason)
                 model._override_error = reason
 
+        self._apply_placement(model)
         errors += resolve_setting_paths(model)
 
         if errors:

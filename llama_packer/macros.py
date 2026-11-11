@@ -399,4 +399,4 @@ class Macros:
 
         # 5. Builtin common GPU flag — llama-server defaults --n-gpu-layers
         #    to "auto" (offload everything), so nothing needs pinning; a
-        #    CPU-resident model gets its explicit "0" from the backend itself.
+        #    CPU-served model gets its explicit "0" from the backend itself.

@@ -15,7 +15,7 @@ import re
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 _DEFAULT_CONTEXT_LENGTH = 32768
-_CTX_ROUND_TO = 8192
+_CTX_ROUND_TO = 4096
 _MIN_CTX_SIZE = 4096
 
 # Room reserved, in tokens, for the model to answer once it has seen an
@@ -88,7 +88,7 @@ _MEASURE_CTX_CAP = 65536
 _MEASURE_TIMEOUT_S = 900
 _MEASURE_STALL_S = 120
 
-# Host-resident KV/RS (Vulkan_Host pool) above this (MiB) rejects a
+# Host-side KV/RS (Vulkan_Host pool) above this (MiB) rejects a
 # measurement point: the pool did not fit device memory (GPU busy or
 # model too large) — the 2026-09-07 Dirk GTT spill signature.
 _KV_SPILL_TOLERANCE_MIB = 8.0
@@ -204,20 +204,6 @@ _DIFFUSION_ARCH_RES = tuple(
         r"^z-?image", r"^ernie[-_]?image", r"^lumina", r"^sdx?-?l",
     )
 )
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-# Default directory roles
-# of a model file (relative to a models-dir root) selects the role;
-# files at the root itself are chat.  Subdirectories absent from this
-# map are not served at all.  Extend or override via the
-# profiles.yaml dirs: mapping.  Keys are matched case-insensitively.
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-_DEFAULT_DIR_ROLES = {
-    "chat": "chat", "t2t": "chat", "vision": "chat",
-    "doc": "chat", "ocr": "chat",
-    "embed": "embeddings", "rerank": "rerank",
-}
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # Weight-file suffixes

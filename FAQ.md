@@ -26,7 +26,7 @@ hf_repo: AtomicChat/Ornith-1.5-9B-GGUF   # resolved offline from $HF_HOME/hub
 `chat/`; the next run auto-writes a stub sidecar beside it (dedup by realpath
 prevents double-serving).
 
-**Not recommended:** mapping the cache itself via `dirs: {hf_hub: chat}` — one
+**Not recommended:** pointing a role's `dir:` at the cache tree — one
 uniform role for mixed content, and stubs get written inside the cache tree.
 
 Never-servable formats regardless of sidecar: CTranslate2 (faster-whisper),
@@ -47,8 +47,8 @@ Three separate causes — check in order:
    serves 40960 no matter how much VRAM is free — small weights buy *slots*,
    never more context than the file allows.
 2. **`parallel: 1` means the solve skipped the model.** Auto-parallel only
-   runs for `role: chat` on llama-server/vLLM with no `parallel:` pin in the
-   sidecar/block or any profile. It is on by default; `matrix:
+   runs for a model whose task endpoint is chat, on llama-server/vLLM, with no
+   `parallel:` pin in the sidecar/block or any profile. It is on by default; `matrix:
    auto_parallel: false` turns it off fleet-wide.
 3. **The floor-ceiling trap.** A tool-calling model defaults to a 131072
    floor; if its max context is below that *and* it has no `context_length:`
@@ -69,7 +69,7 @@ What you probably saw was the per-arch note
 
 which is informational: uncalibrated arches estimate uncorrected (the
 estimate errs slightly optimistic about allocator overhead). The
-corrections live in the durable machine-local `serve-corrections.yaml`
+corrections are in the durable machine-local `serve-corrections.yaml`
 beside `profiles.yaml` — rows carry the witness `shape` and `ts`. Also:
 `llama-packer --remeasure` ignores saved blocks for one run without
 touching any files.
@@ -96,7 +96,7 @@ measurement (a warning points this out).
 
 ## Can I run embed/rerank with `parallel: > 1`?
 
-No — by design. RAG residents always serve single-slot: a declared
+No — by design. Embeddings and rerank models always serve single-slot: a declared
 `parallel:` on an embeddings/rerank model is ignored with a once-per-model
-note. The main chat context those residents serve must never shrink by even
-4k to buy resident parallelism ("main chat slightly better" wins).
+note. The context those servings use must never shrink by even
+4k to buy helper parallelism ("main chat slightly better" wins).

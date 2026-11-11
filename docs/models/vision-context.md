@@ -165,7 +165,7 @@ native-vision model can only use the `image_max_tokens` fallback.
 
 ## VRAM budget formula
 
-The full per-slot context solve in `calc_ctx`:
+The full per-slot context solve in `solve_context`:
 
 ```
 available    = (vram_total - reserve - spare) / (1 + margin)
@@ -206,7 +206,7 @@ ubatch.
 
 | Architecture | mmproj file? | `include_mmproj` axis | Megapixel knob |
 |---|---|---|---|
-| LLaVA, MiniCPM-V, Gemma 3 | Yes | Live — shedding frees VRAM | warned + ignored (fixed/resampled tokens) |
-| Qwen2-VL / Qwen3-VL | Yes | Live — shedding frees VRAM | honoured (`spatial_merge_size` present) |
+| LLaVA, MiniCPM-V, Gemma 3 | Yes | Dynamic — shedding frees VRAM | warned + ignored (fixed/resampled tokens) |
+| Qwen2-VL / Qwen3-VL | Yes | Dynamic — shedding frees VRAM | honoured (`spatial_merge_size` present) |
 | Native multimodal | No | No-op — nothing to shed | warned + ignored (no projector geometry) |
 

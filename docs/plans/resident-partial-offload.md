@@ -1,7 +1,9 @@
 # Roadmap note: partial offload of resident helper weights to host RAM
 
-Status: **proposal — not scheduled**, recorded 2026-10-22. Related:
-`docs/plans/memory-allocation-tags.md` §1 (split representation — the `+`
+Status: **proposal — not scheduled**, recorded 2026-10-22.
+**Amended 2026-11-11:** `min_chat_ctx` is retired; this plan predates the
+role allocation in `docs/allocation.md`. Related:
+the retired memory-allocation-tags plan (git history) §1 (split representation — the `+`
 tag grammar), §3 (measured host RAM), §4 (MoE partial offload — same decider
 shape), `docs/plans/opportunistic-coload.md` §2b (the *context*-squeeze
 counterpart, which already ships a rung of this idea).

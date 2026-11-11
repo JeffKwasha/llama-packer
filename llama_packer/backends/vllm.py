@@ -29,6 +29,7 @@ from llama_packer.consts import (
     VLLM_DEFAULT_IMAGE,
 )
 from llama_packer.backends.base import BaseBackend
+from llama_packer import endpoints as eps
 from llama_packer.endpoints import ENGINE_ENDPOINTS
 from llama_packer.backends.transport import (
     CONTAINER_HF_HOME,
@@ -185,7 +186,7 @@ def _speculative_config(model: "Model") -> dict | None:
 
 def _spec_meta(model: "Model") -> dict:
     """Backend metadata for the writer's mtp_* metadata keys."""
-    if model.role != "chat":
+    if not model.serves_endpoint(eps.CHAT):
         return {"mtp_enabled": False}
     spec = _speculative_config(model)
     if not spec:
@@ -230,10 +231,10 @@ class VllmBackend(BaseBackend):
     # Overridden at bind time; host is the standalone default.
     transport: Transport = HostTransport()
 
-    # Per-role serving task (mirrors llama-server's _ROLE_FLAGS symmetry).
-    _ROLE_TASK = {
-        "embeddings": ["--task", "embed"],
-        "rerank": ["--task", "score"],
+    # Serving task per endpoint (mirrors llama-server's endpoint flags).
+    _ENDPOINT_TASK = {
+        eps.EMBEDDINGS: ["--task", "embed"],
+        eps.RERANK: ["--task", "score"],
     }
 
     def _serve_flags(
@@ -276,12 +277,14 @@ class VllmBackend(BaseBackend):
             flags += ["--moe-backend", mb]
         flags += _mamba_flags(model)
         flags += _kv_cache_dtype_flags(cache_type)
-        flags += self._ROLE_TASK.get(model.role, [])
+        for endpoint, task_flags in self._ENDPOINT_TASK.items():
+            if model.serves_endpoint(endpoint):
+                flags += task_flags
         ct = model.resolved_chat_template
         if ct is not None:
             ref = map_path(ct) if map_path else str(ct)
             flags += ["--chat-template", ref]
-        if model.role == "chat":
+        if model.serves_endpoint(eps.CHAT):
             # Speculative decoding is a generation-only feature.  A container
             # transport passes its rewritten copy (container refs); host
             # derives from frontmatter.
@@ -322,7 +325,8 @@ class VllmBackend(BaseBackend):
             str(model.gguf_path) if model.gguf_path is not None else None)
         # Invariant: vLLM only serves models with a repo id or a local file.
         assert model_ref is not None
-        spec = _speculative_config(model) if model.role == "chat" else None
+        spec = (_speculative_config(model)
+                if model.serves_endpoint(eps.CHAT) else None)
         if spec is not None:
             spec = dict(spec)  # rewrite our copy — never mutate the frontmatter
 

@@ -7,7 +7,30 @@ from pathlib import Path
 
 import pytest
 
+from llama_packer.endpoints import (CHAT, EMBEDDINGS, IMAGES, RERANK,
+                                    SPEECH, TRANSCRIPTIONS)
 from llama_packer.model import Model
+from llama_packer.tasks import Task
+
+_ENDPOINT_BY_TASK = {
+    "chat": CHAT, "coding": CHAT, "qa": CHAT, "aux": CHAT,
+    "describe": CHAT, "max": CHAT,
+    "embeddings": EMBEDDINGS, "rerank": RERANK, "image": IMAGES,
+    "s2t": TRANSCRIPTIONS, "t2s": SPEECH,
+}
+
+
+def fake_tasks(fm: dict) -> tuple:
+    """Resolved tasks for a test model: declared ids, else its role."""
+    ids = fm.get("tasks")
+    if isinstance(ids, str):
+        ids = [ids]
+    if ids:
+        return tuple(Task(str(i), _ENDPOINT_BY_TASK.get(str(i), CHAT))
+                     for i in ids)
+    role = str(fm.get("role") or "chat")
+    task = role if role in _ENDPOINT_BY_TASK else "chat"
+    return (Task(task, _ENDPOINT_BY_TASK[task]),)
 
 
 @pytest.fixture
@@ -26,6 +49,7 @@ def make_model(tmp_path):
         fm: dict = {"name": stem, "context_length": 32768}
         fm.update(frontmatter)
         model = Model(md_path, fm)
+        model.tasks_resolved = fake_tasks(fm)
         # Synthetic fixture: no authored sidecar, so it keeps orphan
         # semantics (engine inference) unless a test says otherwise.
         model.stub = True
@@ -54,7 +78,7 @@ def fit_params_block():
 def _isolated_cache(tmp_path, monkeypatch):
     """Tests never touch the machine-local measurement artifacts
     (corrections, lock, journal) — one test wrote a garbage correction
-    row into the live cache (2026-09-08, rep_stem "m")."""
+    row into the active cache (2026-09-08, rep_stem "m")."""
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LLAMA_PACKER_CORRECTIONS",
                        str(tmp_path / "cache" / "serve-corrections.yaml"))
@@ -137,16 +161,9 @@ TASK_ENDPOINT = {
     "image": "openai.images.generations",
     "s2t": "openai.audio.transcriptions", "t2s": "openai.audio.speech",
 }
-TASK_ROLE = {
-    "chat": "chat", "coding": "chat", "qa": "chat", "aux": "chat",
-    "embeddings": "embeddings", "rerank": "rerank", "image": "image",
-    "s2t": "s2t", "t2s": "t2s",
-}
-
-
 def task_cfg(name: str, **demand) -> dict:
-    """One declared task: the standard endpoint/role for that id + demand."""
-    return {"endpoint": TASK_ENDPOINT[name], "role": TASK_ROLE[name], **demand}
+    """One declared task: the standard endpoint for that id + demand."""
+    return {"endpoint": TASK_ENDPOINT[name], **demand}
 
 
 def tasks_cfg(**demands) -> dict:

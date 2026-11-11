@@ -48,7 +48,7 @@ vllm:
   #                       # nothing downloads.
 
 # ── whisper-server backend (optional, speech-to-text) ──
-# Opt-in via profiles.yaml `dirs: {s2t: s2t}`; each model needs an authored
+# Give the s2t role a `dir:` that owns the whisper tree; each model needs an authored
 # same-stem sidecar beside its GGML .bin. CLI --whisper-server overrides.
 # whisper:
 #   bin: whisper-server
@@ -81,9 +81,9 @@ vllm:
 #   # - when: {name: 'tiny-.*'}
 #   #   cache_type: None                 # delete: fall back to built-in q8_0
 
-# Usage categories a model can declare with `usage:` in its sidecar. Only
-# declared categories count -- an undeclared tag warns and is ignored, which
-# is what keeps the vocabulary honest.
+# Task ids a model can declare with `tasks:` in its sidecar. Only declared
+# ids count -- an undeclared id warns and is ignored, which keeps the
+# vocabulary honest.
 #
 #   min_context   the window the category needs to be useful; a model that
 #                 cannot serve it at any rung is dropped from the set
@@ -91,48 +91,60 @@ vllm:
 #                 floor wins, since the id advertises the context
 #   require       capabilities this category will not give up
 #   sacrifice     preference order for what to shed first, not a cost order
+roles:
+  chat:
+    dir: [chat, t2t, vision, doc, ocr]
+    share: fill
+  embeddings:
+    dir: embed
+    share: min
+  rerank:
+    dir: rerank
+    share: min
+  image:
+    dir: img
+    share: min
+  s2t:
+    dir: s2t
+    share: min
+  t2s:
+    dir: t2s
+    share: min
+
 tasks:
-  # Chat-endpoint tasks: one serving covers all of them; they evict each
-  # other by request. endpoint + role are required; the demand keys are the
-  # floors the planner must meet.
   chat:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 64k
     min_parallel: 2
     sacrifice: [draft, vision]
   coding:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 130k
     min_parallel: 1
     sacrifice: [vision]
     keep: [draft]
   qa:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 32k
     min_parallel: 2
   aux:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
-  # Capability tasks: endpoint and role only; they are sized by their role.
   embeddings:
     endpoint: openai.embeddings
-    role: embeddings
+    min_context: 4096
+    max_context: 4096
   rerank:
     endpoint: openai.rerank
-    role: rerank
+    min_context: 4096
+    max_context: 4096
   image:
     endpoint: openai.images.generations
-    role: image
   s2t:
     endpoint: openai.audio.transcriptions
-    role: s2t
+    device: cpu
   t2s:
     endpoint: openai.audio.speech
-    role: t2s
 

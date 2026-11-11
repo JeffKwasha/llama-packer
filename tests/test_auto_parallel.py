@@ -27,7 +27,7 @@ def _profiles_no_pin():
 
 
 def _scripted_by_parallel(model, by_parallel):
-    """Fake calc_ctx: max affordable ctx keyed on parallel, minus spare.
+    """Fake solve_context: max affordable ctx keyed on parallel, minus spare.
 
     The spare term proves ledger reserves actually reach the budget: every
     MB of spare costs 2 tokens of context in the fake.
@@ -36,11 +36,11 @@ def _scripted_by_parallel(model, by_parallel):
              include_mmproj=True, baseline_mb=0, cache_type="q8_0",
              design_ctx=None, **kw):
         return max(0, by_parallel.get(parallel, 0) - spare_mb * 2)
-    model.vram.calc_ctx = fake
+    model.vram.solve_context = fake
     for flag in (True, False):
         view = model.view_for(flag)
         if view is not model:
-            view.vram.calc_ctx = fake
+            view.vram.solve_context = fake
 
 
 def _view(stem="m", **fm):
@@ -52,7 +52,6 @@ def _view(stem="m", **fm):
 # ── score function: the doc's worked examples ─────────────────────────────
 
 def test_value_two_slots_beat_one_stretched():
-    # Validates: docs/plans/category-semantics.md, 'Parallel: the same search, a different exponent': Rank a (context.
     assert (parallel_value(131072, 131072, 2, 0.75)
             > parallel_value(262144, 131072, 1, 0.75))
 
@@ -60,14 +59,12 @@ def test_value_two_slots_beat_one_stretched():
 def test_value_bump_happens_on_less_than_half_cut():
     # 1x200k vs 2x128k: the 1->2 bump happens even though ctx is cut by
     # less than half.
-    # Validates: docs/plans/category-semantics.md, 'Parallel: the same search, a different exponent': Rank a (context.
     assert (parallel_value(131072, 131072, 2, 0.75)
             > parallel_value(204800, 131072, 1, 0.75))
 
 
 def test_value_big_stretch_beats_slots():
     # 1x512k vs 2x128k: the stretch wins — the math simply decides.
-    # Validates: docs/plans/category-semantics.md, 'Parallel: the same search, a different exponent': Rank a (context.
     assert (parallel_value(524288, 131072, 1, 0.75)
             > parallel_value(131072, 131072, 2, 0.75))
 
@@ -132,7 +129,6 @@ def test_floor_garbage_min_context_ignored(caplog):
 # ── knobs parsing ─────────────────────────────────────────────────────────
 
 def test_knobs_auto_parallel_defaults_on():
-    # Validates: docs/plans/auto-parallel.md, 'Design': auto-parallel is on unless the operator turns it off.
     k = MatrixKnobs.from_cfg({})
     assert k.auto_parallel is True
     assert k.auto_parallel_max == 8
@@ -146,7 +142,6 @@ def test_knobs_auto_parallel_disable():
 
 
 def test_knobs_auto_parallel_parsing():
-    # Validates: docs/plans/auto-parallel.md, 'Design': the knob is read from the matrix section.
     assert MatrixKnobs.from_cfg({"auto_parallel": True}).auto_parallel is True
     assert MatrixKnobs.from_cfg({"auto_parallel": "yes"}).auto_parallel is True
     assert MatrixKnobs.from_cfg({"auto_parallel": "off"}).auto_parallel is False
@@ -155,7 +150,6 @@ def test_knobs_auto_parallel_parsing():
 
 
 def test_knobs_auto_parallel_garbage_warns_and_defaults(caplog):
-    # Validates: docs/plans/auto-parallel.md, 'Design': a malformed value warns and falls back to the default.
     k = MatrixKnobs.from_cfg({"auto_parallel": "maybe",
                               "auto_parallel_max": 0,
                               "parallel_power": -1.0})
@@ -189,7 +183,6 @@ def test_plan_picks_two_slots_over_stretch(make_model):
 
 
 def test_plan_stretch_wins_when_second_slot_too_thin(make_model):
-    # Validates: docs/plans/auto-parallel.md, 'Design': the slot score is (ctx/floor)^0.5 x slots^parallel_power, and the best feasible pair wins
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=8192)
     del m.frontmatter["context_length"]
@@ -280,15 +273,13 @@ def test_explicit_max_context_still_pins_and_floors(make_model):
     assert variants[0].ctx_size == 32768
 
 
-def test_plan_floor_unreachable_falls_back(make_model):
+def test_plan_floor_unreachable_emits_nothing(make_model):
     # Validates: SPEC.md, 'VRAM gating and reservation notes': a rung that does not fit is not a candidate; the next along the order is tried
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=999999)
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768})
-    variants = _planner(m).plan()["ap"]
-    assert variants[0].parallel == 1
-    assert variants[0].ctx_size == 32768
+    assert "ap" not in _planner(m).plan()
 
 
 def test_plan_floor_unreachable_solves_once(make_model):
@@ -308,14 +299,13 @@ def test_plan_floor_unreachable_solves_once(make_model):
         calls.append(parallel)
         return 32768
 
-    m.vram.calc_ctx = fake
+    m.vram.solve_context = fake
     for flag in (True, False):
         view = m.view_for(flag)
         if view is not m:
-            view.vram.calc_ctx = fake
-    variants = _planner(m).plan()["ap"]
-    assert variants[0].parallel == 1
-    assert variants[0].ctx_size == 32768
+            view.vram.solve_context = fake
+    variants = _planner(m).plan()
+    assert "ap" not in variants
     assert calls, "nothing was solved at all"
 
 
@@ -359,11 +349,18 @@ def test_plan_auto_parallel_off_keeps_today(make_model):
 
 
 def test_plan_non_chat_backend_untouched(make_model):
-    # Validates: SPEC.md, 'Knobs (matrix section keys)': only unpinned chat models on llama-server and vLLM enter the auto-parallel solve
+    # Validates: SPEC.md, 'Knobs (matrix section keys)': only chat models
+    # without a parallel pin on llama-server and vLLM enter the
+    # auto-parallel solve.
+    from llama_packer import roles
     m = make_model("ap", role="embeddings")
     del m.frontmatter["context_length"]
     _scripted_by_parallel(m, {1: 32768, 2: 32768})
-    variants = _planner(m).plan()["ap"]
+    try:
+        roles.configure({"roles": {"embeddings": {"share": "100%"}}})
+        variants = _planner(m).plan()["ap"]
+    finally:
+        roles.configure(None)
     assert variants[0].parallel == 1
 
 
@@ -402,58 +399,24 @@ def test_agentic_floor_default_unchanged():
 # ── pools config + ledger ───────────────────────────────────────────────
 
 def test_pools_cfg_parsing():
-    # Validates: docs/plans/auto-parallel.md, 'Configurable pools (operator escape hatch)': the pools section names each pool's vram, spare and reserve_extra
     p = Profiles({"defaults": {}, "profiles": {},
-                  "pools": {"gpu0": {"vram": "24G", "spare": "2G",
-                                     "reserve_extra": "8G",
-                                     "pins": {"image": "40G",
-                                              "embeddings": "auto"}}}})
-    spec = p.pools_cfg["gpu0"]
+                  "pools": {"gpu0": {"vram": "24G", "spare": "2G"}}})
+    spec = p.pools_cfg["default"]
     assert spec["vram"] == "24G"
-    assert spec["pins"] == {"image": "40G", "embeddings": "auto"}
+    assert spec["spare"] == "2G"
     assert Profiles({"defaults": {}}).pools_cfg == {}
 
 
 def test_pools_cfg_garbage_tolerated(caplog):
-    # Validates: docs/plans/auto-parallel.md, 'Configurable pools (operator escape hatch)': a malformed pools entry warns and falls back to the default
     p = Profiles({"defaults": {}, "profiles": {},
-                  "pools": {"gpu0": "huge", "gpu1": {"pins": ["x"]}}})
-    assert p.pools_cfg == {"gpu1": {"vram": None, "spare": None,
-                                   "reserve_extra": None, "pins": {}}}
+                  "pools": {"gpu0": "huge", "gpu1": {"vram": "1G"}}})
+    assert p.pools_cfg == {"gpu1": {"vram": "1G", "spare": None}}
     assert Profiles({"pools": ["x"]}).pools_cfg == {}
 
 
-def test_buckets():
-    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': a pool is a size bucket, not a model type
-    from llama_packer.writer import PoolLedger, footprint_bucket
-    tiny = SimpleNamespace(role="s2t", backend="whisper-server")
-    assert footprint_bucket(tiny) == "tiny"
-    assert footprint_bucket(SimpleNamespace(role="rerank",
-                                            backend="llama-server")) == "tiny"
-    assert footprint_bucket(SimpleNamespace(role="image",
-                                            backend="sd-server")) == "huge"
-    assert footprint_bucket(SimpleNamespace(role="chat",
-                                            backend="llama-server")) == "chat"
-    assert PoolLedger(48000).extra_reserve_mb() == 0
-
-
-def test_ledger_extra_reserve_math():
-    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': the pool's reserve_extra is added to the solve's spare
-    from llama_packer.writer import PoolLedger
-    pools = {"default": {"vram": None, "spare": None,
-                         "reserve_extra": "8G",
-                         "pins": {"image": "4G", "embeddings": "auto"}}}
-    ledger = PoolLedger(48 * 1024, pools)
-    ledger.add_resident("rerank:r", 1024)
-    # 8192 (reserve_extra) + 4096 (explicit pin; auto = 0) + 1024 resident
-    assert ledger.extra_reserve_mb() == 8192 + 4096 + 1024
-
-
 def test_ledger_spare_override_and_device_pools():
-    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': a model is assigned to the pool its device belongs to
     from llama_packer.writer import PoolLedger
-    pools = {"gpu1": {"vram": "24G", "spare": "2G",
-                      "reserve_extra": None, "pins": {}}}
+    pools = {"gpu1": {"vram": "24G", "spare": "2G"}}
     ledger = PoolLedger(96 * 1024, pools)
     assert ledger.pool_vram_mb("gpu1") == 24576
     assert ledger.pool_vram_mb("default") == 96 * 1024
@@ -473,24 +436,21 @@ def _planner_with_pools(model, pools):
                    matrix_cfg={"auto_parallel": True})
 
 
-def test_plan_pools_reserve_extra_shrinks_ctx(make_model):
-    # Same model, same fake: the only difference is an 8G unmodelled
-    # resident on the default pool → 8192 MB × 2 tok = 16384 fewer tokens.
-    # Validates: SPEC.md, 'Context Management': Plan serving variants for every model.
-    def run(pools):
-        m = make_model("ap", backend="llama-server", role="chat",
-                       min_context=4096)
-        del m.frontmatter["context_length"]
-        _scripted_by_parallel(m, {1: 40000, 2: 0})
-        return _planner_with_pools(m, pools).plan()["ap"][0]
-    bare = run({})
-    assert (bare.parallel, bare.ctx_size) == (1, 32768)  # capped by design
-    held = run({"default": {"reserve_extra": "8G"}})
-    assert (held.parallel, held.ctx_size) == (1, 40000 - 16384)
+def test_default_pool_spare_reduces_the_emitted_pool(make_model):
+    # Validates: docs/plans/requirement-trace.md, requirement #108
+    from llama_packer.writer import Planner
+
+    m = make_model("ap", backend="llama-server", role="chat",
+                   min_context=4096)
+    bare = Planner([m], Profiles({"defaults": {}}), fit_bin="unused",
+                   vram_total=48 * 1024).capacity_pools["default"]
+    held = Planner([m], Profiles({"pools": {"default": {"spare": "4G"}}}),
+                   fit_bin="unused", vram_total=48 * 1024
+                   ).capacity_pools["default"]
+    assert bare - held == 4096
 
 
 def test_plan_pools_spare_override_applies(make_model):
-    # Validates: docs/plans/auto-parallel.md, 'Memory pools — size buckets, not model types': the pool's spare is the model's spare for the solve
     m = make_model("ap", backend="llama-server", role="chat",
                    min_context=4096)
     del m.frontmatter["context_length"]
@@ -543,8 +503,7 @@ def test_category_floor_beats_the_tools_heuristic():
     its own category's min_parallel of 2 -- declaring it aux made it strictly
     harder to serve.
 
-    Validates: docs/plans/category-semantics.md: a declared category outranks the
-    heuristics that guess about undeclared models.
+    Validates: docs/plans/requirement-trace.md, requirement #22.
     """
     view = _view(capabilities=["tools", "image"])
     assert resolve_min_ctx(view) == 131072          # untagged: unchanged
@@ -572,21 +531,39 @@ def test_multi_category_takes_the_heaviest():
     assert resolve_min_ctx(view, category_floor=133120) == 133120
 
 
-def test_cpu_resident_chat_gets_no_auto_parallel(make_model):
-    """Host-RAM KV lives in an arena no VRAM ledger budgets.
-
-    calc_ctx returns the design context regardless of the slot count for a
-    CPU-resident model, so every candidate looks equally affordable and the
-    score reduces to p**power — walking straight to the cap. Eight slots on
-    a model declared for one is an 8x KV over-commit nothing accounts for.
-
-    Validates: docs/plans/requirement-trace.md #29.
-    """
+def test_cpu_served_chat_prices_slots_in_its_host_allocation(make_model):
+    # Validates: docs/allocation.md, 'The auction': every model solves its
+    # context and parallel inside its role's allocation in its pool.
     from llama_packer.profiles import Profiles as _P
-    model = make_model("cpu-chat", role="chat", device="cpu")
+    model = make_model("cpu-chat", role="chat", device="cpu",
+                       context_length=262144, tasks=["chat"])
+    _scripted_by_parallel(model, {1: 131072, 2: 65536})
     planner = Planner([model],
                       _P({"defaults": {"cache_type": "q8_0"},
-                          "profiles": {"default": {}}}),
-                      fit_bin="unused", vram_total=64 * 1024)
-    planner._bounded_ctx = lambda *a, **k: 131072
-    assert [v.parallel for v in planner.plan()["cpu-chat"]] == [1]
+                          "profiles": {"default": {}},
+                          "tasks": {"chat": {
+                              "endpoint": "openai.chat.completions",
+                              "min_context": 65536, "min_parallel": 1}}}),
+                      fit_bin="unused", vram_total=64 * 1024,
+                      host_pool_mb=64 * 1024)
+    assert planner.plan()["cpu-chat"][0].parallel == 2
+
+
+def test_pinned_parallel_below_min_parallel_emits_nothing(make_model):
+    # A sidecar/profile parallel: is a pin. If it is below a task's
+    # min_parallel, the task cannot be served to its floor; no entry.
+    m = make_model("ap", backend="llama-server", role="chat",
+                   parallel=1, tasks=["chat"])
+    del m.frontmatter["context_length"]
+    _scripted_by_parallel(m, {1: 32768, 2: 16384})
+    profiles = Profiles({
+        "defaults": {"cache_type": "q8_0"},
+        "profiles": {"default": {}},
+        "tasks": {
+            "chat": {"endpoint": "openai.chat.completions", "role": "chat",
+                     "min_context": 8192, "min_parallel": 2},
+        },
+    })
+    plan = Planner([m], profiles, fit_bin="unused",
+                   vram_total=48 * 1024).plan()
+    assert all(v.category.id != "chat" for v in plan.get("ap", []))

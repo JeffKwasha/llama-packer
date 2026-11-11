@@ -1,119 +1,172 @@
-# ── Sidecar syntax (NEW — lands in P2/P4) ───────────────
+# ── Sidecar syntax ─────────────────────────────────────
 # Compatibility and capability are declared, never inferred. In a model
 # sidecar (the `<model>.md` beside the weights):
 #   engines: [llama-server]    # engine names that can load the weights;
 #                              # required — a single-engine claim is a list
-#   tasks: [embeddings]        # closed catalog ids; unset/empty = unverified
-#                              # (never an invented name)
+#   role: chat                 # operator-defined purpose (see roles: below)
+#   tasks: [embeddings]        # declared task ids; unset/empty = unverified
 # `backend:` (compatibility) and `usage:` (workload tags) are the old
-# spellings: they warn as alien keys once their portion lands, and there is
-# no tolerated dual vocabulary.
+# spellings: they warn as alien keys, and there is no tolerated dual
+# vocabulary.
 #
 # ── Global defaults ────────────────────────────────────
 defaults:
   cache_type: q8_0
-  parallel: 1
+  # Do not set `parallel` here unless you intend to pin every model and
+  # disable auto-parallel; leaving it unset lets the packer choose the
+  # context size and slot count.
+  #
+  # Headroom for the desktop, browser, or other tenants. This comes on top
+  # of the fixed reserve: reserve = 1024 + max(1024, baseline_mb), and
+  # pools.default = VRAM - reserve - spare. Pick it from vram_log --report
+  # over days; --once is a snapshot that includes loaded models. Allocations
+  # fill the pool on purpose, so reserve + spare is the whole headroom.
+  spare: 1G
   temperature: 1.0
   top_p: 0.95
   top_k: 20
   min_p: 0.01
   pres_pen: 0.0
 
+# Top-level defaults shared by every task and serving.
+# min_context: 64k          # default for tasks that omit it
+ttl: 3600                    # idle unload seconds; 0 disables it
+
 # ── Tasks (optional) ──────────────────────────────────
-# A task is a closed catalog id (llama_packer/tasks.py): what work a model
-# does, the endpoint it is served at, and the demand that work needs. A
-# sidecar claims its tasks with `tasks: [coding, chat]`; each satisfiable
-# task emits its own entry, and llama-swap routes by name. Only catalog ids
-# exist -- an unknown id warns and is ignored.
+# A task is a named kind of work (coding, chat, embeddings...) with the
+# endpoint it is served at and the least context and slots it needs. A
+# model claims tasks in its sidecar with `tasks: [coding, chat]`; each task
+# a model can satisfy gets its own entry, and llama-swap routes by name. An
+# unknown name warns and is ignored.
 #
-# This section overrides a task's default demand; it never invents a task.
-# min_context / min_parallel are floors, not requests: one entry at
-# ctx >= 128k and parallel >= 2 satisfies all four tasks below, so nothing
-# forces four entries per model.
+# This section sets a task's minimums; it cannot invent a task.
+# min_context and min_parallel are both minimums. A task that omits
+# min_context uses the top-level value; min_context > max_context is an
+# error. One entry at context >= 128k and slots >= 2 can satisfy several
+# tasks, so nothing forces four entries per model.
 #
-# require:   capabilities that survive every rung of the capability/context
-#            ladder. A model that cannot keep one is dropped from a set
-#            rather than degraded.
-# sacrifice: what to give up first when the budget is short. This is a
-#            *preference*, not a cost order — shedding can buy no context at
-#            all (a model already at its design cap has nothing to reclaim),
-#            so the ladder enumerates rungs rather than walking them.
-#            Unlisted capabilities follow the default order: vision before
-#            draft, because an MTP draft roughly doubles generation speed.
-#            Shedding a draft is opt-in per model (`allow_mtp_shed:`).
+# require:   capabilities that must survive. A model that cannot keep one is
+#            not offered for that task rather than being degraded.
+# sacrifice: what to give up first when memory is short. This is a
+#            *preference*, not a cost order — giving something up may buy no
+#            context at all (a model already at its design cap has nothing
+#            to reclaim). Unlisted capabilities go vision before draft,
+#            because an MTP draft roughly doubles generation speed. Shedding
+#            a draft is opt-in per model (`allow_mtp_shed:`).
 #
-# Tasks are applied per set: a model that meets `coding` beside the
-# canonical RAG pair but not beside a heavier reranker joins `rag` and is
-# dropped from `ragz`. Only chat-task models are considered.
+# Only chat-task models are considered here.
 #
 # shed: the default order for capabilities a task does not name.
 # shed: [vision, draft]
 tasks:
-  # Chat-endpoint tasks: one serving covers all of them; they evict each
-  # other by request. endpoint + role are required; the demand keys are the
-  # floors the planner must meet.
+  # A task is an endpoint contract plus demand. It does not name a role:
+  # the model's role is the model's. `device` is `auto`, `cpu`, or a GPU
+  # index; a sidecar `device:` wins. `parallel_power` overrides
+  # matrix.parallel_power for that task: low keeps context, high buys slots.
+  # `max_context` is the served ceiling; for embeddings/rerank it is the RAG
+  # window.
+  #
+  # A model's tasks must share one endpoint: `--embeddings` and chat are
+  # different commands, so they cannot be one serving. Chat tasks are
+  # aliases of one serving; each gets its own entry.
   chat:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 64k
     min_parallel: 2
     sacrifice: [draft, vision]
   coding:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 130k
     min_parallel: 1
     sacrifice: [vision]
     keep: [draft]
   qa:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 32k
     min_parallel: 2
   aux:
     endpoint: openai.chat.completions
-    role: chat
     min_context: 80k
     min_parallel: 2
     sacrifice: [draft]
-  # A task may also set parallel_power: (B) to override matrix.parallel_power
-  # for its own solve — low keeps context, high buys slots.
-  # Capability tasks: endpoint and role only; they are sized by their role.
   embeddings:
     endpoint: openai.embeddings
-    role: embeddings
+    min_context: 4096
+    max_context: 4096      # the served RAG window; clients chunk to fit
+    ttl: 0                 # keep it loaded
   rerank:
     endpoint: openai.rerank
-    role: rerank
+    min_context: 4096
+    max_context: 4096
+    ttl: 0
   image:
     endpoint: openai.images.generations
-    role: image
   s2t:
     endpoint: openai.audio.transcriptions
-    role: s2t
+    device: cpu
+    # CPU default is 3600 s; set ttl: 0 to keep it warm.
   t2s:
     endpoint: openai.audio.speech
-    role: t2s
 
-# Model roots (CLI --models-dir overrides this). Role is selected by the
-# first-level subdirectory: chat/ t2t/ vision/ doc/ → chat, embed/ →
-# embeddings, rerank/ → rerank; other subdirs (img/, misc/, tmp/…) are
-# ignored, and files at a root are chat.  Any subdirectory may also carry a
-# models.yaml with subtree-scoped `defaults:` and `overrides:`.
+# ── Roles (required) ───────────────────────────────────
+# A role is an operator-defined purpose and allocation policy. The code ships
+# no role names; these are data. A role owns one or more trees with `dir:`;
+# every model under them belongs to it. A sidecar `role:` overrides the tree.
+# There is no default role: a model under no role's tree and with no `role:`
+# is an error, as is a `role:` naming a role not defined here.
+#
+# A role's floor is the maximum floor of its models. The set's floors come
+# out first; the rest is the auction. `share` is the role's request in each
+# set:
+#   share    40 or 40% — request weight (relative; may exceed 100)
+#   share    fill — take what the weighted roles leave
+#   share    min — request 0, accept nothing
+#   share    0 — request 0, accept what remains
+#   device   cpu | GPU index — where every model of the role runs. Same
+#            vocabulary as a sidecar `device:`; omit it to leave placement
+#            to the sidecar (and the task). `cpu` means no VRAM charge,
+#            -ngl 0, and a charge against the `ram` pool.
+# There is no per-role count, fill, or persistent key: one serving per role.
+# Keeping a serving loaded is `ttl: 0` on the task or the sidecar.
+roles:
+  chat:
+    dir: [chat, t2t, vision, doc, ocr]
+    share: fill
+  embeddings:
+    dir: embed
+    share: min
+    # device: cpu          # run the whole role from system RAM
+  rerank:
+    dir: rerank
+    share: min
+  image:
+    dir: img
+    share: min
+  s2t:
+    dir: s2t
+    share: min
+  t2s:
+    dir: t2s
+    share: min
+
+# ── Routing ────────────────────────────────────────────
+# There is no `routing.use`. The mode follows from the input: `matrix.sets:`
+# present → matrix; absent → capacity. `group` is not emitted; a single-leaf
+# set confines a role to running alone; keeping a model loaded is `ttl: 0`.
+#
+# capacity  generated sets size each role; any combination that fits may be
+#           loaded.
+# matrix    each set is its own budget. Only a set can forbid a combination
+#           that fits. It never preloads.
+
+# Model roots (CLI --models-dir overrides this). A model belongs to the role
+# whose `dir:` owns its directory (case-insensitive, relative to the root);
+# a subtree no role owns is skipped and named in the run log.  Any
+# subdirectory may also carry a models.yaml with subtree-scoped `defaults:`
+# and `overrides:`.
 models_dirs:
   - models
   # - /mnt/ai/models  # multiple roots allowed
-
-# Extra directory roles (extend the built-ins). Keys matched case-insensitively;
-# values must be chat | embeddings | rerank | image | s2t | t2s. CLI
-# --extra-dirs adds directories to scan; they are chat unless named here.
-# Image models are opt-in: add `img: image` here to serve diffusion weights via sd-server.
-# Speech-to-text (whisper.cpp) is opt-in: add `s2t: s2t` to serve .bin weights
-# via whisper-server (requires an authored same-stem sidecar per model).
-# dirs:
-#   it2t: chat
-#   img: image
-#   s2t: s2t
 
 # HF cache root for hub-snapshot resolution (hf_repo + model sidecars) and
 # the ${HF_HOME} path macro.  Defaults to $HF_HOME / $HUGGINGFACE_HUB_CACHE /
@@ -133,8 +186,8 @@ models_dirs:
 #   - whisper-server
 
 # ── Profile definitions ────────────────────────────────
-# Each profile overlays `defaults` and emits llama-swap setParamsByID
-# overrides. `allow_profiles` in a model sidecar can filter which profiles
+# Each profile overlays `defaults` and becomes llama-swap's per-request
+# sampling overrides. `allow_profiles` in a model sidecar can filter which profiles
 # apply to that model. Sidecar `modes:` layer over the same-named profile
 # (single merge rule: dicts merge, lists append, None deletes) and replace
 # the profile sampling overrides per-model when present.
@@ -171,8 +224,8 @@ profiles:
 
   # ── Grouping / placement params ──────────────────────
   # Distinct (parallel, cache_type, spare, batch, ubatch) combos get their
-  # own VRAM solve and llama-swap entry; profile names within a group become
-  # setParamsByID keys. `spare` reserves VRAM headroom (e.g. "512m", "6G").
+  # own memory allocation and llama-swap entry; profile names within a group
+  # become per-request overrides. `spare` reserves VRAM headroom.
   # `parallel` is the slot count — and a pin: declaring it opts the model
   # out of auto-parallel.
   # server:
@@ -241,7 +294,7 @@ profiles:
 # ── whisper-server backend (optional, speech-to-text) ─────
 # Defaults for `backend: whisper-server` (whisper.cpp examples/server).
 # CLI --whisper-server wins over this, then $WHISPER_BIN_DIR, then the
-# run directory (cwd), then `whisper-server` on PATH.  Opt-in: add `s2t: s2t` under `dirs:` above;
+# run directory (cwd), then `whisper-server` on PATH.  Opt-in: give the s2t role a `dir:` that owns the whisper tree;
 # each model needs an authored same-stem sidecar next to its GGML .bin
 # (e.g. ggml-large-v3.md beside ggml-large-v3.bin).  Fixed VRAM overhead,
 # excluded from the shared chat matrix.
@@ -256,7 +309,7 @@ profiles:
 # CLI --audio-cpp-server/--audio-cpp-backend win over this, then
 # $AUDIOCPP_BIN_DIR, then the run directory (cwd), then
 # `audiocpp_server` on PATH.  Opt-in: add
-# `t2s: t2s` and/or `s2t: s2t` under `dirs:` above.  Fixed VRAM overhead
+# give the t2s and s2t roles a `dir:` that owns the audio trees.  Fixed VRAM overhead
 # (file size + family buffer), excluded from the shared chat matrix.
 # One entry per sidecar (1:1) — switching models reloads audio.cpp.
 # audio_cpp:
@@ -280,16 +333,20 @@ profiles:
 # ── Hardware (optional) ─────────────────────────────────
 # Override the auto-detected VRAM pool and host-RAM budget. CLI --vram /
 # --baseline / --unified-system-mb win over the VRAM side.
+# Use `defaults.spare` for ordinary tenant/desktop headroom. `baseline_mb`
+# is an advanced override for a known fixed pre-existing load; it only
+# matters above the fixed 1 GiB video reserve and subtracts from the same
+# pool.
 # hardware:
 #   vram: 48G
-#   # baseline_mb: 512m        # extra reserve on top of fixed 2 GiB (default 0)
+#   # baseline_mb: 512m        # known pre-existing load, above the 1 GiB floor
 #   # unified_system_mb: 8192  # system slice on unified hosts (default 8192)
 #   # memory_margin: 0.04      # fraction inflated against every measured VRAM
 #   #                          # term when solving (default 0.04: covers the
 #   #                          # allocator overhead llama.cpp's own buffers
 #   #                          # don't report, ~4% observed on Vulkan/radv)
 #   # fast_storage: /mnt/@/ssd_ai   # physical branch (or list) that holds
-#   #                          # SSD-resident models — reads ~6x faster than
+#   #                          # SSD-backed models — reads ~6x faster than
 #   #                          # platter branches.  Family representatives and
 #   #                          # measurement prefer models resolved here;
 #   #                          # unset = no tier preference.
@@ -300,15 +357,11 @@ profiles:
 #   #                          # vm.min_free_kbytes) | 25% | <abs>
 #   # cgroup_dir: /sys/fs/cgroup/system.slice/llama-swap.service
 
-# ── Role-wide host placement (optional) ─────────────────
-# Every model of a named role runs from RAM — identical to tagging each
-# sidecar `device: cpu`: no VRAM charge, same host budget, -ngl 0, never
-# evicted by a swap, ttl 0. Only the four resident roles can be named here
-# (embeddings, rerank, s2t, t2s); a chat model is placed per sidecar.
-# The key is a role, the value is a device — there is no `role: cpu`.
-# Unset = per-sidecar tags only.
-# device_roles: [embeddings, rerank]
-# device_roles: {embeddings: cpu, s2t: cpu}
+# ── Roles are defined above ────────────────────────────
+# Every role is declared in `roles:` with its trees (`dir`), placement
+# (`device`) and allocation policy. Sidecars may set `role:` to override the
+# tree's role. Placement lives on the role:
+#   embeddings: {dir: embed, device: cpu, ...}
 
 # ── Override rules (optional) ────────────────────────────
 # Pattern-scoped serving choices. `when` is required; `when: true` matches all.
@@ -336,102 +389,57 @@ profiles:
 #   - when: {name: 'tiny-.*'}
 #     cache_type: None                  # delete: fall back to built-in q8_0
 
-# ── Roles (optional; NEW — lands in P5) ─────────────────
-# A role is a use case that *hosts* tasks; it does not require them — RAG
-# with the rerank slot empty is thinner but valid. `pinned` tasks are
-# resident, `on_demand` (the default) load when requested and evict their
-# siblings. Role terms reach every element's serving and degrade before the
-# task's own terms do. The matrix `sets:` below are generated from this
-# table, so hand-authored sets become alien when this lands.
-# roles:
-#   chat:
-#     tasks:
-#       - chat: pinned
-#       - agent: on_demand
-#   rag:
-#     min_context: 4k
-#     sacrifice: [concurrency, vision]
-#     tasks:
-#       - embed: pinned
-#       - rerank: pinned
-#   voice:
-#     tasks:
-#       - stt: pinned
-#       - tts: pinned
+# ── Context and routing knobs (optional) ───────────────
+# A task's `min_context` is a floor and `max_context` is a ceiling. The old
+# `embed_context` / `rerank_context` knobs are gone: put `max_context: 4096`
+# on the embeddings/rerank tasks instead.
 #
-# ── Matrix: shared VRAM and routing sets (optional) ────
-# Residents are pinned and served at a fixed small context, so their
-# footprint is a number you can compute up front; whatever is left goes to
-# chat, and each chat model resolves its own serving against it through its
-# usage category (see `usage:` above and SPEC.md "VRAM Allocation").
+# Limits and guards for shared context:
+#   tools_min_ctx     below this chat context the entry loses the `tools`
+#                     capability (default 128k)
 #
-# `embed_context` / `rerank_context` are that fixed context. They are small
-# on purpose: clients chunk to one stable RAG size, and a flexing context
-# would make the resident tier's VRAM move under the budget. If VRAM is the
-# binding constraint, context in main chat is worth more than context in RAG.
-# Select the residents with --embed / --rerank or a category `selector:`;
-# they always serve single-slot.
-#
-# The shared solve's floors and guards, in the order it applies them:
-#   tools_min_ctx     below this chat context, the RAG pair is squeezed to
-#                     buy context back (default 128k)
-#   coload_min_ctx    how far the RAG pair may be squeezed (default 20k)
-#   ctx_gain_min      the minimum chat gain that makes the squeeze worth it
-#                     (default 4k)
-#   min_chat_ctx      the floor kept for a co-load; below it nothing else is
-#                     admitted (default 64k; tools_min_ctx when tools still
-#                     have it)
-#   estimate_headroom pads an estimated, not measured, co-load overhead
-#                     (default 1.25; must be >= 1.0)
-#
-# A routing set is a use case — a composition of roles that must be live
-# together. `rag` is embed AND rerank (two roles); `talk` is stt AND tts.
-# One set names one model per role; a second category of the same role is an
-# alternative (`rnk | rnk2`), never an addition. Operators may declare their
-# own buckets (one/two/three) and compose them without naming a task.
-# The sets are also the VRAM budget contract: the chat solve reserves the
-# worst branch of the most expensive chat set (`&` sums, `|` maxes, `+set`
-# expands a named set), not the sum of every declared category. A category
-# no chat set references reserves nothing (it can only run alone).
+# `sets:` switches the emitted config to matrix mode. Each set is its own
+# memory budget: [A&B] [A&C] [A&D] constrains only the pairs, so all four can
+# take half the pool, where capacity would force each to a quarter. Only a set
+# can forbid a combination that fits. Expressions use llama-swap syntax:
+# & (together), | (alternative), +set. A model in no set runs
+# alone. Matrix never preloads: it evicts to the cheapest set containing the
+# requested model and starts only that model.
 #
 # matrix:
-#   embed_context: 4096
-#   rerank_context: 4096
-#   # tools_min_ctx: 131072
-#   # coload_min_ctx: 20480
-#   # ctx_gain_min: 4096
-#   # min_chat_ctx: 65536
-#   # estimate_headroom: 1.25
-#   auto_parallel: false        # on by default: value-function (ctx, slots)
-#                               # solve for unpinned chat; false disables it
-#                               # fleet-wide
+#   tools_min_ctx: 131072
+#   auto_parallel: false        # on by default: the packer chooses context and slots
 #   auto_parallel_max: 8        # hard cap on auto slots (vLLM: 16)
-#   parallel_power: 0.75        # fleet default slot exponent: how much context
-#                               # one extra slot may cost. A task's own
-#                               # parallel_power: overrides it. See SPEC.md
-#   categories:                 # var -> served model; `emb`/`rnk` are the
-#     emb: { role: embeddings } # canonical names of the RAG roles
-#     rnk: { role: rerank }
-#     rnk2: { role: rerank, selector: zerank }   # alternative, not additive
-#     stt: { role: s2t }
-#     tts: { role: t2s }
-#   sets:
-#     rag:   "__CHAT_VARS__ & emb & rnk"
-#     ragz:  "__CHAT_VARS__ & emb & rnk2"
-#     talk:  "__CHAT_VARS__ & stt & tts"           # 2-way speech
-#     combo: "__CHAT_VARS__ & (three | (two & one))"  # operator buckets
-#   # evict_costs: {one: 10, two: 10, three: 10}  # forwarded to llama-swap
+#   parallel_power: 0.75        # slot exponent; a task's own overrides it
+#   sets:                       # presence switches to matrix mode
+#     rag: "chat & embeddings & rerank"
+#     voice: "chat & t2s"
+#
+# ── Capacity routing knobs (optional) ──────────────────
+# The generated config uses capacity routing:
+#   reserve       = 1024 + max(1024, baseline_mb)
+#   pools.default = detected VRAM - reserve - spare
+#   pools.ram     = detected host pool
+#   pools.<role>  = 1 (one serving per role)
+# Allocations fill pools.default on purpose; reserve + spare is every bit of
+# headroom, so a nearly full pool is normal.
+# Each model also gets an eviction cost: reload time plus lost prefill
+# (KV-cached endpoints only). `pp_tps`/`drive_mbps` are its inputs, not sizing knobs. A sidecar
+# `pp_tps:` overrides the fleet value; estimate it from hardware TOPS x
+# active parameters, or measure it with extras/bench.py / llama-bench.
+# capacity:
+#   pp_tps: 1000
+#   # drive_mbps: 1000
 
-# ── VRAM pools (optional) ───────────────────────────────────
-# One shared ledger per pool: per-pool spare override, unmodelled residents,
-# and explicit claimant reservations. "auto" keeps the derived math.
+# ── VRAM and RAM pools (optional) ───────────────────────────
+# The emitted `default` pool is detected VRAM minus the measured reserve and
+# `spare`. A per-pool `spare` overrides the fleet value for that pool and
+# reduces its emitted pool.
 # pools:
 #   default:
-#     spare: 2G
-#     reserve_extra: 8G          # VM, game, other tenant
-#     pins:
-#       image: 40G
-#       embeddings: auto
+#     spare: 2G                  # added to the measured reserve
+#   ram:
+#     spare: 2G                  # keep 2G of host RAM free
 
 # ── Flag macros (optional) ──────────────────────────────────
 # Named flag chunks for cmd readability (llama-swap macros). Auto-derived

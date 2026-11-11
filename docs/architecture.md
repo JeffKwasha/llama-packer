@@ -1,7 +1,7 @@
 # Architecture
 
 How llama-packer turns a directory of model sidecars into a llama-swap
-`config.yaml`. Behavioral details live in [SPEC.md](../SPEC.md); this document
+`config.yaml`. Behavioral details are in [SPEC.md](../SPEC.md); this document
 is about *structure* — which component owns what, and why.
 
 ## Data flow
@@ -27,14 +27,14 @@ main()                                        (__main__.py — thin orchestratio
 | `Model` | `model.py` | Sidecar aggregate: frontmatter accessors, companion resolution (mmproj/MTP), design context, pass-through metadata. One instance per servable model |
 | `ScopeStack` | `scope.py` | The single select-and-set engine for sidecar data: folds `models.yaml` defaults outermost→innermost, applies override rules last-match-wins per key, finalizes backend inference + path refs |
 | `Profiles` | `profiles.py` | The profiles.yaml mapping as a typed view: fleet defaults (`cache_type`, `parallel`, spare), `allow_profiles` gating, expression resolution (`base * N`), per-model variant grouping |
-| `Planner` | `writer.py` | Every *context decision*: per-category rung search, shared matrix solve, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
+| `Planner` | `writer.py` | Every *context decision*: per-task rung search, role-budget auction, grouping via `Profiles.groups_for`, bounded-context clamp. Emits `Variant` values |
 | `Variant` | `writer.py` | Frozen plan for one llama-swap entry: parallel/cache_type/spare_mb, profile group, ctx_size, include_mmproj, optional vision_ctx, optional `vram_note` (over-budget squeeze tag for the description) |
 | `emit_config` | `writer.py` | Pure rendering: plans → entry dicts. Zero VRAM contact, zero I/O |
 | `_filter_supported` | `writer.py` | **The** validation boundary: backend format/task compatibility, reasoning-flag value/applicability, cache-type knowability, capability/companion cross-check (`vision` removed → error; mmproj without `image`/`video` → warning). Runs before any VRAM work so rejected models never consume measurements |
 | Backends (engines) | `backends/`, `backends/base.py` | The serving engines (llama.cpp, vLLM, sd.cpp, whisper.cpp, audio.cpp): formats and the endpoints they serve, argv construction (`build_cmd`), and the resource requirements needed to launch them (`host_requires`/`container_requires`). Each renders a resolved `Model` into a `cmd` |
 | Transports | `backends/transport.py` | How an engine's process is launched: `host`, or a container runtime (`docker`, `podman`). Owns host→container path translation, mounts, container env, GPU device flags and lifecycle (`stop_cmd`/`unload_timeout`). One `ContainerTransport(runtime)` serves both docker and podman |
 | Registry binding | `backends/__init__.py` | Materialises one `BoundBackend` per valid (engine, transport) pair; engines declare which transports they support. Names: bare engine for host, `<engine>-<transport>` otherwise. Inference order: engines in declaration order, transports host > podman > docker; a container pair is only inferred when its runtime is on `PATH`. Selection: sidecar/override `backend:` > format/role inference gated by configured resources |
-| `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `calc_ctx`, matrix solver primitives |
+| `VramBudget` | `vram.py` | Per-model VRAM math: fit-params fetch/persist/scaling, companion folding (`effective_static`), `solve_context`, matrix solver primitives |
 | Rule primitives | `overrides.py` | Rule compilation/validation, regex matching (`when`), path resolution for templates/LoRAs — applied by `ScopeStack` |
 | `GpuProfile` | `hardware.py` | VRAM pool detection and reserve semantics (discrete vs unified memory) |
 
@@ -46,41 +46,36 @@ runtime: we choose the fields, llama-swap acts on them.
 | decision | our output | who acts |
 |---|---|---|
 | which entries exist | `models:` (`cmd`, `metadata`, `capabilities`, `name`) | llama-swap serves them |
-| when an idle entry unloads | `ttl:` per entry, `globalTTL:` top-level (seconds; `0` disables idle unload) | llama-swap's idle timer |
-| which entries may be wanted together | `routing.router.settings.matrix` (`vars`, `sets`, `evict_costs`) | llama-swap's matrix router |
-| what memory is pre-charged in the budget | pack-time arithmetic only | nobody at runtime |
+| when an idle entry unloads | `ttl:` per entry, top-level `globalTTL` from the operator's `ttl` (seconds; `0` disables idle unload) | llama-swap's idle timer |
+| which entries may be wanted together | `routing.router.settings.capacity` (`pools`, per-entry `capacities`, `evict_cost`) | llama-swap's capacity router |
+| what memory each serving claims | `capacities:` on each model | llama-swap, at request time |
+| what memory the packer budgets | pack-time arithmetic only | nobody at runtime |
 
-**`pinned` and `on_demand` are memory-accounting classes, not runtime
-states.** A pinned element is charged before the rest of the budget is
-solved, so the emitted config always leaves room for it. It is not a
-request to keep that entry loaded: an entry with a `ttl` still unloads and
-lazily reloads. An on_demand element is simply not pre-charged; its entry
-is still emitted and llama-swap may load it whenever a request names it.
-Neither class changes the entry's definition or its set membership.
+**The packer decides numbers; llama-swap enforces them.** `capacities` are
+declarations, so the packer emits the same measurement margin it solved
+with. `evict_cost` only orders evictions under pressure; it does not
+reserve or preload. Every role emits a size-1 counting pool, which turns
+"one serving per role" into a capacity constraint, so a same-role request
+evicts its sibling without any set vocabulary.
 
-**`sets:` is co-residency vocabulary, not preload.** llama-swap does not
-start a set. The expression says which models may share the card in that
-use case; llama-swap loads/evicts within it under its own policy. We use
-the same expression to price the worst branch in the chat solve.
+Nothing is preloaded: llama-swap starts the requested model and evicts
+whatever the pools require. `ttl` is independent — it yields time, not
+memory.
 
-Example of the emitted form (adapters, `emb`, `rnk`, … are the matrix vars
-from `vars:`):
+Example of the emitted form:
 
 ```yaml
 routing:
   router:
-    use: matrix
+    use: capacity
     settings:
-      matrix:
-        vars: {c1: qwen38-27b-dirk.coding.t, emb: jina-v5-small-retrieval, rnk: qwen3-reranker-0.6b}
-        sets:
-          rag:  (c1 | c2 | …) & emb & rnk
-          ragz: (c1 | c2 | …) & emb & rnk2
+      capacity:
+        pools: {default: 27747, ram: 50000, chat: 1, embeddings: 1, rerank: 1}
+models:
+  qwen38-27b-dirk.coding.t:
+    capacities: {default: 27443, ram: 1300, chat: 1}
+    evict_cost: 250
 ```
-
-`rag` and `ragz` are two use cases that differ only in which model fills
-the rerank element. A request naming a var is routed through the sets that
-contain it.
 
 ## Models, tasks, engines and endpoints
 
@@ -106,23 +101,21 @@ model --declares--> tasks --served at--> endpoints <--served by--> engine
 
 So one engine serves many models, one task can be served by several engines,
 and a model may perform several tasks. Two models performing the same task
-are alternatives, never co-resident.
+are alternatives, never loaded together.
 
 ### A task is a catalog entry
 
-A task is a closed id and carries everything the packer needs to schedule
-it: the endpoint it is served at, the scheduling role it implies, its load
-semantics (request-time parameter vs one task per process), and the negative
-examples that keep near neighbours apart. Adding a task is a contract change
-— endpoint + role + policy — never an agent's passing invention; an unknown
-id warns and is ignored, and "we don't know" is an empty `tasks:`, not an
-invented name.
+A task is a closed id and carries everything the packer needs to size it:
+the endpoint it is served at, its demand, and its placement requirement.
+Adding a task is a contract change — endpoint + policy — never an agent's
+passing invention; an unknown id warns and is ignored, and "we don't know"
+is an empty `tasks:`, not an invented name.
 
-The task vocabulary is declared in `profiles.yaml tasks:`; the code owns only
-the contract it is checked against (the endpoint ids and the scheduling
-roles). A sidecar claims its work with `tasks:`; `role:` and `usage:` are
-alien keys that warn and are ignored. The six scheduling roles (`chat`,
-`embeddings`, `rerank`, `image`, `s2t`, `t2s`) remain the fixed contract.
+The task vocabulary is declared in `profiles.yaml tasks:`; the code owns
+only the contract it is checked against (the endpoint ids). A sidecar claims
+its work with `tasks:` and belongs to a role by its directory or an explicit
+`role:`; `usage:` is an alien key that warns and is ignored. Roles are
+operator data, not a fixed list.
 
 ### An endpoint is standardized
 
@@ -130,54 +123,48 @@ Endpoints are concrete serving surfaces, engine-owned and hardcoded in one
 place: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`,
 `openai.audio.transcriptions`, `openai.audio.speech`, plus `native.*` for
 engine-specific surfaces. Servers and clients choose endpoints; a model
-never does. A role's required endpoints are the union of its tasks'
-endpoints, and one live serving covers every task sharing an endpoint —
+never does. A role's required endpoints are the union of the endpoints of the tasks its
+models declare, and one serving covers every task sharing an endpoint —
 those tasks are aliases of one serving, never one load each.
 
-### A role is a composition
+### A role is ownership; a task is an endpoint contract
 
-A role hosts elements; it does not require them — RAG with the rerank slot
-empty is thinner but valid. Roles live in `profiles.yaml` and list their
-tasks with a persistence class:
+The levels are not interchangeable:
 
-```yaml
-roles:
-  chat:
-    tasks:
-      - chat:  pinned
-      - agent: on_demand
-  rag:
-    min_context: 4k
-    sacrifice: [concurrency, vision]
-    tasks:
-      - embed:  pinned
-      - rerank: pinned
-```
+| level | answers | example |
+|---|---|---|
+| **role** | the tree a model's directory belongs to, plus its allocation policy | `chat` owns `chat/`, `embeddings` owns `embed/` |
+| **task** | the endpoint contract a model can serve | `openai.chat.completions`, `/v1/embeddings` |
+| **share** | a role's request weight in a set's auction | `40%`, `fill`, `min`, or `0` |
+| **capacity pool** | what may be loaded together | `default` VRAM, `ram`, a size-1 counting pool per role |
+| **set** | which combinations may be loaded together | `foo & bar` |
 
-`pinned` is resident; `on_demand` (the default) loads when requested and
-evicts its siblings. Role terms (`require:`/`keep:`/`sacrifice:`/`min_*:`)
-reach every element's serving and rank earlier in the sacrifice order than
-the task's own terms — the role degrades before its tasks do. The matrix
-`sets:` are generated from this table (P5), not hand-authored: dual
-authorship is the drift this design exists to remove.
+A role is not a composition and does not "host" anything. What may be loaded
+together is what the emitted capacities allow: any combination that fits
+every pool, with a size-1 counting pool keeping one model per role. That is
+capacity mode. An operator who must forbid a combination that fits writes
+`matrix.sets:` instead; each set is its own budget.
 
-### Where the registries live
+`ttl` is the temporal knob: sidecar > task > role > top-level `ttl`, `0` =
+never. The top-level default is 3600 s.
 
-`roles.py` is the scheduling table: one row per scheduling role with the
-chat-pass flag, default residency policy, context knob and `device_roles:`
-eligibility. Every derived set (`SERVED_ROLES`, `NON_CHAT_ROLES`,
-`DEVICE_ROLES`) is read off it. The task vocabulary itself comes from
-`profiles.yaml tasks:`; each declaration names one of these roles.
+### Where the registries are
+
+`roles.py` is the role data: one row per operator-declared purpose with the
+tree it owns (`dir`) and an allocation policy. The task
+vocabulary itself comes from `profiles.yaml tasks:`; a model belongs to the
+role that owns its directory or to the one its sidecar names, and a task
+declares only its endpoint, demand, and device.
 
 `endpoints.py` is the other half: the closed set of endpoint ids and the one
 mapping from a task to the endpoint it is served at. An engine declares
 `endpoints`; compatibility is `endpoints.serves(engine.endpoints, task)`, so
 neither side has to learn the other's vocabulary. The registry's validation
-API and the doc/code agreement test live here (`docs_agree`,
+API and the doc/code agreement test are here (`docs_agree`,
 `test_registry_docs_agree`).
 
 Validation follows the same split: an alien sidecar key warns at discovery
-(`role:`/`usage:` are not keys — the warning points at `tasks:`), an
+(`usage:` is not a key — the warning points at `tasks:`), an
 unsupported `device:` warns (`cpu`/non-negative index), and format/endpoint
 compatibility is checked once in `_filter_supported` before any budgeting.
 
@@ -185,13 +172,13 @@ compatibility is checked once in `_filter_supported` before any budgeting.
 
 | Invariant | Home |
 |-----------|------|
-| Context clamp order: VRAM solve → min(max trained context) → min(`--max-context`) | `Planner._bounded_ctx` — the only package-level `calc_ctx` call site |
+| Context clamp order: VRAM solve → min(max trained context) → min(`--max-context`) | `Planner._bounded_ctx` — the only package-level `solve_context` call site |
 | Spare precedence: profile value > CLI `--spare` > 0 | `Profiles.spare_mb` / `global_spare_mb` |
 | Cache precision precedence: sidecar > profile > `q8_0` | `Model.cache_type_for` fed only from `Profiles.default_cache_type` / profile values |
 | Validation happens exactly once, before budgeting | `build_config` composes filter → plan → emit in that order |
 | Plans are values; rendering is pure | `Planner.plan()` returns `dict[stem, list[Variant]]`; `emit_config` has no side effects |
 | Precedence rules exist in one place | raw `defaults:`/`profiles:` dicts are only read through `Profiles` |
-| Backends are (engine × transport) bindings, not per-combination classes | `BoundBackend` over `ENGINES` × `TRANSPORTS` (`backends/__init__.py`); container mechanics live only in `transport.py` |
+| Backends are (engine × transport) bindings, not per-combination classes | `BoundBackend` over `ENGINES` × `TRANSPORTS` (`backends/__init__.py`); container mechanics are only in `transport.py` |
 
 The plan/emit split is deliberate: planning depends only on models'
 `VramBudget` interfaces (injectable/fakeable), emission is deterministic over
@@ -200,7 +187,7 @@ plain data — see `tests/test_planner.py`.
 
 ## Testing seams
 
-- Fake a model's budget directly: `model.vram.calc_ctx = lambda *a, **k: ...`
+- Fake a model's budget directly: `model.vram.solve_context = lambda *a, **k: ...`
   (see `tests/test_planner.py`) — no subprocess mocking needed.
 - Assert emission with literal expected entries: `emit_config` output compares
   equal to hand-written dicts.
@@ -230,6 +217,6 @@ plain data — see `tests/test_planner.py`.
 - [backends/](backends/) — one doc per engine: formats/endpoints, command shape, config keys, VRAM
 - [transports/](transports/) — host / docker / podman: launch wrapping, path translation, lifecycle
 - [SPEC.md](../SPEC.md) — behavioral contract (discovery, fit-params
-  estimate, measurement shape, matrix solve, auto-parallel, batch/ubatch
+  estimate, measurement shape, role budget, auto-parallel, batch/ubatch
   keys, and what deleting a `derived:` block costs)
   (seconds of header-only work — never a server, never a probe).

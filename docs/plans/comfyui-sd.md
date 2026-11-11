@@ -68,7 +68,7 @@ llama-swap already acts as a transparent HTTP proxy for **any** OpenAI/API-compa
 * **No new binary needed** — reuse existing proxy/templating path; just add backends that render `sd-server`/`comfyui-boot` commands and validate via `compat`/`checkEndpoint`.
 * **Role mapping:** extend `utils.SERVED_ROLES` + `dir_role_map` for `img`/`comfy`→`image` (and decide whether `image` is a new native `capabilities` value or stays under `chat` with `type: image`). Sidecar `role: image` or `type: image` could select the backend, similar to `embed`/`rerank`.
 * **VRAM sizing:** sd-server and ComfyUI have no `llama-fit-params` analog. Short-term: honor declared `context_length` / `parameters` or a fixed overhead per model; long-term: measure/load-test or track derived `fit-params` block. Until then, `sizing = declared + companion weights` and budget as fixed overhead (same as CPU-resident path today).
-* **Config generation:** `models[].proxy`, `models[].checkEndpoint`, `models[].compat.ignoreWebsockets`, `upstream.ignorePaths`, and macro `${PORT}` must be emitted. The `matrix` feature (see `docs/plans/matrix-categories.md`) should treat image/ComfyUI models as a separate co-located category rather than evictable chat models.
+* **Config generation:** `models[].proxy`, `models[].checkEndpoint`, `models[].compat.ignoreWebsockets`, `upstream.ignorePaths`, and macro `${PORT}` must be emitted. Capacity routing should treat image/ComfyUI models as a separate co-located category rather than evictable chat models.
 
 ## References
 

@@ -11,8 +11,8 @@ from llama_packer.model import Model, WeightFinder
 from conftest import _hf_tree, catalogue
 
 
-def _sidecar(name: str) -> str:
-    return f"---\nname: {name}\n---\n"
+def _sidecar(name: str, extra: str = "") -> str:
+    return f"---\nname: {name}\n{extra}---\n"
 
 
 def test_from_dir_multiple_dirs(tmp_path):
@@ -21,9 +21,9 @@ def test_from_dir_multiple_dirs(tmp_path):
     d2 = tmp_path / "m2"
     d1.mkdir(); d2.mkdir()
     (d1 / "foo.gguf").write_bytes(b"x")
-    (d1 / "foo.md").write_text(_sidecar("Foo"))
+    (d1 / "foo.md").write_text(_sidecar("Foo", "role: chat\n"))
     (d2 / "bar.gguf").write_bytes(b"x")
-    (d2 / "bar.md").write_text(_sidecar("Bar"))
+    (d2 / "bar.md").write_text(_sidecar("Bar", "role: chat\n"))
 
     models = Model.from_dir([d1, d2], generate_stubs=False)
     assert {m.stem for m in models} == {"foo", "bar"}
@@ -35,56 +35,99 @@ def test_from_dir_dedupes_symlinks_to_same_file(tmp_path):
     d2 = tmp_path / "m2"
     d1.mkdir(); d2.mkdir()
     (d1 / "foo.gguf").write_bytes(b"x")
-    (d1 / "foo.md").write_text(_sidecar("Foo"))
+    (d1 / "foo.md").write_text(_sidecar("Foo", "role: chat\n"))
     (d2 / "bar.gguf").symlink_to(d1 / "foo.gguf")
-    (d2 / "bar.md").write_text(_sidecar("Bar"))
+    (d2 / "bar.md").write_text(_sidecar("Bar", "role: chat\n"))
 
     models = Model.from_dir([d1, d2], generate_stubs=False)
     assert [m.stem for m in models] == ["foo"]
 
 
-def test_role_dirs_whitelist_and_companions(tmp_path):
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
+def test_role_trees_and_companions(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a role owns its
+    # trees with dir:; nested dirs keep the owning role.
     root = tmp_path / "models"
     for sub, files in {
-        "": ["plain.gguf"],
         "chat": ["c1.gguf"],
         "vision": ["v1.gguf", "v1-mmproj.gguf"],  # mmproj is a companion, not a main
         "doc": ["d1.gguf"],
         "embed": ["e1.gguf"],
-        "embed/jina-v5": ["e2.gguf"],  # nested keeps the top-level role
+        "embed/jina-v5": ["e2.gguf"],  # nested keeps the owning role
         "rerank": ["r1.gguf"],
-        "img": ["sd-checkpoint.gguf"],   # not in the map: skipped
-        "misc": ["junk.gguf"],           # not in the map: skipped
+        "img": ["sd-checkpoint.gguf"],
+        "misc": ["junk.gguf"],         # no role owns it: skipped
     }.items():
         d = root / sub
         d.mkdir(parents=True, exist_ok=True)
         for f in files:
-            (d / f).write_bytes(b"x")
+            if sub == "img":
+                write_gguf(d / f, arch="flux1")
+                (d / f"{f[:-5]}.md").write_text(
+                    "---\nname: SD\ntasks: [image]\n"
+                    "engines: [sd-server]\n---\n")
+            else:
+                (d / f).write_bytes(b"x")
 
     models = Model.from_dir(root, generate_stubs=False)
     by_stem = {m.stem: m for m in models}
-    assert set(by_stem) == {"plain", "c1", "v1", "d1", "e1", "e2", "r1"}
-    assert by_stem["plain"].role == "chat"      # root-level default
-    assert by_stem["v1"].role == "chat"         # vision colocates with chat
+    assert set(by_stem) == {"c1", "v1", "d1", "e1", "e2", "r1",
+                            "sd-checkpoint"}
+    assert by_stem["v1"].role == "chat"         # vision belongs to chat
     assert by_stem["e1"].role == "embeddings"
-    assert by_stem["e2"].role == "embeddings"   # nested keeps top-level role
+    assert by_stem["e2"].role == "embeddings"   # nested keeps the owning role
     assert by_stem["r1"].role == "rerank"
+    assert by_stem["sd-checkpoint"].role == "image"
 
 
-def test_dir_roles_override(tmp_path):
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Walk *models_dirs* depth-first and return deduplicated Models.
+def test_role_trees_are_operator_data(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': directory names
+    # carry no meaning; the role that lists them in dir: owns them.
+    from llama_packer import roles
     from llama_packer.discover import discover
     root = tmp_path / "models"
     (root / "ocr").mkdir(parents=True)
     (root / "ocr" / "o1.gguf").write_bytes(b"x")
     (root / "img").mkdir()
-    (root / "img" / "sd.gguf").write_bytes(b"x")
+    write_gguf(root / "img" / "sd.gguf", arch="flux1")
+    (root / "img" / "sd.md").write_text(
+        "---\nname: SD\ntasks: [image]\nengines: [sd-server]\n---\n")
 
-    models = discover([root], generate_stubs=False,
-                      dir_roles={"ocr": "chat", "img": "chat"})
-    assert sorted(m.stem for m in models) == ["o1", "sd"]
-    assert all(m.role == "chat" for m in models)
+    try:
+        roles.configure({"roles": {
+            "text": {"dir": ["ocr"]},
+            "pics": {"dir": "img"},
+        }})
+        models = discover([root], generate_stubs=False)
+    finally:
+        roles.configure(None)
+    assert {m.role for m in models} == {"text", "pics"}
+
+
+def test_model_without_a_role_is_an_error(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': there is no
+    # default role, so an unowned model stops the run.
+    import pytest
+    from llama_packer.discover import DiscoveryError
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "plain.gguf").write_bytes(b"x")
+
+    with pytest.raises(DiscoveryError, match="no role owns this model"):
+        Model.from_dir(root, generate_stubs=False)
+
+
+def test_undefined_sidecar_role_is_an_error(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a role: naming
+    # a role the file does not define stops the run.
+    import pytest
+    from llama_packer.discover import DiscoveryError
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "m.gguf").write_bytes(b"x")
+    (root / "chat" / "m.md").write_text(_sidecar("M", "role: hamster\n"))
+
+    with pytest.raises(DiscoveryError, match="'hamster' is not defined"):
+        Model.from_dir(root, generate_stubs=False)
 
 
 def test_embed_rerank_orphans_get_role_stubs(tmp_path):
@@ -105,8 +148,9 @@ def test_embed_rerank_orphans_get_role_stubs(tmp_path):
     assert (root / "rerank" / "r1.md").read_text() == "---\n---\n\n# r1\n"
 
 
-def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
+def test_type_field_does_not_choose_a_role(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': the role is the
+    # owning tree or an explicit role:; type: is metadata.
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "e.gguf").write_bytes(b"x")
@@ -114,50 +158,44 @@ def test_sidecar_type_field_classifies_outside_role_dirs(tmp_path):
         "---\nname: E\ntype: embedding\n---\n")
 
     models = Model.from_dir([root], generate_stubs=False)
-    assert [m.role for m in models] == ["embeddings"]
+    assert [m.role for m in models] == ["chat"]
 
 
-def test_derived_role_is_not_an_alien_sidecar_key(make_model, caplog):
-    # Validates: SPEC.md, 'Tasks (tasks:)': role is derived from a task claim, so only a role the sidecar actually authored is warned about
+def test_role_is_a_valid_sidecar_key(make_model, caplog):
+    # Validates: docs/plans/requirement-trace.md, requirement #88
     import logging
     from llama_packer.discover import _warn_unsupported_values
-    from llama_packer.scope import ScopeStack
-    m = make_model("tk", tasks=["chat"])
-    ScopeStack(avail={"llama_bin": "/opt/llama-server"},
-               tasks=catalogue()).finalize(m)
-    assert m.frontmatter["role"] == "chat"
+    m = make_model("tk", role="chat", tasks=["chat"])
     with caplog.at_level(logging.WARNING):
         _warn_unsupported_values(m, "tk.md", catalogue())
     assert not [r for r in caplog.records
                 if "role: is not a sidecar key" in r.message]
 
 
-def test_unknown_role_value_warns_with_a_hint(tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #28 -- role has one
-    # canonical spelling per role; a human alias warns instead of falling
-    # through to "no backend supports" much later.
+def test_usage_is_an_alien_sidecar_key(tmp_path, caplog):
+    # Validates: docs/plans/requirement-trace.md, requirement #88
     import logging
     root = tmp_path / "models"
     root.mkdir()
     (root / "m.gguf").write_bytes(b"x")
-    (root / "m.md").write_text("---\nrole: embedder\n---\n")
+    (root / "m.md").write_text("---\nrole: chat\nusage: embedder\n---\n")
     with caplog.at_level(logging.WARNING):
         Model.from_dir([root], generate_stubs=False)
-    assert any("role: is not a sidecar key" in r.message
+    assert any("usage: is not a sidecar key" in r.message
                for r in caplog.records)
 
 
 def test_unknown_device_value_warns(tmp_path, caplog):
-    # Validates: docs/plans/cpu-residency-budget.md #28 -- device is `cpu`
+    # Validates: docs/plans/requirement-trace.md, requirement #88
     # or a non-negative index; anything else used to place the model on the
     # default GPU as if the key were absent.
     import logging
     root = tmp_path / "models"
     root.mkdir()
     (root / "a.gguf").write_bytes(b"x")
-    (root / "a.md").write_text("---\ndevice: gpu\n---\n")
+    (root / "a.md").write_text("---\nrole: chat\ndevice: gpu\n---\n")
     (root / "b.gguf").write_bytes(b"x")
-    (root / "b.md").write_text("---\ndevice: -1\n---\n")
+    (root / "b.md").write_text("---\nrole: chat\ndevice: -1\n---\n")
     with caplog.at_level(logging.WARNING):
         Model.from_dir([root], generate_stubs=False)
     msgs = [r.message for r in caplog.records]
@@ -165,23 +203,25 @@ def test_unknown_device_value_warns(tmp_path, caplog):
     assert any("device -1" in m for m in msgs)
 
 
-def test_unmapped_depth1_dirs_are_skipped(tmp_path, caplog):
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Walk *models_dirs* depth-first and return deduplicated Models.
+def test_unowned_subtrees_are_skipped(tmp_path, caplog):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a subtree no
+    # role owns is skipped and named; a nested name inside an owned tree does
+    # not change the role.
     import logging
     from llama_packer.discover import discover
     root = tmp_path / "models"
-    for sub, served in (("chat", True), ("img", False), ("misc", False)):
+    for sub in ("chat", "misc", "tmp"):
         d = root / sub
         d.mkdir(parents=True)
         (d / f"{sub}.gguf").write_bytes(b"x")
-    (root / "chat" / "img").mkdir()          # nested unmapped name is fine:
-    (root / "chat" / "img" / "deep.gguf").write_bytes(b"x")  # depth-1 decides
+    (root / "chat" / "img").mkdir()          # inside chat/: still chat
+    (root / "chat" / "img" / "deep.gguf").write_bytes(b"x")
 
     with caplog.at_level(logging.INFO):
         models = discover(root, generate_stubs=False)
     stems = {m.stem for m in models}
     assert stems == {"chat", "deep"}
-    assert any("img/, misc/" in r.message or "misc/, img/" in r.message
+    assert any("misc/" in r.message and "tmp/" in r.message
                for r in caplog.records)
 
 
@@ -364,7 +404,7 @@ def test_text_gguf_media_like_name_still_served(tmp_path):
 # ── s2t (whisper) discovery ───────────────────────────────────────────────
 
 def test_s2t_optin_serves_sidecar_bin_models(tmp_path):
-    # Opt-in via dirs: {s2t: s2t}; each whisper .bin needs an authored
+    # A role owning s2t/ serves whisper .bin models; each needs an authored
     # same-stem sidecar (no stubs are generated for .bin orphans).
     # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
     root = tmp_path / "models"
@@ -372,8 +412,7 @@ def test_s2t_optin_serves_sidecar_bin_models(tmp_path):
     (root / "s2t" / "ggml-large-v3.bin").write_bytes(b"x")
     (root / "s2t" / "ggml-large-v3.md").write_text(_sidecar("Whisper Large V3"))
 
-    models = Model.from_dir(root, generate_stubs=False,
-                            dir_roles={"s2t": "s2t"})
+    models = Model.from_dir(root, generate_stubs=False)
     assert len(models) == 1
     m = models[0]
     assert m.role == "s2t"
@@ -387,42 +426,45 @@ def test_s2t_orphan_bin_without_sidecar_skipped_no_stub(tmp_path, caplog):
     (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
 
     with caplog.at_level(logging.INFO):
-        models = Model.from_dir(root, generate_stubs=True,
-                                dir_roles={"s2t": "s2t"})
+        models = Model.from_dir(root, generate_stubs=True)
     assert models == []
     assert not (root / "s2t" / "ggml-base.md").exists()  # no stub written
     assert any("ggml-base.bin" in r.message and "sidecar" in r.message
                for r in caplog.records)
 
 
-def test_s2t_not_opted_in_is_skipped(tmp_path):
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
+def test_s2t_is_skipped_when_no_role_owns_it(tmp_path):
+    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': a tree no role
+    # owns is not served.
+    from llama_packer import roles
+    from llama_packer.discover import discover
     root = tmp_path / "models"
     (root / "s2t").mkdir(parents=True)
     (root / "s2t" / "ggml-base.bin").write_bytes(b"x")
     (root / "s2t" / "ggml-base.md").write_text(_sidecar("W"))
 
-    models = Model.from_dir(root, generate_stubs=False)
+    try:
+        roles.configure({"roles": {"text": {"dir": "chat", "kind": "chat"}}})
+        models = discover(root, generate_stubs=False)
+    finally:
+        roles.configure(None)
     assert models == []
 
 
-def test_bin_outside_s2t_never_served(tmp_path, caplog):
-    # A .bin next to a sidecar in a non-s2t role resolves by stem (ordered
-    # last), but no backend supports .bin outside whisper-server's s2t role —
-    # finalize flags it (info: expected in ordinary fleets, not an
-    # operator error) and _filter_supported drops it from the config.
-    # Validates: SPEC.md, 'Model Discovery and Stub Sidecars': Discover all models across *models_dirs* (thin delegate). The real work lives in :func:`llama_packer.discover.discover`: the.
+def test_bin_model_is_classified_by_its_task(tmp_path):
+    # The tree allocates; the task decides. A .bin under chat/ with an s2t
+    # task is an ASR model, not a chat model.
+    from llama_packer.endpoints import TRANSCRIPTIONS
     root = tmp_path / "models"
     (root / "chat").mkdir(parents=True)
     (root / "chat" / "mysterious.bin").write_bytes(b"x")
     (root / "chat" / "mysterious.md").write_text(
-        "---\nname: Mystery\nengines: [whisper-server]\n---\n")
+        "---\nname: Mystery\ntasks: [s2t]\n"
+        "engines: [whisper-server]\n---\n")
 
-    with caplog.at_level(logging.INFO):
-        models = Model.from_dir(root, generate_stubs=False)
+    models = Model.from_dir(root, generate_stubs=False)
     assert len(models) == 1
-    error = getattr(models[0], "_override_error", None)
-    assert error is not None and "does not serve role 'chat'" in error
+    assert models[0].serves_endpoint(TRANSCRIPTIONS)
 
 
 # ── audio (t2s) discovery is exercised by the audio-cpp backend tests ─────
@@ -528,3 +570,101 @@ def test_snapshot_auto_detect_several_nested_models_errors(tmp_path):
     with pytest.raises(ValueError, match="several models"):
         Model(md_path, {"name": "auto", "hf_repo": "org/repo"},
               hf_home=hf_home)
+
+
+def test_task_device_places_the_model_on_the_host(tmp_path):
+    # Validates: SPEC.md, 'Tasks': a task's device: is a placement
+    # requirement; s2t declares cpu, so its models run on the host.
+    from llama_packer.discover import discover
+    from llama_packer.scope import ScopeStack
+    from llama_packer.tasks import TaskCatalogue
+    root = tmp_path / "models"
+    (root / "s2t").mkdir(parents=True)
+    (root / "s2t" / "m.gguf").write_bytes(b"x")
+    (root / "s2t" / "m.md").write_text(
+        _sidecar("M", "tasks: [s2t]\nengines: [audio-cpp]\n"))
+    stack = ScopeStack(
+        avail={"audio_cpp_bin": "audiocpp_server"},
+        tasks=TaskCatalogue.from_cfg({"s2t": {
+            "endpoint": "openai.audio.transcriptions", "device": "cpu"}}))
+
+    (model,) = discover(root, stack=stack, generate_stubs=False)
+    assert model.on_cpu
+
+
+def test_tasks_spanning_endpoints_are_an_error(tmp_path):
+    # Validates: SPEC.md, 'Tasks': one serving cannot serve two endpoints.
+    import pytest
+    from llama_packer.discover import DiscoveryError, discover
+    from llama_packer.scope import ScopeStack
+    from llama_packer.tasks import TaskCatalogue
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "m.gguf").write_bytes(b"x")
+    (root / "chat" / "m.md").write_text(
+        _sidecar("M", "tasks: [chat, embeddings]\nengines: [llama-server]\n"))
+    stack = ScopeStack(
+        avail={"llama_bin": "llama-server"},
+        tasks=TaskCatalogue.from_cfg({
+            "chat": {"endpoint": "openai.chat.completions"},
+            "embeddings": {"endpoint": "openai.embeddings"}}))
+
+    with pytest.raises(DiscoveryError, match="span endpoints"):
+        discover(root, stack=stack, generate_stubs=False)
+
+
+def test_task_device_conflict_leaves_placement_alone(tmp_path, caplog):
+    # Validates: SPEC.md, 'Tasks': cpu and gpu requirements cannot both hold.
+    import logging
+    from llama_packer.discover import discover
+    from llama_packer.scope import ScopeStack
+    from llama_packer.tasks import TaskCatalogue
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "m.gguf").write_bytes(b"x")
+    (root / "chat" / "m.md").write_text(
+        _sidecar("M", "tasks: [chat, qa]\nengines: [llama-server]\n"))
+    stack = ScopeStack(
+        avail={"llama_bin": "llama-server"},
+        tasks=TaskCatalogue.from_cfg({
+            "chat": {"endpoint": "openai.chat.completions", "device": 0},
+            "qa": {"endpoint": "openai.chat.completions",
+                   "device": "cpu"}}))
+
+    with caplog.at_level(logging.WARNING, logger="llama_packer.scope"):
+        (model,) = discover(root, stack=stack, generate_stubs=False)
+    assert not model.on_cpu
+    assert any("disagree on placement" in r.message for r in caplog.records)
+
+
+def test_discover_without_a_stack_handles_tasks(tmp_path):
+    # Model.from_dir() takes no stack; a sidecar with tasks: must not crash.
+    from llama_packer.discover import discover
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "m.gguf").write_bytes(b"x")
+    (root / "chat" / "m.md").write_text(
+        _sidecar("M", "tasks: [chat]\nengines: [llama-server]\n"))
+    (model,) = discover(root, generate_stubs=False)
+    assert model.stem == "m"
+
+
+def test_sidecar_device_wins_over_a_task(tmp_path, caplog):
+    # Validates: SPEC.md §Device: the sidecar wins and says so.
+    import logging
+    from llama_packer.discover import discover
+    from llama_packer.scope import ScopeStack
+    from llama_packer.tasks import TaskCatalogue
+    root = tmp_path / "models"
+    (root / "chat").mkdir(parents=True)
+    (root / "chat" / "m.gguf").write_bytes(b"x")
+    (root / "chat" / "m.md").write_text(
+        _sidecar("M", "tasks: [chat]\nengines: [llama-server]\ndevice: cpu\n"))
+    stack = ScopeStack(
+        avail={"llama_bin": "llama-server"},
+        tasks=TaskCatalogue.from_cfg(
+            {"chat": {"endpoint": "openai.chat.completions", "device": 0}}))
+    with caplog.at_level(logging.WARNING, logger="llama_packer.scope"):
+        (model,) = discover(root, stack=stack, generate_stubs=False)
+    assert model.on_cpu
+    assert any("sidecar device cpu wins" in r.message for r in caplog.records)

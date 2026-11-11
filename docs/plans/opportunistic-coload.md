@@ -1,7 +1,10 @@
 # Plan: Opportunistic co-loading of small models + main-chat context
 
 Status: **proposal — not scheduled**. Recorded 2026-08-30.
-Related: `docs/plans/matrix-categories.md` (declarative categories — this plan is the automatic counterpart), `SPEC.md` Matrix Context Solving, `llama_packer/{vram,writer,__main__}.py`.
+**Amended 2026-11-11:** the co-load squeeze knobs (`min_chat_ctx`,
+`coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`) are retired; this
+plan predates the role allocation in `docs/allocation.md`.
+Related: the retired matrix-categories design (git history), `SPEC.md` §Capacity routing, `llama_packer/{vram,writer,__main__}.py`.
 
 ## Current state
 
@@ -49,7 +52,7 @@ have no path → `FitParams = None` → cannot be budgeted → excluded.
 
 ### 1. Sizing: `source: estimate` file-size fallback
 
-Generalize `_estimate_safetensors` (`vram.py:373`) into `_estimate_file_size`:
+Generalize `_estimate_safetensors` into `_estimate_file_size`:
 
 - Trigger: `llama-fit-params` fails/unavailable AND the file is not
   safetensors — i.e. whisper GGML (`.bin`) and GGUF with a non-llama-family
@@ -164,7 +167,7 @@ scope here; the clamp already delivers most of that benefit.
 
 ### 4. Capabilities: `tools` vs served context (analysis)
 
-**What goes here.** llama-swap's native capabilities block (`writer.py:284`)
+**What goes here.** llama-swap's native capabilities block
 advertises `tools: true/false` per entry. Today it is a *static passthrough*
 of the sidecar declaration — a model declared `capabilities: [tools]`
 advertises tool calling even when the planner serves it at a solved ctx far
@@ -174,11 +177,10 @@ opencode, UIs) cannot tell the difference from `tools` alone;
 `metadata.context_max` the trained maximum.
 
 **Where from.** The chain is: sidecar frontmatter `capabilities: [...]`
-(hand-authored; template at `templates/models_AGENTS.md:113`) →
-`Model.capabilities` (`model.py:507`, vision auto-added with mmproj) →
+(hand-authored; template at `templates/models_AGENTS.md`) →
+`Model.capabilities` (vision auto-added with mmproj) →
 writer maps to llama-swap's block (`in`/`out`/`tools`/`reranker`/`context`).
-The `reasoning` capability already gates server-flag emission
-(`writer.py:45`) — so capability → emission coupling has precedent; `tools`
+The `reasoning` capability already gates server-flag emission — so capability → emission coupling has precedent; `tools`
 is the one capability with no serving-constraint coupling.
 
 **Who fixes it.** The **builder (writer)**, not the sidecar: the sidecar
@@ -197,7 +199,7 @@ serving may clear 128K where the vision serving does not). Optionally expose
 "not tool capable" from "demoted for context". No llama-swap change needed —
 it just reflects what we emit.
 
-### 5. Sequencing vs matrix-categories.md
+### 5. Sequencing vs the retired matrix categories
 
 This plan is the **automatic default**; categories (that proposal) are the
 **declarative override**. They compose: the opportunistic pass computes the
@@ -211,7 +213,7 @@ pin/extend it. Ship this first — it needs no new config surface.
 * Estimate headroom: **1.25×** for `source: estimate` candidates
   (`matrix.estimate_headroom`), configurable.
 * emb/rnk stay **unconditional** residents regardless of the floor (revisit
-  when `matrix-categories.md` lands), but their *context* yields: squeeze to
+  when matrix categories landed), but their *context* yields: squeeze to
   20K (`matrix.coload_min_ctx`) when chat is below 128K, adopted only if it
   buys chat ≥ 4K (`matrix.ctx_gain_min`).
 * Compute constants: whisper.cpp's own table puts runtime at disk +
@@ -322,16 +324,16 @@ README). The big open question — runtime story — is **resolved**:
 
 ## References
 
-* `llama_packer/vram.py:268` `fit_params_static` (sizing cascade; where the
+* `llama_packer/vram.py` `fit_params_static` (sizing cascade; where the
   file-size fallback hooks in at step 4)
-* `llama_packer/vram.py:373` `_estimate_safetensors` (pattern to generalize)
-* `llama_packer/vram.py:680` `solve_matrix_ctx` (budget equation)
-* `llama_packer/writer.py:531` `_solve_matrix_context` (inclusion pass site;
-  `NON_CHAT_ROLES` skip at :566)
-* `llama_packer/writer.py:383` `_bounded_ctx` (per-model clamp)
-* `llama_packer/__main__.py:230` `_build_matrix_vars` (var emission to extend)
-* `llama_packer/model.py:296` `design_context`
-* `docs/plans/matrix-categories.md` (declarative categories, phase 2)
+* `llama_packer/vram.py` `_estimate_safetensors` (pattern to generalize)
+* `llama_packer/vram.py` `solve_matrix_ctx` (budget equation)
+* `llama_packer/writer.py` `_solve_matrix_context` (inclusion pass site;
+  `NON_CHAT_ROLES` skipped there too)
+* `llama_packer/writer.py` `_bounded_ctx` (per-model clamp)
+* `llama_packer/__main__.py` `_build_matrix_vars` (var emission to extend)
+* `llama_packer/model.py` `design_context`
+* the retired matrix-categories design (git history)
 * https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 (model card; q8_0
   GGUF quickstart, "≥2 GB RAM" note, 24-min/3-h audio limits)
 * https://github.com/NVIDIA/NeMo-Speech.cpp (ggml runtime; server.md:

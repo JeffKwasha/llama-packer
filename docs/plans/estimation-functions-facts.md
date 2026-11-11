@@ -71,7 +71,7 @@ None of these constants have a documented basis (no "measured on X" or
 - llama.cpp: main FitParams + companion additions (mmproj, draft).
 - MTP draft folded only if `main.source != "llama-server"`.
 
-## calc_ctx (context solving)
+## solve_context (context solving)
 
 1. CPU-resident models: return design context (no VRAM bound).
 2. Reserve = `_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline_mb)`.
@@ -88,7 +88,7 @@ None of these constants have a documented basis (no "measured on X" or
 
 - `_design_ctx`: GGUF architectural max > sidecar context_length > default.
 - `_sidecar_ceiling`: sidecar `context_length` only (operator decision).
-- `calc_ctx` uses design for the "does it fit" check, capped by sidecar_ceiling
+- `solve_context` uses design for the "does it fit" check, capped by sidecar_ceiling
   for the final value.
 
 ## Measurement shape and reuse
@@ -506,7 +506,7 @@ ways); only the recurrent-state cache scales with p:
   it drops layers fit-params doesn't count (Dirk has `nextn_predict_layers = 1`,
   a baked-in MTP layer).
 - **Correction is calibrated far below design context.** `_MEASURE_CTX_CAP =
-  65536` (consts.py:83); `_probe_grid` measures the witness at ≤65536/32768/
+  65536`; `_probe_grid` measures the witness at ≤65536/32768/
   16384, but the model serves at design 262144. Any serve-vs-fit gap that
   scales with C (draft KV, allocator rounding) is fitted at 65k and applied
   at 262k — the correction cannot represent it.

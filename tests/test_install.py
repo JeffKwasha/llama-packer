@@ -137,7 +137,7 @@ def test_render_unit_lists_only_present_hidden_dirs(monkeypatch):
     # service never starts. Only what exists may be listed.
     #
     # Validates: docs/install.md, the systemd unit the installer writes.
-    # Validates: docs/plans/requirement-trace.md #53: `InaccessiblePaths=` lists only directories present on this host
+    # Validates: docs/plans/requirement-trace.md, requirement #53
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
     monkeypatch.setattr(ins, "inaccessible_paths",
@@ -162,7 +162,7 @@ def test_unit_is_enableable():
     # never comes back after a reboot.
     #
     # Validates: docs/install.md, the systemd unit the installer writes.
-    # Validates: docs/plans/requirement-trace.md #52: The unit is enableable: it carries `[Install] WantedBy=`
+    # Validates: docs/plans/requirement-trace.md, requirement #52
     body = ins.TEMPLATE.read_text()
     assert "[Install]" in body
     assert "WantedBy=multi-user.target" in body
@@ -330,7 +330,7 @@ def test_a_flat_run_directory_still_resolves(tmp_path):
 
 def test_tools_wins_over_a_stale_flat_copy(tmp_path):
     # Validates: docs/install.md, 'The updater is the installer for binaries': The llama-swap this deployment actually has.
-    """Both layouts present: the deployment one is the live one."""
+    """Both layouts present: the deployment one is the current one."""
     for base in (tmp_path, ins.tools_dir(tmp_path)):
         (build := base / "llama-b11714").mkdir(parents=True)
         (build / "llama-server").write_text("x")
@@ -362,14 +362,14 @@ def test_backup_keeps_the_previous_config(tmp_path):
     # Both are gitignored and machine-local, so an install that overwrites
     # them has no other way back: a regeneration can move every context.
     # Validates: docs/install.md, 'Two orderings that are load-bearing': Copy *path* aside to ``<name>.bak-<n>`` before overwriting it. An install replaces a working config and a working unit in one step.
-    live = tmp_path / "config.yaml"
-    live.write_text("models: {}\n")
-    made = ins.backup(live, dry_run=False)
+    deployed = tmp_path / "config.yaml"
+    deployed.write_text("models: {}\n")
+    made = ins.backup(deployed, dry_run=False)
     assert made.read_text() == "models: {}\n"
-    assert live.read_text() == "models: {}\n"      # untouched by the copy
+    assert deployed.read_text() == "models: {}\n"   # untouched by the copy
     # A second backup must not clobber the first.
-    live.write_text("models: {a: 1}\n")
-    again = ins.backup(live, dry_run=False)
+    deployed.write_text("models: {a: 1}\n")
+    again = ins.backup(deployed, dry_run=False)
     assert again.name == "config.yaml.bak-2"
     assert made.name == "config.yaml.bak-1"
 
@@ -473,7 +473,6 @@ def test_report_resolved_warns_on_missing_hf_home(tmp_path, caplog):
 
 
 def test_report_resolved_quiet_when_hf_home_exists(tmp_path, caplog):
-    # Validates: docs/plans/requirement-trace.md #51: an unreadable HF_HOME warns instead of crashing the installer
     existing = tmp_path / "hfcache"
     existing.mkdir()
     (tmp_path / "config.env").write_text(f"HF_HOME={existing}\n")
@@ -574,7 +573,7 @@ def test_validate_runs_as_the_service_user(tmp_path, monkeypatch):
                                       "stdout": ""})())
     (tmp_path / "llama-swap").write_bytes(b"bin")
     (tmp_path / "config.yaml").write_text("models: {}\n")
-    monkeypatch.setattr(ins, "probe", lambda *a, **k: None)   # no live server
+    monkeypatch.setattr(ins, "probe", lambda *a, **k: None)   # no running server
     ins.start(r, tmp_path / "llama-swap.service", tmp_path, "127.0.0.1:1",
               "lemonade")
     validate = [c for c in commands if "-validate" in c]
@@ -696,3 +695,79 @@ def test_existing_group_proceeds(tmp_path, monkeypatch):
     added = [c[2] for c in ran if c[:2] == ["usermod", "-aG"]]
     assert "grp" not in added, added
     assert set(added) == set(ins._GPU_GROUPS), added
+
+
+# --- installed profiles.yaml ----------------------------------------------
+
+
+def test_install_creates_profiles_from_source_and_never_overwrites(
+        tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'profiles.yaml is yours': the installer
+    # copies a default only when the run directory has none.
+    src = tmp_path / "src.yaml"
+    src.write_text("defaults: {}\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setattr(ins.shutil, "chown", lambda *a, **k: None)
+    got = ins.ensure_profiles(ins.Runner(False), run, "svc", "grp", src)
+    assert got == run / "profiles.yaml"
+    assert got.read_text() == src.read_text()
+    got.write_text("user: edit\n")
+    again = ins.ensure_profiles(ins.Runner(False), run, "svc", "grp", src)
+    assert again.read_text() == "user: edit\n"
+
+
+def test_install_dry_run_does_not_create_profiles(tmp_path):
+    # Validates: docs/install.md, 'profiles.yaml is yours': --dry-run makes
+    # no files.
+    src = tmp_path / "src.yaml"
+    src.write_text("defaults: {}\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    ins.ensure_profiles(ins.Runner(True), run, "svc", "grp", src)
+    assert not (run / "profiles.yaml").exists()
+
+
+def test_install_agent_guide_lands_beside_the_config(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Agent guide in the run directory': the
+    # guide is installed under <dir>/.opencode/skills/profiles-authoring.
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "profiles-authoring.md").write_text("---\nname: X\n---\n")
+    monkeypatch.setattr(ins, "REPO", repo)
+    monkeypatch.setattr(ins.shutil, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(ins.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(ins.pwd, "getpwnam",
+                        lambda _n: type("P", (), {"pw_uid": 0})())
+    monkeypatch.setattr(ins.grp, "getgrnam",
+                        lambda _n: type("G", (), {"gr_gid": 0})())
+    run = tmp_path / "run"
+    run.mkdir()
+    ins.install_agent_guide(ins.Runner(False), run, "svc", "grp")
+    target = run / ".opencode" / "skills" / "profiles-authoring" / "SKILL.md"
+    assert target.read_text().startswith("---")
+
+
+def test_generate_config_uses_the_installed_profiles_path(monkeypatch, tmp_path):
+    # Validates: docs/install.md, 'profiles.yaml is yours': re-packing reads
+    # the run directory's copy, not the repo source.
+    seen = {}
+    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    monkeypatch.setattr(ins, "report_resolved", lambda _d: None)
+
+    class _R:
+        dry_run = False
+
+        def run(self, argv, **kw):
+            seen["argv"] = argv
+            cwd = kw.get("cwd")
+            (cwd / "config.yaml").write_text("models: {}\n")
+            (cwd / "config.env").write_text("")
+            return type("R", (), {"stdout": "", "returncode": 0})()
+
+    args = _args(models_dir=["/models"], profiles=Path("/repo/profiles.yaml"),
+                 spare=None, vram=None, hf_home=None)
+    ins.generate_config(_R(), "svc", tmp_path, args, "llama-packer",
+                        tmp_path / "profiles.yaml")
+    i = seen["argv"].index("--profiles")
+    assert seen["argv"][i + 1] == str(tmp_path / "profiles.yaml")

@@ -36,20 +36,20 @@ def test_chat_cmd_shape(make_model):
     _, entry = _entry(make_model)
     cmd = entry["cmd"]
     assert cmd.startswith("/opt/llama-server --port ${PORT} -m ")
-    # GPU-resident models rely on llama-server's "auto" default; only
-    # CPU-resident models pin --n-gpu-layers 0.
+    # GPU-served models rely on llama-server's "auto" default; only
+    # CPU-served models pin --n-gpu-layers 0.
     assert "--n-gpu-layers" not in cmd
     assert "--cache-type-k q8_0 --cache-type-v q8_0" in cmd
 
 
-def test_cpu_resident_uses_cpu_layers(make_model):
-    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers 0 is emitted only when the model is CPU-resident
+def test_cpu_served_uses_cpu_layers(make_model):
+    # Validates: docs/backends/llama-server.md, 'Command shape': --n-gpu-layers 0 is emitted only when the model is CPU-served
     _, entry = _entry(make_model, device="cpu")
     assert "--n-gpu-layers 0" in entry["cmd"]
 
 
 def test_capabilities_context_is_served_window(make_model):
-    # Validates: docs/plans/requirement-trace.md #56: capabilities.context is the served per-slot window, not the trained maximum
+    # Validates: docs/plans/requirement-trace.md, requirement #56
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -67,7 +67,7 @@ def test_capabilities_context_is_served_window(make_model):
 def test_sidecar_lowers_max_output_tokens(make_model):
     # Validates: SPEC.md, 'Model Metadata': a sidecar may lower the
     # generation ceiling below the served window.
-    # Validates: docs/plans/requirement-trace.md #57: The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window
+    # Validates: docs/plans/requirement-trace.md, requirement #57
     model = make_model("m", backend="llama-server", max_output_tokens=32768)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -81,7 +81,7 @@ def test_sidecar_lowers_max_output_tokens(make_model):
 def test_max_output_tokens_never_exceeds_the_served_window(make_model):
     # Validates: SPEC.md, 'Model Metadata': the emitted ceiling is clamped
     # to the served window even when the sidecar asks for more.
-    # Validates: docs/plans/requirement-trace.md #57: The generation ceiling defaults to the served window; a sidecar may lower it, never raise it above the window
+    # Validates: docs/plans/requirement-trace.md, requirement #57
     model = make_model("m", backend="llama-server", max_output_tokens=262144)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -96,7 +96,7 @@ def test_no_context_max_or_token_limits_when_nothing_is_folded(make_model):
     # At full design context there is no fold to report, and non-chat roles
     # have no token-generation limits to advertise.
     # Validates: SPEC.md, 'Output Format': Build a single llama-swap config entry for a model+profile group.
-    model = make_model("m", backend="llama-server", role="embedding")
+    model = make_model("m", backend="llama-server", role="embeddings")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
         profiles_group=[("default", {})], profiles_defaults={},
@@ -217,7 +217,7 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
     bad_vllm = make_model("bad", backend="vllm", context_length=8192)
 
     for m in (llama, bad_vllm):
-        monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 8192)
+        monkeypatch.setattr(m.vram, "solve_context", lambda *a, **k: 8192)
 
     profiles = {
         "defaults": {"cache_type": "q8_0", "parallel": 1},
@@ -237,7 +237,7 @@ def test_build_config_skips_unsupported_and_emits(make_model, monkeypatch):
 
 def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     # The unsupported-model filter must run BEFORE the mmproj VRAM pre-pass:
-    # rejected models must never reach calc_ctx.  The model gets an mmproj
+    # rejected models must never reach solve_context.  The model gets an mmproj
     # companion so the pre-pass would otherwise consult it.
     # Validates: SPEC.md, 'Output Format': Build llama-swap config from list of Model objects. Composes the pipeline.
     from llama_packer.writer import build_config
@@ -246,8 +246,8 @@ def test_build_config_filters_before_vram_passes(make_model, monkeypatch):
     (bad_vllm.md_path.parent / "bad-mmproj.gguf").write_bytes(b"x")
     bad_vllm.mmproj = bad_vllm  # companion present -> pre-pass engages
     monkeypatch.setattr(
-        bad_vllm.vram, "calc_ctx",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("filtered model reached calc_ctx")),
+        bad_vllm.vram, "solve_context",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("filtered model reached solve_context")),
     )
 
     profiles = {
@@ -270,7 +270,7 @@ def test_build_config_disables_over_budget_model(make_model, monkeypatch):
 
     huge = make_model("huge", backend="llama-server", context_length=8192,
                       base_model="llama3")
-    # 50G weights on a 48G card: remaining < 0 in calc_ctx.
+    # 50G weights on a 48G card: remaining < 0 in solve_context.
     monkeypatch.setattr(
         huge.vram, "effective_static",
         lambda *a, **k: (50000, 0.5, 0.0, 100),
@@ -295,7 +295,7 @@ def test_sidecar_cache_type_drives_cmd(make_model, monkeypatch):
 
     m = make_model("chat", backend="llama-server", context_length=8192,
                    cache_type="f16")
-    monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 8192)
+    monkeypatch.setattr(m.vram, "solve_context", lambda *a, **k: 8192)
     profiles = {
         "defaults": {"cache_type": "q8_0", "parallel": 1},
         "profiles": {"default": {}},
@@ -520,7 +520,7 @@ def test_emitted_config_plain_is_a_plain_dict():
     from llama_packer.writer import EmittedConfig
 
     ec = EmittedConfig({"models": {"m": {"cmd": "x"}}},
-                       entry_ids_by_stem={"m": ["m"]}, coload_stems=["e"])
+                       entry_ids_by_stem={"m": ["m"]})
     plain = ec.plain()
     assert type(plain) is dict
     assert plain == {"models": {"m": {"cmd": "x"}}}
@@ -575,48 +575,36 @@ def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
     assert yaml.safe_load(text)["models"]["m"]["cmd"] == cmd
 
 
-def test_overallocation_guard_catches_an_injected_violation(make_model,
-                                                           monkeypatch, caplog):
-    """The guard must fire on a planner that misbehaves, not just agree.
-
-    Validates: docs/plans/requirement-trace.md #27 -- the emit-time guard is
-    the backstop for "no emitted entry may need more VRAM than exists", so it
-    has to be shown to fire rather than merely agree with a healthy planner.
-
-    Everything upstream honours "never emit an entry that cannot load", so
-    on a healthy planner this check has nothing to do. That is exactly why
-    it needs a test that *breaks* the planner deliberately: otherwise it
-    passes vacuously forever and protects nothing.
-
-    Here calc_ctx is made to report a comfortable context while the quad
-    says the model needs more than the card has -- the shape of the bug it
-    was written for.
-    """
+def test_overallocation_guard_catches_an_injected_violation(make_model, caplog):
+    # Validates: docs/plans/requirement-trace.md, requirement #35
+    # An injected over-budget entry is removed at ERROR, never emitted.
     import logging
-    from llama_packer.writer import build_config
+
+    from llama_packer.profiles import Profiles
+    from llama_packer.writer import (EmittedConfig, Planner, Variant,
+                                     _verify_no_overallocation)
 
     m = make_model("liar", backend="llama-server", context_length=32768)
-    # Reports a fine context for any request...
-    monkeypatch.setattr(m.vram, "calc_ctx", lambda *a, **k: 32768)
-    # ...while the numbers say 90 GB of weights on a 48 GB card.
-    monkeypatch.setattr(m.vram, "effective_static",
-                        lambda *a, **k: (90000, 0.5, 0.0, 100))
-    monkeypatch.setattr(
-        m.vram, "fit_params_static",
-        lambda *a, **k: type("FP", (), {
-            "model_mib": 90000, "kv_per_token_mib": 0.5,
-            "slot_mib": 0.0, "compute_mib": 100, "source": "fit-params"})())
-
-    profiles = {"defaults": {"cache_type": "q8_0", "parallel": 1},
-                "profiles": {"default": {}}}
+    m.vram.solve_context = lambda *a, **k: 32768
+    m.vram.effective_static = lambda *a, **k: (90000, 0.5, 0.0, 100)
+    m.vram.fit_params_static = lambda *a, **k: type("FP", (), {
+        "model_mib": 90000, "kv_per_token_mib": 0.5,
+        "slot_mib": 0.0, "compute_mib": 100, "source": "fit-params"})()
+    profiles = Profiles({"defaults": {"cache_type": "q8_0", "parallel": 1},
+                         "profiles": {"default": {}}})
+    planner = Planner([m], profiles, fit_bin="unused", vram_total=48 * 1024)
+    variant = Variant(parallel=1, cache_type="q8_0", spare_mb=0,
+                      profiles_group=[("default", {"cache_type": "q8_0",
+                                                   "parallel": 1})],
+                      ctx_size=32768, include_mmproj=True,
+                      mem_vram_mib=90000)
+    config = EmittedConfig(entry_ids_by_stem={"liar": ["liar"]})
+    config["models"] = {"liar": {"metadata": {"ctx_size": 32768}}}
     with caplog.at_level(logging.ERROR):
-        config = build_config(
-            [m], profiles, {"llama_bin": "/opt/llama-server"},
-            fit_bin="unused", vram_total=48 * 1024,
-        )
+        _verify_no_overallocation(config, {"liar": [variant]}, [m], planner)
     assert "invariant violated" in caplog.text
     assert "planner bug" in caplog.text
-    assert config["models"] == {}, "the impossible entry survived"
+    assert config["models"] == {}
 
 
 def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,

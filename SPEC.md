@@ -42,7 +42,7 @@ Also emits:
 - **`macros:`** — top-level block mapping each `${VAR}` path macro to its absolute directory (see [Path Macros](#path-macros-macros-block-and-configenv)).
 - **`includeAliasesInList: true`** — presents the `${MODEL_ID}:<mode>`/`${MODEL_ID}:<profile>` aliases in `/v1/models` (llama-swap default is `false`).
 - **`healthCheckTimeout`** — auto-calculated or explicit (see below).
-- **`globalTTL`** — only when `--idle-unload SECONDS` is passed; llama-swap's top-level idle-unload default (see [VRAM gating and reservation notes](#vram-gating-and-reservation-notes)).
+- **`globalTTL`** — llama-swap's top-level idle-unload lifetime. The operator writes `ttl` in `profiles.yaml`; a top-level `ttl` is not a llama-swap key, so the packer emits `globalTTL`. A role, task, or sidecar `ttl:` overrides it; `0` disables idle unload (see [TTL](#ttl)).
 
 ### Writer module
 
@@ -51,7 +51,7 @@ Also emits:
 1. **`_filter_supported()`** — the validation boundary (backend format/role,
    reasoning flags, cache-type knowability); runs before any VRAM work.
 2. **`Planner.plan()`** — context decisions per (model, category): vision rung,
-   pre-pass, shared matrix solve, profile grouping, bounded-context clamp.
+   pre-pass, role-budget auction, profile grouping, bounded-context clamp.
    Returns `Variant` values.
 3. **`emit_config()`** — pure rendering of plans into llama-swap entry dicts.
 
@@ -70,14 +70,19 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `defaults` | Baseline sampling parameters (+ `cache_type`, `parallel`, `spare`) merged under every profile | [Sampling Modes](#sampling-modes), [Cache precision](#cache-precision-cache_type) |
 | `profiles` | Named sampling overrides layered on `defaults`; **required** (at least one) | [Sampling Modes](#sampling-modes) |
 | `overrides` | Pattern-scoped serving rules (`backend`, `chat_template`, `loras`, …) | [Override Rules](#override-rules) |
-| `matrix` | Resident RAG classes at a fixed small context, plus the knobs that allocate the remainder to chat (`embed_context`, `rerank_context`, `auto_parallel*`, `parallel_power`) | [VRAM Allocation](#vram-allocation) |
+| `matrix` | Sizing knobs and the authored `sets` | [VRAM Allocation](#vram-allocation) |
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
 | `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
-| `dirs` | Directory-name → role whitelist (e.g. `{ocr: chat}`) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF_HOME root (the dir containing `hub/`) for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
+| `tasks` | Named kinds of work, their endpoint/role and demand floors | [Tasks](#tasks-tasks) |
+| `roles` | Operator-defined purposes, owned trees, placement and allocation policy | [Roles](#roles-roles) |
+| `pools` | Per-pool solve spare, unmodelled reservations, pins | [Capacity routing](#capacity-routing) |
+| `capacity` | `pp_tps` / `drive_mbps` inputs to eviction cost | [Capacity routing](#capacity-routing) |
+| `macros` | Named flag chunks for `cmd` | [Path Macros](#path-macros-macros-block-and-configenv) |
+| `shed` | Default capability-shedding order | [Tasks](#tasks-tasks) |
 
 `profiles.yaml.example` provides a commented starter with one brief example per category — copy to `profiles.yaml` (gitignored) and uncomment what you need. The bundled `llama_packer/profiles.yaml` is the fallback when no file is present.
 
@@ -103,6 +108,14 @@ pass-through `metadata` for agents (see [Model Metadata](#model-metadata)).
 Within `profiles`, sampling deltas become `filters.setParamsByID` and
 `parallel`/`cache_type`/`spare` differences split a model into separate
 variants/entries; `description` is the only inert key.
+
+`llama-packer --check` loads only the profile and reports every problem it
+can name — unknown top-level and nested keys with a near-miss hint, a
+missing `profiles:` section, a task without `endpoint:`, retired
+`matrix.evict_costs:`, `routing:`, wrong container types, retired
+`device_roles:`, and an override without `when:` — then exits
+`0` or `1`. It performs no model discovery, measurement, or server start,
+so a profile can be checked before the model tree exists.
 
 ## Hardware Detection
 
@@ -155,7 +168,7 @@ The tool calculates `ctx_size` dynamically based on measured VRAM costs, not sta
 ### Measurement via `llama-fit-params`
 
 VRAM follows a validated affine law (see `llama_packer/memory_probe.py` and
-docs/plans/auto-parallel.md):
+§`parallel_power`):
 
 ```
 VRAM(C, p) = model_mib + compute_mib + c*C + p*D
@@ -244,7 +257,7 @@ Semantics:
 - **max**: large images are downscaled to this token ceiling — the control for bounding KV cost and prompt size. Diminishing quality returns beyond ~4k tokens.
 - **Static-resolution archs** (Gemma 3/4, SigLIP: fixed resize, ~256 tokens/image) ignore both flags; declaring them there logs a one-time warning and skips emission, as does declaring them on a model with no mmproj companion.
 
-VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`calc_ctx` raises the rounded-down context to that floor; the matrix solve warns when a model's floor exceeds the shared solution). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
+VRAM accounting: image tokens are ordinary tokens inside the slot's context — they consume KV already budgeted by the context solve, not memory beyond it. The budget therefore guarantees **fit**, not extra headroom: the solved per-slot context is never allowed to drop below `image_max_tokens` when the VRAM affords it (`solve_context` raises the rounded-down context to that floor; the role solve warns when a model's floor exceeds its budget). When even the affordable context cannot hold the floor, a warning is logged and oversized images fail at request time instead of the server failing at load time. Declared bounds are advertised to clients as `metadata.image_min_tokens` / `metadata.image_max_tokens` on vision variants.
 
 ### Context calculation formula
 
@@ -270,7 +283,7 @@ directly without scaling down. `memory_margin` (profiles.yaml
 `hardware.memory_margin`, default 0.01) inflates every measured term so
 measurement residual errs toward reserving more.
 
-`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes. It is **opt-in**: set via `--baseline` or `profiles.yaml` `hardware.baseline_mb`, and defaults to **0**. The fixed `_RESERVE_VIDEO` (1024 MiB) already covers driver/compositor overhead, so auto-detection of the live `used_vram` is intentionally NOT performed — llama-swap keeps model servers resident, and counting that usage would make the budget assume a blank GPU and collapse every context to the minimum. The effective reserve is the fixed system reserve (1024) plus the larger of the fixed video reserve (1024) and any explicit `baseline_mb`. `--spare` is subtracted on top of this reserve. CPU-resident models (`device: cpu`) are excluded from VRAM budgeting entirely and are sized to their own architectural/sidecar context.
+`baseline_mb` is the VRAM already consumed by the driver/compositor/other processes. It is **opt-in**: set via `--baseline` or `profiles.yaml` `hardware.baseline_mb`, and defaults to **0**. The fixed `_RESERVE_VIDEO` (1024 MiB) already covers driver/compositor overhead, so auto-detection of `used_vram` is intentionally NOT performed — llama-swap keeps model servers loaded, and counting that usage would make the budget assume a blank GPU and collapse every context to the minimum. The effective reserve is the fixed system reserve (1024) plus the larger of the fixed video reserve (1024) and any explicit `baseline_mb`. `--spare` is subtracted on top of this reserve. CPU-placed models (`device: cpu`) are excluded from VRAM budgeting entirely: they charge `ram` and solve inside the role's host allocation (§Host pool).
 
 **Design context:** When the affine pair is measured, it uses the model's GGUF architectural context length as the reference point (or sidecar `context_length`, or 32768 default). Sidecar `context_length` is the model's **design maximum** — a ceiling applied when serving (line 255), never a floor. The served size is solved from the VRAM budget, the task's demand and `parallel_power`; `min_context:` is the key that states a floor. Reading `context_length` as a pin (its own floor) made a 262144 design max an unreachable floor, forced the model to parallel 1, and left the only remedy editing the sidecar — rewriting a claim about the model to express an operating decision. If the design context fits within the remaining budget, it is used directly without scaling down.
 
@@ -291,11 +304,11 @@ decided per category, by `solve_rung` walking the category's `sacrifice:` order:
 
 There is no companion entry and no vision-less twin. A model emits **one entry
 per satisfiable category**, and vision is a property of that entry rather than a
-second serving alongside it. Two entries for one model is two categories in
+second serving alongside it. Two entries for one model is two tasks in
 sidecars — a `coding` entry and a `coding-vision` one, the latter declaring
 `require: [vision]` — not a hardcoded pairing.
 
-On the live fleet, the same 31B at the same budget:
+On the running fleet, the same 31B at the same budget:
 
 ```
 gemma4-31b-hauhaucs-balanced.ti        155648  vision kept   (fallback: capability first)
@@ -318,31 +331,33 @@ A model with several profile groups can land two servings on the same category+f
 
 Why not put the context in the id? Because opencode/hermes resolve and cache model ids at startup and do not re-pull them per request — an id that tracks the solve would force a restart on every repack. The context is still exact and client-visible in `metadata.ctx_size`, in `metadata.tasks` (the satisfied tasks), and in the display `name` (e.g. `qwen38-27B-Dirk · coding 156k [ti]`); only the id is frozen. This is a deliberate priority order: **task > stability > fine-grained accuracy**, and a task dropping off under memory pressure is correct — that serving genuinely cannot meet the task.
 
-Anything that *references* an entry must resolve through `entry_ids_by_stem` (stem → emitted ids) rather than `Model.template_id`. A matrix var pointing at a `template_id` makes llama-swap reject the whole config. Validate with `llama-swap -config <file> -validate`.
+Anything that *references* an entry must resolve through `entry_ids_by_stem` (stem → emitted ids) rather than `Model.template_id`. A reference pointing at an unemitted id makes llama-swap reject the whole config. Validate with `llama-swap -config <file> -validate`.
 
 ### VRAM gating and reservation notes
 
 When an explicit reservation (`--spare`, `--baseline`, or their `profiles.yaml` counterparts) shrinks the budget, the planner degrades visibly instead of emitting entries that OOM at load time:
 
-- **Over-budget means omitted.** `calc_ctx` records `over_budget_reason` when
+- **Over-budget means omitted.** `solve_context` records `over_budget_reason` when
   weights + compute do not fit at any context of a rung (or the reserve/spare
   leaves ≤ 0 available). `solve_rung` skips that rung and tries the next along
   the declared order; if none fits, that **category emits nothing** — and a model
   whose every rung is over budget, fallback included, produces no entry at all.
-  Skipped stems never reach the matrix vars, so routing auto-prunes; if *every*
-  chat model is gated away, matrix routing is omitted entirely (warning logged)
-  rather than emitting a degenerate empty OR-list.
+  Skipped stems produce no entry, so routing auto-prunes; the emitted pools
+  still describe the survivors.
 - **Vision is a rung, not a fallback.** There is no "vision → text" retry and
   no companion to suppress: the shed order already decides whether dropping the
   projector is worth it, and a rung that does not fit is simply not a candidate.
-- **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted, before any resident charge) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
+- **Squeeze description note.** When the solve flags `vram_squeezed` and serves strictly below the model's design context *and* the reservation is user-declared — `spare_mb > 0` (pool-adjusted) or `baseline_mb > _RESERVE_VIDEO` (1024 MiB floor) — the entry description gains a trailing note: `(over configured VRAM limits — serving at X of Y design tokens; re-run without --spare/--baseline for full context)`. Equal-to-design solves stay silent (no "serving at N of N"), and a baseline at or below the fixed floor never fires (it is already covered by the reserve). With no reservation, no note is emitted.
 - **Degenerate refusal.** If `vram_total − reserve − spare ≤ 0`, the run fatals *before* any VRAM work (exit 1) and does **not** overwrite an existing `config.yaml`. Same guard applies when the reservation leaves zero model entries.
 
-`--idle-unload SECONDS` emits a top-level `globalTTL: SECONDS` (llama-swap: unload any model after that many seconds of inactivity; `0` = never, the llama-swap default; llama-packer omits the key when the flag is absent). Intended for co-residency with ComfyUI/games that need VRAM on short notice without re-packing.
+The top-level `ttl` is 3600 seconds. llama-swap unloads a model after that
+many seconds of inactivity; `0` disables idle unload. A role `ttl:` overrides
+the top-level value, and a task or sidecar `ttl:` overrides the role. There is
+no idle-unload CLI flag.
 
 ### Tasks (`tasks:`)
 
-The global `min_context` is one floor for the whole fleet, which cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, the scheduling role it implies, and the demand that work needs. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids and the scheduling roles. A task whose endpoint or role is not in those sets is warned about and dropped:
+The top-level `min_context`, when set, is the default floor for tasks that do not declare one; it cannot say "coding wants 128k, Q&A is fine with 32k". A **task** is a catalog id that names one kind of work, the endpoint it is served at, and the demand that work needs. A task that omits `min_context` uses the design-derived cascade: the model's explicit `min_context`, a pinned `--max-context`, `tools_min_ctx` for tool callers, then half the design context. An explicitly set top-level `min_context` overrides the last two. `min_context > max_context` is an error that stops the run before a config is written. The catalogue is **declared** in `profiles.yaml tasks:` — the code hardcodes only the contract a declaration is checked against: the endpoint ids. A task whose endpoint is not in that set is warned about and dropped:
 
 ```yaml
 tasks:
@@ -361,152 +376,253 @@ Two things follow from this.
 
 That tie rule is the whole of "coding drops vision to maximise context, and only adds vision when it is free": shedding usually buys context, so the projector goes; when VRAM holds design context either way, nothing is bought and the projector stays attached rather than being discarded for no gain.
 
-**A task and the null task want different things from the same rung list**, so `solve_rung` takes `prefer_capability`. A task takes the rung buying the **most context** — coding would rather have 262144 tokens text-only than 131072 with a projector. The null task takes the **first** rung that qualifies, because it has no goals and handing up a capability to buy context nobody asked for is a pointless trade. On the live fleet that shows as `gemma4-31b-hauhaucs-balanced.ti` (fallback, vision kept, 155648) beside `gemma4-31b-hauhaucs-balanced.coding.t` (vision shed, 180224).
+**A task and the null task want different things from the same rung list**, so `solve_rung` takes `prefer_capability`. A task takes the rung buying the **most context** — coding would rather have 262144 tokens text-only than 131072 with a projector. The null task takes the **first** rung that qualifies, because it has no goals and handing up a capability to buy context nobody asked for is a pointless trade. On the running fleet that shows as `gemma4-31b-hauhaucs-balanced.ti` (fallback, vision kept, 155648) beside `gemma4-31b-hauhaucs-balanced.coding.t` (vision shed, 180224).
 
 `require` and `keep` are different and both are honoured: `require` gates existence (a model lacking the capability does not satisfy the category, so no entry claims it), while `keep` only forbids shedding — a coding model with no MTP draft is still coding. A category that cannot meet `min_context` at any rung emits **nothing**. Capabilities named by neither list are shed last, in the order from `shed:` in profiles.yaml, which defaults to vision before draft.
 
-`min_parallel` is honoured when a candidate qualifies and yields to the context floor when it does not — concurrency is a throughput preference, the context is what the display name advertises.
+`min_parallel` is a floor too: a candidate must meet both it and `min_context`. If no serving does, the task emits nothing. `parallel_power` is the knob that makes the solver try harder for slots; it never lowers a floor.
 
-`parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on an unpinned chat model on a slot-based backend.
+`parallel_power:` (B) may also be set **per task**, overriding `matrix.parallel_power` for that task's solve only. That is how one model serves two shapes from one GGUF: `coding` keeps its context (low B) while `describe` buys slots (high B). The value is validated like the matrix knob — finite and non-negative, warned about and ignored otherwise — and an absent value falls through to the matrix knob. The null/fallback category is not a task and keeps exponent 0. Like `auto_parallel`, the override only acts on a chat model without a `parallel:` pin on a slot-based backend.
 
 ## VRAM Allocation
 
-Two tiers, and only two.
+One allocation algebra, two routers. The algebra lives in
+[docs/allocation.md](allocation.md); this section states the parts that
+appear in the emitted config.
 
-### Residents
+### Pools
 
-Pinned for as long as the service is up, because losing them means losing
-the KV cache and reloading on every lookup. Embeddings and rerank are the
-clear case; speech (STT/TTS) are optional residents.
+```
+available(pool) = physical(pool) − (measured reserve + spare)
+```
 
-Each resident serves a **fixed small context** — `embed_context` /
-`rerank_context`, default 4096. Two reasons, and the second is what makes
-the rest of this section work:
+- The measured reserve is the OS plus driver/compositor/scanout floor. The
+  fixed system reserve is 1024 MiB and the video reserve is the larger of
+  1024 MiB and `hardware.baseline_mb`; a unified host uses
+  `hardware.unified_system_mb`. Detection of `used_vram` is deliberately off:
+  the servers it would count are the ones this packer starts.
+- `spare` is the operator's addition, one value per pool
+  (`pools.<id>.spare`), or the fleet `spare` when the pool has none.
+- `default` is the GPU pool and `ram` the host pool. A serving's cost is a
+  tuple over pools, `cpu` first. The tuple is built from the host: one field
+  per discrete GPU, or one shared field for unified memory, plus fake limits
+  such as a role pool of 1.
 
-- clients standardise on one RAG context and chunk to it, so the embed size
-  is a stable contract rather than a function of what else is loaded;
-- **a fixed small context makes the resident tier's VRAM a number you can
-  compute up front**, which is what makes the remainder meaningful. A
-  context that flexed with load would make the budget move under you.
+### Floor and sets
 
-The cap is not a concession to revisit when VRAM is tight. If VRAM binds,
-context in main chat is worth more than context in RAG.
+A serving's floor is the memory it needs at its task's `min_context` and
+`min_parallel`, through the measured memory law. A role's floor is the
+maximum floor of all models in the role.
 
-A sidecar declaring `device: cpu` pins that resident (or any model) to
-**host RAM instead**: it charges the host pool, never VRAM — one of the
-two budgets, never both.
+A set's floor follows its expression:
 
-Residents are selected by role, or by `--embed` / `--rerank` CLI selectors.
-**They always serve single-slot**: resident parallelism must never buy
-context away from the chat it serves. A declared `parallel:` on an
-embeddings/rerank model is ignored with a note.
+```
+floor(A & B)       = floor(A) + floor(B)
+floor(A | B)       = max(floor(A), floor(B))
+floor(A & (B | C)) = floor(A) + max(floor(B), floor(C))
+floor(+set)        = floor(set)
+```
+
+If a component of `floor(set)` exceeds `available`, the set is dropped and
+logged as an error.
+
+### The auction
+
+```
+auction(set) = available − floor(set)          # one device pool
+```
+
+The auction runs on the pool the model's device names. The other fields of
+the cost tuple are static charges; a role pool of 1 is a capacity check, not
+memory to share out.
+
+Each member requests a share of it by `share:` weight. `N%` requests N,
+`fill` takes what the weighted roles leave below 100, split equally; when
+they leave nothing it weighs 0 and accepts a remainder freed by a capped
+role, `min` requests 0 and accepts nothing, `0` requests 0 and accepts what
+remains. Weights are normalised per set. A role whose memory does not grow
+with context uses `min`; its floor is the whole cost.
+
+```
+request(role, set) = weight / Σ weights in set × auction(set)
+allocation(role)   = min over its sets of floor + request
+```
+
+Each set is priced on its own. A role's limit is the minimum across the
+sets it belongs to, so adding a set can only lower it. An offer in one set
+does not change its offer in another; each set logs its own unallocated
+headroom.
+
+A role runs one serving at a time. In capacity mode every role is a pool of
+value 1 and every entry charges 1; in matrix mode a role label expands to one
+entry.
+
+### Capacity routing
+
+llama-swap's capacity engine is the default: it runs when `matrix.sets:` is
+absent or empty. The packer emits:
+
+```yaml
+routing:
+  router:
+    use: capacity
+    settings:
+      capacity:
+        pools: {default: <available VRAM>, ram: <host pool>, foo: 1, bar: 1}
+models:
+  <id>:
+    capacities: {default: <MiB>, ram: <MiB>, foo: 1}
+    evict_cost: <seconds>
+```
+
+- Capacity prices each role's share directly: `floor + share × (available −
+  floor)`; `fill` takes the remainder above the floors, split equally among fills; `min` and `0`
+  stay at the floor. Set generation is future work; a fleet needing
+  cross-role co-residency authors `matrix.sets:` (matrix mode).
+- Any combination whose summed capacities fit every pool may coexist.
+- One size-1 pool per role makes one serving per role. Requesting another
+  model of the role evicts the current one.
+- `capacities` carry the same measurement margin as the solve.
+- `evict_cost` is `load_seconds + prefill_seconds`; prefill applies to
+  KV-cached endpoints only.
+- Nothing is preloaded; only the requested model starts.
+- `matrix.sets:` selects the matrix engine instead. A set is a permission;
+  it can forbid a combination that fits.
+- `matrix.categories`, `matrix.evict_costs`, and an input `routing:` key are
+  retired.
+
+Profile `pools:` keys (optional; per pool id):
+
+- `spare:` — added to the measured reserve for that pool.
+- `vram:` — nominal size used to resolve bare memory values. It does not
+  change the emitted `default`.
+- `reserve_extra:` and `pins:` are retired and error. Reserving memory for a
+  named role or model is future work.
+
+The emitted `default` pool is `--vram` or `hardware.vram` minus the measured
+reserve and the spare.
+
+### Device (`device:`)
+
+One vocabulary, one parser (`utils.parse_device`): `auto` (the default,
+llama-packer decides), `cpu`, or a non-negative GPU index (`1`, `"1"`).
+Omit the key for `auto`. There is no `gpu` or `any` spelling.
+
+It can be declared in three places, most specific first:
+
+| where | applies to |
+|---|---|
+| sidecar `device:` | this model only |
+| task `device:` | a default for every model serving that task |
+| role `device:` | a default for every model of that role |
+
+The sidecar wins. When it omits the key, the task's declaration applies, then
+the role's. A sidecar that contradicts a task or role logs a warning.
+Conflicting task devices warn and leave placement unset.
+
+`cpu` places the serving on the host: `-ngl 0`, charged to the `ram` pool,
+never VRAM. An index pins the GPU (`ROCR_VISIBLE_DEVICES` /
+`CUDA_VISIBLE_DEVICES`).
 
 ### Host pool (`device: cpu`)
 
-A `device: cpu` sidecar places the serving entirely in host RAM: it
-competes for no VRAM — charged by neither the resident tier nor a chat
-set, it cannot be evicted on VRAM grounds, and once warm it stays.
-Its price is a host-RAM budget with the same decision quality
-(`docs/plans/cpu-residency-budget.md`):
+A `device: cpu` sidecar places the serving entirely in host RAM: it charges
+the `ram` pool, never VRAM. Its price is a host-RAM budget with the same
+decision quality (`docs/plans/cpu-residency-budget.md`):
 
-- **detection** finds the pool at pack time — `MemAvailable` minus a sysctl
+- **detection** finds the pool at pack time: `MemAvailable` minus a sysctl
   pressure zone (per-zone high-watermark sum; declared fallback 25% of
   total), capped by the llama-swap service cgroup headroom
   (`memory.high`/`memory.max` − `memory.current`). Every term is
   overridable from `profiles.yaml hardware:`; each chosen value is logged
   with the arm that picked it.
-- **the charge** is the serving's own measured quad at its design context
-  — the same `derived:` block family the VRAM budget uses, measured
-  under a `--n-gpu-layers 0` shape stamp. A declared `parallel:` on a CPU
-  chat model is honoured and multiplies the pool terms; residents stay
-  single-slot.
-- **the check is go/no-go**: a quad that will not fit the pool remaining
-  after committed residents logs the shortfall and emits no id — no
-  solve-down, no automatic offload. `device: cpu` is the only gate.
+- **the charge** is the serving's own measured quad at its served context,
+  emitted as `capacities.ram`.
+- **the solve is the same**: a CPU model solves its context inside its
+  role's `ram` allocation, exactly like a GPU model inside `default`. The
+  role's 128 MiB host floor and the task floors apply before the share.
+- **eviction is capacity-driven**: when `ram` is full, llama-swap evicts the
+  cheapest serving instead of failing. There is no automatic offload.
+- A CPU model is not exempt from eviction; evicting it frees host RAM.
+  Its `ttl` follows the same rule as any other serving.
 
-**Moving a whole usecase off VRAM** takes one declaration —
-`profiles.yaml device_roles: [embeddings, rerank]` (or the mapping
-`{embeddings: cpu, rerank: cpu}`) places every model of those roles on the
-host, exactly as if each sidecar carried `device: cpu`. The key is a role
-and the value is a device; there is no `role: cpu` field. A CPU helper entry
-also joins every routing set and serves with `ttl: 0`: a request names
-it, it loads once, and no later swap evicts it — evicting it would
-reclaim no device memory. Set subsets mean nothing is preloaded.
+**Moving a whole usecase off VRAM** takes one declaration:
+`roles.<name>.device: cpu` places every model of that role on the host,
+exactly as if each sidecar carried `device: cpu`.
 
 `metadata.packing` names the placement (`device: cpu|gpu`) and the decided
 byte facts (`ram_mib`/`vram_mib`, `kv_per_token`) so clients can filter
 without parsing ids.
 
+### Roles (`roles:`)
+
+A role is ownership and allocation. Models are assigned by the tree it owns
+(or a sidecar `role:`); models in the same role evict each other on request.
+The code ships no role names; the default roles are data in
+`llama_packer/profiles.yaml`.
+
+```yaml
+roles:
+  cat:
+    dir: cats              # the tree this role owns
+    share: fill            # take what the weighted roles leave
+  dog:
+    dir: dogs
+    share: 10%             # request weight
+    device: cpu            # every model of this role runs from system RAM
+```
+
+- `dir` is the models-root-relative directory or directories this role owns;
+  `.` is the root. A tree belongs to exactly one role; overlapping trees are
+  an error. A role without one is reachable only by an explicit sidecar
+  `role:`.
+- A role has no behaviour. The models under it declare `tasks:`, and each
+  task names the endpoint it is served at; the role name is arbitrary.
+- `share` is the role's request in each set: a number (`40`, `40%`, and
+  values above 100 are relative weights), `fill` (the remainder, or 0 when
+  none), `min` (0, accept nothing), or `0` (0, accept what remains).
+  Weights are normalised per set; they do not sum to a cap.
+- `device` is `auto`, `cpu`, or a GPU index, exactly the sidecar vocabulary.
+  A sidecar `device:` overrides it per model, and a task `device:` is the
+  work's requirement.
+
+A role runs one serving at a time. There is no per-role count, cap, weight,
+exclusivity, or fill key. `share: 100` is not exclusivity; a single-leaf set
+is.
+
+The router follows from the input, not from a key:
+
+- `matrix.sets:` present → matrix. Each set is its own budget.
+- absent or empty → capacity.
+
 ### Remainder
 
 ```
-reserve        = RESERVE_SYSTEM(1024) + max(RESERVE_VIDEO(1024), baseline_mb)
-available      = vram_total - reserve - spare
-resident_vram  = Σ VRAM(resident, at its own fixed context)
-chat_budget    = available - resident_vram
+reserve   = 1024 + max(1024, baseline_mb)
+available = vram_total - reserve - spare
 ```
 
-The matrix solve turns `chat_budget` into **one shared per-slot
-`chat_ctx`** — the target every co-resident chat model is sized against.
-Each chat model then resolves its own serving against that target, through
-its category:
-
-```
-for each chat model:
-    for each declared category, and the fallback:
-        solve (shed, ctx, parallel) from chat_ctx
-```
-
-Two chat models can therefore serve different contexts — a 27B stops at its
-design window, a 4B takes the full target — but they are priced against the
-same number. The worst set branch is charged once, before `chat_ctx` is
-solved; there is no per-set re-solve.
-
-A model smaller than its own category's `min_context` at every rung emits
-**nothing** for that category. The fallback entry is the floor on that: every
-model gets one, and it too can fail.
+Each role is solved inside its allocation from the auction. A model that
+cannot meet its task floor emits nothing for that task; the fallback
+model_id remains. A role that loses every model emits nothing and warns once.
 
 ### Knobs (matrix section keys)
 
 | key | default | meaning |
 | --- | --- | --- |
-| `embed_context` | 4096 | Context the resident embeddings model serves at |
-| `rerank_context` | 4096 | Context the resident rerank model serves at |
-| `auto_parallel` | true | Spend leftover VRAM on concurrent chat slots: unpinned chat models on llama-server/vLLM get a value-function (ctx, slots) solve — score `(ctx/floor)^0.5 × slots^parallel_power`, best feasible pair wins. Set `false` to disable fleet-wide; a sidecar `parallel:` pin opts a single model out |
+| `auto_parallel` | true | Spend leftover memory on concurrent slots: a value-function `(ctx, slots)` solve, best feasible pair wins. `false` disables it fleet-wide; a sidecar `parallel:` pin opts one model out |
 | `auto_parallel_max` | 8 | Hard cap on auto-parallel slots |
-| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score: what each extra simultaneous chat is worth. See "What `parallel_power` actually controls" below — the neutral point is model-dependent, so a fleet-wide value is a *bias*, not a target |
+| `parallel_power` | 0.75 | Slot exponent B in the auto-parallel score |
 
-### What is left from the old design
+`tools_min_ctx` (default 128k) is the context below which a chat entry loses the `tools` capability. The co-load squeeze knobs (`min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min`, `estimate_headroom`) are retired.
 
-Two different things, and they should not be confused:
+### TTL
 
-`sets:`, `evict_costs:` and `categories:` are **still live** — they are
-forwarded verbatim to llama-swap's matrix router, which is their consumer.
-What changed is that admission is now per entry rather than per model: a
-`.coding` entry and a `.aux` entry of the same model get independent
-verdicts, because they are independently sized servings. A `.aux` entry
-that cannot hold its 80k minimum beside the 5.7 GB reranker is dropped from
-`ragz` while the `.coding` entry stays in it.
-
-`sets:` is also the **budget contract**. A set is a role composition
-(`rag: __CHAT_VARS__ & emb & rnk` is embed *and* rerank; `talk:
-__CHAT_VARS__ & stt & tts` is 2-way speech), and the chat solve reserves the
-worst branch of the most expensive chat-capable set it can be requested
-under: `&` sums, `|` maxes, `+set` expands, nesting prices recursively. It is
-not the sum of every declared category, and a category in no chat set
-reserves nothing (llama-swap can only hold it alone). A second category of
-the same role is an alternative, never an addition — one model per role per
-set. The rule is the sets' own: summing every declared category would make
-every chat solve pay for a bucket even when the set holding it is an
-alternative to a cheaper one.
-
-`tools_min_ctx`, `min_chat_ctx`, `coload_min_ctx`, `ctx_gain_min` and
-`estimate_headroom` shape the shared solve, in that order: the RAG pair is
-squeezed only when chat falls below `tools_min_ctx`, no further than
-`coload_min_ctx`, and only if the gain reaches `ctx_gain_min`; a co-load is
-admitted only while chat stays at `min_chat_ctx` (or `tools_min_ctx` when
-the chat model still has tools); an estimated, not measured, overhead is
-padded by `estimate_headroom`. Defaults: 128k, 64k, 20k, 4k, 1.25.
+Per-entry `ttl` resolves sidecar > task > role > top-level `ttl`. The
+top-level default is 3600. `0` disables idle unload; otherwise the most
+specific declared value wins. The emitted top-level key is `globalTTL`,
+llama-swap's name; the operator writes `ttl` in `profiles.yaml`. TTL and
+capacity are independent: TTL yields time, capacity bounds memory.
 
 ### What `parallel_power` actually controls
 
@@ -815,7 +931,7 @@ declares `engines: [vllm]` (or an override rule sets it); the registry picks
 host, podman or docker. The emitted entry runs `vllm serve`,
 published to llama-swap's `${PORT}` host macro. Everything else works
 identically: aliases/modes (`filters.setParamsByID`), `metadata`, capabilities,
-matrix routing.
+capacity routing.
 
 All three endpoints are supported, mapped onto vLLM's pooling interface:
 
@@ -896,7 +1012,7 @@ persisted to the sidecar `derived:` block with `source:` `vllm-estimate` /
 
 When neither is available, context falls back to the declared `context_length` (or GGUF
 architectural max) and vLLM's own startup profiling bounds the actual allocation. Companion
-(mmproj/MTP) folding is skipped for vLLM models — vision/draft heads live inside the HF repo.
+(mmproj/MTP) folding is skipped for vLLM models — vision/draft heads are inside the HF repo.
 
 `--gpu-memory-utilization` is derived from the same reserve/spare budget llama.cpp uses
 (`available / vram`), unless `vllm.gpu_mem_util` is set explicitly in `profiles.yaml`.
@@ -990,7 +1106,7 @@ a ~60 GB NVFP4 model gets ≥ 600 s.
 
 ## Image Backend (sd-server)
 
-A model with `role: image` (selected via `dirs: {img: image}` and/or `type: image`) is served with
+A model with `role: image` (selected by a role owning `img/` or a sidecar `role: image`) is served with
 `sd-server` from [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`engines: [sd-server]`).
 The emitted entry runs `sd-server --diffusion-model …` plus `cli_args` verbatim, proxied via llama-swap's `${PORT}`.
 
@@ -1010,7 +1126,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 # name: flux-4b
 # # llm: qwen-4b.gguf
 # ---
-# With dirs: {img: image} and backends: [llama-server, sd-server] the entry emits:
+# With a role owning img/ and backends: [llama-server, sd-server] the entry emits:
 # cmd: sd-server --listen-port ${PORT} --listen-ip 0.0.0.0 --diffusion-model ${MODELS_DIR}/img/flux-4b.gguf  # add --vae etc. via cli_args:
 # proxy: http://127.0.0.1:${PORT}
 # checkEndpoint: /          # sd-server returns 200 on / only (not /health — Discussion #866)
@@ -1024,7 +1140,7 @@ Emission (see `docs/plans/comfyui-sd.md`):
 
 ### Memory estimation
 
-`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, zero KV terms, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM. A 40 GB diffusion model will not fit after the resident tier, and the category solve says so rather than the config pretending otherwise: if no rung fits, no entry is emitted.
+`sd-server` has no `llama-fit-params` analog, so VRAM is fixed overhead: `model_mib = file-size(diffusion)`, zero KV terms, `compute_mib = 512`. `ctx_size` tracks `design_context` (sidecar `context_length` or default) but does not affect VRAM. A 40 GB diffusion model will not fit beside the other servings, and the solve says so rather than the config pretending otherwise: if no rung fits, no entry is emitted.
 
 ### Binary precedence
 
@@ -1037,14 +1153,13 @@ Emission (see `docs/plans/comfyui-sd.md`):
 ### Limitations
 
 - Single `sd-server` per diffusion model; no multi-UNet or distributed setup.
-- VRAM sizing is fixed and deliberately conservative — large flux/sdxl models should be sized via `spare` / `baseline` or explicit `hardware.vram` tuning, not matrix sharing.
+- VRAM sizing is fixed and deliberately conservative — large flux/sdxl models should be sized via `spare` / `baseline` or explicit `hardware.vram` tuning, not shared co-residency.
 - `cli_args` pass-through works, but backend-specific flags (`--diffusion-fa`, `--offload-to-cpu`, `--lora-model-dir`) are operator-provided via sidecar `cli_args:` until first-class `sd_*` keys are added.
 - ComfyUI (`comfyui-boot`) remains future work via the same `image` role — see `docs/plans/comfyui-sd.md` for `compat.ignoreWebsockets` / `upstream.ignorePaths` shape.
 
 ## Audio Backend (whisper-server)
 
-A model with `role: s2t` (opt-in: an `s2t/` directory plus `dirs: {s2t: s2t}` in
-`profiles.yaml`) is served with **whisper-server** from
+A model with `role: s2t` (the default `s2t` role owns `s2t/`; `backends:` enables whisper-server) is served with **whisper-server** from
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`engines: [whisper-server]`) —
 the long-lived HTTP server from `examples/server` (the analog of `llama-server`;
 `whisper-cli` is oneshot and cannot be proxied by llama-swap). Exposes
@@ -1052,7 +1167,7 @@ OpenAI-compatible `POST /v1/audio/transcriptions`.
 
 ```yaml
 # profiles.yaml
-dirs: {s2t: s2t}
+roles: {s2t: {dir: s2t}}
 backends: [llama-server, whisper-server]
 
 # sidecar: s2t/ggml-large-v3.md (authored — .bin orphans are never stubbed)
@@ -1100,11 +1215,10 @@ zero KV terms, `compute_mib = 100` (measured on Vulkan: process footprint
 ≈ Σ model files — activation memory is small; sd-server keeps its 512 MiB
 diffusion buffer); a sidecar `vram_mb` pins the total outright.
 `ctx_size` tracks `design_context` (sidecar `context_length` or default)
-without affecting VRAM. s2t models can be declared
-**residents** (see [VRAM Allocation](#vram-allocation)), in which case they
-are reserved alongside RAG and served at a fixed small context so repeated
-lookups do not reload them. The emitted `--parallel` maps the sidecar/profile
-slot count to concurrent transcription workers.
+without affecting VRAM. An s2t serving with `ttl: 0` stays loaded and is
+charged like any other serving at its task's context. The emitted
+`--parallel` maps the sidecar/profile slot count to concurrent transcription
+workers.
 
 ## Audio Backend (audio-cpp)
 
@@ -1112,12 +1226,12 @@ A model with `role: t2s` (text-to-speech) or `role: s2t` (ASR) is served
 through the native **audio.cpp** engine (`audiocpp_server`). The full contract
 — roles, sidecar keys (`audio_cpp: {family, task, options, voice, voice_ref}`),
 profiles.yaml keys (`audio_cpp: {bin, backend, device, …}`), the emitted
-`sh -c` heredoc, classification, VRAM and matrix categories — lives in
+`sh -c` heredoc, classification, VRAM and role allocation — lives in
 [docs/backends/audio-cpp.md](docs/backends/audio-cpp.md).
 
 ```yaml
 # profiles.yaml
-dirs: {t2s: t2s, s2t: s2t}
+roles: {t2s: {dir: t2s}, s2t: {dir: s2t}}
 backends: [llama-server, audio-cpp]
 ```
 
@@ -1133,7 +1247,7 @@ Sidecars carry model-intrinsic data. Cross-cutting serving choices —
 `engines:` in the sidecar (or in a rule, for one-off exceptions); fleet-level
 policy belongs here.
 
-Rules can also live in a **directory-scoped** `models.yaml`: any subdirectory
+Rules can also be defined in a **directory-scoped** `models.yaml`: any subdirectory
 of a models root may carry one whose `overrides:` apply only to models in
 that subtree, and whose `defaults:` seed each subtree sidecar's frontmatter
 (see [Directory-scoped models.yaml](#directory-scoped-modelsyaml) below).
@@ -1344,7 +1458,7 @@ backends:
   - llama-server    # tried first for everything it can serve
   - vllm            # vLLM host binary
   - vllm-podman     # container pair
-  - sd-server       # image generation (opt-in; needs dirs: img: image)
+  - sd-server       # image generation (the default image role owns img/)
   # vllm-docker     # absent = disabled, even with resources configured
 ```
 
@@ -1383,7 +1497,7 @@ sd:
 ```
 
 The same *intent* maps to different flags per engine, so each backend owns its
-own `args` (audio.cpp is a config-file service — its knobs live under
+own `args` (audio.cpp is a config-file service — its knobs are under
 `audio_cpp:`). Values must be a string of flags (a non-string value aborts the run)
 and are validated with shlex at build time (bad quoting aborts the run);
 they don't feed the VRAM estimator — they're operator responsibility, like
@@ -1478,33 +1592,30 @@ kv_per_token_mib [MiB/token] = kv_bytes_per_token / 2²⁰
 ## Model Discovery and Stub Sidecars
 
 Every `--models-dir` directory is scanned independently via a depth-first
-walk (`discover.discover` → `scope.ScopeStack`; role mapping via
-`utils.dir_role_map`). At each level the directory's `models.yaml` scope is
+walk (`discover.discover` → `scope.ScopeStack`; role mapping from each
+role's `dir:`). At each level the directory's `models.yaml` scope is
 pushed, its models are built, then children are visited:
 
 - `.md` sidecar files are the entry points; each binds to the model file whose
   stem matches its own, or the file named by `model:`.
-- Within a models dir the **first relative path component** selects the role
-  via `dirs:` in profiles.yaml (case-insensitive). Defaults:
+- Within a models dir a role owns one or more trees with `dir:` in
+  profiles.yaml (case-insensitive, relative to the models root; `.` is the
+  root). The default roles in `llama_packer/profiles.yaml` supply the usual mapping as data:
 
-  | Prefix | Role | Meaning |
+  | Directory | Role | Meaning |
   |--------|------|---------|
-  | `chat` | `chat` | Chat — and its mmproj/MTP companions living next to it |
-  | `t2t` | `chat` | Legacy name for the chat dir |
-  | `vision` | `chat` | VLMs + mmproj (same role as chat, colocated) |
-  | `doc`, `ocr` | `chat` | OCR / extraction / file-format models (chat-role, organizational split; `doc` is the canonical name, `ocr` its legacy alias) |
-| `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
-| `rerank` | `rerank` | Reranker models |
-| `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`; opt-in via `dirs: {s2t: s2t}`) |
-| `t2s` | `t2s` | Text-to-speech (audio.cpp via audio-cpp; opt-in via `dirs: {t2s: t2s}`) |
-| `img` | `image` | Diffusion / image generation (sd-server; opt-in via `dirs: {img: image}`) |
+  | `chat`, `t2t`, `vision`, `doc`, `ocr` | `chat` | Chat and its mmproj/MTP companions; the extra names are organizational splits |
+  | `embed` | `embeddings` | Embedding models; nested subdirs (e.g. `embed/jina-v5/`) keep the role |
+  | `rerank` | `rerank` | Reranker models |
+  | `s2t` | `s2t` | Speech-to-text (whisper.cpp GGML `.bin`) |
+  | `t2s` | `t2s` | Text-to-speech (audio.cpp via audio-cpp) |
+  | `img` | `image` | Diffusion / image generation (sd-server) |
 
-  Files at the root itself default to `chat`; files under any other
-  subdirectory (`img/` when not opted in, `misc/`, `tmp/`,
-  `hf_hub/`, … — and `s2t/`, `t2s/`, `img/` when not opted in) are **skipped** — one summary line per run names the
-  skipped directories so nothing disappears silently. The whitelist is
-  extendable via profiles.yaml `dirs:` (e.g. `{ocr: chat, it2t: chat}`) and
-  via CLI `--extra-dirs` (backcompat for `embed`/`rerank`).
+  The names are not special: a tree belongs to the role whose `dir:` lists
+  it. A model under no role's tree and with no sidecar `role:` is an error,
+  as is a `role:` that names an undefined role. Directories no role owns are
+  **skipped** — one summary line per run names them so nothing disappears
+  silently. `--extra-dirs` is retired and warns.
 
   A `<models-root>/.modelignore` file excludes individual files/subtrees in
   place (no moving or deleting): one glob per line, `#` comments; a pattern
@@ -1518,7 +1629,7 @@ pushed, its models are built, then children are visited:
 
 `--models-dir` precedence: CLI `--models-dir` (when given) > profiles.yaml
 `models_dirs:` (a list) > `./models`. The tracked `profiles.yaml.example` is
-the template; the live `profiles.yaml` is machine-local (gitignored). When no
+the template; the actual `profiles.yaml` is machine-local (gitignored). When no
 profiles file exists, llama-packer logs a warning pointing at the example and
 proceeds with the bundled defaults.
 
@@ -1784,7 +1895,7 @@ weaknesses:
 
 ## Measured-Block Persistence
 
-Machine-written values live in the sidecar `.md` file under a single
+Machine-written values are stored in the sidecar `.md` file under a single
 `derived` nested block — and `--dry-run` writes none of them — the only dynamically generated branch
 (llama-packer's own calculation cache: never hand-edit, delete to force
 re-evaluation; legacy `fit-params`/`measured` blocks are located but
@@ -1836,7 +1947,7 @@ derived:
 ```
 
 **Serve corrections.** Per-arch family rows measured by the opt-in
-`--probe-memory` (fit-params estimate vs real llama-server truth) live in
+`--probe-memory` (fit-params estimate vs real llama-server truth) are in
 the durable machine-local `serve-corrections.yaml` beside `profiles.yaml`
 (gitignored; `LLAMA_PACKER_CORRECTIONS` relocates it; the retired
 `~/.cache` JSON stays readable as a fallback). Each row records the
@@ -1880,7 +1991,7 @@ report — every write it withheld — *is* the output of the run.
 | `_RESERVE_SYSTEM` | 1024 | MB reserved for OS/driver/scratch buffers |
 | `_RESERVE_VIDEO` | 1024 | MB reserved for GPU video output framebuffer |
 
-In `llama_packer/utils.py`; the companion/MTP and cache-precision constants live in `llama_packer/vram.py` / `utils.py`:
+In `llama_packer/utils.py`; the companion/MTP and cache-precision constants are in `llama_packer/vram.py` / `utils.py`:
 
 | Constant | Defined in | Meaning |
 |----------|-----------|---------|

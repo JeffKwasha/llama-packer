@@ -93,9 +93,6 @@ class BoundBackend(BaseBackend):
                        stem: str | None = None) -> None:
         return self.engine.warn_unhandled(declared, stem)
 
-    def default_batch_ubatch(self, role: str) -> tuple[int, int]:
-        return self.engine.default_batch_ubatch(role)
-
     def is_available(self, avail: dict) -> bool:
         return (self.engine.supports(avail, self.transport)
                 and self.transport.is_available(avail))
@@ -178,9 +175,10 @@ def infer_backend(model: "Model", avail: dict | None = None,
     for backend in candidates:
         if fmt in backend.formats and backend.is_available(avail):
             # The endpoint must be served — otherwise a .gguf diffusion model
-            # under role=image would incorrectly infer llama-server and then be
-            # skipped as unsupported.  Infer the only backend that can serve it.
-            if not endpoints.serves(backend.endpoints, model.role):
+            # would incorrectly infer llama-server and then be skipped as
+            # unsupported.  Infer the only backend that can serve it.
+            needed = {t.endpoint for t in model.tasks_resolved}
+            if not needed <= backend.endpoints:
                 continue
             return backend.name
     return None
@@ -220,8 +218,9 @@ def resolve_engines(model: "Model", names: tuple[str, ...],
             if fmt not in backend.formats:
                 why = f"cannot load {fmt}"
                 continue
-            if not endpoints.serves(backend.endpoints, model.role):
-                why = f"does not serve role {model.role!r}"
+            needed = {t.endpoint for t in model.tasks_resolved}
+            if not needed <= backend.endpoints:
+                why = "does not serve " + ", ".join(sorted(needed))
                 continue
             if not backend.is_available(avail):
                 why = "not available (binary/image or runtime missing)"

@@ -16,7 +16,7 @@ when the plan that produced them is pruned.
 - **resident-partial-offload** — see
   [resident-partial-offload.md](resident-partial-offload.md).
 - **Measured host RAM** beyond the minimal keys in
-  [cpu-residency-budget.md](cpu-residency-budget.md) (memory-allocation-tags
+  [cpu-residency-budget.md](cpu-residency-budget.md) (the retired memory-allocation-tags
   §3).
 - **Alias rework** (Option A) — pending the llama-swap alias-routing probe.
 - **vLLM host offload.**
@@ -34,11 +34,13 @@ when the plan that produced them is pruned.
   `llama_packer/vram.py`), not the planner.
   **Evidence, 2026-11-02:** reproduced on `llama-b11988` for all four named
   models; the artifacts record `error: invalid argument: --fit-print`.
-  Cause: `_detect_matrix` is called with `fit_bin=llama_bin`
-  (`__main__.py:1175`), so `vram.fit_params` launches `llama-server`, which
+  Cause: `_detect_matrix` was called with `fit_bin=llama_bin`, so
+  `vram.fit_params` launches `llama-server`, which
   has `--fit` but not `--fit-print`. The flag belongs to the sibling
   `llama-fit-params` binary, which accepts the same argv and exits 0. The fix
   is the call site (pass `fit_bin`, not `llama_bin`) plus a regression test.
+  **Fixed 2026-11-07:** `_resolve_matrix` takes both binaries and passes the
+  fit one; `test_matrix_resolution_measures_with_fit_binary` holds it.
   A failed run now writes
   `~/.cache/llama-packer/fit-params-failures/<ts>-<pid>-<model>-<outcome>.log`
   (argv, model facts, binary identity, full stdout/stderr, exit/signal) and

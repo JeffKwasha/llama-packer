@@ -2,8 +2,8 @@
 """Branch-focused tests for decision paths the happy-path suite never hit.
 
 These target error handling and fallbacks (where the two bugs found earlier
-lived) plus the locally-added code paths: the role/backend guard, matrix
-category reservation failures, and audio-cpp config fallbacks.
+were found) plus the locally-added code paths: the role/backend guard and
+audio-cpp config fallbacks.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import pytest
 from llama_packer import writer
 from llama_packer.backends import get_backend
 from llama_packer.macros import Macro, Macros
-from llama_packer.profiles import Profiles
 
 
 def _stub_vram(m):
@@ -38,109 +37,13 @@ def test_filter_supported_rejects_audio_image_roles_on_llama_server(
     with caplog.at_level("ERROR"):
         out = writer._filter_supported([m], "q8_0")
     assert out == []
-    assert "not supported" in caplog.text
+    assert "needs " in caplog.text
 
 
 def test_filter_supported_allows_role_on_matching_backend(make_model):
     # Validates: SPEC.md, 'Backend Selection': the same role passes on the backend that serves it.
     m = _stub_vram(make_model("m", role="t2s", backend="audio-cpp"))
     assert writer._filter_supported([m], "q8_0") != []
-
-
-# ── shared matrix solve: degenerate inputs ────────────────────────────────
-
-def test_solve_matrix_no_chat_participants_returns_none(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a matrix with no chat participant has no shared solve.
-    embed = _stub_vram(make_model("e", role="embeddings"))
-    rerank = _stub_vram(make_model("r", role="rerank"))
-    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    assert writer._solve_matrix_context(
-        [], embed, rerank, "unused", 100000, None, profiles) is None
-
-
-def _matrix_fixture(make_model, monkeypatch, chat_backend, chat_parallel):
-    chat = _stub_vram(make_model("c", backend=chat_backend,
-                                 parallel=chat_parallel, context_length=32768))
-    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
-    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
-    captured: dict = {}
-
-    def fake_solve(**kw):
-        captured.update(kw)
-        return 100000
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solve)
-    profiles = Profiles({"defaults": {"parallel": 4},
-                         "profiles": {"default": {}}})
-    result = writer._solve_matrix_context(
-        [chat], embed, rerank, "unused", 100000, None, profiles,
-        knobs=writer.MatrixKnobs(embed_context=32768, rerank_context=16384))
-    return result, captured
-
-
-def test_matrix_parallel_zero_vllm_is_treated_as_single_seq(make_model, monkeypatch):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a vLLM entry with parallel 0 is one sequence, not zero.
-    result, captured = _matrix_fixture(make_model, monkeypatch, "vllm", 0)
-    assert result is not None
-    # vLLM uncapped -> the shared solve evaluates one max-length sequence.
-    assert captured["chat_models"][0][5] == 1
-
-
-def test_matrix_parallel_zero_llama_cpp_falls_back_to_default(make_model, monkeypatch):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': a llama.cpp entry with parallel 0 falls back to the default count.
-    result, captured = _matrix_fixture(make_model, monkeypatch, "llama-server", 0)
-    assert result is not None
-    assert captured["chat_models"][0][5] == 4
-
-
-# ── declared matrix category reservation failures ─────────────────────────
-
-def test_matrix_category_unsizable_is_skipped(make_model, caplog, monkeypatch):
-    # Validates: SPEC.md, 'VRAM Allocation': a category that cannot be
-    # sized is skipped, never reserved.
-    chat = _stub_vram(make_model("c", context_length=32768))
-    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
-    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
-    tts = make_model("t", role="t2s")
-    tts.vram.effective_static = lambda *a, **k: None   # cannot be sized
-    tts.vram.fit_params_static = lambda *a, **k: SimpleNamespace(
-        model_mib=1.0, kv_per_token_mib=0.0, slot_mib=0.0, compute_mib=1.0,
-        source="fit-params")
-    monkeypatch.setattr(writer, "solve_matrix_ctx", lambda **kw: 100000)
-    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    with caplog.at_level("WARNING"):
-        result = writer._solve_matrix_context(
-            [chat], embed, rerank, "unused", 100000, None, profiles,
-            knobs=writer.MatrixKnobs(embed_context=32768, rerank_context=16384),
-            fixed_categories=[("tts", tts)])
-    assert result is not None
-    assert result.coloads == ()
-    assert "cannot size" in caplog.text
-
-
-def test_matrix_category_that_does_not_fit_is_not_reserved(make_model, caplog,
-                                                           monkeypatch):
-    # Validates: SPEC.md, 'VRAM Allocation': a category that does not fit
-    # is not charged against the chat context.
-    chat = _stub_vram(make_model("c", context_length=32768))
-    embed = _stub_vram(make_model("e", role="embeddings", context_length=32768))
-    rerank = _stub_vram(make_model("r", role="rerank", context_length=16384))
-    tts = _stub_vram(make_model("t", role="t2s", context_length=4096))
-
-    def fake_solve(**kw):
-        # Baseline solves comfortably; reserving any category collapses it.
-        return 100 if kw.get("fixed_overhead_mb", 0) else 100000
-
-    monkeypatch.setattr(writer, "solve_matrix_ctx", fake_solve)
-    profiles = Profiles({"defaults": {}, "profiles": {"default": {}}})
-    with caplog.at_level("WARNING"):
-        result = writer._solve_matrix_context(
-            [chat], embed, rerank, "unused", 100000, None, profiles,
-            knobs=writer.MatrixKnobs(embed_context=32768, rerank_context=16384),
-            fixed_categories=[("tts", tts)])
-    assert result is not None
-    assert result.chat_ctx == 100000          # category not charged
-    assert "does not fit" in caplog.text
 
 
 # ── audio-cpp config fallbacks ────────────────────────────────────────────

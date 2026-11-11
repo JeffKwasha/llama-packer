@@ -1,8 +1,8 @@
 # vLLM / DGX Spark backend — design proposal
 
 **Status:** in progress — docker-VLLM scaffold, recipe keys and container
-correctness merged to `main` (see `docs/plans/gb10-support-plan.md`); the
-remaining followers are listed under "Planned" below.
+correctness merged to `main` (git history has the gb10 plan); the remaining
+followers are listed under "Planned" below.
 **Date:** 2026-08-15 (updated 2026-09-09)
 **Branch:** `gb10-support` (merged; supersedes the stale `vllm-gb10` scaffold branch)
 **Primary backend:** llama-swap / llama.cpp (unchanged). vLLM is a second backend
@@ -104,7 +104,7 @@ safetensors, so the GGUF fallback is a last resort.
 - **vLLM memory estimator** (`llama_packer/vllm_estimate.py`) — `vllm-memory-estimator`
   (optional, Python API) produces `model_mib`/`ctx_factor`/`compute_mib` for vLLM models,
   falling back to the local `.safetensors` header estimate, feeding the existing
-  `FitParams`/`calc_ctx`/`solve_matrix_ctx` pipeline unchanged. `--gpu-memory-utilization`
+  `FitParams`/`solve_context`/`solve_matrix_ctx` pipeline unchanged. `--gpu-memory-utilization`
   is derived from the same reserve/spare budget llama.cpp uses.
 - **Direct binary mode** — `backend: vllm` emits `vllm serve` (no docker); `vllm-docker`
   stays selectable. Binary resolved via `--vllm-server` > `vllm.bin` > `vllm` on PATH.
@@ -113,7 +113,7 @@ safetensors, so the GGUF fallback is a last resort.
 
 ## Implemented 2026-09-09 (branch `gb10-support`)
 
-Per `docs/plans/gb10-support-plan.md`:
+Per the gb10 implementation:
 
 - **Recipe keys (C1–C5)** — `vllm_quantization` (`--quantization`), `moe_backend`,
   `mamba:` (five `--mamba-*` flags), `tool_call_parser`, `reasoning_parser`; opt-in,

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml  # noqa: E402
 
+from llama_packer import roles  # noqa: E402
 from llama_packer.discover import discover  # noqa: E402
 from llama_packer.utils import hf_hub_cache  # noqa: E402
 
@@ -52,10 +53,9 @@ def load_profiles(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def audio_cpp_models(models_dirs, dir_roles, hf_home):
+def audio_cpp_models(models_dirs, hf_home):
     """Yield Models whose weight is an audio.cpp file (hf_repo + audio role)."""
-    for m in discover(models_dirs, generate_stubs=False,
-                      dir_roles=dir_roles, hf_home=hf_home):
+    for m in discover(models_dirs, generate_stubs=False, hf_home=hf_home):
         if m.role in AUDIO_ROLES and m.hf_repo:
             yield m
         else:
@@ -109,7 +109,7 @@ def main() -> int:
     profiles = load_profiles(REPO_ROOT / "profiles.yaml")
     models_dirs = [Path(d).absolute() for d in (
         args.models_dir or profiles.get("models_dirs") or ["models"])]
-    dir_roles = profiles.get("dirs") or {}
+    roles.configure(profiles)
     hf_home = args.hf_home or profiles.get("hf_home")
     hub = hf_hub_cache(hf_home)
     if hub is None:
@@ -117,7 +117,7 @@ def main() -> int:
         return 2
 
     counts: dict[str, int] = {}
-    for m in audio_cpp_models(models_dirs, dir_roles, hf_home):
+    for m in audio_cpp_models(models_dirs, hf_home):
         p = m.gguf_path
         if p is None:
             counts["unresolved"] = counts.get("unresolved", 0) + 1

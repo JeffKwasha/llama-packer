@@ -388,8 +388,68 @@ def check_writable(r: Runner, path: Path, user: str, what: str) -> None:
                        "during a re-pack will not persist", what, path, user)
 
 
+def ensure_profiles(r: Runner, dir_: Path, user: str, group: str,
+                    requested: Path | None) -> Path:
+    """The run directory's ``profiles.yaml``, created from a default if absent.
+
+    The installed copy is authoritative: an existing file is never
+    overwritten, so an operator's edits survive a reinstall. With no
+    installed copy, *requested* (``--profiles``) is used, else the bundled
+    ``llama_packer/profiles.yaml``. The copy is owned by the service
+    account and group-writable so the operator's agent can edit it.
+    """
+    target = dir_ / "profiles.yaml"
+    if target.exists():
+        logger.info("profiles: using installed %s", target)
+        return target
+    source = requested or (REPO / "llama_packer" / "profiles.yaml")
+    if not source.is_file():
+        raise InstallError(f"profiles source {source} does not exist")
+    print(f"  create {target} from {source}")
+    if r.dry_run:
+        return target
+    shutil.copy2(source, target)
+    shutil.chown(target, user=user, group=group)
+    os.chmod(target, 0o664)
+    logger.info("profiles: created %s — edit it for this host, then re-pack",
+                target)
+    return target
+
+
+def install_agent_guide(r: Runner, dir_: Path, user: str, group: str) -> None:
+    """Place the profiles guide where an agent started in *dir_* finds it.
+
+    OpenCode reads ``<cwd>/.opencode/skills`` and walks up to the project
+    root; a guide beside the config travels with the installation. This is
+    a document, not a service dependency — ``--no-agent-guide`` skips it.
+    """
+    source = REPO / "docs" / "profiles-authoring.md"
+    target = dir_ / ".opencode" / "skills" / "profiles-authoring" / "SKILL.md"
+    if not source.is_file():
+        logger.warning("agent guide %s is missing; skipped", source)
+        return
+    print(f"  create {target} from {source}")
+    if r.dry_run:
+        return
+    created: list[Path] = []
+    parent = target.parent
+    while not parent.exists() and parent != dir_:
+        created.append(parent)
+        parent = parent.parent
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    for path in reversed(created):
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o775)
+    shutil.chown(target, user=user, group=group)
+    os.chmod(target, 0o664)
+    logger.info("agent guide: %s", target)
+
+
 def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
-                    packer: str) -> None:
+                    packer: str, profiles: Path | None = None) -> None:
     """Run llama-packer as the service user to (re)write the config.
 
     As the service user rather than root, so the ``derived:`` blocks it
@@ -404,7 +464,7 @@ def generate_config(r: Runner, user: str, dir_: Path, args: argparse.Namespace,
     makes the config self-referential: it names the build it will run.
     """
     cmd = [packer, "--models-dir", *args.models_dir,
-           "--profiles", str(args.profiles),
+           "--profiles", str(profiles or args.profiles),
            "--output", str(dir_ / "config.yaml")]
     if args.spare:
         cmd += ["--spare", args.spare]
@@ -703,8 +763,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="llama-swap listen address (default 127.0.0.1:8123)")
     p.add_argument("--models-dir", nargs="+", required=True,
                    help="model roots passed to llama-packer (repeatable)")
-    p.add_argument("--profiles", type=Path, default=REPO / "profiles.yaml",
-                   help="profiles.yaml for llama-packer")
+    p.add_argument("--profiles", type=Path, default=None,
+                   help="source profiles.yaml, copied into <dir> only when "
+                        "<dir>/profiles.yaml does not exist (default: the "
+                        "bundled llama_packer/profiles.yaml)")
+    p.add_argument("--agent-guide", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="install docs/profiles-authoring.md as an OpenCode "
+                        "skill under <dir>/.opencode/skills (default: on)")
     p.add_argument("--spare", default=None,
                    help="VRAM to reserve for other tenants (passed through)")
     p.add_argument("--vram", default=None,
@@ -760,7 +826,12 @@ def main(argv: list[str] | None = None) -> int:
         print("\n== config ==")
         for md in args.models_dir:
             check_writable(r, Path(md), args.user, "models dir")
-        generate_config(r, args.user, dir_, args, find_packer(args.packer))
+        profiles = ensure_profiles(r, dir_, args.user, args.group,
+                                   args.profiles)
+        if args.agent_guide:
+            install_agent_guide(r, dir_, args.user, args.group)
+        generate_config(r, args.user, dir_, args, find_packer(args.packer),
+                        profiles)
 
         print("\n== unit ==")
         unit = install_unit(r, args, dir_)

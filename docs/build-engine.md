@@ -55,7 +55,7 @@ needs. The rules below are the ones its tests hold up.
   with the binary.
 - **A build tree without the binary is an error.**
 - **A good build installs beside the prebuilt one and moves the link**; a
-  **failed build leaves the live symlink alone.**
+  **failed build leaves the current symlink alone.**
 - **A build that cannot see the card is never installed.**
 - **An existing build is not replaced without asking**; `--rebuild` replaces
   the tree.

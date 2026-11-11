@@ -12,7 +12,7 @@ from llama_packer import tasks
 from conftest import TASK_ENDPOINT, catalogue, task_cfg, tasks_section
 from llama_packer.tasks import Task, TaskCatalogue, resolve_tasks
 from llama_packer.utils import parse_ctx_size as _parse_ctx_size
-from llama_packer.writer import FALLBACK, KNOWN_CAPABILITIES
+from llama_packer.writer import KNOWN_CAPABILITIES, fallback_task
 
 
 # ── context size parsing ───────────────────────────────────────────────────
@@ -36,6 +36,18 @@ def test_parse_ctx_size_accepts_ints_and_suffixes(raw, expected):
 def test_parse_ctx_size_rejects_junk(raw):
     # Validates: SPEC.md, 'Context Tiers': a context size is a positive integer or a 128k / 1M string; anything else is rejected
     assert _parse_ctx_size(raw) is None
+
+
+def test_task_declares_device_and_max_context():
+    # Validates: docs/plans/requirement-trace.md, requirement #107
+    cat = TaskCatalogue.from_cfg({
+        "spot": {"endpoint": CHAT, "device": 1,
+                 "max_context": "8k", "min_context": "2k"},
+    })
+    task = cat.get("spot")
+    assert task.device == 1
+    assert task.max_context == 8192
+    assert task.min_context == 2048
 
 
 # ── the catalogue ──────────────────────────────────────────────────────────
@@ -117,7 +129,6 @@ def test_catalogue_empty_config_keeps_the_defaults():
 
 
 def test_known_capabilities_are_the_ladder_axes():
-    # Validates: docs/plans/category-semantics.md, 'Degradation': the ladder's axes are vision and draft
     assert KNOWN_CAPABILITIES == frozenset({"vision", "draft"})
 
 
@@ -182,24 +193,15 @@ def _demands(cat: TaskCatalogue, *names: str) -> tuple[Task, ...]:
     return tuple(_d(cat, n) for n in names)
 
 
-# ── per-set co-resident overhead ────────────────────────────────────────────
+# ── set-expression splitting ──────────────────────────────────────────────
 
 from llama_packer.writer import (  # noqa: E402
-    MatrixKnobs,
     Planner,
-    _expr_leaves,
-    set_overhead_mb,
     _split_top,
 )
 
-_MB = {"emb": 749, "rnk": 1002, "rnk2": 5766, "stt": 1898, "tts": 1204,
-       "s2t": 2814, "s2t2": 1914}
-_CH = frozenset(f"c{i}" for i in range(1, 39))
-_CO = frozenset({"s2t", "s2t2"})
-
 
 def test_split_top_respects_parentheses():
-    # Validates: docs/plans/opportunistic-coload.md, 'Design sketch': the split is at parenthesis depth zero.
     assert _split_top("a & b & c", "&") == ["a", "b", "c"]
     assert _split_top("a | b & c", "|") == ["a", "b & c"]
     # a term fully wrapped in parens yields the bare term
@@ -209,83 +211,6 @@ def test_split_top_respects_parentheses():
     # a `|` nested inside parens is not a top-level alternative, and the
     # outer parens are not stripped because they belong to sub-terms
     assert _split_top("(a | b) & c", "|") == ["(a | b) & c"]
-
-
-@pytest.mark.parametrize("expr,expected", [
-    ("__CHAT_VARS__ & emb & rnk", 749 + 1002),
-    ("__CHAT_VARS__ & emb & rnk2", 749 + 5766),
-    ("__CHAT_VARS__ & stt", 1898),
-    ("__CHAT_VARS__ & tts", 1204),
-    ("__CHAT_VARS__", 0),
-])
-def test_set_overhead_sums_coresidents(expr, expected):
-    # Validates: SPEC.md, 'VRAM Allocation': a co-resident set is charged the sum of its members
-    assert set_overhead_mb(expr, _MB, _CH, _CO) == expected
-
-
-def test_set_overhead_charges_priciest_or_branch_only():
-    # emb and rnk2 are alternatives -- only one is ever resident, and the
-    # entry must survive the heavier one.
-    # Validates: docs/plans/opportunistic-coload.md, 'Design': an OR branch charges only the pricier side.
-    assert set_overhead_mb("__CHAT_VARS__ & (emb | rnk2)", _MB, _CH, _CO) == 5766
-    assert set_overhead_mb("((c1 | c2)) & emb & (rnk | rnk2)",
-                           _MB, _CH, _CO) == 749 + 5766
-
-
-def test_set_overhead_sums_coloads():
-    # co-loads genuinely stack with each other, unlike OR branches
-    # Validates: docs/plans/opportunistic-coload.md, 'Design': co-loads stack with each other.
-    assert set_overhead_mb("__CHAT_VARS__ & __COLOAD_VARS__",
-                           _MB, _CH, _CO) == 2814 + 1914
-
-
-def test_set_overhead_ignores_explicit_chat_vars():
-    # Validates: SPEC.md, 'VRAM Allocation': an explicit chat var is not charged as a co-resident
-    assert set_overhead_mb("(c1 | c2) & emb", _MB, _CH, _CO) == 749
-    assert set_overhead_mb("c1 & emb & stt", _MB, _CH, _CO) == 749 + 1898
-
-
-def test_set_overhead_ignores_unknown_vars():
-    # an unresolvable var charges nothing rather than exploding the solve
-    # Validates: docs/plans/opportunistic-coload.md, 'Design': an unknown var is charged nothing.
-    assert set_overhead_mb("__CHAT_VARS__ & mystery", _MB, _CH, _CO) == 0
-
-
-def test_set_overhead_prices_nested_branches():
-    # Validates: docs/plans/cpu-residency-budget.md #22 -- a set expression is
-    # a boolean tree: `&` sums, `|` maxes, and a nested group is never
-    # mistaken for an unknown var worth 0.
-    buckets = {"one": 1000, "two": 2000, "three": 4000}
-    ch = frozenset({"c1"})
-    # (two & three) is a branch, so this is max(1000, 6000) -- the old
-    # depth-0 split saw an unknown var and returned 1000.
-    assert set_overhead_mb("(c1) & (one | (two & three))", buckets,
-                           ch, frozenset()) == 6000
-    assert set_overhead_mb("(c1) & (three | (two & one))", buckets,
-                           ch, frozenset()) == 4000
-
-
-def test_set_overhead_expands_named_sets():
-    # Validates: docs/plans/cpu-residency-budget.md #22 -- `+set` expands the
-    # referenced expression, and a cycle terminates instead of recursing.
-    buckets = {"one": 1000, "two": 2000, "three": 4000}
-    cfgs = {"combo": "three | (two & one)"}
-    assert set_overhead_mb("(c1) & +combo", buckets, frozenset({"c1"}),
-                           frozenset(), sets_cfg=cfgs) == 4000
-    cyc = {"a": "+b", "b": "+a"}
-    assert set_overhead_mb("(c1) & +a", buckets, frozenset({"c1"}),
-                           frozenset(), sets_cfg=cyc) == 0
-
-
-def test_expr_leaves_walks_nested_branches():
-    # Validates: docs/plans/cpu-residency-budget.md #22 -- the walker names the
-    # real leaves of a nested branch, not a variable called "two & three", and
-    # expands `+set` references.
-    assert _expr_leaves("(c1) & (three | (two & one))") == \
-        {"c1", "one", "two", "three"}
-    assert _expr_leaves("(c1) & +combo",
-                        {"combo": "three | (two & one)"}) == \
-        {"c1", "one", "two", "three"}
 
 
 # ── the id label ────────────────────────────────────────────────────────────
@@ -304,21 +229,18 @@ from llama_packer.writer import ctx_label  # noqa: E402
     (2097152, "2M"),
 ])
 def test_ctx_label(ctx, expected):
-    # Validates: docs/plans/category-semantics.md, 'Ids carry no context': the served context is labelled compactly.
     assert ctx_label(ctx) == expected
 
 
 def test_ctx_label_never_exceeds_four_characters():
     # A client scans the id list; an id that wanders past four characters
     # stops being comparable at a glance.
-    # Validates: docs/plans/category-semantics.md, 'Ids carry no context': the label is compact enough for an id.
     for ctx in range(0, 4 * 1024 * 1024, 4096):
         assert len(ctx_label(ctx)) <= 4, ctx
 
 
 def test_ctx_labels_below_the_mega_threshold_are_unique():
     # Exact contexts must not collide, or two entries would share an id.
-    # Validates: docs/plans/category-semantics.md, 'Ids carry no context': the labels are unique below the mega threshold.
     seen = {}
     for ctx in range(0, 1000 * 1024, 1024):
         lbl = ctx_label(ctx)
@@ -355,33 +277,27 @@ def _auto_par(table, **kw):
 def test_min_parallel_is_honoured_when_a_candidate_qualifies():
     # Every slot count clears the 64k chat floor, so a demand for 4 slots
     # must not be quietly served with fewer.
-    # Validates: docs/plans/auto-parallel.md, 'Design': a candidate that meets min_parallel is taken.
     table = {p: 262144 for p in range(1, 9)}
     p, ctx = _auto_par(table, floor=65536, min_parallel=4)
     assert p >= 4, (p, ctx)
     assert ctx >= 65536
 
 
-def test_context_floor_outranks_min_parallel():
-    # Two slots would drop under the demand's 64k floor, so the single wide
-    # window is served instead. Concurrency is a preference; the context is
-    # what the entry id advertises, and a client that cannot fit its prompt
-    # gains nothing from a spare slot.
-    # Validates: docs/plans/auto-parallel.md, 'Design': the context floor outranks min_parallel.
+def test_min_parallel_is_hard_when_no_candidate_meets_it():
+    # Two slots would drop under the demand's 64k floor, so there is no
+    # serving that meets both floors: no entry, rather than one below the
+    # declared slot count. parallel_power is the knob for making the solver
+    # try harder for slots; it does not lower the floor.
     table = {1: 262144, 2: 40000}
-    p, ctx = _auto_par(table, floor=65536, min_parallel=2)
-    assert (p, ctx) == (1, 262144), (p, ctx)
+    assert _auto_par(table, floor=65536, min_parallel=2) is None
 
 
 def test_demand_never_trades_below_its_context_floor():
     # The budget only reaches ~96k however few slots are used, so a 128k
-    # coding demand is unreachable: no candidate qualifies and the solver
-    # falls back rather than inventing a context. Dropping the model from
-    # the sets it cannot serve is the admission pass's job, not this one's.
-    # Validates: docs/plans/auto-parallel.md, 'Design': a demand is never served below its own context floor.
+    # coding demand is unreachable: no candidate qualifies, and the task
+    # emits nothing rather than inventing a context.
     table = {p: 98304 for p in range(1, 9)}
-    p, ctx = _auto_par(table, floor=131072, min_parallel=1)
-    assert (p, ctx) == (1, 98304), (p, ctx)
+    assert _auto_par(table, floor=131072, min_parallel=1) is None
 
 
 def _profiles_stub(**kw):
@@ -565,23 +481,6 @@ def test_unusable_category_name_falls_back_to_a_bare_id(make_model):
     assert list(config["models"]) == ["m"]
 
 
-def test_dump_yaml_annotates_set_memory():
-    # The config documents its own memory split: a comment above each set.
-    # Only direct children of `sets:` are annotated, so a var that happens to
-    # share a set's name is left alone.
-    # Validates: SPEC.md, 'Output Format': the emitted YAML carries the memory set it was built with.
-    from llama_packer.writer import dump_yaml
-    text = dump_yaml(
-        {"routing": {"router": {"settings": {"matrix": {
-            "vars": {"rag": "m", "c1": "m2"},
-            "sets": {"rag": "c1 & emb", "voice": "c1 & stt"},
-        }}}}},
-        {"rag": 1751, "voice": 1898})
-    assert "# rag: 1751 MiB allocated to its co-resident models (1.71 GiB)" in text
-    assert "# voice: 1898 MiB allocated to its co-resident models (1.85 GiB)" in text
-    assert text.count("# rag:") == 1  # the `vars: rag` key is not annotated
-
-
 def test_require_gates_existence(make_model, tmp_path):
     """A model lacking a required capability does not satisfy the category.
 
@@ -661,21 +560,21 @@ def test_unnamed_capabilities_come_last_not_first():
 
 def test_none_sacrifice_means_never_degrade():
     """
-    Validates: docs/plans/category-semantics.md, 'The null category (fallback)': the
-    fallback keeps mmproj and MTP even at the cost of all its context.
     """
     assert writer.shed_levels(None) == (frozenset(),)
 
 
 def test_fallback_is_a_bare_minimum_category():
     """Every model emits this; it has no name and never degrades.
-
-    Validates: docs/plans/category-semantics.md, 'The null category (fallback)'.
     """
-    assert FALLBACK.id == ""
-    assert FALLBACK.min_context == 4096
-    assert FALLBACK.min_parallel == 1
-    assert FALLBACK.sacrifice == ()      # default order, floor-gated
+    from types import SimpleNamespace
+
+    fb = fallback_task(SimpleNamespace(
+        tasks_resolved=(), design_context=32768))
+    assert fb.id == ""
+    assert fb.min_context == 4096
+    assert fb.min_parallel == 1
+    assert fb.sacrifice == ()      # default order, floor-gated
 
 
 # ── keep vs require ───────────────────────────────────────────────────────
@@ -799,7 +698,7 @@ def test_usage_warnings_lead_with_the_sidecar_name(caplog):
 
 
 def test_audio_cpp_task_must_match_the_model_task(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md #98 -- an engine-level task cannot contradict the model's task.
+    # Validates: docs/plans/requirement-trace.md, requirement #98
     from llama_packer.discover import _warn_unsupported_values
 
     m = make_model("tts", tasks=["s2t"], audio_cpp={"family": "qwen3_tts",

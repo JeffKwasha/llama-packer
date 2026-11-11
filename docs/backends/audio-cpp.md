@@ -28,9 +28,9 @@ audio.cpp `task` values map onto llama-packer roles:
 | `vc`, `s2s` | `vc` (later) | audio → audio |
 | `sep` | (later) | audio → audio × tracks |
 
-Shipped now: `t2s` + `s2t`. Additional roles are recorded in
-[`docs/plans/audio-roles.md`](../plans/audio-roles.md); they are schema-stable
-because `capabilities.in/out` are freeform lists.
+Shipped now: `t2s` + `s2t` (the default roles). Role labels are
+operator data, so another label is free; a new audio behaviour is a contract
+change, not a schema change.
 
 ## Sidecar
 
@@ -129,9 +129,9 @@ engine resolves the path and rejects extensionless targets with
 Two layers keep audio GGUFs off the chat path and whisper models out of
 audio.cpp:
 
-1. **Directory authority** — audio models live under audio-mapped dirs
-   (`t2s/`, `s2t/`, …; opt-in via `dirs:`). A `.gguf` in `chat/` is never an
-   audio model.
+1. **Directory authority** — audio models are under the directories their
+   roles own (`t2s/`, `s2t/`, …; the default roles own them, and `backends:`
+   enables the engine). A `.gguf` in `chat/` is never an audio model.
 2. **Role + formats** — audio.cpp serves only `t2s`/`s2t` for
    `.gguf`/`.safetensors`/`hf_repo`, so llama.cpp's `.gguf` chat selection
    cannot claim them. whisper `.bin` models are not in its formats, so they
@@ -146,20 +146,23 @@ family-dependent constant (`_AUDIO_CPP_COMPUTE_MB`, default 1024 MB), so
 
 ## Matrix
 
-Declare audio as co-load categories ([`matrix:`](../../profiles.yaml.example)):
+Declare audio as co-load sets ([`matrix:`](../../profiles.yaml.example)):
 
 ```yaml
 matrix:
-  categories: {tts: {role: t2s}, stt: {role: s2t}}
-  evict_costs: {tts: 50, stt: 50}     # brief use: evict before chat context
   sets:
-    rag:   "__CHAT_VARS__ & emb & rnk"
-    voice: "__CHAT_VARS__ & (tts | stt)"
+    voice: "t2s & s2t"
+  sets:
+    rag:   "chat & embeddings & rerank"
+    voice: "chat & s2t"
+    talk:  "chat & t2s"
 ```
 
-`tts` and `stt` are separate categories because switching between them forces
-a resident reload. Declared categories are reserved as fixed-overhead residents
-alongside chat and RAG while the chat context stays at/above the co-load floor.
+A set names roles (or literal entry ids); the chat solve reserves the most
+expensive model each named role can contribute. `tts` and `stt` are separate
+sets because switching between them forces a reload. A task
+with `device: cpu` (the audio-cpp default here) places its models on the host,
+so they cost RAM rather than VRAM.
 
 ## Build / install
 
@@ -207,7 +210,7 @@ Vulkan backend requested but registry 'Vulkan' has no device 0
 
 — while llama.cpp offloads normally from the same account, the same `/dev`
 and the same unit (verified: `/sys/class/drm/card1/.../mem_info_vram_used`
-shows a resident model), so it is audio.cpp's device enumeration rather than
+shows a loaded model), so it is audio.cpp's device enumeration rather than
 a permission problem. Measured CPU cost: parakeet ASR RTF 0.076, kokoro
 synthesis comfortably under real time. To settle it properly, watch
 `journalctl -u llama-swap -f` (as a user in `systemd-journal`) while making a
@@ -238,15 +241,14 @@ maturity; use `audio-cpp` for breadth or a unified TTS+ASR service.
 
 ## History / sources
 
-The research brief this landed from is preserved in git history
-(`docs/plans/audio-cpp.md`, removed after migration): upstream
+The research brief this landed from is preserved in git history: upstream
 `app/server/README.md`, `docs/gguf.md`, `docs/build/linux.md`, and the working
 config in llama-swap issue #36 (`@dkruyt`, 2026-07-03).
 
 **2026-09-16 rework (0.8.0):** all emitted-key claims verified against the
-0.8.0 server README + live binary (AMD R9700 / RADV Vulkan): `hip`/`rocm`
+0.8.0 server README + current binary (AMD R9700 / RADV Vulkan): `hip`/`rocm`
 backend, `lazy_load`, `default_voice_preset`/`voice_presets`,
 `load_options`/`session_options`, `model_spec_override`, embedded package
-specs in standalone GGUFs, symlinked-blob rejection. Live-verified families:
+specs in standalone GGUFs, symlinked-blob rejection. Verified on hardware:
 kokoro `tts`, chatterbox_turbo `tts`, chatterbox `clon`, parakeet_tdt `asr`,
 nemotron_asr `asr`.

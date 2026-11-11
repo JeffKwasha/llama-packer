@@ -56,8 +56,10 @@ def _tree(root: Path) -> dict[str, tuple[int, str]]:
 
 
 def _sidecar(dir_: Path, stem: str = "documented") -> Path:
-    (dir_ / f"{stem}.gguf").write_bytes(b"x")
-    md = dir_ / f"{stem}.md"
+    tree = dir_ / "chat"
+    tree.mkdir(exist_ok=True)
+    (tree / f"{stem}.gguf").write_bytes(b"x")
+    md = tree / f"{stem}.md"
     md.write_text(f"---\nname: {stem.capitalize()}\n---\n")
     return md
 
@@ -193,7 +195,6 @@ def test_dry_run_reports_each_withheld_write(tmp_path, caplog):
     """
     md = _sidecar(tmp_path)
     chat = tmp_path / "chat"
-    chat.mkdir()
     (chat / "lonely.gguf").write_bytes(b"x")
 
     with caplog.at_level(logging.INFO, logger="llama_packer.utils"):

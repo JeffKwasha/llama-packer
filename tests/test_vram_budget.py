@@ -1,5 +1,5 @@
 # tests/test_vram_budget.py
-"""calc_ctx and solve_matrix_ctx budget math under the affine VRAM law:
+"""solve_context budget math under the affine VRAM law:
 
     VRAM(C, p) = model_mib + compute_mib + c*C + p*D
 
@@ -20,13 +20,12 @@ from llama_packer import gpu_state, vram
 from llama_packer.consts import _MIN_CTX_SIZE
 from llama_packer.vram import (FitParams, parse_device_buffers,
                                parse_fit_log, parse_host_buffers,
-                               parse_spill_mib, solve_matrix_ctx)
+                               parse_spill_mib)
 
 
 # ── serve-shaped log parsing ──────────────────────────────────────────────
 
 def test_parse_device_buffers_sums_device_only():
-    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     """Real Dirk (-text) numbers: weights max, both contexts' KV/RS/compute,
     host-visible buffers excluded."""
     text = """\
@@ -50,7 +49,6 @@ def test_parse_device_buffers_sums_device_only():
 
 
 def test_parse_device_buffers_empty_log():
-    # Validates: docs/plans/estimation-functions-facts.md, 'The affine model': Sum device-resident buffer lines of a llama-server ``-lv 5`` log. Returns MiB per component: ``weights`` (max across load passes: the.
     assert parse_device_buffers("garbage") == {
         "weights": 0.0, "kv": 0.0, "rs": 0.0, "compute": 0.0, "output": 0.0}
 
@@ -77,7 +75,7 @@ _CPU_SERVE_LOG = """\
 
 
 def test_parse_host_buffers_reads_final_pass():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': The parse reads the **final pass** — the buffer lines between the last two breakdown headers — instead of summing duplicated pass lines; and: reports host-side (non-device) sums.
+    # Validates: docs/plans/requirement-trace.md, requirement #59
     """Host sums from the final pass only: pass-1's real compute (36.10)
     must not double count, and the host weights equal the breakdown's
     model column (two CPU_Mapped buffers sum, 121.50 + 344.78)."""
@@ -90,7 +88,7 @@ def test_parse_host_buffers_reads_final_pass():
 
 
 def test_parse_host_buffers_headerless_log_parses_whole():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a log with no breakdown header parses whole (fixture/fit-params compatible).
+    # Validates: docs/plans/requirement-trace.md, requirement #60
     text = """\
 0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =   344.78 MiB
 0.05.263.779 I llama_kv_cache:        CPU KV buffer size =   476.00 MiB
@@ -101,7 +99,7 @@ def test_parse_host_buffers_headerless_log_parses_whole():
 
 
 def test_parse_device_buffers_whole_log_device_path():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': the device path keeps its whole-log sums — the projection pass of a device run measures 0 — and never touches host sums.
+    # Validates: docs/plans/requirement-trace.md, requirement #65
     """Device sums are unchanged by this refactor: host-side values of a
     CPU-shaped run contribute nothing to them (excluded upstream by the
     spill check)."""
@@ -111,7 +109,6 @@ def test_parse_device_buffers_whole_log_device_path():
 
 
 def test_parse_spill_rejects_vulkanless_fullcpu_launch():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a ``-ngl 999`` launch that lost Vulkan still measures nothing — the spill check rejects it exactly as before.
     """A `-ngl 999` run that never got the GPU serves the full-CPU shape;
     the device-shaped spill formula sees host-visible KV and refuses."""
     assert parse_spill_mib(_CPU_SERVE_LOG) == pytest.approx(476.00)
@@ -119,7 +116,7 @@ def test_parse_spill_rejects_vulkanless_fullcpu_launch():
 
 def test_run_measure_server_cpu_shape_returns_host_buffers(
         make_model, tmp_path, guard_env):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``device: cpu`` measures (and shape-stamps) with ``--n-gpu-layers 0`` instead of ``-ngl 999`` … and never runs the device-shaped spill rejection.
+    # Validates: docs/plans/requirement-trace.md, requirement #61, #62
     model = make_model("a", device="cpu")
     stub = _stub_server(
         tmp_path,
@@ -140,7 +137,7 @@ def test_run_measure_server_cpu_shape_returns_host_buffers(
 
 def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
         make_model, tmp_path, guard_env):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': a ``-ngl 999`` launch that lost Vulkan still measures nothing.
+    # Validates: docs/plans/requirement-trace.md, requirement #62
     model = make_model("a")
     stub = _stub_server(
         tmp_path,
@@ -156,7 +153,7 @@ def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
 
 
 def test_parse_fit_log_host_row_fallback():
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': ``parse_fit_log`` falls back to the ``Host`` report row when no device row exists.
+    # Validates: docs/plans/requirement-trace.md, requirement #63
     """Captured CPU-shaped fit-params run: the affine report row is named
     ``Host`` — today the parse rejects the whole run."""
     text = """\
@@ -177,7 +174,7 @@ Host 466 476 316
 
 
 def test_parse_fit_log_prefers_device_row():
-    # Validates: docs/plans/estimation-functions-facts.md: the device report row; a ``Host`` row beside it never wins.
+    # Validates: docs/plans/requirement-trace.md, requirement #63
     text = """\
 Vulkan0 18904 8704 1552
 Host 466 476 316
@@ -190,7 +187,7 @@ Host 466 476 316
 
 def test_measure_affine_trio_cpu_shape_persists_host_quad(
         make_model, tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md, 'Requirements (citable by tests)': the affine trio (``c`` from ``(C, C/2)``, ``D`` from the p pair) derives CPU quads without measuring anything anew.
+    # Validates: docs/plans/requirement-trace.md, requirement #64
     """Stub fit-params replays the three captured CPU-shaped runs
     (8192/1, 8192/2, 4096/1); c = (476−238)/4096, D = 0, weights 466.
     The persisted block carries the CPU device in its shape stamp."""
@@ -217,10 +214,10 @@ def test_measure_affine_trio_cpu_shape_persists_host_quad(
 
 def test_host_measurement_does_not_leak_into_vram_pricing(make_model,
                                                          tmp_path):
-    # Validates: docs/plans/cpu-residency-budget.md #11/#27 -- a host-RAM
+    # Validates: docs/plans/requirement-trace.md, requirement #74
     # measurement (allow_cpu=True, the host ledger) caches the same quad; a
-    # VRAM-priced call must still see None, or the CPU resident is charged to
-    # the chat solve after all.
+    # VRAM-priced call must still see None, or the CPU-served model is charged
+    # to the chat solve after all.
     stub = _stub_fit_run(tmp_path)
     model = make_model("a", device="cpu", context_length=8192)
     model.vram.remeasure = False
@@ -288,7 +285,6 @@ def _stub_fit_run(tmp_path):
 # ── spill validity check (2026-09-07 post-mortem) ─────────────────────────
 
 def test_parse_spill_mib_host_kv_is_spill():
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib rejects host-KV capacity spills
     """Host KV = the capacity-spill signature; structural CPU-mapped
     weights (<= 2 GiB) and host compute/output staging are not spill."""
     text = """\
@@ -303,7 +299,6 @@ def test_parse_spill_mib_host_kv_is_spill():
 
 
 def test_parse_spill_mib_cpu_map_beyond_tolerance():
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib tolerates llama.cpp's structural CPU weight placement
     """CPU-mapped weights above the structural headroom = offload failure."""
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size =  8000.00 MiB
@@ -314,7 +309,6 @@ def test_parse_spill_mib_cpu_map_beyond_tolerance():
 
 
 def test_parse_spill_mib_clean_log_is_zero():
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': parse_spill_mib rejects host-KV capacity spills while tolerating llama.cpp's structural CPU weight placement
     text = """\
 0.00.437 I load_tensors:      Vulkan0 model buffer size = 18904.68 MiB
 0.28.744 I llama_kv_cache:    Vulkan0 KV buffer size =  8704.00 MiB
@@ -346,14 +340,13 @@ exec sleep 30
 @pytest.fixture
 def guard_env(tmp_path, monkeypatch):
     """Clear pre-flight, tmp cache dir, fast stall window."""
-    monkeypatch.setattr(vram.gpu_state, "llama_residents", lambda: [])
+    monkeypatch.setattr(vram.gpu_state, "llama_processes", lambda: [])
     monkeypatch.setattr(vram, "_MEASURE_STALL_S", 1)
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     return tmp_path / "cache"
 
 
 def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     buffers = model.vram._run_measure_server(
         _stub_server(tmp_path, _OK_BODY), "q8_0", 8192, 1, "")
@@ -367,7 +360,6 @@ def test_run_measure_server_ok_and_child_dead(make_model, tmp_path, guard_env):
 
 
 def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     body = ("echo '0.00 I llama_kv_cache: Vulkan_Host KV buffer size = "
             "8704.00 MiB'\necho listening on http://127.0.0.1:1\nexec sleep 30\n")
     model = make_model("a")
@@ -378,10 +370,9 @@ def test_run_measure_server_rejects_spill(make_model, tmp_path, guard_env):
     assert entry["outcome"] == "spill"
 
 
-def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
-                                                     monkeypatch):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
-    monkeypatch.setattr(vram.gpu_state, "llama_residents",
+def test_run_measure_server_refused_beside_processes(make_model, tmp_path,
+                                                    monkeypatch):
+    monkeypatch.setattr(vram.gpu_state, "llama_processes",
                         lambda: ["123 jk /x/llama-server -m y"])
     monkeypatch.setenv("LLAMA_PACKER_CACHE_DIR", str(tmp_path / "cache"))
     model = make_model("a")
@@ -390,12 +381,11 @@ def test_run_measure_server_refused_beside_residents(make_model, tmp_path,
         str(tmp_path / "never-spawned"), "q8_0", 8192, 1, "") is None
     entry = json.loads((tmp_path / "cache" / "measure-journal.jsonl")
                        .read_text().splitlines()[-1])
-    assert entry["outcome"] == "refused-residents"
+    assert entry["outcome"] == "refused-processes"
 
 
 def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
                                                    guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     stub = _stub_server(tmp_path, "echo starting\nexec sleep 60\n")
     buffers = model.vram._run_measure_server(stub, "q8_0", 8192, 1, "")
@@ -408,7 +398,6 @@ def test_run_measure_server_stall_abandons_quickly(make_model, tmp_path,
 
 
 def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': One serve-shaped llama-server run → device buffer MiB.
     model = make_model("a")
     stub = _stub_server(tmp_path, "exit 1\n")
     assert model.vram._run_measure_server(stub, "q8_0", 8192, 1, "") is None
@@ -417,43 +406,43 @@ def test_run_measure_server_exit_detected(make_model, tmp_path, guard_env):
     assert entry["outcome"] == "exited"
 
 
-# ── calc_ctx ──────────────────────────────────────────────────────────────
+# ── solve_context ──────────────────────────────────────────────────────────────
 
 
-def test_calc_ctx_fits_design(make_model, fit_params_block):
+def test_solve_context_fits_design(make_model, fit_params_block):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("a", **{"derived": fit_params_block})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    ctx = model.vram.solve_context(32768, fit_bin="unused")
     # available = 32768 - 2048 = 30720; remaining = 30720 - 10000 - 1000 = 19720
     # design cost = (0.5*32768 + 0) * 1 = 16384 <= 19720 -> design context
     assert ctx == 32768
 
 
-def test_calc_ctx_scales_down_and_rounds(make_model):
+def test_solve_context_scales_down_and_rounds(make_model):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b", **{"derived": fm})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    ctx = model.vram.solve_context(32768, fit_bin="unused")
     # remaining = 30720 - 26000 = 4720; X = 4720/(0.5*1) = 9440 -> rounded 8192
     assert ctx == 8192
 
 
-def test_calc_ctx_slot_mib_charged_per_slot(make_model):
+def test_solve_context_slot_mib_charged_per_slot(make_model):
     # A nonzero D is charged once per slot: at p=2 the KV pool doubles AND
     # the slot cost doubles, so the affordable per-slot context shrinks.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 300.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("b2", **{"derived": fm})
-    p1 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=1)
-    p2 = model.vram.calc_ctx(32768, fit_bin="unused", parallel=2)
+    p1 = model.vram.solve_context(32768, fit_bin="unused", parallel=1)
+    p2 = model.vram.solve_context(32768, fit_bin="unused", parallel=2)
     # p=1: X = (4720 - 300)/0.5 = 8840 -> 8192
     # p=2: X = (4720 - 600)/(0.5*2) = 4120 -> 4096
     assert p1 == 8192
     assert p2 == 4096
 
-def test_calc_ctx_floors_at_min(make_model, caplog):
+def test_solve_context_floors_at_min(make_model, caplog):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     import logging
 
@@ -462,7 +451,7 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
           "source": "llama-server", "shape": ""}
     model = make_model("c", **{"derived": fm})
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=1024)
+        ctx = model.vram.solve_context(32768, fit_bin="unused", spare_mb=1024)
     assert ctx == _MIN_CTX_SIZE
     # The warning must say what the user gets and why: needs vs budget and
     # the verdict (the model cannot load — the planner disables it).
@@ -477,7 +466,7 @@ def test_calc_ctx_floors_at_min(make_model, caplog):
     assert model.vram.vram_squeezed is False
 
 
-def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
+def test_solve_context_never_reports_a_context_it_cannot_afford(make_model,
                                                            caplog):
     """The invariant: an emitted entry must never need more VRAM than exists.
 
@@ -502,14 +491,14 @@ def test_calc_ctx_never_reports_a_context_it_cannot_afford(make_model,
 
     # 24576 - reserve(2048) - weights(20471) - compute(1174) leaves ~883 MiB.
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+        ctx = model.vram.solve_context(24576, fit_bin="unused", spare_mb=0,
                                   parallel=4, design_ctx=202752)
     assert ctx < _MIN_CTX_SIZE, "reported a servable context"
     assert model.vram.over_budget_reason is not None
     assert "below the" in model.vram.over_budget_reason
 
 
-def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
+def test_solve_context_serves_normally_when_the_minimum_is_reachable(make_model):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """One MiB more budget and the same model serves -- so the guard above
     is a threshold, not a blanket refusal."""
@@ -517,16 +506,16 @@ def test_calc_ctx_serves_normally_when_the_minimum_is_reachable(make_model):
           "slot_mib": 448.87, "compute_mib": 1174, "source": "llama-server",
           "cache_type": "q8_0", "shape": ""}
     model = make_model("roomy", **{"derived": fm})
-    ctx = model.vram.calc_ctx(24576, fit_bin="unused", spare_mb=0,
+    ctx = model.vram.solve_context(24576, fit_bin="unused", spare_mb=0,
                               parallel=1, design_ctx=202752)
     assert ctx >= 4096
     assert model.vram.over_budget_reason is None
 
 
-def test_calc_ctx_applies_spare(make_model, fit_params_block):
+def test_solve_context_applies_spare(make_model, fit_params_block):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("d", **{"derived": fit_params_block})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=3072)
+    ctx = model.vram.solve_context(32768, fit_bin="unused", spare_mb=3072)
     # available = 32768 - 2048 - 3072 = 27648; remaining = 27648-11000 = 16648
     # design cost = 16384 <= 16648 -> design still fits
     assert ctx == 32768
@@ -535,7 +524,7 @@ def test_calc_ctx_applies_spare(make_model, fit_params_block):
 # ── over-budget / squeeze gating flags ───────────────────────────────────
 
 
-def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
+def test_solve_context_over_budget_when_available_nonpositive(make_model, caplog):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     import logging
 
@@ -544,14 +533,14 @@ def test_calc_ctx_over_budget_when_available_nonpositive(make_model, caplog):
           "source": "llama-server", "shape": ""}
     model = make_model("nb", **{"derived": fm})
     with caplog.at_level(logging.WARNING):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused", spare_mb=40000)
+        ctx = model.vram.solve_context(32768, fit_bin="unused", spare_mb=40000)
     assert ctx == _MIN_CTX_SIZE
     assert model.vram.over_budget_reason is not None
     assert "exhausted" in model.vram.over_budget_reason
     assert model.vram.vram_squeezed is False
 
 
-def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
+def test_solve_context_squeezed_flag_when_design_does_not_fit(make_model):
     # Weights fit but the full 32768 design context does not: the solve
     # falls back smaller and flags the squeeze for the description note.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
@@ -559,7 +548,7 @@ def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
           "compute_mib": 100, "cache_type": "q8_0",
           "source": "llama-server", "shape": ""}
     model = make_model("sq", **{"derived": fm})
-    ctx = model.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    ctx = model.vram.solve_context(49152, fit_bin="unused", spare_mb=0)
     # available = 47104; remaining = 47104 - 32100 = 15004
     # design cost = 16384 > 15004 -> squeezed; not over budget.
     assert ctx < 32768
@@ -567,7 +556,7 @@ def test_calc_ctx_squeezed_flag_when_design_does_not_fit(make_model):
     assert model.vram.vram_squeezed is True
 
 
-def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
+def test_solve_context_flags_reset_between_calls(make_model, fit_params_block):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """Flags are per-solve: a tight call's verdict must not leak into the
     next call's plan (groups may carry different spare)."""
@@ -575,46 +564,36 @@ def test_calc_ctx_flags_reset_between_calls(make_model, fit_params_block):
         "model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
         "compute_mib": 100, "cache_type": "q8_0",
         "source": "llama-server", "shape": ""}})
-    tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    tight.vram.solve_context(49152, fit_bin="unused", spare_mb=0)
     assert tight.vram.over_budget_reason is not None
 
     # Same budget object, looser effective budget via the fitting block:
     # swap the measured quad for one that fits and the flags must clear.
     tight.vram.effective_static = lambda *a, **k: (
         1000, 0.5, 0.0, 100)
-    ctx = tight.vram.calc_ctx(49152, fit_bin="unused", spare_mb=0)
+    ctx = tight.vram.solve_context(49152, fit_bin="unused", spare_mb=0)
     assert tight.vram.over_budget_reason is None
     assert tight.vram.vram_squeezed is False
     assert ctx >= _MIN_CTX_SIZE
 
 
-def test_calc_ctx_memory_margin_shrinks_ctx(make_model):
+def test_solve_context_memory_margin_shrinks_ctx(make_model):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fm = {"model_mib": 50000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
           "compute_mib": 1000, "cache_type": "q8_0", "source": "llama-server", "shape": ""}
     model = make_model("mm", **{"derived": fm})
-    plain = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.0)
-    margined = model.vram.calc_ctx(65536, fit_bin="unused", memory_margin=0.01)
+    plain = model.vram.solve_context(65536, fit_bin="unused", memory_margin=0.0)
+    margined = model.vram.solve_context(65536, fit_bin="unused", memory_margin=0.01)
     # available = 63520 (plain) vs 63520/1.01 = 62891.1 (margined)
-    # plain: remaining 12520 -> 25040 -> 24576; margined: 11891 -> 23782 -> 16384
+    # plain: remaining 12520 -> 25040 -> 24576; margined: 11891 -> 23782 -> 20480
     assert plain == 24576
-    assert margined == 16384
-
-
-def test_calc_ctx_cpu_resident_returns_design(make_model):
-    """
-    Validates: SPEC.md, 'VRAM Allocation': a CPU-resident model costs no VRAM, so its
-    context is its design maximum.
-    """
-    model = make_model("e", device="cpu", context_length=8192)
-    ctx = model.vram.calc_ctx(1024, fit_bin="unused")
-    assert ctx == 8192
+    assert margined == 20480
 
 
 # ── unestimable fallback (no estimate source works) ──────────────────────
 
 
-def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
+def test_solve_context_unestimable_falls_back_to_design(make_model, caplog):
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     """No measurement source -> design ctx + unestimated flag, never raise."""
     import logging
@@ -622,12 +601,12 @@ def test_calc_ctx_unestimable_falls_back_to_design(make_model, caplog):
     model = make_model("ue", context_length=32768)
     model.vram.effective_static = lambda *a, **k: None
     with caplog.at_level(logging.WARNING, logger="llama_packer.vram"):
-        ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+        ctx = model.vram.solve_context(32768, fit_bin="unused")
     assert ctx == 32768
     assert model.vram.unestimated_reason is not None
     assert any("VRAM measurement failed" in r.message for r in caplog.records)
     # The warning is deduped: a repeat solve logs it once.
-    model.vram.calc_ctx(32768, fit_bin="unused")
+    model.vram.solve_context(32768, fit_bin="unused")
     assert sum("VRAM measurement failed" in r.message
                for r in caplog.records) == 1
 
@@ -653,12 +632,12 @@ def test_fit_params_undecodable_output_returns_none(make_model, monkeypatch,
     assert any("fit-params failed" in r.message for r in caplog.records)
 
 
-def test_calc_ctx_vllm_no_estimate_returns_design(make_model):
+def test_solve_context_vllm_no_estimate_returns_design(make_model):
     # vLLM model with no estimator and no local safetensors: graceful fallback.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     model = make_model("f", backend="vllm", hf_repo="org/model",
                        context_length=65536)
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused")
+    ctx = model.vram.solve_context(32768, fit_bin="unused")
     assert ctx == 65536
 
 
@@ -713,7 +692,6 @@ def test_fit_params_static_measure_failure_uses_transient_fit_params(
 
 
 def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     """The persisted constants predict memory for any (context, slots)."""
     model = make_model("pred", **{"derived": fit_params_block})
     fp = model.vram.fit_params_static("unused")
@@ -723,7 +701,6 @@ def test_fit_params_static_vram_mib_prediction(make_model, fit_params_block):
 
 
 def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     model = make_model("pf", **{"derived": None})
     monkeypatch.setattr(model.vram, "fit_params", lambda *a, **k: None)
     assert model.vram.fit_params_static("/bin/fit") is None
@@ -733,7 +710,6 @@ def test_fit_params_static_pair_failure_falls_back(make_model, monkeypatch):
 
 
 def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     legacy = dict(fit_params_block)
     legacy.pop("kv_per_token_mib")
     legacy.pop("slot_mib")
@@ -747,7 +723,6 @@ def test_legacy_block_stale_and_rewritten(make_model, fit_params_block):
 
 def test_fit_params_static_cache_type_mismatch_remeasures(
         make_model, fit_params_block):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Measurement shape and reuse': Get affine VRAM constants for this model at *cache_type*. Checks.
     model = make_model("s", **{"derived": fit_params_block})
     assert model.vram.fit_params_static("unused", cache_type="q8_0") is not None
     # A different cache type has no readable block and no binary: None.
@@ -769,24 +744,24 @@ def _vision(make_model, tmp_path, stem, fit, **extra):
     return make_model(stem, **fm)
 
 
-def test_calc_ctx_image_floor_raises_ctx(make_model, tmp_path):
+def test_solve_context_image_floor_raises_ctx(make_model, tmp_path):
     # A declared image budget plus the output reserve must fit the solved
     # context: the ctx is raised from the rounded-down value to the floor
     # when affordable.
-    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys are in the mmproj block.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=7500)
-    ctx = model.view_for(True).vram.calc_ctx(
+    ctx = model.view_for(True).vram.solve_context(
         32768, fit_bin="unused", include_mmproj=True)
     # remaining = 30720 - 26000 - mmproj(0 + 150) = 4570; affordable 9140
     # tokens; rounded ctx 8192 -> raised to 7500 + 1024 reserve = 8524
     assert ctx == 8524
 
 
-def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
-    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys live.
+def test_solve_context_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
+    # Validates: SPEC.md, 'Companion (mmproj / MTP) VRAM accounting': Frontmatter view for a serving variant. The companion-off variant is this model itself: overlay keys are in the mmproj block.
     import logging
 
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
@@ -794,7 +769,7 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
            "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=16384)
     with caplog.at_level(logging.WARNING):
-        ctx = model.view_for(True).vram.calc_ctx(
+        ctx = model.view_for(True).vram.solve_context(
             32768, fit_bin="unused", include_mmproj=True)
     # floor 16384 > affordable 9140: ctx raised to what fits (9140), warning
     assert ctx == 9140
@@ -802,7 +777,7 @@ def test_calc_ctx_image_floor_unaffordable_warns(make_model, tmp_path, caplog):
                for r in caplog.records)
 
 
-def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
+def test_solve_context_image_floor_native_vision(make_model, tmp_path):
     """Native vision (no mmproj file) must still get the image floor.
 
     Qwen3-VL / Gemma3 have vision baked into the main weights. image_max_tokens
@@ -814,18 +789,18 @@ def test_calc_ctx_image_floor_native_vision(make_model, tmp_path):
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = make_model("i", **{"derived": fit, "image_max_tokens": 9440})
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=True)
+    ctx = model.vram.solve_context(32768, fit_bin="unused", include_mmproj=True)
     assert ctx >= 9440
 
 
-def test_calc_ctx_text_variant_ignores_image_floor(make_model, tmp_path):
+def test_solve_context_text_variant_ignores_image_floor(make_model, tmp_path):
     # The -text variant serves no vision, so the floor must not apply.
     # Validates: SPEC.md, 'Context calculation formula': Calculate max per-slot context size for given VRAM. The solved value is the context available to *each* parallel slot;.
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
            "source": "llama-server", "shape": ""}
     model = _vision(make_model, tmp_path, "i", fit, image_max_tokens=9440)
-    ctx = model.vram.calc_ctx(32768, fit_bin="unused", include_mmproj=False)
+    ctx = model.vram.solve_context(32768, fit_bin="unused", include_mmproj=False)
     assert ctx == 8192
 
 
@@ -921,86 +896,10 @@ def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog)
     assert any("vision is not required" in r.message for r in caplog.records)
 
 
-# ── solve_matrix_ctx ──────────────────────────────────────────────────────
-
-
-def test_solve_matrix_ctx_basic(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
-    chat = make_model("chat", context_length=32768)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768,
-        spare_mb=0,
-        chat_models=[(chat, 8000, 0.4, 0.0, 500, 1, 0)],
-        embed_params=(500, 0.1, 0.0, 100),
-        rerank_params=None,
-        embed_ctx=8192,
-        rerank_ctx=0,
-    )
-    # available = 30720; embed overhead = 500+100+0.1*8192 = 1419
-    # remaining_for_chat = 29301; chat_budget = 29301-8000-500 = 20801
-    # ctx = 20801/0.4 = 52002 -> round 49152 -> min(arch 32768) = 32768
-    assert ctx == 32768
-
-
-def test_solve_matrix_ctx_no_chat_models():
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0, chat_models=[],
-        embed_params=None, rerank_params=None,
-    )
-    assert ctx == _MIN_CTX_SIZE
-
-
-def test_solve_matrix_ctx_exhausted_budget(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
-    chat = make_model("chat", context_length=32768)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0,
-        chat_models=[(chat, 40000, 0.4, 0.0, 0, 1, 0)],
-        embed_params=None, rerank_params=None,
-    )
-    # chat_budget = 30720 - 40000 < 0 -> skipped -> best_ctx 0 -> MIN_CTX
-    assert ctx == _MIN_CTX_SIZE
-
-
-def test_solve_matrix_ctx_rider_does_not_set_the_bar(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
-    """An unestimable rider (zero-cost placeholder, kv_factor 0) rides the
-    measurable models' solve — its native max must not inflate the shared
-    chat context (which would suppress tools demotion fleet-wide and serve
-    the unverified model at a context nothing bounded)."""
-    measurable = make_model("m", context_length=131072)
-    rider = make_model("rider", context_length=262144)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0,
-        chat_models=[
-            (measurable, 8000, 0.2, 0.0, 500, 1, 0),
-            (rider, 0, 0.0, 0.0, 0, 1, 0),
-        ],
-        embed_params=None, rerank_params=None,
-    )
-    # rider excluded: budget = 30720 - 8500 = 22220 -> 111100 -> round to
-    # 106496 -> min(arch 131072); NOT the rider's native 262144.
-    assert ctx == 106496
-
-
-def test_solve_matrix_ctx_all_riders_fall_to_min(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
-    rider = make_model("rider", context_length=262144)
-    ctx = solve_matrix_ctx(
-        vram_total_mb=32768, spare_mb=0,
-        chat_models=[(rider, 0, 0.0, 0.0, 0, 1, 0)],
-        embed_params=None, rerank_params=None,
-    )
-    # Nothing measurable bounds the solve -> the floor.
-    assert ctx == _MIN_CTX_SIZE
-
-
 # ── _measure_affine_trio: the (C, C/2) derivation ─────────────────────────
 
 
 def test_measure_affine_trio_small_design_exact(make_model):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': VRAM follows a validated affine law: model + kv x ctx x slots + slot + compute
     """The pool difference divides by the ACTUAL ctx delta: designs below
     8192 (the former r3 floor at 4096) previously mis-derived c by ~1.5x
     and persisted it as a trusted fit-estimate block."""
@@ -1022,7 +921,6 @@ def test_measure_affine_trio_small_design_exact(make_model):
 
 
 def test_measure_affine_trio_sub4k_design_still_measures(make_model):
-    # Validates: docs/plans/auto-parallel.md, 'Findings: the affine VRAM law (2026-09-07, SEAL record)': VRAM follows a validated affine law, measured live over a (ctx, parallel) grid
     """Even a sub-4k design (an error or a testcase for text models) now
     measures exactly instead of returning None — no per-run retry tax."""
     model = make_model("t", context_length=4096)
@@ -1041,7 +939,6 @@ def test_measure_affine_trio_sub4k_design_still_measures(make_model):
 
 
 def test_design_context_sub4k_text_warns(make_model, caplog):
-    # Validates: docs/plans/estimation-functions-facts.md, 'Context ceiling vs design context': the design context is the model's ceiling, and a sub-4k one is warned about
     """A text model with a sub-4k context ceiling is almost certainly a
     mislabeled/corrupt GGUF — one note, not a crash."""
     import logging
@@ -1058,22 +955,6 @@ def test_design_context_sub4k_text_warns(make_model, caplog):
         assert e.design_context == 2048
     assert not [r for r in caplog.records if "sub-4k" in r.message
                 and "emb" in r.message]
-
-
-def test_solve_matrix_ctx_fixed_overhead_mb(make_model):
-    # Validates: docs/plans/matrix-categories.md, 'Design sketch': Solve the shared per-slot chat context under the affine VRAM law. The VRAM budget for a co-resident group sharing one per-slot context X:.
-    chat = make_model("chat", context_length=32768)
-    chat_models = [(chat, 8000, 0.2, 0.0, 500, 1, 0)]
-    # available = 14336; budget = 5836 -> 29180 -> round 24576
-    assert solve_matrix_ctx(
-        vram_total_mb=16384, spare_mb=0, chat_models=chat_models,
-        embed_params=None, rerank_params=None,
-    ) == 24576
-    # 2000 MB of co-loads: budget = 3836 -> 19180 -> round 16384
-    assert solve_matrix_ctx(
-        vram_total_mb=16384, spare_mb=0, chat_models=chat_models,
-        embed_params=None, rerank_params=None, fixed_overhead_mb=2000,
-    ) == 16384
 
 
 # ── fixed-overhead backends ───────────────────────────────────────────────
@@ -1111,7 +992,7 @@ def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
 
     The ceiling was only applied in the design-fits branch, so the same model
     and sidecar produced two different answers depending on which branch the
-    budget happened to select: 32768 when it fit, 98304 when VRAM forced the
+    budget happened to select: 32768 when it fit, a smaller value when VRAM forced the
     squeeze. SPEC spells out both clamps, and the caller cannot recover it --
     _bounded_ctx passes design_context, which prefers the GGUF header over
     the sidecar.
@@ -1124,11 +1005,11 @@ def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
           "shape": ""}
     model = make_model("pinned", context_length=32768, **{"derived": fm})
 
-    roomy = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+    roomy = model.vram.solve_context(24576, fit_bin="unused", parallel=1,
                                design_ctx=131072)
     assert roomy == 32768
 
-    tight = model.vram.calc_ctx(16384, fit_bin="unused", parallel=1,
+    tight = model.vram.solve_context(16384, fit_bin="unused", parallel=1,
                                design_ctx=131072)
     assert tight <= 32768, f"squeeze ignored the sidecar pin: {tight}"
     assert model.vram.vram_squeezed is True
@@ -1148,7 +1029,7 @@ def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
           "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
           "shape": ""}
     model = make_model("unpinned", context_length=131072, **{"derived": fm})
-    ctx = model.vram.calc_ctx(24576, fit_bin="unused", parallel=1,
+    ctx = model.vram.solve_context(24576, fit_bin="unused", parallel=1,
                               design_ctx=131072)
     assert ctx == 131072
 

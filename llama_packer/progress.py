@@ -17,7 +17,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 #: Per-level style used when log records are rendered through the rich
-#: console while the bar is live (keeps the `X | message` log shape).
+#: console while the bar is shown (keeps the `X | message` log shape).
 _LEVEL_STYLES: dict[int, str] = {
     logging.DEBUG: "dim",
     logging.WARNING: "yellow",
@@ -39,7 +39,7 @@ except ImportError:  # rich is optional; every method below no-ops then
 class _ConsoleLogHandler(logging.Handler):
     """Render log records through the progress bar's rich console.
 
-    While a rich Live bar is on screen, plain writes to another stream
+    While a rich progress bar is on screen, plain writes to another stream
     land *after* the bar and force it to redraw ("scrolling"). Records
     printed via the bar's own console are positioned above it by rich.
     """
@@ -102,7 +102,7 @@ class PackerProgress:
             # the variable-width action label goes last so nothing jumps.
             # Own console bound to stderr: log output (also stderr) shares
             # this stream, and records printed via it land above the bar
-            # instead of fighting a separate stdout Live display.
+            # instead of fighting a separate stdout display.
             console = _rc.Console(stderr=True, highlight=False)  # type: ignore[union-attr]
             self._progress = _rp.Progress(
                 _rp.BarColumn(),
