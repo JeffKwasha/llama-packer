@@ -92,10 +92,9 @@ its number. A fill uses what the weighted roles leave below 100, split
 equally; when they leave nothing, the fill weighs 0 and accepts any
 remainder a capped role frees.
 
-When one set offers a role less than another requested, that set has memory
-left: fix the role at its allocation and renormalise the rest among the
-remaining requesters. Repeat until stable. Unallocated memory is logged at
-INFO per set.
+Each set is allocated on its own. A role's final allocation is the minimum
+across the sets it belongs to, so adding a set can only lower it. Memory a
+capped role leaves in a set is logged as unallocated, not moved.
 
 A model then solves inside its role's allocation. One role runs one serving
 at a time: in capacity mode every role is a pool of value 1 and every entry

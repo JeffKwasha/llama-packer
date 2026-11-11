@@ -133,10 +133,10 @@ offer from the sets it is in**, per pool:
 allocation(role) = min over sets containing role of offer(role, set)
 ```
 
-When one set gives a role less than another set requested for it, that set
-has memory left. Recompute that set: fix the role at its allocation,
-subtract it, and renormalise the rest of the auction among the remaining
-requesters by the same weights. Repeat until no offer changes.
+Each set is allocated on its own against the full available pool. A role's
+allocation is the minimum of its offers across the sets it belongs to.
+Adding a set can only lower a role, never raise it. Memory a capped role
+leaves in a set is logged as unallocated, not moved to another role.
 
 Accept in ascending floor order, then alphabetically on a tie. Roles accept
 first; the models inside a role follow the same order. The order makes the
@@ -150,7 +150,7 @@ B takes the remaining 4
 ```
 
 `A` also appears in another set that offers only 3, so `A` accepts 3. The
-first set recomputes with `A` fixed at 3, and `B` takes the new remainder.
+first set keeps `B` at its own offer and logs the rest as unallocated.
 
 `min` stays at its floor and never accepts. `0` requests nothing but
 accepts memory left after the requesters are placed; when several accepting
@@ -165,8 +165,7 @@ memory the serving cannot use.
 Each model then solves its context and parallel inside its role's allocation
 in its pool. Each set logs its unallocated memory at INFO.
 
-The iterative rule is the recorded design. A system of equations would do
-better; this is the algorithm to implement first.
+The per-set rule is the recorded design.
 
 ## One serving per role
 

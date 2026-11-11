@@ -12,7 +12,6 @@ import re
 from collections import namedtuple
 from dataclasses import dataclass
 
-MAX_ROUNDS = 32
 
 _TOKEN = re.compile(r"[A-Za-z0-9._:-]+|[&|()]")
 
@@ -143,37 +142,17 @@ def effective_weights(members, weights, fills):
     return out
 
 
-def _offer(budget: int, members, weights, floors, fills, fixed):
-    free = [r for r in members if r not in fixed]
-    effective = effective_weights(free, weights, fills)
-    total = sum(effective.values())
-
-    fixed_used = sum(amount - floors[role]
-                     for role, amount in fixed.items())
-    shared = max(0, budget - fixed_used)
-    out = {r: floors[r] for r in members}
-    for role, amount in fixed.items():
-        out[role] = amount
-    if total > 0:
-        for role in free:
-            if effective[role] > 0:
-                out[role] = floors[role] + int(
-                    shared * effective[role] / total)
-    return out
-
-
 def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
             weights: dict[str, float], fills: frozenset[str] = frozenset(),
             accepts: frozenset[str] = frozenset()
             ) -> tuple[dict[str, int], dict[str, int]]:
-    """Allocate one pool by the docs/allocation.md auction.
+    """Allocate one pool set by set, then take the minimum per role.
 
-    A set is one budget. Floors come out first. Weighted roles divide the
-    rest, then `fill` roles take the remainder, then `0` roles take what is
-    left. A role accepts the minimum offer across its sets; a set that offers
-    less than another requested fixes that role and renormalises. Ties
-    resolve by ascending floor, then name, so the fixed point is
-    deterministic.
+    Each set gets the full budget. Floors come out, the weighted roles and
+    fills divide what is left, and `0` roles take any remainder. A role's
+    final allocation is the smallest offer across the sets it belongs to.
+    Adding a set can only lower a role; memory a capped role leaves in a set
+    is reported as unallocated, never moved to another role.
     """
     members = {name: leaves(expr) for name, expr in sets.items()}
     ceilings = {name: budget - floor_of(expr, floors)
@@ -185,54 +164,37 @@ def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
     def order(roles):
         return sorted(roles, key=lambda r: (floors[r], r))
 
-    offers = {name: _offer(ceilings[name], order(members[name]), weights,
-                           floors, fills, {}) for name in sets}
-    alloc = {}
-    for role in {r for rs in members.values() for r in rs}:
-        values = [offers[name][role] for name in sets if role in members[name]]
-        alloc[role] = min(values)
+    offers = {}
+    for name, roles in members.items():
+        roles = order(roles)
+        available = ceilings[name]
+        effective = effective_weights(roles, weights, fills)
+        total = sum(effective.values())
+        alloc = {role: floors[role] for role in roles}
+        if total > 0:
+            for role in roles:
+                if effective[role] > 0:
+                    alloc[role] = floors[role] + int(
+                        available * effective[role] / total)
+        used = sum(alloc[role] - floors[role] for role in roles)
+        idle = [role for role in roles
+                if role in accepts and effective.get(role, 0.0) == 0.0]
+        left = available - used
+        if idle and left > 0:
+            part = left // len(idle)
+            for role in order(idle):
+                alloc[role] += part
+        offers[name] = alloc
 
-    for _ in range(MAX_ROUNDS):
-        free = {name: _offer(ceilings[name], order(members[name]), weights,
-                             floors, fills, {}) for name in sets}
-        fixed = {
-            name: {r: alloc[r] for r in members[name]
-                   if alloc[r] < free[name][r]}
-            for name in sets
-        }
-        offers = {
-            name: _offer(ceilings[name], order(members[name]), weights,
-                         floors, fills, fixed[name])
-            for name in sets
-        }
-        nxt = {}
-        for role in alloc:
-            values = [offers[name][role] for name in sets
-                      if role in members[name]]
-            nxt[role] = min(values)
-        if nxt == alloc:
-            break
-        alloc = nxt
-    else:
-        raise ValueError("auction did not converge")
+    alloc = {}
+    for role in {r for roles in members.values() for r in roles}:
+        alloc[role] = min(offers[name][role] for name in members
+                          if role in members[name])
 
     unallocated = {}
-    for name in sets:
-        used = sum(alloc[role] - floors[role] for role in members[name])
+    for name, roles in members.items():
+        used = sum(alloc[role] - floors[role] for role in roles)
         unallocated[name] = ceilings[name] - used
-
-    for name in sets:
-        effective = effective_weights(members[name], weights, fills)
-        idle = [r for r in members[name]
-                if r in accepts and effective.get(r, 0.0) == 0.0]
-        left = unallocated[name]
-        if not idle or left <= 0:
-            continue
-        share = left // len(idle)
-        for role in order(idle):
-            alloc[role] += share
-        unallocated[name] = left - share * len(idle)
-
     return alloc, unallocated
 
 
