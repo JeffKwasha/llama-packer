@@ -22,15 +22,12 @@ available(pool) = physical(pool) − reserve(pool)
   reserves.
 - Pools are independent. Settings and CLI arguments name the pool whose
   spare they change (`gpu0`, `cpu`, …); today only the GPU spare can be set.
-- A serving's cost is a tuple over pools, `cpu` first:
-
-  ```python
-  Memory = namedtuple("Memory", ["cpu", "gpu0", "gpu1"])
-  ```
-
-  `cpu` is emitted as `ram` today, `gpu0` as `default`. Per-card pools and
-  unified memory (several devices sharing one field) are future work; the
-  tuple already expresses them.
+- A serving's cost is a tuple over pools, `cpu` first. The tuple is built
+  from the host: `cpu`, then one field per discrete GPU, or one shared field
+  for unified memory, plus any fake resource that exists to impose a limit
+  (a role pool of 1 is one). A namedtuple is created from those ids, so
+  every number has a name. `cpu` is emitted as `ram`; a single GPU as
+  `default`.
 - An entry charges every field its serving touches. A pool absent from an
   entry's capacities is zero to that entry.
 
@@ -103,11 +100,12 @@ Each role in the set carries a request weight and an accept flag from its
 | `min` | 0 | no |
 | `0` | 0 | yes |
 | `27%` | 27 | yes |
-| `fill` | 100 | yes |
+| `fill` | the remainder after the weighted requests | yes |
 
-Weights are relative, not percentages of a whole: 60 and 90 are 60:90. Any
-positive value is valid, including above 100 — `share: 123` is 123 parts of
-the set's auction.
+A weight is a percentage of the auction. Claims scale down only when they
+exceed 100 together: 60 and 90 become 60/150 and 90/150, while a lone 50
+leaves half for a fill. Any positive value is valid; 123 scales with the
+rest.
 
 Requests are normalised inside each set, never capped at an absolute
 percentage:
@@ -136,13 +134,14 @@ fixed point deterministic.
 Example — set `A & B` with auction 15 GiB, `A` at 60 and `B` at 90:
 
 ```
-A requests 60/150 × 15 = 6
-B requests 90/150 × 15 = 9
+A requests 60% × 15 = 9
+B requests 90% × 15 = 13.5
+the set is overclaimed, so both scale by 100/150: A 6, B 9
 ```
 
-`A`'s other set offers only 5, so `A` accepts 5. Recompute: the remaining
-auction is 10 and `B` is the only remaining requester, so `B` is offered 10
-and accepts it.
+`A`'s other set offers only 3, so `A` accepts 3. Recompute: the remaining
+auction is 12 and `B` requests 90% of it, which is 10 in whole MiB. `B`
+accepts 10.
 
 `min` stays at its floor. `0` requests nothing but accepts memory left after
 the requesters are placed; when several accepting roles share one set's

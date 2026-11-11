@@ -404,7 +404,9 @@ available(pool) = physical(pool) − (measured reserve + spare)
 - `spare` is the operator's addition, one value per pool
   (`pools.<id>.spare`), or the fleet `spare` when the pool has none.
 - `default` is the GPU pool and `ram` the host pool. A serving's cost is a
-  tuple over pools, `cpu` first: `Memory(cpu, gpu0, gpu1)`.
+  tuple over pools, `cpu` first. The tuple is built from the host: one field
+  per discrete GPU, or one shared field for unified memory, plus fake limits
+  such as a role pool of 1.
 
 ### Floor and sets
 

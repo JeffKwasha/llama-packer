@@ -127,8 +127,12 @@ Every serving has a cost in every pool, including zero, and `cpu` is the
 first field:
 
 ```python
-Memory = namedtuple("Memory", ["cpu", "gpu0", "gpu1"])
+Memory = namedtuple("Memory", ["cpu", "gpu0", "gpu1", ...])
 ```
+
+The field list is built from the host: `cpu`, then one field per discrete
+GPU, or one shared field for unified memory, plus fake limits such as a role
+pool of 1.
 
 | placement | cost tuple |
 |---|---|

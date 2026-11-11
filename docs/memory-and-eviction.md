@@ -18,8 +18,10 @@ available(pool) = physical(pool) − (measured reserve + spare)
   (`pools.<id>.spare`). It is the only reserve knob. There is no `reserve:`
   key: replacing the measured floor is unsafe, and adding to it is what
   `spare` means.
-- `default` is the GPU pool; `ram` is the host pool. Each maps to a field of
-  the cost tuple, `cpu` first: `Memory(cpu, gpu0, gpu1)`.
+- `default` is the GPU pool; `ram` is the host pool. A serving's cost is a
+  tuple built from the host's pools, `cpu` first, then one field per discrete
+  GPU or one shared field for unified memory, plus fake limits such as a
+  role pool of 1.
 
 The emitted pool is `available`. Allocations are meant to fill it.
 
@@ -71,7 +73,7 @@ Each member requests a share of it, by weight:
 | `min` | 0 | no |
 | `0` | 0 | yes |
 | `27%` | 27 | yes |
-| `fill` | 100 | yes |
+| `fill` | the remainder after the weighted requests | yes |
 
 ```
 request(role, set) = weight / Σ weights in set × auction(set)
@@ -178,10 +180,10 @@ pressure can still evict it.
 
 ### Two GPUs
 
-A sidecar `device: 1` pins the serving to the second GPU. The cost tuple is
-`Memory(cpu, gpu0, gpu1)`; today the emitted pool set is the aggregate
-`default`, so size the aggregate honestly. Per-card pools and unified memory
-are future work.
+A sidecar `device: 1` pins the serving to the second GPU. The cost tuple
+carries one field per pool the host exposes; today the emitted pool set is
+the aggregate `default`, so size the aggregate honestly. Per-card emission
+and unified memory are future work.
 
 ## Verify
 
