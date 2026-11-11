@@ -181,10 +181,11 @@ The packer emits pools and per-entry `capacities`. llama-swap loads the
 requested model if it fits every pool, evicting by `evict_cost` when it does
 not. Any combination that fits is allowed.
 
-Set generation is not designed yet. Until it is, every model is its own
-single-model set, so capacity sizes each model alone. Serious fleets author
-`matrix.sets:`. Once generated, an ephemeral set is identical to an authored
-one; only its origin differs.
+Capacity prices each role directly against its pool:
+`budget = floor + share × (available − floor)`. `fill` takes the pool,
+split equally among fills; `min` and `0` stay at the floor. Shares are
+independent and admission decides co-residency. Set generation is future
+work; cross-role co-residency is authored in matrix mode.
 
 ### Matrix
 
@@ -303,16 +304,17 @@ Implemented:
   id with no endpoint, at the smallest reachable task floor.
 - TTL: top-level `ttl` (default 3600), role, task, sidecar; the most
   specific wins. The emitted key is `globalTTL`.
-- Capacity mode sizes each model alone and warns when `matrix.sets:` is
-  absent. `pools.<id>.spare` and `--spare-pool` set a pool's spare.
-- One solve: the role budgets from the authored sets. There is no category pick and no fixed pair.
+- Capacity prices each role's share directly and warns when
+  `matrix.sets:` is absent. `pools.<id>.spare` and `--spare-pool` set a
+  pool's spare.
+- One solve: role budgets from the authored sets (matrix) or the role's
+  share (capacity). There is no category pick and no fixed pair.
 
 Not implemented yet:
 
 - Multi-device role floors. A role with models on several devices reserves
   its floor on each; splitting the role is the current answer.
-- A CPU model is not solved down to its `ram` allocation. The host ledger is
-  the remaining gate.
-- Capacity set generation. Until it is designed, each model is its own set.
+- Capacity set generation. Until it is designed, capacity prices each
+  role's share directly: floor + share of the pool above it.
 - Per-card pool emission and unified memory. The cost tuple can express them;
   the emitter uses `default` and `ram`.

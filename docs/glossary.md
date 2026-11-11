@@ -20,7 +20,7 @@ either way it should not be used in a commit message until it is.
 | **endpoint** | A standardized serving surface: `openai.chat.completions`, `openai.embeddings`, `openai.rerank`, `openai.images.generations`, `openai.audio.transcriptions`, `openai.audio.speech`, `native.*`. Engine-owned; servers and clients choose it, a model never does. | `endpoints.py` |
 | **family** | The interchangeability unit: serving one member taught you how to serve the other (same launch options, template, quantization conventions). Agent-assigned with evidence; the arch string is a confirm-only hint. Not the audio.cpp loader `family`, which is `audio_cpp.family`. | sidecar `family:` |
 | **device** | Where a serving runs: `cpu` or a non-negative GPU index; unset means no explicit placement. Sidecar, task and role all use `utils.parse_device`. See SPEC §Device for precedence. | `Model.on_cpu`, `utils.parse_device` |
-| **host-placed** | A `device: cpu` model: charged to the `ram` capacity pool, 0 VRAM. Do not call it "a CPU task"; placement is not identity. Its `ttl` follows the same rule as any serving. | `HostLedger` |
+| **host-placed** | A `device: cpu` model: charged to the `ram` capacity pool, 0 VRAM. Do not call it "a CPU task"; placement is not identity. Its context solves inside its role's `ram` allocation and its `ttl` follows the same rule as any serving. | `Model.on_cpu`, `Planner.host_pool_mb` |
 | **role `device`** | Where every model of a role runs: `auto`, `cpu`, or a GPU index, the sidecar vocabulary; the sidecar wins. | `roles.py`, `utils.parse_device` |
 | **profiles.yaml** | Fleet-wide sampling defaults, spare values, backend defaults, the `tasks:` demand overrides, and the optional `matrix:` section. | `profiles.py` |
 | **override** | A rule that beats the profiles default, scoped to a glob or a directory. Per-directory `models.yaml` is the directory-scoped form. | `overrides.py` |
@@ -36,7 +36,7 @@ either way it should not be used in a commit message until it is.
 | **`D`** (`slot_mib`) | Fixed cost per parallel slot: SWA ring buffers plus slot overhead. | `vram.py` |
 | **slot** | One concurrent conversation. `parallel` is how many a model serves at once. | `parallel:` |
 | **budget** (`VramBudget`) | The object that answers "what fits", from either measured coefficients or a pin. | `vram.py` |
-| **set solve** | The pack-time context solve inside one set: one budget, floors first, then the auction. Authored sets drive matrix mode; capacity sizes each model alone until generation lands. | `Planner._role_budgets`, `allocation.auction` |
+| **set solve** | The pack-time context solve inside one set: one budget, floors first, then the auction. Authored sets drive matrix mode; until set generation lands, capacity prices each role's share directly. | `Planner._role_budgets`, `allocation.auction` |
 | **loaded together** | Allowed at the same time because the capacities fit every pool. A role still runs one serving at a time. | SPEC §Capacity routing |
 | **baseline_mb** | The floor the reserve is measured against — what the GPU actually shows used before llama-packer runs. | profiles `hardware:` |
 | **`ttl`** | Idle lifetime: top-level default 3600 s, overridden by a role, task, or sidecar `ttl:`. `0` disables idle unload. | SPEC §TTL |
@@ -55,8 +55,8 @@ either way it should not be used in a commit message until it is.
 
 | Term | Means | Code |
 |---|---|---|
-| **host pool** | The host RAM the ledger may spend: `min(sys_free, cgroup_free)`, each term logged with the arm (`declared`/`sysctl`/`fallback-25%`/`skipped-cgroup`) that chose it. | `hardware.py:HostProfile` |
-| **host ledger** | Sibling of `PoolLedger` that charges host-placed quads. Go/no-go, never a solve-down. | `HostLedger` |
+| **host pool** | The host RAM the budget may spend: `min(sys_free, cgroup_free)`, each term logged with the arm (`declared`/`sysctl`/`fallback-25%`/`skipped-cgroup`) that chose it. | `hardware.py:HostProfile` |
+| **host budget** | A role's `ram` allocation: `floor + share × (available − floor)`, with `fill` taking the pool split among fills. Host-placed models solve their context inside it, like GPU models inside `default`. | `_role_budgets`, `VramModel.solve_context` |
 
 ## The capability ladder
 

@@ -189,14 +189,17 @@ evicts the current one.
 | `matrix.sets:` non-empty | matrix: emit the declared sets |
 | `matrix.sets:` absent or empty | capacity |
 
-Capacity uses the same algebra with sets generated from the role floors. The
-emitted config is pools plus per-entry capacities. **Once generated, an
-ephemeral set is identical to a declared one**: same floor, same auction,
-same reallocation. Only its origin differs.
+Capacity prices each role directly against its pool, without generating
+sets:
 
-Set generation is not designed yet. Until it is, every model is its own
-single-model set, so capacity sizes each model alone. Serious fleets author
-matrix sets.
+```
+budget(role) = floor(role) + share × (available − floor(role))
+```
+
+A `fill` role takes the pool, split equally among fills; `min` and `0` stay
+at the floor. Shares are independent; the role pools and admission decide
+co-residency. Generated sets remain future work; a fleet needing cross-role
+co-residency uses matrix mode.
 
 Sets never preload. On a request for X, llama-swap picks a set containing X,
 evicts what is outside it, and starts only X. Subsets are permitted.

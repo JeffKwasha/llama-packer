@@ -475,9 +475,10 @@ models:
     evict_cost: <seconds>
 ```
 
-- Set generation is not designed yet. Until it is, every model is its own
-  single-model set, so capacity sizes each model alone. Serious fleets author
-  `matrix.sets:`.
+- Capacity prices each role's share directly: `floor + share × (available −
+  floor)`; `fill` takes the pool, split equally among fills; `min` and `0`
+  stay at the floor. Set generation is future work; a fleet needing
+  cross-role co-residency authors `matrix.sets:` (matrix mode).
 - Any combination whose summed capacities fit every pool may coexist.
 - One size-1 pool per role makes one serving per role. Requesting another
   model of the role evicts the current one.
@@ -537,6 +538,9 @@ decision quality (`docs/plans/cpu-residency-budget.md`):
   with the arm that picked it.
 - **the charge** is the serving's own measured quad at its served context,
   emitted as `capacities.ram`.
+- **the solve is the same**: a CPU model solves its context inside its
+  role's `ram` allocation, exactly like a GPU model inside `default`. The
+  role's 128 MiB host floor and the task floors apply before the share.
 - **eviction is capacity-driven**: when `ram` is full, llama-swap evicts the
   cheapest serving instead of failing. There is no automatic offload.
 - A CPU model is not exempt from eviction; evicting it frees host RAM.

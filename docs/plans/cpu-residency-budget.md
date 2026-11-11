@@ -10,6 +10,10 @@ under pressure like any other resident; a non-chat helper defaults to
 composition section and the host-ledger unit judgement below are history:
 each fixed CPU category is judged on its own quad against what is free
 after the committed pair (requirement #70).
+**Amended 2026-11-11:** `HostLedger` is retired. A CPU model now solves its
+context down inside its role's `ram` allocation — `floor + share ×
+(available − floor)` — exactly like a GPU model inside `default`; the
+go/no-go passages below are history. See `docs/allocation.md` §Capacity.
 Related: the retired memory-tag plan (§3 measured host RAM — this plan is
 its minimal form), `docs/plans/opportunistic-coload.md`
 (CPU-resident coload at 0 GPU cost, today's rule),
