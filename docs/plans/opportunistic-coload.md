@@ -177,7 +177,7 @@ opencode, UIs) cannot tell the difference from `tools` alone;
 `metadata.context_max` the trained maximum.
 
 **Where from.** The chain is: sidecar frontmatter `capabilities: [...]`
-(hand-authored; template at `templates/models_AGENTS.md`) →
+(hand-authored; template at `templates/AGENTS.md`) →
 `Model.capabilities` (vision auto-added with mmproj) →
 writer maps to llama-swap's block (`in`/`out`/`tools`/`reranker`/`context`).
 The `reasoning` capability already gates server-flag emission — so capability → emission coupling has precedent; `tools`

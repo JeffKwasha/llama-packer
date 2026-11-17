@@ -15,7 +15,7 @@ vLLM doesn't have).
 
 **Models directory guide:** `llama-packer --agents` writes `AGENTS.md` into
 each `--models-dir` from the bundled template
-(`llama_packer/templates/models_AGENTS.md`) when the file is missing — never
+(`llama_packer/templates/AGENTS.md`) when the file is missing — never
 overwriting an existing one, and logging (not aborting) on write failure. The
 guide documents discovery and sidecar conventions for AI agents. As a
 non-frontmatter `.md` (no leading `---`), `AGENTS.md` is skipped by model
@@ -33,7 +33,7 @@ Each model entry produces:
 | `description` | Optional model description |
 | `filters.setParamsByID` | Per-request sampling overrides keyed by `${MODEL_ID}:profile` (global profiles, or a model's own `modes:` when declared). Always nested under `filters:` (see [Sampling Modes](#sampling-modes)) |
 | `metadata` | Pass-through metadata from `.md` frontmatter (excluded: consumed keys) |
-| `capabilities` | Native llama-swap block: `in`/`out` modalities, `tools`, `reranker`, `context` |
+| `capabilities` | Native llama-swap block: `in`/`out` modalities, `tools`, `reranker`, `embeddings`, `context` |
 | `env` | Per-model GPU device pinning (e.g. `ROCR_VISIBLE_DEVICES=0`) |
 | `concurrencyLimit` | Per-model concurrency cap (if declared) |
 
@@ -74,7 +74,7 @@ The input config, resolved from `--profiles` (default `./profiles.yaml`, falling
 | `hardware` | `vram`, `baseline_mb`, `unified_system_mb`, `gpu_family` overrides | [Hardware Detection](#hardware-detection) |
 | `vllm` | Backend resources: `image`, `bin`, `container_args` (legacy `docker_args`/`podman_args`), `container_port`, `container_vendor`, optional `gpu_mem_util` / `hf_cache` | [vLLM Backend](#vllm-backend) |
 | `backends` | Ordered enable/prefer list of backend names (absent = all, registration order) | [Backend Selection](#backend-selection) |
-| `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags (performance tuning) | [Global backend args](#global-backend-args) |
+| `llama_server` / `vllm` / `sd` / `whisper` | Per-backend fleet-wide `args:` flags and `bin:` path (performance tuning) | [Global backend args](#global-backend-args) |
 | `models_dirs` | Model root directories (CLI `--models-dir` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars) |
 | `hf_home` | HF_HOME root (the dir containing `hub/`) for hub snapshot resolution (CLI `--hf-home` wins) | [Model Discovery and Stub Sidecars](#model-discovery-and-stub-sidecars), [Path Macros](#path-macros-macros-block-and-configenv) |
 | `tasks` | Named kinds of work, their endpoint/role and demand floors | [Tasks](#tasks-tasks) |
@@ -151,12 +151,14 @@ GPU vendor also determines the device-pinning env var: `ROCR_VISIBLE_DEVICES` (A
 
 ## llama.cpp Build Selection
 
-When `--llama-server` is not given, the binary directory resolves via
-`utils.find_bin_dir`:
+When `--llama-server` is not given, the binary resolves by the same chain as
+every other engine (see [Host binary resolution](#host-binary-resolution)):
 
-1. `$LLAMA_BIN_DIR` — explicit build dir, wins over everything
-2. `--llama-version N` → `./llama-bN` if it exists
-3. default (`latest`) → the highest-numbered `./llama-b[0-9]*` directory
+1. `profiles.yaml llama_server.bin` — a binary or a `llama-b*` directory
+2. `$LLAMA_BIN_DIR` — explicit build dir
+3. `--llama-version N` → `./llama-bN` if it exists
+4. default (`latest`) → the highest-numbered `llama-b[0-9]*` directory under
+   `tools/`, then the run directory
 
 `llama-server` and `llama-fit-params` are both taken from the resolved
 directory; no match aborts with the available versions listed.
@@ -1728,12 +1730,14 @@ the stub next to it.
 Every backend whose engine is a single host binary resolves it by one chain,
 highest first:
 
-1. `--<engine>-server` (`--sd-server`, `--whisper-server`,
-   `--audio-cpp-server`, `--vllm-server`)
-2. `profiles.yaml <engine>.bin` (`sd:`, `whisper:`, `audio_cpp:`, `vllm:`)
-3. `$SD_BIN_DIR` / `$WHISPER_BIN_DIR` / `$AUDIOCPP_BIN_DIR` / `$VLLM_BIN_DIR`
-4. the **run directory** — the directory llama-packer is invoked from
-5. `PATH`
+1. `--<engine>-server` (`--llama-server`, `--sd-server`,
+   `--whisper-server`, `--audio-cpp-server`, `--vllm-server`)
+2. `profiles.yaml <engine>.bin` (`llama_server:`, `sd:`, `whisper:`,
+   `audio_cpp:`, `vllm:`)
+3. `$LLAMA_BIN_DIR` / `$SD_BIN_DIR` / `$WHISPER_BIN_DIR` /
+   `$AUDIOCPP_BIN_DIR` / `$VLLM_BIN_DIR`
+4. the run directory's **`tools/`**, then the run directory itself
+5. `PATH` (not for llama.cpp)
 
 Steps 2-3 accept a *file or a directory*; a directory expands to
 `<dir>/<engine>`, mirroring `LLAMA_BIN_DIR`.

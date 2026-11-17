@@ -468,8 +468,7 @@ QUICK_GRID = [(512, 512)]
 def resolve_tools_dir(args: argparse.Namespace) -> Path:
     if args.dir:
         return Path(args.dir)
-    root, per_engine = upd.load_engines_config()
-    return upd.resolve_install_dirs(None, (root, per_engine))["cpp"][0]
+    return upd.resolve_install_dirs()["cpp"][0]
 
 
 def llama_binaries(tools: Path) -> list[Path]:

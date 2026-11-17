@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from llama_packer.__main__ import (resolve_host_binary,
+from llama_packer.__main__ import (resolve_host_binary, resolve_llama_bin,
                                  _apply_env_subst,
                                  _health_check_timeout)
 from llama_packer.utils import make_subst
@@ -342,3 +342,62 @@ def test_empty_role_is_pruned_from_a_set(caplog):
             {"c": "chat"}, {"c": ["c"]})
     assert out == {"voice": "c", "talk": "c"}
     assert "has no entries" in caplog.text
+
+
+def _build(root, tag="llama-b9"):
+    entry = root / tag
+    entry.mkdir(parents=True)
+    binary = entry / "llama-server"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    return binary
+
+
+def test_llama_server_prefers_profiles_over_the_environment(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'No per-engine configuration is needed':
+    # profiles.yaml is the first tier after the CLI, then the environment.
+    base = tmp_path / "run"
+    base.mkdir()
+    env_bin = tmp_path / "env"
+    _build(env_bin, "llama-b7")
+    monkeypatch.setenv("LLAMA_BIN_DIR", str(env_bin))
+    chosen = tmp_path / "custom" / "llama-server"
+    chosen.parent.mkdir()
+    chosen.write_text("#!/bin/sh\n")
+
+    llama_bin, bin_dir = resolve_llama_bin(None, str(chosen), "latest", base)
+
+    assert llama_bin == str(chosen.resolve())
+    assert bin_dir == str(chosen.resolve().parent)
+
+
+def test_llama_server_profiles_bin_accepts_a_directory(tmp_path):
+    # Validates: docs/install.md, 'No per-engine configuration is needed': a
+    # directory names the binary inside it, as the env tier does.
+    base = tmp_path / "run"
+    base.mkdir()
+    binary = _build(tmp_path / "opt", "llama-b12")
+
+    llama_bin, _ = resolve_llama_bin(None, str(binary.parent), "latest", base)
+
+    assert llama_bin == str(binary.resolve())
+
+
+def test_llama_server_falls_back_to_the_environment_then_tools(
+        tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'No per-engine configuration is needed':
+    # with no profiles entry, the environment wins, then tools/.
+    base = tmp_path / "run"
+    base.mkdir()
+    _build(base / "tools", "llama-b9")
+    env_bin = tmp_path / "env"
+    _build(env_bin, "llama-b7")
+    monkeypatch.setenv("LLAMA_BIN_DIR", str(env_bin))
+
+    llama_bin, _ = resolve_llama_bin(None, None, "latest", base)
+    assert llama_bin == str(env_bin / "llama-b7" / "llama-server")
+
+    monkeypatch.delenv("LLAMA_BIN_DIR")
+    llama_bin, bin_dir = resolve_llama_bin(None, None, "latest", base)
+    assert bin_dir == "tools/llama-b9"
+    assert llama_bin == str(base / "tools" / "llama-b9" / "llama-server")

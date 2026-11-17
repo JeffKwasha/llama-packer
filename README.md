@@ -25,54 +25,75 @@ Features:
 - ComfyUI or a game took the GPU? Re-pack with `--spare`/`--baseline` — models that no longer fit are dropped (not emitted as load-time OOM landmines), vision models fall back to text-only when only the projection is unaffordable, and squeezed entries say so in their description. The top-level `ttl` additionally lets llama-swap release VRAM after idle.
 
 
-## Quickstart ("It's alive")
+## Install
 
-prerequisites: git + python 3.10 + uv + linux (and your GPU driver supports vulkan, sorry Intel)
-
-```sh
-git clone https://github.com/JeffKwasha/llama-packer.git
-cd llama-packer
-./extras/update.py       # llama.cpp + llama-swap; add `all` for every engine
-uv run llama-packer --models-dir ~/models --output ~/llama-swap-config.yaml
-./llama-swap --config ~/llama-swap-config.yaml
-```
-
-Targets are positional: `update.py all` fetches llama.cpp, llama-swap,
-audio.cpp, whisper.cpp and stable-diffusion.cpp; a bare run fetches only the
-first two. Of the five, only llama-swap publishes a `checksums.txt`, so it is
-the only one that gets a real sha256 check — see
-[extras/README.md](extras/README.md).
-
-`profiles.yaml` is optional at this stage — the bundled defaults are used and
-you get a warning saying so. Copy `profiles.yaml.example` to `profiles.yaml`
-next (see [Profiles](#profiles-profilesyaml)) to start tuning.
-
-For development, `uv pip install -e .`. To pin an older tree, clone with
-`--branch <release tag>`, or install without cloning via
-`uv pip install git+https://github.com/JeffKwasha/llama-packer.git@<release tag>`.
-There is no PyPI package — `uvx llama-packer` will not resolve; use the
-clone-and-`uv run` path above.
-
-If a run exits with `no llama-b#### directory found`, it needs `llama-server`
-and `llama-fit-params`: run `./extras/update.py`, set `LLAMA_BIN_DIR`, or pass
-`--llama-server /path/to/llama-server`. A "no models found" pack means the
-directory has no `.gguf` files — pass `--models-dir`, or `--create-stubs` if
-you also want empty sidecars written beside the ones that have none.
-
-## Running it as a service
-
-The Quickstart leaves you with a foreground process. For a persistent,
-systemd-managed deployment rooted at `/opt/llama`:
+llama-packer is a Python module. It reads the models on disk and writes a
+llama-swap `config.yaml`; it needs no service, no engine, and no account of its
+own. Install it into an environment you already use:
 
 ```sh
-sudo ./extras/install.py --user llama --group models --models-dir /mnt/ai/models
+uv venv
+uv pip install git+https://github.com/JeffKwasha/llama-packer.git@main
 ```
 
-That creates the service account, fetches the binaries, regenerates the config
-under that account, writes a hardened unit, and starts it — then reports what
-the API is actually advertising. `--dry-run` prints every change first. The
-unit, the account's deliberately empty home, and the group that may re-pack
-the config are all explained in [docs/install.md](docs/install.md).
+`pip install git+…@main` works too. There is no PyPI package yet, so `uvx
+llama-packer` will not resolve; use the git URL.
+
+Prerequisites: python 3.10 or newer, and at least one `.gguf` under the models
+directory. `uv` is convenient, not required.
+
+```sh
+llama-packer --models-dir /path/to/models --output llama-swap-config.yaml
+```
+
+`profiles.yaml` is optional: the bundled defaults are used and a warning says
+so. Start from `profiles.yaml.example` in this repository when you want to
+tune. Sidecars are optional until you want capabilities, context, or sampling
+per model; the guide ships as `llama_packer/templates/AGENTS.md` (see below).
+
+Serve the result with the llama-swap you already have:
+
+```sh
+llama-swap --config llama-swap-config.yaml
+```
+
+No llama-swap yet? See "Engines" below.
+
+## Engines (optional)
+
+llama-packer only writes the config. Engines can come from a distribution
+package, a container, a build, or the updater in this repository.
+
+`extras/update.py` is a single stdlib script, not a package. Nothing needs to be
+installed: put it in the directory that should hold the binaries, or anywhere,
+and run it from the directory it should manage.
+
+```sh
+./update.py --plan       # the decision, downloads nothing
+./update.py --fetch      # newest llama.cpp + llama-swap into ./tools
+./update.py all --fetch  # + audio.cpp, whisper.cpp, stable-diffusion.cpp
+```
+
+A bare run only links what is already installed. The target comes from the
+directory you run it in: from an install directory it manages `<dir>/tools`;
+from `tools/` itself it manages that directory. It needs python 3.11.4 or newer
+and `curl`; `GITHUB_TOKEN` raises the unauthenticated API limit. Only llama-swap
+publishes a `checksums.txt`.
+
+If your binaries live somewhere else, point the packer at them with
+`--llama-server`, `LLAMA_BIN_DIR`, or `profiles.yaml <engine>.bin`; the full
+chain is in [docs/install.md](docs/install.md).
+
+## Updating
+
+```sh
+uv pip install --upgrade git+https://github.com/JeffKwasha/llama-packer.git@main
+./update.py --fetch      # engines, if you use the updater
+```
+
+Re-run llama-packer after an engine update: the config records the flags it was
+measured with, not the build. Validate the emitted config with
+`llama-swap -config <file> -validate` before serving it.
 
 ## Beyond the smoketest
 
@@ -81,14 +102,14 @@ Sure it might work if you made sidecars for each model... but researching and wr
 
 There has to be a better way!
 
-cp llama_packer/templates/models_AGENTS.md ${MODELS_DIR}/AGENTS.md.
+# writes AGENTS.md next to the models, then packs as usual
+llama-packer --agents --models-dir /path/to/models
 
 Tell your AI harness: 
 read models/AGENTS.md for each of my models in models/{chat, embed, rerank} research the model on huggingface and write a sidecar, use a subagent for each model
 
 Now you have capabilities, context windows, MTP support where available.
 
-mv profiles.yaml.example profiles.yaml
 
 - **Aliases.** Give one model several names — `instruct`, `coding`, `thinking` — each with its own sampling parameters, switched per-request with no reload. Declared once in the sidecar's `modes:` (or generated from `profiles.yaml`); emitted as `filters.setParamsByID` overrides.
 - **Capacity-budgeted co-loading.** Keep small models (embedders, rerankers, a quick draft model) loaded alongside your main chat model. Every serving declares its VRAM/host-RAM capacity, llama-swap evicts the cheapest one when a pool is full, and a size-1 role pool keeps one model per role loaded.
@@ -127,7 +148,7 @@ capabilities:
 Both `s2t` backends are available and the choice is per-model: `whisper-server`
 covers the whisper model family, `audio-cpp` covers its own (`parakeet`,
 `nemotron_asr`, `qwen3_asr`, `voxtral_realtime`, …) and can also serve `t2s` from
-the same process. `extras/update.py all` fetches every one of these engines;
+the same process. `extras/update.py all --fetch` fetches every one of these engines;
 see [docs/backends/](docs/backends/) for the per-engine sidecars and VRAM model.
 
 On a **chat** model, `capabilities: [image]` adds image *input* (`vision`
@@ -185,7 +206,7 @@ Profiles overlay `defaults` and emit `filters.setParamsByID`; sidecar `modes:` /
 
 ### Models directory guide (`AGENTS.md`)
 
-Run `llama-packer --agents` to write an `AGENTS.md` sidecar guide into each models dir — only when missing, so your edits are never overwritten. The bundled source is [`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md).
+Run `llama-packer --agents` to write an `AGENTS.md` sidecar guide into each models dir — only when missing, so your edits are never overwritten. The bundled source is [`llama_packer/templates/AGENTS.md`](llama_packer/templates/AGENTS.md).
 
 ### vLLM backend
 
@@ -266,14 +287,12 @@ relative paths resolve from the active working directory:
 }
 ```
 
-**Installed deployments.** `extras/install.py` creates `<run-dir>/profiles.yaml`
-from the bundled default when it is absent (never overwriting an existing
-one) and places this guide at
-`<run-dir>/.opencode/skills/profiles-authoring/SKILL.md`, owned by the
-service account. Pass `--no-agent-guide` to skip the guide. An agent started
-in the run directory then discovers it; see
-[docs/install.md](docs/install.md#profilesyaml-is-yours) for editing and
-re-packing.
+**Service deployments.** If you used `extras/install.py`, it creates
+`<run-dir>/profiles.yaml` from the bundled default when it is absent (never
+overwriting an existing one) and places this guide at
+`<run-dir>/.opencode/skills/profiles-authoring/SKILL.md`, owned by the service
+account; `--no-agent-guide` skips the guide. See
+[docs/install.md](docs/install.md#profilesyaml-is-yours).
 
 For an existing install without the guide, copy it in:
 
@@ -291,12 +310,13 @@ OpenCode reloads skills on save; no restart is needed. Load it with
 - [docs/glossary.md](docs/glossary.md) — the vocabulary, if a word in a commit message or a PR does not mean what you think it means
 - [SPEC.md](SPEC.md) — detailed configuration specification
 - [docs/architecture.md](docs/architecture.md) — component map, invariants, extension points
-- [docs/install.md](docs/install.md) — systemd deployment from a run directory ([extras/install.py](extras/install.py))
+- [docs/install.md](docs/install.md) — advanced: systemd deployment from a run directory, with a service account ([extras/install.py](extras/install.py))
 - [docs/backends/](docs/backends/) — per-engine notes: llama-server, vLLM, sd-server, whisper-server, audio-cpp
 - [profiles.yaml.example](profiles.yaml.example) — commented starter for `profiles.yaml`; [llama_packer/profiles.yaml](llama_packer/profiles.yaml) is the bundled fallback
 - [docs/profiles-authoring.md](docs/profiles-authoring.md) — agent-facing guide for authoring and validating `profiles.yaml`
 - [docs/memory-and-eviction.md](docs/memory-and-eviction.md) — VRAM/RAM budgets, co-residency reservations, eviction cost, TTL
 - [docs/llama-swap.md](docs/llama-swap.md) — llama-swap capabilities mapped to the `profiles.yaml`/sidecar input that provides each
+- [docs/development.md](docs/development.md) — engineering rules: design before code, claim verification, mutation anchors, portioned landings
 
 ## Limitations
 

@@ -262,6 +262,7 @@ profiles:
 # throughput cost measured) and stamps the VRAM measurement shape; `batch`
 # has no VRAM effect and is deliberately not part of the shape.
 # llama_server:
+#   bin: /opt/llama/tools/llama-server   # or a llama-bNNNN directory
 #   args: "--flash-attn on"
 #   # batch: 2048       # -b, logical batch — throughput only, no VRAM effect
 #   # ubatch: 512       # -ub, per-pass tokens — shapes the compute buffer

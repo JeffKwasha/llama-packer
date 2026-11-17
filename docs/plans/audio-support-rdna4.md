@@ -349,7 +349,7 @@ low-latency landscape for local ASR on AMD:
 
 ## 6. Sidecar authoring for audio — is `AGENTS.md` enough?
 
-`llama_packer/templates/models_AGENTS.md` **covers the audio sidecar keys well**
+`llama_packer/templates/AGENTS.md` **covers the audio sidecar keys well**
 — `s2t`/`t2s` dir layout, `audio_cpp: {family, task, options, voice}`, and the
 `vram_mb` pin all appear (lines ~29–31, 126–132, 128). The template is strong.
 

@@ -35,7 +35,7 @@ Legal references, in order of preference:
 
 1. a `SPEC.md` §section or `docs/` page — `SPEC §Knobs (matrix section keys)`;
 2. a `requirement-trace.md` row — `requirement #74`;
-3. a symbol — `_host_unit_refusals`, `models_AGENTS.md`.
+3. a symbol — `_host_unit_refusals`, `AGENTS.md`.
 
 If none of those says it, explain it right there in the sentence. Never
 `file.py:123`, never `SPEC 305`, never `PR #12`, never a second copy of the

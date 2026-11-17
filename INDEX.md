@@ -6,7 +6,7 @@ Generate llama-swap configs from GGUF/VLLM model metadata. See [README.md](READM
 
 - [`llama_packer/__main__.py`](llama_packer/__main__.py) — CLI entry point (`llama-packer`), VRAM/env resolution, matrix wiring; `--check` validates profiles.yaml without discovery or a server
 - [`llama_packer/profiles.yaml`](llama_packer/profiles.yaml) — sampling profiles + `vllm:` backend defaults (bundled)
-- [`llama_packer/templates/models_AGENTS.md`](llama_packer/templates/models_AGENTS.md) — bundled `models/AGENTS.md` guide (written with `--agents`)
+- [`llama_packer/templates/AGENTS.md`](llama_packer/templates/AGENTS.md) — bundled `models/AGENTS.md` guide (written with `--agents`)
 
 ## Modules
 
@@ -65,11 +65,11 @@ Engines and transports are independent axes: each engine declares the transports
 
 ## Data dirs
 
-- `models/` — GGUF + `.md` sidecars (`chat/` `vision/` `doc/` `embed/` `rerank/` by use-case; `img/` served only when a role owns it; optional per-directory `models.yaml`; see SPEC.md "Model Discovery"); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/models_AGENTS.md`) if missing
+- `models/` — GGUF + `.md` sidecars (`chat/` `vision/` `doc/` `embed/` `rerank/` by use-case; `img/` served only when a role owns it; optional per-directory `models.yaml`; see SPEC.md "Model Discovery"); `AGENTS.md` guide auto-written with `--agents` (from bundled `llama_packer/templates/AGENTS.md`) if missing
 - configured model roots (`models_dirs:`) — same layout (`t2t/` legacy → `chat/`, `vision/`, `doc`/`ocr/`, `embed/`, `rerank/`; `img/` etc. ignored unless a role owns them); each role owns one or more trees with `dir:`, `hf_home:` sets the HF cache root
 - `profiles.yaml.example` — tracked template; the actual `profiles.yaml` is machine-local (gitignored)
 - `llama-b*/` — llama.cpp builds (used via `find_bin_dir`)
-- [`extras/update.py`](extras/update.py) — prebuilt server binaries, each engine updated **in the directory it is already installed in** (resolved, not taken from the cwd; `--print-paths` shows the resolution, `--dir engine=path` pins one, optional [`extras/engines.ini`](extras/engines.ini) configures the root); positional target selectors (`llama`/`ll`, `cpp`, `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, `all`) + backends; default = llama.cpp + llama-swap, `all` adds the three with no upstream checksums; stdlib-only Python
+- [`extras/update.py`](extras/update.py) — prebuilt server binaries, each engine updated **in the directory it is already installed in** (the run directory, taken from where the command was run; `--print-paths` shows the resolution, `--dir engine=path` pins one); positional target selectors (`llama`/`ll`, `cpp`, `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, `all`) + backends; default = llama.cpp + llama-swap, `all` adds the three with no upstream checksums; stdlib-only Python
 - [`extras/install.py`](extras/install.py) — systemd deployer: service account, binaries, config, hardened unit from [`extras/llama-swap.service.in`](extras/llama-swap.service.in) ([docs/install.md](docs/install.md))
 - [`extras/check_sidecar_budget.py`](extras/check_sidecar_budget.py) — judge one emitted capacity-routing config: applies the router's own rule (summed `capacities` fit every pool, one serving per role pool) and reports which sidecars can be loaded beside each chat (`--require t2s,embeddings,...`); exit 1 when a required set cannot fit
 - [`extras/sidecar_eval.py`](extras/sidecar_eval.py) — run llama-packer once per sidecar-residency strategy (`host`, `voice`, `rag-hot`, `rag-voice`, `all-hot`) over a base `profiles.yaml` and tabulate largest chat charge, headroom, entries and median ctx; exit 1 when a strategy cannot host its required set ([docs/plans/sidecar-residency-eval.md](docs/plans/sidecar-residency-eval.md))

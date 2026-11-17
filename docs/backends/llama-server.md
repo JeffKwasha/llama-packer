@@ -6,12 +6,13 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
 - **Engine:** llama.cpp · **Transports:** host only (`llama-server`).
 - **Endpoints:** `openai.chat.completions`, `openai.embeddings`, `openai.rerank`.
 - **Formats:** `.gguf`.
-- **Binary:** `--llama-server` > `$LLAMA_BIN_DIR` > the run directory, scanned
-  for the highest `llama-b<NNNN>/` (see `find_bin_dir`). There is no
-  `profiles.yaml` key and no `PATH` fallback for this one: a build that is
-  not a versioned `llama-b*` directory is not a build the planner can size
-  against. Its cwd scan is the reason the other backends' resolution gained a
-  run-directory tier too.
+- **Binary:** `--llama-server` > `profiles.yaml llama_server.bin` >
+  `$LLAMA_BIN_DIR` > the run directory's `tools/`, then the run directory,
+  scanned for the highest `llama-b<NNNN>/` (see `find_bin_dir`). A `bin:` or
+  `$LLAMA_BIN_DIR` may name the binary or a `llama-b*` directory; there is no
+  `PATH` fallback, because a build that is not a versioned `llama-b*`
+  directory is not a build the planner can size against. Its cwd scan is the
+  reason the other backends' resolution gained a run-directory tier too.
 - **Proxied:** no — llama-swap manages the process and proxies by port.
 
 ## Command shape

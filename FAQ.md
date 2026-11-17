@@ -33,7 +33,7 @@ Never-servable formats regardless of sidecar: CTranslate2 (faster-whisper),
 transformers checkpoints (Qwen3-ASR/TTS), diffusion pipelines (ACE-Step) —
 they need different backends entirely.
 
-See also `models_AGENTS.md` ("Hub-downloaded files need no symlink") and
+See also `AGENTS.md` ("Hub-downloaded files need no symlink") and
 SPEC.md "Model Discovery".
 
 ## Why is my small model stuck at low context and `parallel: 1`?

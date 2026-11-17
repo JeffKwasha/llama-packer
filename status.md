@@ -12,7 +12,7 @@
   Committed (bb60b68). Deployed and verified: TTS 200, ASR 200.
 
 - **Install location resolution:** `update.py` updates each engine where it
-  already is, not in the cwd. `--print-paths`, `--dir`, `extras/engines.ini`.
+  already is, resolved from the run directory. `--print-paths`, `--dir`.
   Committed (6675da2).
 
 - **Tools/ layout:** `/opt/llama/tools/` holds all five engines with stable

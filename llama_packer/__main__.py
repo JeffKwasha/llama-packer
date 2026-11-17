@@ -138,7 +138,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="llama-server version (default: latest)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
                         help="Show llama-packer version and exit")
-    parser.add_argument("--llama-server", help="Explicit path to llama-server binary")
+    parser.add_argument("--llama-server",
+                        help="Explicit path to llama-server binary (overrides "
+                             "profiles.yaml llama_server.bin and $LLAMA_BIN_DIR)")
     parser.add_argument("--models-dir", nargs="+", default=None,
                         help="Model directories (default: profiles.yaml models_dirs, "
                              "else ./models); pass multiple to scan several")
@@ -207,7 +209,7 @@ def write_agents_md(models_dir: Path) -> None:  # noqa: D401 - see body
     """Write the bundled AGENTS.md guide into ``models_dir`` if missing.
 
     The canonical guide ships inside the package
-    (``llama_packer/templates/models_AGENTS.md``) so it travels with the tool.
+    (``llama_packer/templates/AGENTS.md``) so it travels with the tool.
     It is copied only when ``models/AGENTS.md`` does not already exist — user
     edits are never overwritten.  A failure to write is logged and ignored so
     config generation can continue.
@@ -217,7 +219,7 @@ def write_agents_md(models_dir: Path) -> None:  # noqa: D401 - see body
         logger.info("AGENTS.md exists, keeping: %s", dest)
         return
     try:
-        src = importlib.resources.files("llama_packer").joinpath("templates", "models_AGENTS.md")
+        src = importlib.resources.files("llama_packer").joinpath("templates", "AGENTS.md")
         if not src.is_file():
             logger.warning("bundled AGENTS.md template missing: %s", src)
             return
@@ -407,6 +409,28 @@ def _health_check_timeout(models, args) -> int:
     return hct
 
 
+def resolve_llama_bin(cli: str | None, profile_bin: str | None,
+                      version: str, base: Path) -> tuple[str, str]:
+    """``(llama_bin, bin_dir)`` by the same chain as every other engine.
+
+    ``--llama-server`` > ``profiles.yaml llama_server.bin`` > ``$LLAMA_BIN_DIR``
+    > ``tools/`` > the run directory. llama.cpp is the one engine whose
+    default is a versioned build directory, so the last two tiers are
+    :func:`llama_packer.utils.find_bin_dir`.
+    """
+    chosen = cli or profile_bin
+    if chosen:
+        path = Path(str(chosen)).expanduser()
+        if path.is_dir():
+            path = path / "llama-server"
+        # resolve() follows a symlinked llama-server into the versioned
+        # build dir, the home of its llama.cpp siblings (fit-params, ...).
+        resolved = path.resolve()
+        return str(resolved), str(resolved.parent)
+    bin_dir = find_bin_dir(version, base)
+    return str(base / bin_dir / "llama-server"), bin_dir
+
+
 def resolve_host_binary(
     cli: str | None,
     section: str | None,
@@ -573,14 +597,9 @@ def main(argv: list[str] | None = None) -> None:
     if err:
         fatal("profiles.yaml %s", err)
 
-    if args.llama_server:
-        llama_bin = str(Path(args.llama_server).resolve())
-        # resolve() follows a symlinked llama-server into the versioned
-        # build dir, the home of its llama.cpp siblings (fit-params, ...).
-        bin_dir = str(Path(args.llama_server).resolve().parent)
-    else:
-        bin_dir = find_bin_dir(args.version, Path.cwd())
-        llama_bin = str(Path.cwd() / bin_dir / "llama-server")
+    llama_cfg = profiles_cfg.get("llama_server") or {}
+    llama_bin, bin_dir = resolve_llama_bin(
+        args.llama_server, llama_cfg.get("bin"), args.version, Path.cwd())
 
     fit_bin = str(Path.cwd() / bin_dir / "llama-fit-params")
 

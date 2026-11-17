@@ -103,36 +103,69 @@ def make_binary(path: Path, text: str) -> Path:
     return path
 
 
+def arch_for(engine):
+    """The architecture spelling each target's asset names use."""
+    if engine.key == "swap":
+        return upd.get_llama_swap_arch()
+    return upd.engine_arch(engine)
+
+
+def run_engine(engine, install_dir, *, arch=None, keep=2, tag="",
+               backend=""):
+    """The sequence main() runs: plan, apply, converge links, prune."""
+    plan = upd.plan_engine(engine, install_dir,
+                           arch=arch_for(engine) if arch is None else arch,
+                           requested_tag=tag, backend=backend)
+    if not plan.ok:
+        upd.eprint(plan.error)
+        return None
+    if not upd.apply_plan(plan):
+        return None
+    ok, backed_up = upd.ensure_links(engine, install_dir,
+                                     "" if plan.noop else plan.tag)
+    if not ok:
+        return None
+    upd.prune_engine(engine, install_dir, keep, keep_backup=backed_up)
+    return plan
+
+
 @pytest.fixture(autouse=True)
-def _no_deployment_config(monkeypatch, tmp_path):
-    """Keep every test off this box's committed ``extras/engines.ini``.
+def _no_real_deployment(monkeypatch, tmp_path):
+    """Keep every test off this box's real deployment directory.
 
-    Two separate hazards, one fixture. The shipped file names a real
-    deployment's directories, so a test that resolves install locations
-    without saying where they come from would assert against whichever box the
-    suite runs on -- and, worse, *install into it*: resolution feeds the
-    installers, and a stubbed download plus a real deployment directory is a
-    real deployment directory with a fake binary in it. That happened once
-    (a 22-byte llama-server in /opt/llama/tools) before this fixture existed.
-
-    Pinning the discovery candidates to ``tmp_path`` as well closes the second
-    door: with the shipped config unreadable, discovery walks outwards from
-    the cwd and would otherwise reach the real repo and the real tools root.
-    Tests that care about configuration pass it in explicitly.
+    Discovery is derived from the cwd, so a test that forgot to chdir would
+    resolve (and, with a stubbed download, install into) the checkout. Pin
+    both the candidates and the last-resort root to ``tmp_path``.
     """
-    monkeypatch.setattr(upd, "config_path",
-                        lambda: tmp_path / "no-such-engines.ini")
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+    monkeypatch.setenv("LLAMA_DIR", str(tmp_path))
+
+
+def _stub_plans(monkeypatch, calls, directories=None):
+    """Replace the plan seams so main() records targets without installing."""
+
+    def _engine(engine, directory, *a, **k):
+        calls.append(engine.key)
+        if directories is not None:
+            directories[engine.key] = directory
+        return upd.Plan(engine=engine, directory=Path(directory), noop=True,
+                        note=f"{engine.label} up to date")
+
+    monkeypatch.setattr(upd, "plan_engine", _engine)
 
 
 # --- version discovery / bookkeeping ---------------------------------------
 
 
 def test_highest_installed_ignores_non_numeric_suffix(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': Highest installed llama.cpp build number among llama-b<NNNN> dirs.
-    (tmp_path / "llama-b11507").mkdir()
-    (tmp_path / "llama-b8913").mkdir()
-    (tmp_path / "llama-b1234-extra").mkdir()  # upstream never ships this
+    # Validates: docs/install.md, 'Where an update installs': Only an intact
+    # build counts; a truncated newer directory must not suppress a fetch.
+    for name in ("llama-b11507", "llama-b8913"):
+        entry = tmp_path / name
+        entry.mkdir()
+        (entry / "llama-server").write_text("#!/bin/sh\n")
+    (tmp_path / "llama-b12000").mkdir()        # truncated, newest, no binary
+    (tmp_path / "llama-b1234-extra").mkdir()   # upstream never ships this
     (tmp_path / "llama-bnope").mkdir()
     assert upd.highest_installed(tmp_path) == 11507
 
@@ -149,11 +182,11 @@ def test_cpp_build_number():
     assert upd.cpp_build_number("v262") is None
 
 
-def test_cleanup_old_versions_keeps_newest_n(tmp_path):
+def test_prune_cpp_keeps_newest_n(tmp_path):
     # Validates: docs/install.md, 'Where an update installs': Remove old llama-b<NNNN> dirs, keeping only the newest ``keep``.
     for build in (10000, 11000, 11500, 11501, 11502):
         (tmp_path / f"llama-b{build}").mkdir()
-    upd.cleanup_old_versions(tmp_path, keep=3)
+    upd.prune_engine(upd.CPP, tmp_path, 3)
     assert sorted(p.name for p in tmp_path.iterdir()) == [
         "llama-b11500",
         "llama-b11501",
@@ -161,12 +194,12 @@ def test_cleanup_old_versions_keeps_newest_n(tmp_path):
     ]
 
 
-def test_cleanup_old_versions_noop_when_not_owner(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'Where an update installs': cleanup only removes what this tool installed.
+def test_prune_cpp_noop_when_not_writable(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': cleanup only removes what this run may prune.
     for build in (10000, 11000, 11500, 11501):
         (tmp_path / f"llama-b{build}").mkdir()
-    monkeypatch.setattr(upd, "_owned_by_current_user", lambda _p: False)
-    upd.cleanup_old_versions(tmp_path, keep=1)
+    monkeypatch.setattr(upd, "_can_prune", lambda _p: False)
+    upd.prune_engine(upd.CPP, tmp_path, 1)
     assert len(list(tmp_path.iterdir())) == 4
 
 
@@ -176,7 +209,7 @@ def test_prune_swap_keeps_newest_but_never_a_referenced_file(tmp_path):
         make_binary(tmp_path / f"llama-swap-v{version}", "stub")
     os.symlink("llama-swap-v260", tmp_path / "rollback-link")
 
-    upd.cleanup_old_llama_swap_versions(tmp_path, keep=2)
+    upd.prune_engine(upd.SWAP, tmp_path, 2)
 
     # newest two kept; v260 survives only because a symlink points at it
     assert (tmp_path / "llama-swap-v262").is_file()
@@ -188,7 +221,7 @@ def test_prune_swap_removes_unreferenced(tmp_path):
     # Validates: docs/install.md, 'Where an update installs': Remove old llama-swap-vNNN binaries.
     for version in (260, 261, 262):
         make_binary(tmp_path / f"llama-swap-v{version}", "stub")
-    upd.cleanup_old_llama_swap_versions(tmp_path, keep=2)
+    upd.prune_engine(upd.SWAP, tmp_path, 2)
     assert not (tmp_path / "llama-swap-v260").exists()
 
 
@@ -200,7 +233,7 @@ def test_prune_swap_ignores_bak_and_foreign_files(tmp_path):
     (tmp_path / "_HASH_FAIL_llama-swap-v262-linux_amd64.tar.gz").write_bytes(b"y")
     make_binary(tmp_path / "llama-swap", "stub")  # primary, possibly a symlink
 
-    upd.cleanup_old_llama_swap_versions(tmp_path, keep=1)
+    upd.prune_engine(upd.SWAP, tmp_path, 1)
     assert not (tmp_path / "llama-swap-v260").exists()
     assert (tmp_path / "llama-swap").exists()
 
@@ -209,56 +242,141 @@ def test_prune_swap_bogus_keep_defaults_to_one(tmp_path):
     # Validates: docs/install.md, 'Where an update installs': Remove old llama-swap-vNNN binaries.
     for version in (260, 261, 262):
         make_binary(tmp_path / f"llama-swap-v{version}", "stub")
-    upd.cleanup_old_llama_swap_versions(tmp_path, keep=0)
+    upd.prune_engine(upd.SWAP, tmp_path, 0)
     assert (tmp_path / "llama-swap-v262").is_file()
     assert not (tmp_path / "llama-swap-v261").exists()
 
 
-# --- symlinks --------------------------------------------------------------
+# --- stable names ----------------------------------------------------------
+# The link is derived from the tree, not from the plan, so a run that died
+# between the promote and the link is finished by the next one.
 
 
-def test_update_cpp_symlinks_repoints_only_llama_b_links(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': Repoint top-level symlinks that target an old llama-b* dir.
-    (tmp_path / "llama-b12000").mkdir()
-    os.symlink("llama-b11507", tmp_path / "server")
-    os.symlink("llama-b11507", tmp_path / "server2")
-    os.symlink("llama-swap-v262", tmp_path / "swap")  # not ours to touch
-    (tmp_path / "llama-b11999").mkdir()
+def test_ensure_links_follows_the_newest_installed_build(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': The stable symlink moves, superseded versions and the leftovers of interrupted runs are removed.
+    for build in (11500, 11539):
+        entry = tmp_path / f"llama-b{build}"
+        entry.mkdir()
+        (entry / "llama-server").write_bytes(b"bin")
+        (entry / "llama-server").chmod(0o755)
+    os.symlink("./llama-b11500/llama-server", tmp_path / "llama-server")
 
-    upd.update_llama_cpp_symlinks(tmp_path, "b12000")
-
-    assert os.readlink(tmp_path / "server") == "llama-b12000"
-    assert os.readlink(tmp_path / "server2") == "llama-b12000"
-    assert os.readlink(tmp_path / "swap") == "llama-swap-v262"
-
-
-def test_update_cpp_symlinks_absent_target_is_noop(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': a symlink whose target is gone is left alone.
-    os.symlink("llama-b11507", tmp_path / "server")
-    upd.update_llama_cpp_symlinks(tmp_path, "b12000")
-    assert os.readlink(tmp_path / "server") == "llama-b11507"
+    assert upd.ensure_links(upd.CPP, tmp_path) == (True, False)
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11539/llama-server"
 
 
-def test_update_cpp_symlinks_accepts_plain_build(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': Repoint top-level symlinks that target an old llama-b* dir.
-    (tmp_path / "llama-b12000").mkdir()
-    os.symlink("llama-b11507", tmp_path / "server")
-    upd.update_llama_cpp_symlinks(tmp_path, "b12000")
-    assert os.readlink(tmp_path / "server") == "llama-b12000"
+def test_ensure_links_creates_a_link_that_a_crash_never_wrote(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': Pruning runs on a no-op run too, so a tree that drifted converges.
+    entry = tmp_path / "llama-b11539"
+    entry.mkdir()
+    (entry / "llama-server").write_bytes(b"bin")
+    (entry / "llama-server").chmod(0o755)
+
+    assert upd.ensure_links(upd.CPP, tmp_path) == (True, False)
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11539/llama-server"
 
 
-def test_update_swap_symlinks_repoints_but_skips_primary(tmp_path):
+def test_ensure_links_ignores_a_truncated_newer_entry(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': The stable symlink moves, superseded versions and the leftovers of interrupted runs are removed.
+    for build, write_binary in ((11500, True), (11539, False)):
+        entry = tmp_path / f"llama-b{build}"
+        entry.mkdir()
+        if write_binary:
+            (entry / "llama-server").write_bytes(b"bin")
+            (entry / "llama-server").chmod(0o755)
+
+    upd.ensure_links(upd.CPP, tmp_path)
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11500/llama-server"
+
+
+def test_ensure_links_leaves_other_links_alone(tmp_path):
     # Validates: docs/install.md, 'Where an update installs': each engine keeps its history beside the current one and is reached through a stable name
     make_binary(tmp_path / "llama-swap-v262", "stub")
     os.symlink("llama-swap-v261", tmp_path / "llama-swap")
-    os.symlink("llama-swap-v261", tmp_path / "rollback")
-    os.symlink("llama-b11507", tmp_path / "server")  # not ours to touch
+    os.symlink("llama-b11507", tmp_path / "server")
 
-    upd.update_llama_swap_symlinks(tmp_path, "llama-swap-v262")
+    upd.ensure_links(upd.SWAP, tmp_path)
 
-    assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v261"
-    assert os.readlink(tmp_path / "rollback") == "llama-swap-v262"
+    assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
     assert os.readlink(tmp_path / "server") == "llama-b11507"
+
+
+def test_ensure_links_migrates_a_real_binary_and_reports_the_backup(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': the .bak copy once the stable name is a symlink (the versioned history is the rollback then).
+    make_binary(tmp_path / "llama-swap", "old build")
+    make_binary(tmp_path / "llama-swap-v262", "new build")
+
+    assert upd.ensure_links(upd.SWAP, tmp_path) == (True, True)
+    assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
+    assert "old build" in (tmp_path / "llama-swap.bak").read_text()
+
+
+def test_an_explicit_pin_moves_the_stable_name_backwards(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'The updater command line': an explicitly named version is installed as asked.
+    make_binary(tmp_path / "llama-swap-v262", "v262")
+    os.symlink("llama-swap-v262", tmp_path / "llama-swap")
+    blob = make_swap_tarball()
+    payload = {"tag_name": "v260", "assets": [
+        {"browser_download_url": SWAP_URL},
+        {"browser_download_url": CHECKSUMS_URL},
+    ]}
+    monkeypatch.setattr(upd, "gh_api", lambda _url: payload)
+    monkeypatch.setattr(
+        upd, "download",
+        stub_download(blob, checksums_line(
+            "llama-swap-v262-linux_amd64.tar.gz", blob)))
+
+    plan = upd.plan_engine(upd.SWAP, tmp_path, arch="linux_amd64",
+                           requested_tag="v260")
+    assert upd.apply_plan(plan) is True
+    upd.ensure_links(upd.SWAP, tmp_path, plan.tag)
+
+    assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v260", \
+        "a pinned older version must be the one served"
+
+
+def test_a_crash_before_the_link_is_finished_by_the_next_run(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'The updater installs the engines': Pruning runs on a no-op run too, so a tree that drifted converges.
+    """Killed between promote() and the symlink: the entry exists, the link is stale.
+
+    The plan then says "already installed", so if the link only moved on the
+    install path the tree would keep pointing at the old build forever.
+    """
+    for build in (11500, 11539):
+        entry = tmp_path / f"llama-b{build}"
+        entry.mkdir()
+        (entry / "llama-server").write_bytes(b"bin")
+        (entry / "llama-server").chmod(0o755)
+    os.symlink("./llama-b11500/llama-server", tmp_path / "llama-server")
+
+    assert upd.main(["cpp", "b11539", "--dir", f"cpp={tmp_path}"]) == 0
+
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11539/llama-server"
+
+
+def test_two_runs_in_one_directory_serialize(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': Two runs in one directory do not overlap; the second waits.
+    import fcntl
+    with upd.dir_lock(tmp_path):
+        key = hashlib.sha256(str(tmp_path.resolve()).encode()).hexdigest()[:16]
+        path = Path(upd.tempfile.gettempdir()) / f"llama-update-{key}.lock"
+        other = os.open(path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(other)
+
+
+def test_ensure_links_with_nothing_intact_changes_nothing(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': The stable symlink moves, superseded versions and the leftovers of interrupted runs are removed.
+    (tmp_path / "llama-b11539").mkdir()          # empty: not an install
+    assert upd.ensure_links(upd.CPP, tmp_path) == (True, False)
+    assert not (tmp_path / "llama-server").exists()
 
 
 # --- argument parsing ------------------------------------------------------
@@ -344,7 +462,7 @@ def test_main_rejects_mutually_exclusive(tmp_path, monkeypatch, capsys):
 
 
 def test_gh_api_parses_status_line(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
+    # Validates: docs/install.md, 'The updater installs the engines': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
     def fake_run(cmd, **kwargs):
         class Result:
             stdout = '[{"tag_name": "b1"}]\n200'
@@ -357,7 +475,7 @@ def test_gh_api_parses_status_line(monkeypatch):
 
 
 def test_gh_api_401_is_auth_failure(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
+    # Validates: docs/install.md, 'The updater installs the engines': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
     def fake_run(cmd, **kwargs):
         class Result:
             stdout = '{"message": "Bad credentials"}\n401'
@@ -371,7 +489,7 @@ def test_gh_api_401_is_auth_failure(monkeypatch):
 
 
 def test_gh_api_403_rate_limit(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
+    # Validates: docs/install.md, 'The updater installs the engines': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
     def fake_run(cmd, **kwargs):
         class Result:
             stdout = '{"message": "API rate limit exceeded"}\n403'
@@ -385,7 +503,7 @@ def test_gh_api_403_rate_limit(monkeypatch):
 
 
 def test_gh_api_transport_failure(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
+    # Validates: docs/install.md, 'The updater installs the engines': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
     def fake_run(cmd, **kwargs):
         class Result:
             stdout = "\n000"
@@ -399,7 +517,7 @@ def test_gh_api_transport_failure(monkeypatch):
 
 
 def test_gh_api_404_returns_body(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
+    # Validates: docs/install.md, 'The updater installs the engines': GET a GitHub API URL and return the parsed JSON body. Uses curl rather than urllib: this box reaches the network through a.
     def fake_run(cmd, **kwargs):
         class Result:
             stdout = '{"message": "Not Found"}\n404'
@@ -436,11 +554,11 @@ def install_swap(tmp_path, monkeypatch, *, tag="v262", blob=None, checksum=None,
         make_binary(tmp_path / "llama-swap", existing)
     monkeypatch.setattr(upd, "gh_api", api or fake_api())
     monkeypatch.setattr(upd, "download", stub_download(blob, checksum))
-    return upd.update_llama_swap(tmp_path, keep_swap=2, requested_tag=tag)
+    return run_engine(upd.SWAP, tmp_path, keep=2, tag=tag) is not None
 
 
 def test_swap_install_creates_symlink_and_verifies(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     assert install_swap(tmp_path, monkeypatch) is True
     out = capsys.readouterr().out
     assert "Checksum verified:" in out
@@ -452,7 +570,7 @@ def test_swap_install_creates_symlink_and_verifies(tmp_path, monkeypatch, capsys
 
 
 def test_swap_install_hash_mismatch_quarantines(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     blob = make_swap_tarball()
     wrong = "0" * 64 + "  llama-swap-v262-linux_amd64.tar.gz\n"
     assert install_swap(tmp_path, monkeypatch, blob=blob, checksum=wrong) is False
@@ -465,7 +583,7 @@ def test_swap_install_hash_mismatch_quarantines(tmp_path, monkeypatch, capsys):
 
 
 def test_swap_install_hash_lookup_single_space_works(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     blob = make_swap_tarball()
     checksum = checksums_line("llama-swap-v262-linux_amd64.tar.gz", blob, prefix=" ")
     assert install_swap(tmp_path, monkeypatch, blob=blob, checksum=checksum) is True
@@ -473,7 +591,7 @@ def test_swap_install_hash_lookup_single_space_works(tmp_path, monkeypatch):
 
 
 def test_swap_install_backs_up_regular_file_then_symlinks(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     assert install_swap(tmp_path, monkeypatch, existing="old") is True
     out = capsys.readouterr().out
     assert "Backing up old llama-swap to llama-swap.bak" in out
@@ -482,22 +600,21 @@ def test_swap_install_backs_up_regular_file_then_symlinks(tmp_path, monkeypatch,
     assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
 
 
-def test_swap_install_symlink_branch_backs_up_target(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+def test_swap_install_symlink_branch_repoints_without_a_backup(tmp_path, monkeypatch, capsys):
+    # Validates: docs/install.md, 'The updater installs the engines': a symlink repoint copies nothing; the versioned history is the rollback.
     make_binary(tmp_path / "llama-swap-v261", "version: v261 (fake), built at 2026-01-01\n")
     os.symlink("llama-swap-v261", tmp_path / "llama-swap")
 
     assert install_swap(tmp_path, monkeypatch) is True
     out = capsys.readouterr().out
-    # One wording for every shape now that swap_symlink handles all three.
-    assert "Backing up llama-swap -> llama-swap.bak" in out
     assert "llama-swap -> llama-swap-v262" in out
     assert os.readlink(tmp_path / "llama-swap") == "llama-swap-v262"
-    assert "version: v261" in (tmp_path / "llama-swap.bak").read_text()
+    assert not (tmp_path / "llama-swap.bak").exists(), (
+        "a symlink repoint must not copy the old binary")
 
 
 def test_swap_install_backup_failure_keeps_old_binary(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     def failing_copy(*args, **kwargs):
         raise OSError("no space left on device")
 
@@ -511,14 +628,14 @@ def test_swap_install_backup_failure_keeps_old_binary(tmp_path, monkeypatch, cap
 
 
 def test_swap_install_missing_asset(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     api = fake_api(urls=[CHECKSUMS_URL, CHECKSUMS_URL])  # no tar.gz asset
     assert install_swap(tmp_path, monkeypatch, api=api) is False
     assert "Could not find llama-swap asset" in capsys.readouterr().err
 
 
 def test_swap_install_missing_checksums(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     api = fake_api(urls=[SWAP_URL, SWAP_URL])  # no checksums.txt asset
     assert install_swap(tmp_path, monkeypatch, api=api) is False
     assert "Could not find checksums.txt" in capsys.readouterr().err
@@ -534,43 +651,43 @@ def test_swap_install_unknown_tag(tmp_path, monkeypatch, capsys):
 
 
 def test_swap_install_already_up_to_date(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Check latest (or requested) release, verify sha256, atomically replace.
+    # Validates: docs/install.md, 'The updater installs the engines': Check latest (or requested) release, verify sha256, atomically replace.
     make_binary(tmp_path / "llama-swap", "version: v262 (fake), built at 2026-10-03\n")
     monkeypatch.setattr(upd, "gh_api", fake_api())
     monkeypatch.setattr(
         upd, "download", lambda *a, **k: pytest.fail("must not download anything")
     )
-    assert upd.update_llama_swap(tmp_path, keep_swap=2) is True
+    assert run_engine(upd.SWAP, tmp_path, keep=2) is not None
     assert "already up-to-date" in capsys.readouterr().out
 
 
 def test_swap_install_local_build_ahead_of_latest(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Check latest (or requested) release, verify sha256, atomically replace.
+    # Validates: docs/install.md, 'The updater installs the engines': Check latest (or requested) release, verify sha256, atomically replace.
     make_binary(tmp_path / "llama-swap", "version: v300 (local build), built at 2027-01-01\n")
     monkeypatch.setattr(upd, "gh_api", fake_api())
     monkeypatch.setattr(
         upd, "download", lambda *a, **k: pytest.fail("must not download anything")
     )
-    assert upd.update_llama_swap(tmp_path, keep_swap=2) is True
+    assert run_engine(upd.SWAP, tmp_path, keep=2) is not None
     assert "already up-to-date" in capsys.readouterr().out
 
 
 def test_swap_install_explicit_tag_already_present(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Check latest (or requested) release, verify sha256, atomically replace.
+    # Validates: docs/install.md, 'The updater installs the engines': Check latest (or requested) release, verify sha256, atomically replace.
     make_binary(tmp_path / "llama-swap", "version: v262 (fake), built at 2026-10-03\n")
     monkeypatch.setattr(upd, "gh_api", fake_api())
-    assert upd.update_llama_swap(tmp_path, keep_swap=2, requested_tag="262") is True
+    assert run_engine(upd.SWAP, tmp_path, keep=2, tag="262") is not None
     assert "already installed" in capsys.readouterr().out
 
 
 def test_swap_install_accepts_bare_number_tag(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     assert install_swap(tmp_path, monkeypatch, tag="262") is True
     assert (tmp_path / "llama-swap-v262").is_file()
 
 
 def test_swap_install_prunes_old_unreferenced_binaries(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     for version in (260, 261):
         make_binary(tmp_path / f"llama-swap-v{version}", "stub")
     assert install_swap(tmp_path, monkeypatch) is True
@@ -595,7 +712,7 @@ def test_installed_swap_version_zero_from_unparseable(tmp_path):
 
 
 def test_expected_sha256_double_and_single_space(tmp_path):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': the updater owns downloading, sha256 verification and pruning
+    # Validates: docs/install.md, 'The updater installs the engines': the updater owns downloading, sha256 verification and pruning
     blob = b"payload"
     digest = hashlib.sha256(blob).hexdigest()
     (tmp_path / "checksums.txt").write_text(
@@ -608,7 +725,7 @@ def test_expected_sha256_double_and_single_space(tmp_path):
 
 
 def test_sha256_file(tmp_path):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': the updater owns downloading, sha256 verification and pruning
+    # Validates: docs/install.md, 'The updater installs the engines': the updater owns downloading, sha256 verification and pruning
     blob = b"payload"
     path = tmp_path / "blob"
     path.write_bytes(blob)
@@ -625,17 +742,33 @@ def install_cpp(tmp_path, monkeypatch, *, version=None, blob=None, url=CPP_URL,
         upd, "gh_api", lambda _url: {"assets": [{"browser_download_url": url}]}
     )
     monkeypatch.setattr(upd, "download", stub_download(blob, ""))
-    return upd.update_llama_cpp(
-        tmp_path, version=tag if version is None else version, arch_override=""
-    )
+    plan = cpp_plan(tmp_path, tag if version is None else version)
+    if plan is None:
+        return False, None
+    if not upd.apply_plan(plan):
+        return False, None
+    upd.ensure_links(upd.CPP, tmp_path)
+    upd.prune_engine(upd.CPP, tmp_path, upd.KEEP_VERSIONS)
+    return True, (None if plan.noop else plan.tag)
+
+
+def cpp_plan(install_dir, token, *, arch=""):
+    backend, requested = upd.split_cpp_version(token)
+    plan = upd.plan_engine(upd.CPP, install_dir,
+                           arch=upd.get_llama_cpp_arch(arch),
+                           requested_tag=requested, backend=backend or "vulkan")
+    if not plan.ok:
+        upd.eprint(plan.error)
+        return None
+    return plan
 
 
 def test_cpp_install_extracts_into_version_dir(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     ok, installed = install_cpp(tmp_path, monkeypatch)
     assert (ok, installed) == (True, "b11539")
     out = capsys.readouterr().out
-    assert "Installed to: " in out
+    assert "Installed llama.cpp b11539 to " in out
     assert (tmp_path / "llama-b11539" / "llama-server").is_file()
 
 
@@ -645,26 +778,29 @@ def test_cpp_install_prunes_and_rewires_links(tmp_path, monkeypatch):
         (tmp_path / f"llama-b{build}").mkdir()
     os.symlink("llama-b11500", tmp_path / "server")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *_a, **_k: True)
     monkeypatch.setattr(
         upd, "gh_api", lambda _url: {"assets": [{"browser_download_url": CPP_URL}]}
     )
     monkeypatch.setattr(upd, "download", stub_download(make_cpp_tarball(), ""))
 
     # pruning + symlink rewiring happen in main() after a real install
-    assert upd.main(["b11539"]) == 0
+    assert upd.main(["b11539", "--cpp-only", "--fetch"]) == 0
     assert (tmp_path / "llama-b11539").is_dir()
     assert not (tmp_path / "llama-b10000").exists()
     assert not (tmp_path / "llama-b11000").exists()
-    # three newest dirs kept: b11539, b11501, b11500 (the one the link pointed at)
+    # three newest dirs kept: b11539, b11501, b11500 (still referenced by "server")
     assert (tmp_path / "llama-b11500").is_dir()
-    assert os.readlink(tmp_path / "server") == "llama-b11539"
+    assert os.readlink(tmp_path / "server") == "llama-b11500", \
+        "a link this tool does not own is left alone"
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11539/llama-server"
 
 
 def test_cpp_already_present_is_noop_for_pruning(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     (d := tmp_path / "llama-b11539").mkdir()
-    (d / "llama-server").write_bytes(b"bin")   # a real install, not a stub dir
+    (d / "llama-server").write_bytes(b"bin")
+    (d / "llama-server").chmod(0o755)   # a real install, not a stub dir
     (tmp_path / "llama-b10000").mkdir()
     os.symlink("llama-b10000", tmp_path / "server")
 
@@ -698,7 +834,7 @@ def test_cpp_truncated_dir_is_not_certified_as_installed(tmp_path,
 
 def test_cpp_tarball_without_llama_server_is_rejected(tmp_path, monkeypatch,
                                                       capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': True when a tag lookup came back as an API error, not a release.
+    # Validates: docs/install.md, 'The updater installs the engines': True when a tag lookup came back as an API error, not a release.
     """A tarball that is not a llama.cpp release must not be installed."""
     import io as _io
     import tarfile as _tf
@@ -714,35 +850,32 @@ def test_cpp_tarball_without_llama_server_is_rejected(tmp_path, monkeypatch,
 
 
 def test_cpp_unknown_version(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': llama.cpp half of the run. Returns (ok.
+    # Validates: docs/install.md, 'The updater installs the engines': llama.cpp half of the run. Returns (ok.
     monkeypatch.setattr(upd, "gh_api", lambda _url: {"message": "Not Found"})
-    ok, installed = upd.update_llama_cpp(tmp_path, "b9999", "")
-    assert (ok, installed) == (False, None)
+    assert cpp_plan(tmp_path, "b9999") is None
     assert "Version b9999 not found" in capsys.readouterr().err
 
 
 def test_cpp_no_matching_asset(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': llama.cpp half of the run. Returns (ok.
+    # Validates: docs/install.md, 'The updater installs the engines': llama.cpp half of the run. Returns (ok.
     monkeypatch.setattr(
         upd,
         "gh_api",
         lambda _url: {"assets": [{"browser_download_url": "https://example.com/readme.txt"}]},
     )
-    ok, _ = upd.update_llama_cpp(tmp_path, "b11539", "")
-    assert ok is False
+    assert cpp_plan(tmp_path, "b11539") is None
     assert "Could not find vulkan (x64) asset for b11539" in capsys.readouterr().err
 
 
 def test_cpp_rocm_non_x64_arch(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': llama.cpp half of the run. Returns (ok.
+    # Validates: docs/install.md, 'The updater installs the engines': llama.cpp half of the run. Returns (ok.
     monkeypatch.setattr(upd, "gh_api", fake_api(cpp_tag="b11539"))
-    ok, _ = upd.update_llama_cpp(tmp_path, "rocm", "arm64")
-    assert ok is False
+    assert cpp_plan(tmp_path, "rocm", arch="arm64") is None
     assert "rocm builds are Linux x64 only" in capsys.readouterr().err
 
 
 def test_cpp_download_failure_is_an_error(tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': llama.cpp half of the run. Returns (ok.
+    # Validates: docs/install.md, 'The updater installs the engines': llama.cpp half of the run. Returns (ok.
     def failing_download(*_args, **_kwargs):
         raise subprocess.CalledProcessError(22, ["curl"])
 
@@ -752,14 +885,14 @@ def test_cpp_download_failure_is_an_error(tmp_path, monkeypatch, capsys):
         lambda _url: {"assets": [{"browser_download_url": CPP_URL}]},
     )
     monkeypatch.setattr(upd, "download", failing_download)
-    ok, _ = upd.update_llama_cpp(tmp_path, "b11539", "")
-    assert ok is False
+    plan = cpp_plan(tmp_path, "b11539")
+    assert plan is not None and upd.apply_plan(plan) is False
     assert "download failed" in capsys.readouterr().err
     assert not (tmp_path / "llama-b11539").exists()
 
 
 def test_extract_tar_gz_processes_plain_tarball(tmp_path):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': the updater owns downloading, sha256 verification and pruning
+    # Validates: docs/install.md, 'The updater installs the engines': the updater owns downloading, sha256 verification and pruning
     archive = tmp_path / "blob.tar.gz"
     archive.write_bytes(make_cpp_tarball())
     upd.extract_tar_gz(archive, tmp_path)
@@ -877,7 +1010,7 @@ def test_resolve_engine_tag_skips_assetless_semver_tag(monkeypatch):
     # whisper.cpp publishes v1.9.5 (no assets) and b5454 (assets) on the
     # same day. Taking "latest" would find a release with nothing to
     # download; matching the tag shape is what makes this correct.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
+    # Validates: docs/install.md, 'The updater installs the engines': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
     releases = [
         {"tag_name": "v1.9.5", "assets": []},
         {"tag_name": "b5454",
@@ -890,7 +1023,7 @@ def test_resolve_engine_tag_skips_assetless_semver_tag(monkeypatch):
 
 def test_resolve_engine_tag_skips_build_without_our_arch(monkeypatch):
     # b5130 exists but only carries arm64 assets, so it cannot serve here.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
+    # Validates: docs/install.md, 'The updater installs the engines': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
     releases = [
         {"tag_name": "b5454",
          "assets": [{"browser_download_url": WHISPER_URL}]},
@@ -904,7 +1037,7 @@ def test_resolve_engine_tag_skips_build_without_our_arch(monkeypatch):
 
 def test_resolve_engine_tag_audio_cpp_uses_semver(monkeypatch):
     # audio.cpp ships binaries on its semver tag, unlike whisper.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
+    # Validates: docs/install.md, 'The updater installs the engines': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
     releases = [
         {"tag_name": "v0.9.2",
          "assets": [{"browser_download_url": AUDIO_URL}]},
@@ -914,7 +1047,7 @@ def test_resolve_engine_tag_audio_cpp_uses_semver(monkeypatch):
 
 
 def test_resolve_engine_tag_no_match_returns_empty(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
+    # Validates: docs/install.md, 'The updater installs the engines': Newest tag matching ``tag_re`` that actually carries our asset. Reading the *release list* rather than ``/releases/latest`` is the point:.
     monkeypatch.setattr(upd, "gh_api", engine_api([{"tag_name": "v1.9.5",
                                                     "assets": []}]))
     assert upd.resolve_engine_tag(upd.WHISPER, "x64") == ""
@@ -943,14 +1076,14 @@ def test_audio_cpp_asset_pattern_picks_the_portable_build():
 def test_audio_cpp_is_a_bundle_because_its_libs_must_travel():
     # The portable server loads libggml-vulkan.so from its own directory.
     # Validates: docs/backends/audio-cpp.md, 'Build / install': the audio-cpp asset is a bundle, because its libraries have to travel with it.
-    assert upd.AUDIO_CPP.bundle, "a solo binary would not find its backend"
+    assert upd.AUDIO_CPP.kind == "bundle", "a solo binary would not find its backend"
 
 
 def test_verify_archive_warns_when_upstream_has_no_checksums(tmp_path,
                                                              capsys):
     # The chosen policy: install anyway, but say plainly that there was
     # nothing to verify against.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Check the archive against ``checksums.txt`` when one is published.
+    # Validates: docs/install.md, 'The updater installs the engines': Check the archive against ``checksums.txt`` when one is published.
     archive = tmp_path / "a.tar.gz"
     archive.write_bytes(b"x")
     assert upd.verify_archive(archive, "a.tar.gz", {"assets": []},
@@ -973,7 +1106,7 @@ def test_verify_archive_quarantines_mismatch_in_install_dir(tmp_path,
                                                             capsys):
     # The quarantined file must land where it survives the temp dir that
     # holds the download, and without the execute bit.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Check the archive against ``checksums.txt`` when one is published.
+    # Validates: docs/install.md, 'The updater installs the engines': Check the archive against ``checksums.txt`` when one is published.
     blob = b"not what checksums.txt says"
     archive = tmp_path / "dl" / "a.tar.gz"
     archive.parent.mkdir()
@@ -995,7 +1128,7 @@ def test_verify_archive_quarantines_mismatch_in_install_dir(tmp_path,
 
 
 def test_update_engine_installs_and_symlinks(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Fetch, verify and install one engine.
+    # Validates: docs/install.md, 'The updater installs the engines': Fetch, verify and install one engine.
     blob = make_audio_tarball()
     releases = [{"tag_name": "v0.9.2",
                  "assets": [{"browser_download_url": AUDIO_URL}]}]
@@ -1003,7 +1136,7 @@ def test_update_engine_installs_and_symlinks(tmp_path, monkeypatch):
                         engine_api(releases, {"v0.9.2": releases[0]["assets"]}))
     monkeypatch.setattr(upd, "download",
                         lambda url, dest, **kw: dest.write_bytes(blob))
-    assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2) is True
+    assert run_engine(upd.AUDIO_CPP, tmp_path) is not None
     primary = tmp_path / "audiocpp_server"
     assert primary.is_symlink()
     assert os.readlink(primary) == "audiocpp_server-v0.9.2/audiocpp_server"
@@ -1016,7 +1149,7 @@ def test_update_engine_installs_bundle_with_its_libraries(tmp_path, monkeypatch)
     # finds them via RUNPATH=$ORIGIN, so a copy of the binary alone is a
     # broken install. The whole directory has to land, and the symlink has
     # to point into it.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Fetch, verify and install one engine.
+    # Validates: docs/install.md, 'The updater installs the engines': Fetch, verify and install one engine.
     blob = make_engine_tarball(
         "whisper-server", wrap="whisper-bin-ubuntu-x64",
         extra=(("libwhisper.so.1", b"\x7fELF fake"),))
@@ -1026,7 +1159,7 @@ def test_update_engine_installs_bundle_with_its_libraries(tmp_path, monkeypatch)
                         engine_api(releases, {"b5454": releases[0]["assets"]}))
     monkeypatch.setattr(upd, "download",
                         lambda url, dest, **kw: dest.write_bytes(blob))
-    assert upd.update_engine(upd.WHISPER, tmp_path, "x64", 2) is True
+    assert run_engine(upd.WHISPER, tmp_path) is not None
     bundle = tmp_path / "whisper-server-b5454"
     assert bundle.is_dir(), "the bundle directory must be installed whole"
     assert (bundle / "libwhisper.so.1").is_file(), "libraries must travel with it"
@@ -1039,7 +1172,7 @@ def test_update_engine_installs_bundle_with_its_libraries(tmp_path, monkeypatch)
 
 
 def test_update_engine_backs_up_the_replaced_binary(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Fetch, verify and install one engine.
+    # Validates: docs/install.md, 'The updater installs the engines': Fetch, verify and install one engine.
     make_binary(tmp_path / "audiocpp_server", "old build")
     blob = make_audio_tarball()
     releases = [{"tag_name": "v0.9.2",
@@ -1048,19 +1181,19 @@ def test_update_engine_backs_up_the_replaced_binary(tmp_path, monkeypatch):
                         engine_api(releases, {"v0.9.2": releases[0]["assets"]}))
     monkeypatch.setattr(upd, "download",
                         lambda url, dest, **kw: dest.write_bytes(blob))
-    assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2) is True
+    assert run_engine(upd.AUDIO_CPP, tmp_path) is not None
     assert "old build" in (tmp_path / "audiocpp_server.bak").read_text()
 
 
 def test_update_engine_is_a_noop_when_already_present(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Fetch, verify and install one engine.
+    # Validates: docs/install.md, 'The updater installs the engines': Fetch, verify and install one engine.
     bundle = tmp_path / "audiocpp_server-v0.9.2"
     bundle.mkdir()
     (bundle / "audiocpp_server").write_bytes(b"bin")
     called = []
     monkeypatch.setattr(upd, "gh_api",
                         lambda url: called.append(url) or [])
-    assert upd.update_engine(upd.AUDIO_CPP, tmp_path, "x64", 2, "v0.9.2") is True
+    assert run_engine(upd.AUDIO_CPP, tmp_path, tag="v0.9.2") is not None
     assert called == [], "must not hit the API when the version is already there"
 
 
@@ -1079,14 +1212,18 @@ def test_cleanup_engine_versions_keeps_referenced(tmp_path):
 
 def test_engines_are_opt_in(monkeypatch, tmp_path):
     # A plain run must not touch the audio engines: they install unverified.
-    # Validates: docs/install.md, 'Where an update installs': main.
+    # Validates: docs/install.md, 'Engines not fetched by a bare run': a bare run leaves the unverified engines alone.
     monkeypatch.setattr(upd.sys, "argv", ["update.py"])
     seen = []
-    monkeypatch.setattr(upd, "update_engine",
-                        lambda *a, **k: seen.append(a[0].key))
-    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a: (True, None))
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *a: True)
-    assert upd.main([]) == 0
+
+    def _plan(eng, *a, **k):
+        if eng.key in ("audio", "whisper", "sd"):
+            seen.append(eng.key)
+        return upd.Plan(engine=eng, directory=tmp_path, noop=True,
+                        note="up to date")
+
+    monkeypatch.setattr(upd, "plan_engine", _plan)
+    assert upd.main(["--fetch"]) == 0
     assert seen == []
 
 
@@ -1160,27 +1297,21 @@ def test_main_selects_only_named_targets(tmp_path, monkeypatch, capsys):
     # Validates: docs/install.md, 'The updater command line': only the named targets are selected
     monkeypatch.chdir(tmp_path)
     calls = []
-    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: calls.append("cpp") or (True, None))
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: calls.append("swap") or True)
-    monkeypatch.setattr(upd, "update_engine",
-                        lambda eng, *a, **k: calls.append(eng.key) or True)
-    assert upd.main(["audio"]) == 0
+    _stub_plans(monkeypatch, calls)
+    assert upd.main(["audio", "--fetch"]) == 0
     assert calls == ["audio"]
     assert "audio.cpp" in capsys.readouterr().out
 
 
 def test_bare_run_still_defaults_to_the_verified_pair(tmp_path, monkeypatch,
                                                       capsys):
-    # The other three publish no checksums.txt, so a routine bare run must
-    # not start installing them.
-    # Validates: docs/install.md, 'Where an update installs': main.
+    # A routine bare run must install the serving stack and the tool that
+    # writes its config, not the three engines that publish no checksums.
+    # Validates: docs/install.md, 'The updater command line': no target means llama.cpp and llama-swap.
     monkeypatch.chdir(tmp_path)
     calls = []
-    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: calls.append("cpp") or (True, None))
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: calls.append("swap") or True)
-    monkeypatch.setattr(upd, "update_engine",
-                        lambda eng, *a, **k: calls.append(eng.key) or True)
-    assert upd.main([]) == 0
+    _stub_plans(monkeypatch, calls)
+    assert upd.main(["--fetch"]) == 0
     assert calls == ["cpp", "swap"]
 
 
@@ -1188,11 +1319,8 @@ def test_main_all_selects_every_target(tmp_path, monkeypatch):
     # Validates: docs/install.md, 'The updater command line': all selects every engine
     monkeypatch.chdir(tmp_path)
     calls = []
-    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: calls.append("cpp") or (True, None))
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: calls.append("swap") or True)
-    monkeypatch.setattr(upd, "update_engine",
-                        lambda eng, *a, **k: calls.append(eng.key) or True)
-    assert upd.main(["all"]) == 0
+    _stub_plans(monkeypatch, calls)
+    assert upd.main(["all", "--fetch"]) == 0
     assert set(calls) == set(upd.ALL_TARGETS)
 
 
@@ -1200,8 +1328,6 @@ def test_main_rejects_selector_plus_legacy_only_flag(tmp_path, monkeypatch,
                                                     capsys):
     # Validates: docs/install.md, 'The updater command line': a selector together with the legacy --only flag is refused rather than guessed at
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(upd, "update_llama_cpp", lambda *a, **k: (True, None))
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *a, **k: True)
     assert upd.main(["audio", "--cpp-only"]) == 1
     assert "alternatives" in capsys.readouterr().err
 
@@ -1231,11 +1357,11 @@ def test_sd_is_a_zip_bundle():
     # Validates: docs/backends/audio-cpp.md, 'Build / install': the sd-server asset is a zip bundle.
     sd = upd.STABLE_DIFFUSION
     assert sd.fmt == "zip"
-    assert sd.bundle, "sd-server links against sibling .so via RUNPATH=$ORIGIN"
+    assert sd.kind == "bundle", "sd-server links against sibling .so via RUNPATH=$ORIGIN"
 
 
 def test_zip_extraction_roundtrip(tmp_path):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': the updater owns downloading, sha256 verification and pruning
+    # Validates: docs/install.md, 'The updater installs the engines': the updater owns downloading, sha256 verification and pruning
     import zipfile as _zip
     archive = tmp_path / "rel.zip"
     with _zip.ZipFile(archive, "w") as zf:
@@ -1257,15 +1383,17 @@ def test_llama_swap_honours_arch_override(tmp_path, monkeypatch):
     # --arch used to be silently dropped here, while every other target
     # honoured it -- so `update.py all --arch arm64` installed an x86
     # llama-swap next to arm64 everything else.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Check latest (or requested) release, verify sha256, atomically replace.
+    # Validates: docs/install.md, 'The updater installs the engines': Check latest (or requested) release, verify sha256, atomically replace.
     seen = {}
-    monkeypatch.setattr(upd, "get_llama_swap_arch",
-                        lambda override="": seen.setdefault("arch", override) or "linux_arm64")
-    monkeypatch.setattr(upd, "installed_llama_swap_version", lambda p: 0)
-    monkeypatch.setattr(upd, "latest_llama_swap_tag", lambda: "v999")
-    monkeypatch.setattr(upd, "release_assets", lambda url: {"assets": []})
-    assert upd.update_llama_swap(tmp_path, 2, "v999", "arm64") is False
-    assert seen["arch"] == "arm64"
+
+    def _plan(engine, directory, **kw):
+        seen.update(kw)
+        return upd.Plan(engine=engine, directory=directory, noop=True,
+                        note="up to date")
+
+    monkeypatch.setattr(upd, "plan_engine", _plan)
+    assert upd.main(["swap", "--arch", "arm64", "--fetch", "--dir", f"swap={tmp_path}"]) == 0
+    assert seen["arch"] == "linux_arm64"
 
 
 def test_single_backend_engine_says_it_ignored_the_request(capsys):
@@ -1282,7 +1410,7 @@ def test_latest_cpp_tag_skips_the_assetless_semver_tag(monkeypatch):
     # same day. Taking the newest tag outright returned v0.7.0 and then
     # failed with "Could not find Vulkan asset" — so `update.py` was unable
     # to update llama.cpp at all.
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Newest llama.cpp tag that actually carries a prebuilt Linux asset.
+    # Validates: docs/install.md, 'The updater installs the engines': Newest llama.cpp tag that actually carries a prebuilt Linux asset.
     releases = [
         {"tag_name": "v0.7.0",
          "assets": [{"browser_download_url": "https://x/source.tar.gz"}]},
@@ -1296,7 +1424,7 @@ def test_latest_cpp_tag_skips_the_assetless_semver_tag(monkeypatch):
 
 
 def test_latest_cpp_tag_returns_empty_when_nothing_matches(monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': Newest llama.cpp tag that actually carries a prebuilt Linux asset.
+    # Validates: docs/install.md, 'The updater installs the engines': Newest llama.cpp tag that actually carries a prebuilt Linux asset.
     monkeypatch.setattr(upd, "gh_api",
                         lambda url: [{"tag_name": "v0.7.0", "assets": []}])
     assert upd.latest_llama_cpp_tag("ubuntu-vulkan-x64") == ""
@@ -1367,7 +1495,7 @@ def test_version_sort_key_orders_mixed_naming_schemes():
 # --- one backend table, and no silent fallback to Vulkan -------------------
 
 
-def test_cpu_backend_does_not_install_vulkan():
+def test_cpu_backend_does_not_install_vulkan(tmp_path, monkeypatch):
     """`update.py cpu` used to fetch the Vulkan tarball and say nothing.
 
     DEFAULT_VERSION is "latest-vulkan", and the old folding saw a backend
@@ -1378,19 +1506,30 @@ def test_cpu_backend_does_not_install_vulkan():
     Validates: docs/plans/requirement-trace.md #40: cpu/cuda must not silently install
     Vulkan.
     """
-    assert upd._backend_version(upd.DEFAULT_VERSION, "cpu") == "latest-cpu"
-    assert upd._backend_version(upd.DEFAULT_VERSION, "cuda") == "latest-cuda"
-    assert upd._backend_version(upd.DEFAULT_VERSION, "rocm") == "latest-rocm"
+    seen = {}
+
+    def _plan(engine, directory, **kw):
+        seen.clear()
+        seen.update(kw)
+        return upd.Plan(engine=engine, directory=directory, noop=True,
+                        note="up to date")
+
+    monkeypatch.setattr(upd, "plan_engine", _plan)
+    assert upd.main(["cpu", "--cpp-only", "--fetch", "--dir",
+                     f"cpp={tmp_path}"]) == 0
+    assert seen["backend"] == "cpu"
     # An explicit backend already in the token still wins.
-    assert upd._backend_version("latest-cuda", "cpu") == "latest-cuda"
-    assert upd._backend_version("b11658", "rocm") == "b11658-rocm"
+    assert upd.main(["latest-cuda", "cpu", "--cpp-only", "--fetch", "--dir",
+                     f"cpp={tmp_path}"]) == 0
+    assert seen["backend"] == "cuda"
 
 
 @pytest.mark.parametrize("backend,expected", [
-    ("latest-cpu", "ubuntu-x64"),
-    ("latest-cuda", r"ubuntu-cuda-[^-]*-x64"),
-    ("latest-vulkan", "ubuntu-vulkan-x64"),
-    ("latest-rocm", r"ubuntu-rocm-[^-]*-x64"),
+    ("latest-cpu",
+     r"/llama-[^/]*-bin-ubuntu-(?!vulkan|rocm|cuda)(?:[0-9.]+-)?x64\.tar\.gz$"),
+    ("latest-cuda", r"/llama-[^/]*-bin-ubuntu-cuda-[^-/]*-x64\.tar\.gz$"),
+    ("latest-vulkan", r"/llama-[^/]*-bin-ubuntu-vulkan-x64\.tar\.gz$"),
+    ("latest-rocm", r"/llama-[^/]*-bin-ubuntu-rocm-[^-/]*-x64\.tar\.gz$"),
 ])
 def test_each_backend_matches_its_own_asset(backend, expected):
     # Validates: docs/backends/audio-cpp.md, 'Build / install': each backend matches its own asset, never another's.
@@ -1419,7 +1558,7 @@ def test_cpu_pattern_does_not_match_a_vulkan_asset():
 
 
 def test_already_latest_does_not_claim_an_install(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'The updater is the installer for binaries': llama.cpp half of the run. Returns (ok.
+    # Validates: docs/install.md, 'The updater installs the engines': llama.cpp half of the run. Returns (ok.
     """A no-op run must not report a tag, or main prunes and rewires anyway.
 
     The latest-build path used to discard install_llama_cpp's "installed"
@@ -1429,12 +1568,14 @@ def test_already_latest_does_not_claim_an_install(tmp_path, monkeypatch):
     d = tmp_path / "llama-b11539"
     d.mkdir()
     (d / "llama-server").write_bytes(b"bin")
+    (d / "llama-server").chmod(0o755)
     monkeypatch.setattr(upd, "latest_llama_cpp_tag", lambda _p: "b11539")
-    monkeypatch.setattr(upd, "release_assets", lambda _u: {"assets": [
-        {"browser_download_url": CPP_URL}]})
-    ok, installed = upd.update_llama_cpp(tmp_path, "latest-vulkan", "")
-    assert ok is True
-    assert installed is None, "claimed an install it did not perform"
+    monkeypatch.setattr(upd, "download",
+                        lambda *a, **k: pytest.fail("must not download"))
+    plan = upd.plan_engine(upd.CPP, tmp_path, arch="x64", backend="vulkan")
+    assert plan.noop, "an installed build must not look like an install"
+    assert upd.apply_plan(plan) is True
+    assert not list(tmp_path.glob(".stage-*"))
 
 
 # --- a bad --arch is refused, not interpolated into a regex ----------------
@@ -1535,6 +1676,17 @@ def _clean_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+def test_discovery_ignores_a_venv(tmp_path):
+    # Validates: docs/install.md, 'Where an update installs': an environment is managed by pip/uv, not updated in place.
+    venv = tmp_path / "env"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    make_binary(venv / "bin" / "llama-swap", "x")
+    swap = upd.INSTALL_UNITS["swap"]
+    assert swap.holding_children(tmp_path) == []
+    assert swap.lives_in(venv) is False, "a venv root is not an install"
+
+
 def test_existing_install_is_updated_in_place_from_anywhere(tmp_path, monkeypatch):
     # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
     _clean_env(monkeypatch)
@@ -1614,40 +1766,21 @@ def test_two_installs_in_one_root_are_not_a_guess(tmp_path, monkeypatch, capsys)
 
 
 def test_dir_override_beats_everything(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
+    # Validates: docs/install.md, 'Where an update installs': --dir wins.
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(upd, "load_engines_config",
-                        lambda: (tmp_path, {"audio": str(tmp_path / "from-cfg")}))
 
     dirs = upd.resolve_install_dirs({"audio": str(tmp_path / "explicit")})
 
     assert dirs["audio"] == (tmp_path / "explicit", "--dir")
 
 
-def test_config_beats_discovery(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
-    _clean_env(monkeypatch)
-    monkeypatch.chdir(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    make_binary(home / "audiocpp_server", "audio")
-    monkeypatch.setattr(upd, "_discovery_candidates",
-                        lambda: [home])
-    monkeypatch.setattr(upd, "load_engines_config",
-                        lambda: (None, {"audio": tmp_path / "declared"}))
-
-    assert upd.resolve_install_dirs()["audio"] == (
-        tmp_path / "declared", "engines.ini")
-
-
 def test_bin_dir_env_is_shared_with_llama_packer(tmp_path, monkeypatch):
-    # The packer already resolves $AUDIOCPP_BIN_DIR; one variable, both tools.
-    # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
+    # The packer resolves $AUDIOCPP_BIN_DIR too; one variable, both tools.
+    # Validates: docs/install.md, 'Where an update installs': the same names.
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AUDIOCPP_BIN_DIR", str(tmp_path / "engines"))
-    monkeypatch.setattr(upd, "load_engines_config", lambda: (None, {}))
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
 
     assert upd.resolve_install_dirs()["audio"] == (
@@ -1655,109 +1788,37 @@ def test_bin_dir_env_is_shared_with_llama_packer(tmp_path, monkeypatch):
 
 
 def test_bin_dir_env_accepts_a_binary_path(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
+    # Validates: docs/install.md, 'Where an update installs': a file names its directory.
     _clean_env(monkeypatch)
     binary = tmp_path / "engines" / "whisper-server"
     binary.parent.mkdir()
     make_binary(binary, "server")
     monkeypatch.setenv("WHISPER_BIN_DIR", str(binary))
-    monkeypatch.setattr(upd, "load_engines_config", lambda: (None, {}))
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
 
     assert upd.resolve_install_dirs()["whisper"][0] == tmp_path / "engines"
 
 
-def test_root_takes_over_when_nothing_is_installed(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
+def test_llama_dir_takes_over_when_nothing_is_installed(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': $LLAMA_DIR is the root.
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(upd, "load_engines_config",
-                        lambda: (tmp_path / "tools", {}))
+    monkeypatch.setenv("LLAMA_DIR", str(tmp_path / "declared"))
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
 
     dirs = upd.resolve_install_dirs()
-    assert dirs["audio"] == (tmp_path / "tools", "engines.ini root")
+    assert dirs["audio"] == (tmp_path / "declared", "$LLAMA_DIR")
 
 
-def test_fallback_without_config_or_env_is_the_cwd(tmp_path, monkeypatch):
-    # Validates: docs/install.md, 'Where an update installs': ``{engine key: (directory.
+def test_fallback_without_env_is_the_run_directorys_tools(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': a new install
+    # goes to <run>/tools, whether or not the directory exists yet.
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(upd, "load_engines_config", lambda: (None, {}))
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
 
-    assert upd.resolve_install_dirs()["cpp"] == (tmp_path, "current directory")
-
-
-# --- engines.ini ------------------------------------------------------------
-
-
-def test_engines_config_reads_root_and_per_engine(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': ``(root.
-    cfg = tmp_path / "engines.ini"
-    cfg.write_text(
-        "[engines]\n"
-        "# a comment\n"
-        "root = /tools\n"
-        "audio = /tools/audiocpp\n"
-        "\n"
-        "[other]\n"
-        "root = ignored\n")
-
-    root, engines = upd.load_engines_config(cfg)
-
-    assert root == Path("/tools")
-    assert engines == {"audio": Path("/tools/audiocpp")}
-
-
-def test_engines_config_empty_values_mean_unset(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': ``(root.
-    cfg = tmp_path / "engines.ini"
-    cfg.write_text("[engines]\nroot =\naudio =\n")
-    assert upd.load_engines_config(cfg) == (None, {})
-
-
-def test_engines_config_absent_file_is_not_an_error(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': ``(root.
-    assert upd.load_engines_config(tmp_path / "nope.ini") == (None, {})
-
-
-def test_engines_config_malformed_is_reported_not_fatal(tmp_path, capsys):
-    # Validates: docs/install.md, 'Where an update installs': ``(root.
-    cfg = tmp_path / "engines.ini"
-    cfg.write_text("this is not ini [[[\n")
-    root, engines = upd.load_engines_config(cfg)
-    assert (root, engines) == (None, {})
-    assert "ignoring unreadable" in capsys.readouterr().err
-
-
-def test_engines_config_unknown_engine_is_reported(tmp_path, capsys):
-    # Validates: docs/install.md, 'Where an update installs': ``(root.
-    cfg = tmp_path / "engines.ini"
-    cfg.write_text("[engines]\nnope = /x\n")
-    _, engines = upd.load_engines_config(cfg)
-    assert engines == {}
-    assert "unknown engine" in capsys.readouterr().err
-
-
-def test_shipped_engines_ini_names_only_known_engines(capsys):
-    # Validates: docs/install.md, 'Where an update installs': ``(root.
-    """The committed file is a real deployment's, not a template.
-
-    It must parse cleanly and name nothing the resolver does not know — a
-    typo here silently sends an update to the wrong place, which is exactly
-    the failure the config exists to prevent.
-    """
-    shipped = EXTRAS / "engines.ini"
-    assert shipped.is_file()
-    root, engines = upd.load_engines_config(shipped)
-    assert set(engines) <= set(upd.INSTALL_UNITS)
-    assert capsys.readouterr().err == ""
-    # Whatever it declares, every engine it covers resolves to that directory
-    # rather than falling back to a guess.
-    for key, declared in engines.items():
-        dirs = upd.resolve_install_dirs(config=(root, engines))
-        assert dirs[key][0] == declared, key
+    assert upd.resolve_install_dirs()["cpp"] == (tmp_path / "tools",
+                                                "run directory")
 
 
 # --- CLI surface ------------------------------------------------------------
@@ -1771,17 +1832,172 @@ def test_dir_override_must_be_engine_equals_path():
         upd.parse_dir_overrides(["nope=/x"])
 
 
+def test_a_bare_run_links_what_is_installed_and_never_downloads(
+        tmp_path, monkeypatch, capsys):
+    # Validates: docs/install.md, 'The updater command line': by default the
+    # updater only links what is already installed.
+    entry = tmp_path / "llama-b11539"
+    entry.mkdir()
+    (entry / "llama-server").write_bytes(b"bin")
+    (entry / "llama-server").chmod(0o755)
+    monkeypatch.setattr(upd, "plan_engine",
+                        lambda *a, **k: pytest.fail("must not resolve a release"))
+    monkeypatch.setattr(upd, "gh_api",
+                        lambda *a, **k: pytest.fail("must not touch the network"))
+
+    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
+
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11539/llama-server"
+    assert "linked b11539" in capsys.readouterr().out
+
+    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
+    assert "already linked" in capsys.readouterr().out
+
+
+def test_a_tool_the_service_user_cannot_execute_is_not_linked(
+        tmp_path, monkeypatch, capsys):
+    # Validates: docs/install.md, 'Where an update installs': only a tool the
+    # service account can execute is linked.
+    entry = tmp_path / "llama-b11539"
+    entry.mkdir()
+    (entry / "llama-server").write_bytes(b"bin")
+    (entry / "llama-server").chmod(0o644)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = [str(a) for a in cmd]
+        return type("R", (), {"returncode": 1})()
+
+    monkeypatch.setattr(upd.shutil, "which", lambda _n: "/sbin/runuser")
+    monkeypatch.setattr(upd.subprocess, "run", fake_run)
+    assert upd.main(["cpp", "--user", "svc", "--dir",
+                     f"cpp={tmp_path}"]) == 1
+
+    assert not (tmp_path / "llama-server").exists()
+    assert seen["cmd"][:3] == ["/sbin/runuser", "-u", "svc"]
+    assert "not executable by svc" in capsys.readouterr().err
+
+
+def test_a_tool_the_service_user_can_execute_is_linked(
+        tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': the execute bit
+    # is checked as the service account, not as the caller.
+    entry = tmp_path / "llama-b11539"
+    entry.mkdir()
+    (entry / "llama-server").write_bytes(b"bin")
+    (entry / "llama-server").chmod(0o755)
+    seen = {"runs": 0, "cmd": []}
+
+    def fake_run(cmd, **kw):
+        seen["runs"] += 1
+        seen["cmd"] = [str(a) for a in cmd]
+        return type("R", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+
+    monkeypatch.setattr(upd.shutil, "which", lambda _n: "/sbin/runuser")
+    monkeypatch.setattr(upd.subprocess, "run", fake_run)
+
+    assert upd.main(["cpp", "--user", "svc", "--dir",
+                     f"cpp={tmp_path}"]) == 0
+    assert seen["runs"], "the check must actually ask the account"
+    assert seen["cmd"][:3] == ["/sbin/runuser", "-u", "svc"]
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11539/llama-server"
+
+
+def _installed_build(root, tag, *, mode=0o755):
+    entry = root / f"llama-{tag}"
+    entry.mkdir()
+    binary = entry / "llama-server"
+    binary.write_bytes(b"bin")
+    binary.chmod(mode)
+    return entry
+
+
+def test_link_mode_leaves_a_real_primary_alone(tmp_path, capsys):
+    # Validates: docs/install.md, 'Where an update installs': by default a real
+    # binary is not replaced by a link; --fetch is what installs over it.
+    _installed_build(tmp_path, "b11539")
+    real = tmp_path / "llama-server"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+
+    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
+
+    assert not real.is_symlink(), "a real file is not replaced"
+    assert not (tmp_path / "llama-server.bak").exists()
+    out, err = capsys.readouterr()
+    assert "real file" in out + err
+
+
+def test_a_noop_link_run_does_not_rewrite_the_symlink(tmp_path):
+    # Validates: docs/install.md, 'Where an update installs': a repeated run
+    # touches nothing it does not have to.
+    make_binary(tmp_path / "llama-swap-v262", "stub")
+    os.symlink("llama-swap-v262", tmp_path / "llama-swap")
+    before = (tmp_path / "llama-swap").lstat()
+
+    assert upd.main(["swap", "--dir", f"swap={tmp_path}"]) == 0
+
+    after = (tmp_path / "llama-swap").lstat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino,
+                                                 before.st_mtime_ns)
+
+
+def test_link_mode_falls_back_to_an_executable_older_build(tmp_path, capsys):
+    # Validates: docs/install.md, 'Where an update installs': only an
+    # executable entry is linked, and the newest unusable one is skipped.
+    _installed_build(tmp_path, "b11539", mode=0o644)
+    _installed_build(tmp_path, "b11500", mode=0o755)
+
+    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
+
+    assert os.readlink(tmp_path / "llama-server") == \
+        "./llama-b11500/llama-server"
+    assert "b11539" in capsys.readouterr().err
+
+
+def test_link_mode_refuses_a_pin_that_is_not_installed(tmp_path, capsys):
+    # Validates: docs/install.md, 'The updater command line': a version is
+    # either linked or reported, never silently ignored.
+    _installed_build(tmp_path, "b11539")
+
+    assert upd.main(["cpp", "b9999", "--dir", f"cpp={tmp_path}"]) == 1
+    assert "b9999 is not installed" in capsys.readouterr().err
+
+
+def test_a_pin_is_reported_even_when_a_real_primary_exists(tmp_path, capsys):
+    # Validates: docs/install.md, 'The updater command line': a version is
+    # either linked or reported, never silently ignored.
+    _installed_build(tmp_path, "b11539")
+    real = tmp_path / "llama-server"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+
+    assert upd.main(["cpp", "b9999", "--dir", f"cpp={tmp_path}"]) == 1
+    assert "b9999 is not installed" in capsys.readouterr().out
+
+
+def test_the_gate_fails_closed_when_runuser_is_missing(tmp_path, monkeypatch,
+                                                       capsys):
+    # Validates: docs/install.md, 'Where an update installs': the check runs as
+    # the account, and an unanswerable check is not a pass.
+    _installed_build(tmp_path, "b11539")
+    monkeypatch.setattr(upd.shutil, "which", lambda _n: None)
+
+    assert upd.main(["cpp", "--user", "svc", "--dir",
+                     f"cpp={tmp_path}"]) == 1
+    assert "runuser not found" in capsys.readouterr().err
+    assert not (tmp_path / "llama-server").exists()
+
+
 def test_print_paths_downloads_nothing(tmp_path, monkeypatch, capsys):
     # Validates: docs/install.md, 'The updater command line': --print-paths prints where each engine would be updated and why, and downloads nothing
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
-    monkeypatch.setattr(upd, "update_llama_cpp",
-                        lambda *a, **k: pytest.fail("must not install"))
-    monkeypatch.setattr(upd, "update_llama_swap",
-                        lambda *a, **k: pytest.fail("must not install"))
-    monkeypatch.setattr(upd, "update_engine",
-                        lambda *a, **k: pytest.fail("must not install"))
+    monkeypatch.setattr(upd, "plan_engine",
+                        lambda *a, **k: pytest.fail("must not resolve"))
 
     assert upd.main(["all", "--print-paths"]) == 0
 
@@ -1795,18 +2011,10 @@ def test_main_passes_each_engine_its_own_directory(tmp_path, monkeypatch):
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
-    seen = {}
-    monkeypatch.setattr(
-        upd, "update_llama_cpp",
-        lambda d, *_a, **_k: (seen.__setitem__("cpp", d), (True, None))[1])
-    monkeypatch.setattr(
-        upd, "update_llama_swap",
-        lambda d, *_a, **_k: (seen.__setitem__("swap", d), True)[1])
-    monkeypatch.setattr(
-        upd, "update_engine",
-        lambda eng, d, *_a, **_k: (seen.__setitem__(eng.key, d), True)[1])
-
-    assert upd.main(["all", "--dir", "audio=/srv/audio"]) == 0
+    calls = []
+    seen: dict = {}
+    _stub_plans(monkeypatch, calls, seen)
+    assert upd.main(["all", "--fetch", "--dir", "audio=/srv/audio"]) == 0
     assert seen["audio"] == Path("/srv/audio")
 
 
@@ -1814,7 +2022,7 @@ def test_bad_dir_stops_before_any_download(tmp_path, monkeypatch, capsys):
     # Validates: docs/install.md, 'The updater command line': a bad --dir stops the run before anything is downloaded
     _clean_env(monkeypatch)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(upd, "update_llama_cpp",
+    monkeypatch.setattr(upd, "plan_engine",
                         lambda *a, **k: pytest.fail("must not install"))
     assert upd.main(["cpp", "--dir", "audio"]) == 1
     assert "--dir expects" in capsys.readouterr().err
@@ -1830,13 +2038,12 @@ def test_cpp_install_creates_the_stable_server_link(tmp_path, monkeypatch):
     # Validates: docs/install.md, 'Where an update installs': main.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
-    monkeypatch.setattr(upd, "update_llama_swap", lambda *_a, **_k: True)
     monkeypatch.setattr(
         upd, "gh_api", lambda _url: {"assets": [{"browser_download_url": CPP_URL}]}
     )
     monkeypatch.setattr(upd, "download", stub_download(make_cpp_tarball(), ""))
 
-    assert upd.main(["b11539"]) == 0
+    assert upd.main(["b11539", "--cpp-only", "--fetch"]) == 0
 
     server = tmp_path / "llama-server"
     assert server.is_symlink()
@@ -1852,7 +2059,7 @@ def test_stable_server_link_follows_a_new_build(tmp_path, monkeypatch):
     make_binary(build2 / "llama-server", "server")
     os.symlink("./llama-b11539/llama-server", tmp_path / "llama-server")
 
-    upd.update_llama_cpp_symlinks(tmp_path, "b11600")
+    upd.ensure_links(upd.CPP, tmp_path)
 
     assert os.readlink(tmp_path / "llama-server") == "./llama-b11600/llama-server"
 
@@ -1865,7 +2072,118 @@ def test_a_real_llama_server_file_is_never_replaced(tmp_path, capsys):
     build.mkdir()
     make_binary(build / "llama-server", "server")
 
-    upd.update_llama_cpp_symlinks(tmp_path, "b11600")
+    upd.ensure_links(upd.CPP, tmp_path)
 
     assert not (tmp_path / "llama-server").is_symlink()
     assert "is a real file" in capsys.readouterr().err
+
+
+# --- unified release selection and pruning ---------------------------------
+
+
+def test_release_selection_is_by_channel_word_and_date(monkeypatch):
+    # Validates: docs/install.md, 'The updater installs the engines': stable targets never take a prerelease, flagged releases are skipped, and candidates are ordered by date.
+    releases = [
+        {"tag_name": "v226", "published_at": "2026-05-01T00:00:00Z"},
+        {"tag_name": "v225", "published_at": "2026-05-02T00:00:00Z"},
+        {"tag_name": "v228", "published_at": "2026-05-04T00:00:00Z",
+         "prerelease": True},
+        {"tag_name": "v229", "name": "v229 unusable",
+         "published_at": "2026-05-05T00:00:00Z"},
+        {"tag_name": "v230", "name": "v230 (experimental)",
+         "published_at": "2026-05-06T00:00:00Z"},
+        {"tag_name": "v231", "draft": True,
+         "published_at": "2026-05-07T00:00:00Z"},
+    ]
+    monkeypatch.setattr(upd, "gh_api", lambda _url: releases)
+    assert upd.latest_llama_swap_tag() == "v225"
+
+
+def test_build_channel_accepts_prerelease(monkeypatch):
+    # Validates: docs/install.md, 'The updater installs the engines': build targets take the prereleases their projects mark the binaries as.
+    releases = [
+        {"tag_name": "b2", "prerelease": True,
+         "assets": [{"browser_download_url": WHISPER_URL}]},
+        {"tag_name": "b1", "prerelease": True,
+         "assets": [{"browser_download_url": WHISPER_URL}]},
+    ]
+    monkeypatch.setattr(upd, "gh_api", engine_api(releases))
+    assert upd.resolve_engine_tag(upd.WHISPER, "x64") == "b2"
+
+
+def test_explicit_pin_installs_with_a_warning(tmp_path, monkeypatch, capsys):
+    # Validates: docs/install.md, 'The updater installs the engines': a pinned version is installed as asked, with a warning.
+    blob = make_audio_tarball()
+    payload = {"assets": [{"browser_download_url": AUDIO_URL}],
+               "name": "v0.9.2 (unusable)", "tag_name": "v0.9.2"}
+    monkeypatch.setattr(upd, "gh_api", lambda _url: payload)
+    monkeypatch.setattr(upd, "download",
+                        lambda url, dest, **kw: dest.write_bytes(blob))
+    assert run_engine(upd.AUDIO_CPP, tmp_path, tag="v0.9.2") is not None
+    assert "installing as requested" in capsys.readouterr().err
+    assert (tmp_path / "audiocpp_server-v0.9.2").is_dir()
+
+
+def test_prune_removes_leftovers_and_stale_backup(tmp_path):
+    # Validates: docs/install.md, 'The updater installs the engines': the same pass removes interrupted staging, old quarantines and a .bak whose stable name is a symlink.
+    for tag in ("v1", "v2"):
+        make_binary(tmp_path / f"audiocpp_server-{tag}", tag)
+    os.symlink("audiocpp_server-v2", tmp_path / "audiocpp_server")
+    (tmp_path / "audiocpp_server.bak").write_bytes(b"old")
+    (tmp_path / ".stage-audio-dead").mkdir()
+    older = tmp_path / "_HASH_FAIL_a.tar.gz"
+    newer = tmp_path / "_HASH_FAIL_b.tar.gz"
+    older.write_bytes(b"a")
+    newer.write_bytes(b"b")
+    os.utime(older, (1, 1))
+    os.utime(newer, (2, 2))
+
+    upd.prune_engine(upd.AUDIO_CPP, tmp_path, keep=2)
+
+    assert not (tmp_path / ".stage-audio-dead").exists()
+    assert not older.exists()
+    assert newer.exists(), "the newest quarantine is diagnostic evidence"
+    assert not (tmp_path / "audiocpp_server.bak").exists()
+    assert (tmp_path / "audiocpp_server-v2").exists()
+
+
+def test_prune_runs_even_when_the_engine_is_current(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'The updater installs the engines': pruning runs on a no-op run too, so a tree that drifted converges.
+    bundle = tmp_path / "audiocpp_server-v0.9.2"
+    bundle.mkdir()
+    make_binary(bundle / "audiocpp_server", "audio")
+    os.symlink("audiocpp_server-v0.9.2/audiocpp_server",
+               tmp_path / "audiocpp_server")
+    older = tmp_path / "audiocpp_server-v0.9.1"
+    older.mkdir()
+    make_binary(older / "audiocpp_server", "old")
+    (tmp_path / "audiocpp_server.bak").write_bytes(b"stale")
+    (tmp_path / ".stage-audio-dead").mkdir()
+    monkeypatch.setattr(upd, "gh_api",
+                        lambda _url: pytest.fail("must not hit the API"))
+
+    assert run_engine(upd.AUDIO_CPP, tmp_path, tag="v0.9.2") is not None
+    assert not (tmp_path / "audiocpp_server.bak").exists()
+    assert not (tmp_path / ".stage-audio-dead").exists()
+
+
+def test_plan_prints_versions_and_stops_before_installing(tmp_path, monkeypatch,
+                                                          capsys):
+    # Validates: docs/install.md, 'The updater installs the engines': the plan names current -> candidate, size and destination, and --plan stops there.
+    _clean_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(upd, "_discovery_candidates", lambda: [tmp_path])
+
+    def _engine(engine, directory, *a, **k):
+        return upd.Plan(engine=engine, directory=Path(directory),
+                        current="b11539", tag="b11658", size=38_000_000)
+
+    monkeypatch.setattr(upd, "plan_engine", _engine)
+    monkeypatch.setattr(upd, "apply_plan",
+                        lambda *a, **k: pytest.fail("--plan must not install"))
+
+    assert upd.main(["--plan", "--fetch"]) == 0
+    out = capsys.readouterr().out
+    assert "Plan:" in out
+    assert "b11539 -> b11658" in out
+    assert "38.0 MB" in out

@@ -155,6 +155,16 @@ def test_embeddings_role_flags(make_model):
     assert "--embedding --embd-normalize 2" in entry["cmd"]
 
 
+def test_embeddings_capability_is_advertised(make_model):
+    # Validates: SPEC.md, 'Output Format': an embeddings entry carries
+    # capabilities.embeddings, which llama-swap uses to class it; a chat entry
+    # does not claim it.
+    _, entry = _entry(make_model, "e", role="embeddings")
+    assert entry["capabilities"]["embeddings"] is True
+    _, chat = _entry(make_model, "c", role="chat")
+    assert chat["capabilities"]["embeddings"] is False
+
+
 def test_rerank_role_flags(make_model):
     # Validates: docs/backends/llama-server.md, 'Roles and flags': the rerank role adds --rerank --pooling rank
     _, entry = _entry(make_model, "r", role="rerank")

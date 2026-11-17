@@ -146,6 +146,12 @@ Two constraints act before cost:
 
 ## TTL
 
+`spare` and `ttl` are the same policy in two dimensions: space and time. Both
+exist because the machine has tenants we cannot account for, so both resolve
+conflicts conservatively toward them. `spare` keeps room free; `ttl` gives an
+idle model back. Neither is a performance knob, and neither is a substitute
+for the other.
+
 - Top-level `ttl`, default 3600.
 - A role's `ttl` overrides it; a task's or sidecar's `ttl` overrides the role.
 - `ttl: 0` disables idle unload. TTL never reserves memory.

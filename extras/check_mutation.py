@@ -5,17 +5,18 @@
 
 A test that passes whether or not the code is there does not hold the
 requirement up -- it only appears to. For every requirement this inverts the
-named implementation in a scratch copy of the tree and asserts the named
-tests then FAIL. Restored afterwards, so the working tree is untouched.
+named implementation in a reflinked scratch copy of the tree and asserts the
+named tests then FAIL. The working tree is never written, so a crash cannot
+leave it modified; the copy is removed on exit.
 
 This is the check that would have caught `met_demands`: removing it left
 `require` gating nothing, and no test noticed until I happened to go looking.
 """
+import fnmatch
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -205,78 +206,121 @@ def tests_for(req: int, trace: str) -> list[str]:
     return re.findall(r"`(test_[A-Za-z0-9_]+)`", row.group(1)) if row else []
 
 
+#: Entries a test run never reads: VCS metadata, caches, and the dev engine
+#: artifacts in a checkout that doubles as a deployment.
+SKIP_NAMES = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache",
+              ".mypy_cache", "node_modules"}
+SKIP_GLOBS = ("llama-swap*", "llama-b*", "*.sqlite", "*.sqlite-*")
+
+
+def scratch_copy(dest: Path) -> None:
+    """Copy the tree with reflinks, so the working tree is never written.
+
+    ``cp --reflink=always`` makes this metadata-only on BTRFS; on a filesystem
+    without reflinks it fails and a normal copy is used instead.
+    """
+    sources = [str(e) for e in ROOT.iterdir()
+               if e.name not in SKIP_NAMES
+               and not any(fnmatch.fnmatch(e.name, g) for g in SKIP_GLOBS)]
+    base = ["cp", "-a", *sources, str(dest)]
+    try:
+        subprocess.run([base[0], "--reflink=always", *base[1:]], check=True,
+                       capture_output=True)
+    except subprocess.CalledProcessError:
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir()
+        subprocess.run(base, check=True)
+
+
+def test_index(root: Path) -> dict[str, list[str]]:
+    """``test name -> files defining it``, read once for the whole run."""
+    index: dict[str, list[str]] = {}
+    for path in sorted((root / "tests").rglob("test_*.py")):
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        for name in re.findall(r"^def (test_[A-Za-z0-9_]+)\(", text,
+                               re.MULTILINE):
+            index.setdefault(name, []).append(str(path.relative_to(root)))
+    return index
+
+
+def outcomes(output: str) -> dict[str, set[str]]:
+    """Per-test PASSED/FAILED/ERROR from a pytest run."""
+    seen: dict[str, set[str]] = {}
+    for line in output.splitlines():
+        match = re.search(r"::(test_[A-Za-z0-9_]+)(?:\[[^\]]*\])?\s+"
+                          r"(PASSED|FAILED|ERROR)", line)
+        if match:
+            seen.setdefault(match.group(1), set()).add(match.group(2))
+    return seen
+
+
+#: Fixed name, so a copy left by a crashed run is removed by the next one.
+#: Dot-prefixed and ``.tmp``-suffixed, which matches the backup and VCS
+#: excludes (``.*`` and ``*.tmp``); same filesystem as the repo, so the copy
+#: is a reflink rather than a full write.
+WORK = ROOT.parent / ".mutation-check.tmp"
+
+
 def main() -> int:
     trace = TRACE.read_text()
+    index = test_index(ROOT)
+    shutil.rmtree(WORK, ignore_errors=True)
+    WORK.mkdir()
+    try:
+        scratch_copy(WORK)
+        return _run(trace, index, WORK)
+    finally:
+        shutil.rmtree(WORK, ignore_errors=True)
+
+
+def _run(trace: str, index: dict[str, list[str]], work: Path) -> int:
     bad = 0
     for test_name, (rel, needle, *replacement) in sorted(MUTATIONS.items()):
         row = next((ln for ln in trace.splitlines() if f"`{test_name}`" in ln), "")
         names = [test_name] + [n for n in re.findall(r"`(test_[A-Za-z0-9_]+)`", row) if n != test_name]
-        if not names:
-            print(f"  {test_name} no tests named")
+        missing = [n for n in names if n not in index]
+        if missing:
+            print(f"  {test_name} no tests named: {', '.join(missing)}")
             bad += 1
             continue
-        with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp) / "tree"
-            shutil.copytree(ROOT, work, ignore=shutil.ignore_patterns(
-                ".git", "__pycache__", ".venv", "*.pyc", ".ruff_cache", ".pytest_cache", ".claude", "node_modules"))
-            target = work / rel
-            text = target.read_text()
-            if needle not in text:
-                print(f"  {test_name} MUTATION STALE - anchor not found in {rel}")
-                bad += 1
-                continue
-            target.write_text(text.replace(needle, replacement[0] if replacement else "", 1))
-            # Map each test name to the file that defines it.
-            files = set()
-            for n in names:
-                hit = subprocess.run(
-                    ["grep", "-rlE", rf"^def {n}\(", "tests"],
-                    cwd=work, capture_output=True, text=True, check=False).stdout.split()
-                if not hit:
-                    print(f"          - {n} not found in tests/")
-                    bad += 1
-                    break
-                files.update(hit)
-            else:
-                # Each named test is run on its own: a mutation is only
-                # caught if *that* test fails, not if some sibling in the
-                # same file happens to. A rule with two tests where only
-                # one holds it is a rule half-tested.
-                results = []
-                for n in names:
-                    f = subprocess.run(
-                        ["grep", "-rlE", rf"^def {n}\(", "tests"],
-                        cwd=work, capture_output=True,
-                        text=True, check=False).stdout.split()
-                    r = subprocess.run(
-                        ["python", "-m", "pytest", "-q", "-p",
-                         "no:cacheprovider", *f, "-k", n],
-                        cwd=work, capture_output=True, text=True,
-                        check=False)
-                    # returncode is the reliable signal: 0 = passed, 5 = no
-                    # tests collected, anything else means the test (or its
-                    # collection) failed. Matching words in the last line
-                    # missed an IndentationError, whose usual summary line
-                    # never arrives -- the traceback is the last thing on
-                    # stdout, and "IndentationError" is not the string
-                    # "error".
-                    results.append((n, r.returncode not in (0, 5)))
-                # A requirement is held if *some* named test fails without
-                # the code. Naming several tests does not mean they share a
-                # code path -- --max-context, say, is read both through
-                # _serving_pin() and directly in the slot solve -- so
-                # demanding that every one of them catch one mutation just
-                # measures which accessor got deleted. Per-test detail is
-                # printed regardless, so a test that never catches anything
-                # stays visible rather than quietly riding along.
-                caught = any(ok for _, ok in results)
-                print(f"  {test_name[:52]:<52} "
-                      f"{'CAUGHT' if caught else 'MISSED'}")
-                for n, ok in results:
-                    if not ok:
-                        print(f"          - {n}: other code path")
-                if not caught:
-                    bad += 1
+        original = (ROOT / rel).read_text()
+        if needle not in original:
+            print(f"  {test_name} MUTATION STALE - anchor not found in {rel}")
+            bad += 1
+            continue
+        (work / rel).write_text(original.replace(
+            needle, replacement[0] if replacement else "", 1))
+        files = sorted({f for n in names for f in index[n]})
+        run = subprocess.run(
+            [sys.executable, "-m", "pytest", "-v", "--no-header",
+             "--tb=no", "-p", "no:cacheprovider", *files,
+             "-k", " or ".join(names)],
+            cwd=work, capture_output=True, text=True, check=False)
+        # A mutation may also break collection outright; that is still the
+        # mutation being detected, so fall back to the exit code.
+        seen = outcomes(run.stdout)
+        results = []
+        for n in names:
+            states = seen.get(n, set())
+            results.append((n, bool(states & {"FAILED", "ERROR"})
+                            if states else run.returncode not in (0, 5)))
+        # A requirement is held if *some* named test fails without the code.
+        # Naming several tests does not mean they share a code path --
+        # --max-context, say, is read both through _serving_pin() and directly
+        # in the slot solve -- so demanding that every one of them catch one
+        # mutation just measures which accessor got deleted. Per-test detail
+        # is printed regardless, so a test that never catches anything stays
+        # visible rather than quietly riding along.
+        caught = any(ok for _, ok in results)
+        print(f"  {test_name[:52]:<52} {'CAUGHT' if caught else 'MISSED'}")
+        for n, ok in results:
+            if not ok:
+                print(f"          - {n}: other code path")
+        if not caught:
+            bad += 1
     print("\nall requirements hold" if not bad else f"\n{bad} not holding")
     return 1 if bad else 0
 
