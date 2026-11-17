@@ -32,6 +32,7 @@ The memory model behind routing, capacities and eviction is in
 | Change sampling per request | `filters.setParamsByID` | `profiles:` and sidecar `modes:` |
 | Show modes as models | auto-created aliases in `/v1/models` | `includeAliasesInList: true` (emitted) |
 | Advertise context/tools/vision | `capabilities` badges | sidecar `capabilities:`, `context_length`, `tasks:` |
+| Show a model as Embeddings in the UI | `capabilities.embeddings` class | the `embeddings` role (emitted from the endpoint) |
 | Expose a static model list | `metadata` passthrough | emitted automatically |
 | Tune launch flags fleet-wide | `cmd` rendered from macros | `llama_server.args`, `macros:` |
 | Share paths with systemd | path macros | `models_dirs`, `hf_home` → `config.env` |

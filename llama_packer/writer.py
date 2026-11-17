@@ -628,6 +628,7 @@ def _build_entry(
         "tools": "tools" in [c.lower() for c in caps],
         "reranker": "reranker" in caps_l
                     or model.serves_endpoint(RERANK),
+        "embeddings": model.serves_endpoint(EMBEDDINGS),
         "context": ctx_size,
     }
 

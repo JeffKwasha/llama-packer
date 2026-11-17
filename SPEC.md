@@ -33,7 +33,7 @@ Each model entry produces:
 | `description` | Optional model description |
 | `filters.setParamsByID` | Per-request sampling overrides keyed by `${MODEL_ID}:profile` (global profiles, or a model's own `modes:` when declared). Always nested under `filters:` (see [Sampling Modes](#sampling-modes)) |
 | `metadata` | Pass-through metadata from `.md` frontmatter (excluded: consumed keys) |
-| `capabilities` | Native llama-swap block: `in`/`out` modalities, `tools`, `reranker`, `context` |
+| `capabilities` | Native llama-swap block: `in`/`out` modalities, `tools`, `reranker`, `embeddings`, `context` |
 | `env` | Per-model GPU device pinning (e.g. `ROCR_VISIBLE_DEVICES=0`) |
 | `concurrencyLimit` | Per-model concurrency cap (if declared) |
 
