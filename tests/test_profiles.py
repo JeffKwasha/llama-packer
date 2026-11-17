@@ -45,6 +45,16 @@ def test_check_profiles_names_every_nested_error():
     assert "dirs: retired" in text
 
 
+def test_check_profiles_accepts_llama_server_bin():
+    # Validates: docs/install.md, 'No per-engine configuration is needed':
+    # llama_server.bin is the first tier for the llama.cpp binary.
+    problems = check_profiles({
+        "profiles": {"default": {}},
+        "llama_server": {"bin": "/opt/llama/tools/llama-server"},
+    })
+    assert "bin" not in "\n".join(problems), problems
+
+
 def test_check_profiles_validates_sets_and_retired_routing():
     # Validates: docs/plans/requirement-trace.md, requirement #109
     problems = check_profiles({

@@ -47,6 +47,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
@@ -296,7 +297,8 @@ def newest_build(dir_: Path) -> Path | None:
     return None
 
 
-def install_binaries(r: Runner, dir_: Path, mode: str) -> None:
+def install_binaries(r: Runner, dir_: Path, mode: str,
+                     user: str = "") -> None:
     """Put ``llama-swap`` and a llama.cpp build under *dir_*.
 
     Delegates to ``extras/update.py``, which already owns downloading,
@@ -308,11 +310,10 @@ def install_binaries(r: Runner, dir_: Path, mode: str) -> None:
     generated config and a tree of binaries rather than both mixed together at
     the top level.
 
-    Every engine's directory is pinned with ``--dir``. ``update.py`` otherwise
-    updates each engine *where it finds it*, searching outwards from the cwd --
-    which is right for an operator running it by hand and wrong here: a
-    fresh deployment into a new directory must install into *that* directory,
-    not adopt the engines of whatever parent it happens to sit under.
+    It runs with the run directory as its cwd and without ``--dir``: the
+    updater resolves ``tools/`` from there, and an engine already installed
+    flat in the run directory (the layout that predates ``tools/``) is found
+    and updated in place instead of being duplicated into ``tools/``.
 
     It runs *before* the config is generated, and that ordering is load
     bearing rather than cosmetic: ``find_bin_dir`` resolves the llama
@@ -326,12 +327,71 @@ def install_binaries(r: Runner, dir_: Path, mode: str) -> None:
         logger.info("fetching binaries into %s via extras/update.py "
                     "(set GITHUB_TOKEN for the API rate limit)", target)
         target.mkdir(parents=True, exist_ok=True)
-        pinned: list[str] = []
-        for engine in ("cpp", "swap", "audio", "whisper", "sd"):
-            pinned += ["--dir", f"{engine}={target}"]
-        r.run([sys.executable, str(REPO / "extras" / "update.py"), *pinned],
-              cwd=dir_)
+        extra = ["--user", user] if user else []
+        r.run([sys.executable, str(REPO / "extras" / "update.py"), "all",
+               "--fetch", *extra], cwd=dir_)
     require_binaries(r, dir_)
+
+
+def packer_script(python: str) -> Path:
+    """The console script *python*'s environment gets from the install."""
+    res = subprocess.run(
+        [python, "-c",
+         "import sysconfig; print(sysconfig.get_path('scripts'))"],
+        capture_output=True, text=True, check=False)
+    if res.returncode:
+        raise InstallError(
+            f"could not ask {python} for its scripts directory: "
+            f"{(res.stderr or res.stdout).strip()}")
+    return Path(res.stdout.strip()) / "llama-packer"
+
+
+def install_packer(r: Runner, dir_: Path, source: str = "",
+                   python: str = "") -> None:
+    """Install llama-packer as a package and link its console script.
+
+    A snapshot install, not ``-e``: the checkout is the source at this
+    moment, not something the deployment has to keep. ``--packer-source``
+    takes a path, a wheel, or a pip spec; ``--python`` names the environment
+    that should own the package (default: the one running this script). A
+    distro Python that refuses installs needs an existing uv env or venv.
+    """
+    spec = source or str(REPO)
+    target = python or sys.executable
+    uv = shutil.which("uv")
+    if uv:
+        cmd = [uv, "pip", "install", "--python", target, spec]
+    else:
+        cmd = [target, "-m", "pip", "install", spec]
+    logger.info("installing llama-packer into %s from %s", target, spec)
+    r.run(cmd, capture=True)
+    script = packer_script(target)
+    link = tools_dir(dir_) / "llama-packer"
+    if r.dry_run:
+        print(f"  $ ln -snf {script} {link}")
+        return
+    if not script.is_file():
+        raise InstallError(
+            f"installed llama-packer from {spec}, but no console script at "
+            f"{script}; check the source provides [project.scripts]")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(script.resolve())
+    print(f"  {link} -> {script.resolve()}")
+
+
+def install_updater(r: Runner, dir_: Path) -> None:
+    """Put the updater in ``tools/`` as one of the deployment's tools."""
+    target = tools_dir(dir_) / "update"
+    source = REPO / "extras" / "update.py"
+    if r.dry_run:
+        print(f"  $ copy {source} {target}")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    target.chmod(0o755)
+    print(f"  {target}")
 
 
 def require_binaries(r: Runner, dir_: Path) -> None:
@@ -348,7 +408,7 @@ def require_binaries(r: Runner, dir_: Path) -> None:
             f"{dir_} has no llama-b* build with a llama-server and no "
             "llama-swap (looked in the directory and in its tools/ "
             f"subdirectory); run ./extras/install.py without --binaries skip, "
-            f"or populate it with: ({REPO / 'extras' / 'update.py'} --dir "
+            f"or populate it with: ({REPO / 'extras' / 'update.py'} --fetch --dir "
             f"cpp={tools_dir(dir_)} --dir swap={tools_dir(dir_)})")
 
 
@@ -663,7 +723,7 @@ def start(r: Runner, unit: Path, dir_: Path, listen: str, user: str,
     previous config rather than failing — so a bad repack shows up as
     silently stale ids, not as an error. Better to catch it here.
     """
-    swap = dir_ / "llama-swap"
+    swap = llama_swap_binary(dir_)
     config = dir_ / "config.yaml"
     if not r.dry_run and swap.is_file():
         # As the service user, for the same reason the repack is: the run
@@ -721,14 +781,28 @@ def probe(r: Runner, listen: str, timeout_s: float = _PROBE_TIMEOUT_S) -> None:
 # ── entry point ─────────────────────────────────────────────────────────
 
 
-def find_packer(explicit: str | None) -> str:
+def find_packer(explicit: str | None, dir_: Path | None = None) -> str:
     """Locate the ``llama-packer`` entry point.
 
-    Prefers the repo's own venv so the config is generated by the code in
-    this checkout rather than by whatever is installed system-wide.
+    Prefers the launcher ``extras/update.py`` installed into the run
+    directory's ``tools/``, so the config is generated by the checkout the
+    deployment pinned. Falls back to this repo's venv, then PATH.
     """
     if explicit:
         return explicit
+    if dir_ is not None:
+        local = tools_dir(dir_) / "llama-packer"
+        if local.exists() or local.is_symlink():
+            try:
+                res = subprocess.run([str(local), "--version"],
+                                     capture_output=True, text=True,
+                                     timeout=60, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                res = None
+            if res is not None and res.returncode == 0:
+                return str(local)
+            logger.warning("%s does not run; falling back to another llama-packer",
+                           local)
     venv = REPO / ".venv" / "bin" / "llama-packer"
     if venv.is_file():
         return str(venv)
@@ -778,7 +852,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-home", default=None,
                    help="HF cache root for the config-generation run")
     p.add_argument("--packer", default=None,
-                   help="llama-packer executable (default: this repo's venv)")
+                   help="llama-packer executable (default: <dir>/tools/"
+                        "llama-packer, then this repo's venv, then PATH)")
+    p.add_argument("--packer-source", default="",
+                   help="what to install llama-packer from: a checkout, a "
+                        "wheel, or a pip spec (default: this repo)")
+    p.add_argument("--python", default="",
+                   help="interpreter to install llama-packer into (default: "
+                        "the one running this script). A distro Python that "
+                        "refuses installs needs an existing uv env or venv.")
     p.add_argument("--binaries", choices=("update", "skip"), default="update",
                    help="run extras/update.py in the run directory first "
                         "(default), or leave the binaries already there")
@@ -821,16 +903,18 @@ def main(argv: list[str] | None = None) -> int:
         prepare_dir(r, dir_, args.group)
 
         print("\n== binaries ==")
-        install_binaries(r, dir_, args.binaries)
+        install_binaries(r, dir_, args.binaries, args.user)
 
         print("\n== config ==")
         for md in args.models_dir:
             check_writable(r, Path(md), args.user, "models dir")
+        install_packer(r, dir_, args.packer_source, args.python)
+        install_updater(r, dir_)
         profiles = ensure_profiles(r, dir_, args.user, args.group,
                                    args.profiles)
         if args.agent_guide:
             install_agent_guide(r, dir_, args.user, args.group)
-        generate_config(r, args.user, dir_, args, find_packer(args.packer),
+        generate_config(r, args.user, dir_, args, find_packer(args.packer, dir_),
                         profiles)
 
         print("\n== unit ==")

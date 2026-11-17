@@ -109,14 +109,13 @@ failed, which is the proof that the test holds its rule.
 | test_install::test_verify_unit_ignores_unrelated_unit_failures | `verify_unit` made to raise on any message | fails |
 | test_macros::test_duplicate_name_replaces_previous | the collision warning removed | fails |
 | test_progress::test_progress_noop_under_pytest | both "no bar here" guards removed | fails |
-| test_update::test_audio_cpp_is_a_bundle_because_its_libs_must_travel | the audio-cpp asset's `bundle` flag cleared | fails |
-| test_update::test_cleanup_old_versions_noop_when_not_owner | the ownership guard removed | fails |
+| test_update::test_audio_cpp_is_a_bundle_because_its_libs_must_travel | the audio-cpp asset's `kind` changed to `single` | fails |
+| test_update::test_prune_cpp_noop_when_not_writable | the writability guard removed | fails |
 | test_update::test_cpu_pattern_does_not_match_a_vulkan_asset | the cpu pattern widened | fails |
 | test_update::test_each_backend_matches_its_own_asset[latest-cpu-…] | the cpu pattern widened | fails |
 | test_update::test_prune_swap_keeps_newest_but_never_a_referenced_file | the "still referenced" check inverted | fails |
 | test_update::test_sd_is_a_zip_bundle | the sd-server asset's format changed | fails |
 | test_update::test_sd_tag_pattern_matches_and_rejects | the sd-server tag pattern widened | fails |
-| test_update::test_update_cpp_symlinks_absent_target_is_noop | the missing-target guard removed | fails |
 | test_usage::test_fallback_is_a_bare_minimum_category | `_MIN_CTX_SIZE` changed to 8192 | fails |
 | test_usage::test_keep_protects_from_shedding_without_gating_existence | `kept` dropped from the protected set | fails |
 | test_usage::test_known_capabilities_are_the_ladder_axes | a third ladder axis added | fails |

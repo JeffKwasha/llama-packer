@@ -1,10 +1,13 @@
 # Installing llama-swap under systemd
 
-`extras/install.py` creates the service account, installs the binaries, 
+`extras/install.py` creates the service account, installs the binaries,
 regenerates `config.yaml`, writes a hardened systemd unit, and starts it.
+`<service-user>` and `<service-group>` are yours to choose: the account is
+created if it does not exist, the group must already exist.
 
 ```sh
-sudo ./extras/install.py --user lemonade --group models --models-dir /mnt/ai/models
+sudo ./extras/install.py --user <service-user> --group <service-group> \
+  --models-dir /mnt/ai/models
 ```
 
 Idempotent: it refreshes the binaries, the config and the unit;
@@ -18,7 +21,9 @@ it never recreates the user and never drops an existing config.
 | Account | `useradd --system --no-create-home --shell /usr/sbin/nologin` if absent; added to `render`, `video` and `--group` |
 | Run directory | `<dir>` as `root:<group>` mode `2775` |
 | Profiles | `<dir>/profiles.yaml` created from the bundled default (or `--profiles`) **only when absent**; never overwritten |
-| Binaries | `extras/update.py all`, every engine pinned with `--dir <engine>=<dir>` |
+| Binaries | `extras/update.py all --fetch` with the run directory as cwd; it fills `<dir>/tools` and updates a flat install in place |
+| llama-packer | installed as a package from `--packer-source` (default: this checkout) into the environment named by `--python` (default: the installer's), a snapshot rather than an editable link |
+| The updater | copied to `<dir>/tools/update`, one of the deployment's tools |
 | Config | llama-packer run **as the service user** from `<dir>`, writing `<dir>/config.yaml` and the sibling `config.env` |
 | Agent guide | `docs/profiles-authoring.md` copied to `<dir>/.opencode/skills/profiles-authoring/SKILL.md` (default; `--no-agent-guide` skips it) |
 | Unit | [`extras/llama-swap.service.in`](../extras/llama-swap.service.in) rendered, `systemd-analyze verify`-ed, written to `/etc/systemd/system/llama-swap.service` |
@@ -116,7 +121,7 @@ than failing loudly.
 Either pass it explicitly:
 
 ```sh
-sudo ./extras/install.py --user lemonade --group models \
+sudo ./extras/install.py --user <service-user> --group <service-group> \
   --models-dir /mnt/ai/models --hf-home /mnt/ai/huggingface
 ```
 
@@ -132,13 +137,14 @@ llama-packer resolves **every** host binary — `llama-server` and
 highest first:
 
 1. `--<engine>-server`
-2. `profiles.yaml <engine>.bin`
-3. `$SD_BIN_DIR` / `$WHISPER_BIN_DIR` / `$AUDIOCPP_BIN_DIR` / `$VLLM_BIN_DIR`
-4. **the run directory** — the directory llama-packer is invoked from
+2. `profiles.yaml <engine>.bin` (for llama.cpp, `llama_server.bin`)
+3. `$SD_BIN_DIR` / `$WHISPER_BIN_DIR` / `$AUDIOCPP_BIN_DIR` / `$VLLM_BIN_DIR`,
+   or `$LLAMA_BIN_DIR`
+4. **the run directory's `tools/`**, then the directory itself
 5. `PATH`
 
 Because the installer runs llama-packer *with the run directory as its cwd*,
-step 4 resolves everything placed there by `update.py all`. No `profiles.yaml`
+step 4 resolves everything placed in `tools/` by `update.py all --fetch`. No `profiles.yaml`
 edit, no environment variable, no PATH change.
 
 That step exists because llama.cpp has always been found by scanning the cwd
@@ -164,15 +170,69 @@ which may differ from whatever produced the config being replaced — every
 context, id and capacity allocation can shift. Pass the same `--spare` the current
 config was built with to reproduce it.
 
-## The updater is the installer for binaries
+## The updater installs the engines
 
-`extras/update.py` already owns downloading, sha256 verification and
-pruning, so `install.py` runs it rather than keeping a second copy of that
-logic in step. `--binaries skip` leaves the binaries alone if you have already
-populated the directory. `install.py` passes an explicit `--dir` per engine so
-a fresh deployment installs into *its* run directory rather than adopting
-engines it finds in a parent — see below for how a hand-run update decides
-where to put things.
+`extras/update.py` owns downloading, sha256 verification, installation and
+pruning for the five engines. It does not install llama-packer: that is a
+package install, done by `install.py` (or by hand, see "Installing
+llama-packer"). `--binaries skip` leaves the binaries alone if you have
+already populated the directory. `install.py` runs the updater with the run
+directory as its working directory and no `--dir`, so a fresh deployment
+fills `<dir>/tools` and an engine already installed flat in `<dir>` is
+updated in place rather than duplicated.
+
+Two modes, and the default is the quiet one.
+
+**Link (default).** No network, no download. Each selected target is pointed
+at what is already installed in the run directory, and only if the service
+account can execute it (`--user`, default the invoking user). Nothing
+installed means nothing to do, and the run says so. `tools/update` after an
+install is this mode, so a repeated run touches nothing it does not have to.
+
+**Fetch (`--fetch`).** The install/upgrade pipeline, three phases, all five
+targets:
+
+1. **Plan.** Every selected target is resolved against GitHub *before*
+   anything is downloaded. The plan names each target's current and candidate version,
+   the download size, and where it will land. `--plan` stops here.
+2. **Install.** Download (with a live progress bar on a terminal), verify
+   the hash when the release publishes one, extract into a staging directory
+   on the destination filesystem, then promote by rename.
+3. **Tidy and report.** The stable symlink moves, superseded versions and
+   the leftovers of interrupted runs are removed, and the summary says what
+   was installed and what was already current. Every removal is printed as
+   it happens; the tool does not total up bytes it reclaimed.
+
+**Release selection is by channel and date, not by list order.** Each target
+declares a channel: the upstream *stable* line (llama-swap, audio.cpp,
+stable-diffusion.cpp) or the *build* line (llama.cpp's `bNNNNN`, whisper.cpp's
+`bNNNN`). Stable targets never take a GitHub prerelease. Build targets do,
+because those projects mark every build prerelease while publishing the
+binaries only there. Independently of the channel, a release whose name or tag
+says **experimental**, **do not use**, **unusable** or **broken** is skipped
+(llama-swap ships several such tags), drafts are skipped, and candidates are ordered by
+`published_at` — the API list is not reliably date-ordered. An explicitly
+named version is installed as asked, with a warning when upstream marks it
+experimental or prerelease.
+
+**Pruning is one rule for every target.** The newest *N* versioned entries
+per engine are kept (llama.cpp 3, everything else 2), anything a symlink still
+points at is never removed, and the entries are ordered by their numbers
+rather than their spelling. The same pass removes the files this tool creates
+and then abandons: interrupted `.stage-*` directories, all but the newest
+`_HASH_FAIL_*` quarantine, and the `.bak` copy once the stable name is a
+symlink (the versioned history is the rollback then). Pruning runs on a no-op
+run too, so a tree that drifted converges.
+
+The stable names are derived from the tree, not from what the run intended:
+each run points `<primary>` at the newest *intact* entry it finds. So a run
+killed between the rename and the link is finished by the next one, instead
+of leaving "already installed" permanently beside a stale link.
+
+Two runs in one directory do not overlap: the second waits for the first
+(`flock` on a per-directory lock file under `/tmp`, so nothing is added to
+the tree). Without that, each run would reap the other's `.stage-*` as an
+interrupted leftover.
 
 That does mean **an update needs the GitHub API** (and `GITHUB_TOKEN` for
 the rate limit). There is deliberately no systemd timer for it. A new
@@ -195,20 +255,36 @@ flags. The rules below are the ones the tool's tests hold up.
 - **The tool's own help lists the targets, the flags and the precedence**, and
   an unknown option or a bad value stops the run rather than being ignored.
 - **Targets are positional, first match wins.** `llama`/`ll`, `cpp`,
-  `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, and `all`. `all` must be
-  typed in full — a glob works too, and `s*` selects `swap` and `sd`.
-- **No target means llama.cpp and llama-swap**: the two that publish
-  `checksums.txt`. `all` adds the three that do not.
-- **A version positional belongs to the target it follows.** A bare `v<N>` is
-  a llama-swap version; a `bNNNN` is a llama.cpp build. `--cpp-only` ignores
-  a swap version, and `--swap-only` ignores a build number.
+  `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, and `all`.
+  `all` must be typed in full — a glob works too, and `s*` selects `swap`
+  and `sd`.
+- **No target means llama.cpp and llama-swap**: the serving stack. `all`
+  adds audio.cpp, whisper.cpp and stable-diffusion.cpp.
+- **By default nothing is downloaded.** The run links what is already
+  installed and prunes, and the summary says `linked` rather than
+  `installed`. `--fetch` downloads the newest release.
+- **`--user ACCOUNT`** is the account whose execute permission decides
+  whether a tool may be linked. The check runs as that account, so a binary
+  that exists but is root-only is reported and left unlinked. When the check
+  cannot be made (no `runuser`, not root, no such account) the run says which
+  and links nothing, rather than assuming the answer.
+- **A bare `v<N>` is a llama-swap version; a `bNNNN` is a llama.cpp build.**
+  The other engines are pinned with `--audio-cpp-version`,
+  `--whisper-version` and `--sd-version`, because their tags are not
+  distinguishable from a target name. `--cpp-only` ignores a swap version,
+  and `--swap-only` ignores a build number.
 - **`--swap-only` and `--cpp-only` are mutually exclusive**, and a selector
-  together with the legacy `--only` flag is refused rather than guessed at.
-- **When two version positionals are given, the last one wins**, and a
+  together with one of those flags is refused rather than guessed at.
+- **When two llama.cpp versions are given, the last one wins**, and a
   positional that is not a target is left to the version parser.
-- **`--keep-swap N` / `--keep-engine-versions N`** keep that many old
-  versions. A non-positive count is refused; `KEEP_SWAP_VERSIONS` and
-  `KEEP_ENGINE_VERSIONS` are the environment equivalents.
+- **`--plan` (also spelled `--dry-run`) shows what the run would do and
+  stops**: with `--fetch` the current → candidate versions, size and
+  destination; without it, the link decision. `--print-paths` is the narrower question and stops at the
+  directory.
+- **`--keep-cpp N`, `--keep-swap N` and `--keep-engine-versions N`** keep
+  that many old versions. A non-positive count is refused;
+  `KEEP_SWAP_VERSIONS` and `KEEP_ENGINE_VERSIONS` are the environment
+  equivalents.
 - **`--arch`** overrides the detected architecture (`x64`/`amd64`/`linux_amd64`,
   `arm64`/`aarch64`/`linux_arm64`, `s390x`). A bad value is refused at parse
   time, and an architecture the tool does not know is refused rather than
@@ -223,9 +299,10 @@ flags. The rules below are the ones the tool's tests hold up.
   one.
 - **A release tag the release list does not carry is an error**, not a
   silent skip.
-- **`checksums.txt` is verified when the release publishes one.** When it does
-  not, the install says plainly that the download was unverified rather than
-  pretending to a check it could not do.
+- **`checksums.txt` is verified when the release publishes one.** llama-swap
+  is the only target that does; the rest install from an immutable tag URL
+  over TLS, and the install says plainly that the download was unverified
+  rather than pretending to a check it could not do.
 - **`--require-checksums` refuses an archive the release did not checksum**,
   where the default install warns that the download was unverified.
 - **The newest is kept by number, not by spelling**: `master-1000` outranks
@@ -237,15 +314,21 @@ flags. The rules below are the ones the tool's tests hold up.
 
 ## Where an update installs
 
-An engine is updated **in the directory it is already installed in**, not in
-the directory you happened to run the command from. `update.py` searches
-outwards from the cwd for an existing install — a `llama-b*/` build, an
-`audiocpp_server`, a `whisper-server`, and for the hand-made layouts that
-predate it, one of those nested one or two levels down — and updates the one
-it finds. Running it from `$HOME` and from the engine's own directory now
-produce the same result, and running it from the wrong place no longer
-installs a second copy of an engine you already have. Where two directories
-in one root both hold the same engine, it says so and refuses to guess.
+The location comes from where the command was run, never from where the
+script lives. Run `tools/update` from the install directory and it updates
+`<install>/tools`; run it from `tools` itself and it updates that directory.
+Those are the same place, which is what lets the copied updater be moved or
+renamed without breaking anything.
+
+Inside that directory an engine is updated **where it already is**: a
+`llama-b*/` build, an `audiocpp_server`, a `whisper-server`, and for the
+hand-made layouts that predate `tools/`, one of those nested one or two
+levels down. `tools/` first, then the install directory itself. Running it
+from the install directory and from `tools/` produce the same result, because
+they name the same directory; running it somewhere else installs into *that*
+directory's `tools/`, which is why the deployment's copy is the one to run.
+Where two directories in one root both hold the same engine, it warns and
+updates the directory that holds them rather than picking one of the two.
 
 Each engine keeps its history beside the current one and is reached through a
 stable name, so moving forward or rolling back is a single symlink:
@@ -254,8 +337,10 @@ stable name, so moving forward or rolling back is a single symlink:
 tools/llama-swap       -> llama-swap-v266
 tools/llama-server     -> ./llama-b12345/llama-server
 tools/whisper-server   -> ./whisper-server-b4938/whisper-server
-tools/audiocpp_server  -> audiocpp_server-v0.9.2
+tools/audiocpp_server  -> audiocpp_server-v0.9.2/audiocpp_server
 tools/sd-server        -> ./sd-server-master-968-abc/sd-server
+tools/llama-packer     -> <interpreter>/bin/llama-packer
+tools/update                                a copy of extras/update.py
 ```
 
 In a deployment that is the `tools/` subdirectory of the run directory:
@@ -263,8 +348,42 @@ In a deployment that is the `tools/` subdirectory of the run directory:
 ```
 /opt/llama/
 ├── config.yaml  config.env          generated, replaced on every pack
-└── tools/                            engines; update.py owns this tree
+└── tools/                            engines, llama-packer and update.py
 ```
+
+`llama-packer` and `update` have no versioned entries of their own.
+llama-packer is an ordinary package install into the active interpreter — a
+snapshot, not an editable link, so the checkout it came from is not needed
+afterwards — and the launcher is a symlink to that interpreter's console
+script. `update` is a byte-for-byte copy of `extras/update.py`, placed by the
+installer as one of the deployment's tools. It is a copy rather than a link
+on purpose: the deployment must keep working when the checkout moves or is
+not on that host. A run of `tools/update` uses only the directory it was run
+from, never the path it was installed from.
+
+## Installing llama-packer
+
+The installer does this for you, and it is also a one-line manual step:
+
+```bash
+uv pip install /path/to/llama-packer            # a checkout, as a snapshot
+uv pip install git+https://github.com/JeffKwasha/llama-packer@main
+```
+
+Run them inside the environment that should own the package (`uv venv` first,
+or an existing uv env). A snapshot, never `uv pip install -e`: an editable install leaves a pointer
+into a development directory that must then survive forever. `install.py`
+accepts `--packer-source PATH|URL` for either form, and links the resulting
+console script into `<dir>/tools/llama-packer`. `--python` names the
+environment that should own the package; a distro Python that refuses installs
+needs an existing uv env or venv.
+
+`extras/install.py` generates the config with that launcher when it runs:
+`<dir>/tools/llama-packer --version` exiting zero is what "it runs" means, so
+a deployment is packed by the checkout it pinned rather than by whatever the
+operator's `PATH` resolves. A launcher that is absent, or that does not run,
+is reported and the search continues with this checkout's `.venv`, then
+`PATH`; `--packer PATH` skips the search.
 
 `llama-packer` looks in `tools/` before the run directory itself
 (`llama_packer/utils.py:binary_search_dirs`), so a deployment can keep several
@@ -280,20 +399,23 @@ downloads nothing:
 ```
 
 To settle a directory explicitly, in order of precedence: `--dir
-audio=/path` for one run, an `[engines]` entry in `extras/engines.ini`, or
-`$AUDIOCPP_BIN_DIR` and its equivalents — the same variables llama-packer
-resolves with, so one export configures both tools. Engines with no existing
-install and no configuration go to `[engines] root`, then `$LLAMA_DIR`, then
-the cwd.
+audio=/path` for one run, or `$AUDIOCPP_BIN_DIR` and its equivalents — the
+same variables llama-packer resolves with, so one export configures both
+tools. An engine with no existing install goes to `$LLAMA_DIR`, then the run
+directory's `tools/`. There is no config file: llama-packer reads
+`profiles.yaml` for the same paths, and an engine somebody installed with
+their own package manager stays under that tool's management.
 
 ## Engines not fetched by a bare run
 
 `extras/update.py all` fetches llama.cpp, llama-swap, audio.cpp,
-whisper.cpp and stable-diffusion.cpp, so with that run the run directory
-holds every engine and nothing needs pointing anywhere else. A bare
-`extras/update.py` fetches only llama.cpp + llama-swap, in which case the
-other engines are still configured by path — [docs/backends/audio-cpp.md](backends/audio-cpp.md)
-has the detail. Point at them however you prefer:
+whisper.cpp and stable-diffusion.cpp, so with that run the run directory holds
+every engine and nothing needs pointing anywhere else. A bare
+`extras/update.py` has nothing to fetch by default; `--fetch` gets llama.cpp
+and llama-swap, in which case the other engines are still configured by
+path —
+[docs/backends/audio-cpp.md](backends/audio-cpp.md) has the detail. Point at
+them however you prefer:
 
 ```yaml
 # profiles.yaml
@@ -347,7 +469,7 @@ with the installed profiles file, so re-packing by hand should match:
 
 ```sh
 cd /opt/llama
-sudo -u lemonade llama-packer --models-dir /mnt/ai/models \
+sudo -u <service-user> llama-packer --models-dir /mnt/ai/models \
   --profiles profiles.yaml --output /opt/llama/config.yaml
 ```
 

@@ -614,7 +614,7 @@ class Model:
         "tasks",
     })
 
-    # Known pass-through metadata keys (documented in models_AGENTS.md)
+    # Known pass-through metadata keys (documented in AGENTS.md)
     # Any frontmatter key not in FIELDS and not in this set triggers a warning
     # but still flows through as metadata (elegance over backwards compat).
     KNOWN_METADATA: ClassVar[frozenset[str]] = frozenset({

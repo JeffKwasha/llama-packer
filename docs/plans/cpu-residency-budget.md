@@ -523,7 +523,7 @@ description grammar; mem-tag `+`/`SSD`/RAM rules unchanged.
   shape of the VRAM two-tier section; refusal/over-budget wording shared.
 - `docs/backends/llama-server.md`: `-ngl 0` note now states the budget rule
   off the host pool, not "CPU-resident are free."
-- `templates/models_AGENTS.md`: `device: cpu` sidecar example.
+- `templates/AGENTS.md`: `device: cpu` sidecar example.
 - `profiles.yaml.example`: `hardware:` host-pool keys with the resolution
   table as comments.
 

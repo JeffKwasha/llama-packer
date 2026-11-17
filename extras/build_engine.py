@@ -15,8 +15,8 @@ up serving a binary nobody can account for:
   ``update.py`` does behind your back, and ``--dry-run`` prints the whole plan
   (fetch URL, cmake invocation, where the artifacts land) before spending it.
 * **Shape.** The result is installed exactly like a download: a versioned entry
-  beside the engine's stable symlink, in the same directory ``engines.ini``
-  names, pruned by the same rules. A source build and a prebuilt one are
+  beside the engine's stable symlink, in the run directory's ``tools/``,
+  pruned by the same rules. A source build and a prebuilt one are
   interchangeable from every other tool's point of view.
 
 Why an engine needs this at all: the R9700 is **gfx1201**, which the stock
@@ -47,8 +47,6 @@ from pathlib import Path
 import update as upd
 
 HERE = Path(__file__).resolve().parent
-CONFIG_NAME = upd.CONFIG_NAME
-
 
 class BuildError(RuntimeError):
     """A build that cannot proceed, or that produced something unusable."""
@@ -583,8 +581,7 @@ def resolve_dir(args: argparse.Namespace) -> Path:
     """
     overrides = upd.parse_dir_overrides(
         [f"{args.engine}={args.dir}"] if args.dir else [])
-    root, per_engine = upd.load_engines_config()
-    return upd.resolve_install_dirs(overrides, (root, per_engine))[args.engine][0]
+    return upd.resolve_install_dirs(overrides)[args.engine][0]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -617,8 +614,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jobs", type=int, default=0,
                         help="parallel build jobs (default: all cores)")
     parser.add_argument("--dir", metavar="PATH",
-                        help="install directory (default: what "
-                             f"{CONFIG_NAME} and discovery resolve)")
+                        help="install directory (default: the run "
+                             "directory's tools/)")
     parser.add_argument("--rebuild", action="store_true",
                         help="replace an existing build of the same name")
     parser.add_argument("--from-build", metavar="DIR",

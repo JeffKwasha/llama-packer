@@ -376,11 +376,14 @@ doubles generation speed. Shedding a draft is opt-in per model
 ### Backend resources and macros
 
 `llama_server`, `vllm`, `sd`, `whisper`, and `audio_cpp` hold fleet-wide
-`args:` and backend resources (`bin`, `image`, `docker_args`, …).
+`args:` and backend resources (`bin`, `image`, `docker_args`, …). `bin:` is
+the first tier for every host binary, above the environment and the run
+directory; it accepts a file or a directory.
 `macros:` defines named flag chunks usable as `${NAME}` in `cmd`.
 
 ```yaml
 llama_server:
+  bin: /opt/llama/tools/llama-server   # or a llama-bNNNN directory
   args: "--flash-attn on"
   ubatch: 512
 

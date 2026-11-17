@@ -401,7 +401,6 @@ def test_dry_run_prints_the_plan_and_downloads_nothing(tmp_path, monkeypatch,
     monkeypatch.setenv("ROCM_PATH", str(rocm))
     monkeypatch.setattr(bld.upd, "download",
                         lambda *a, **k: pytest.fail("must not fetch"))
-    monkeypatch.setattr(bld.upd, "load_engines_config", lambda: (None, {}))
 
     rc = bld.main(["audio", "--ref", "v0.9.2", "--backend", "hip",
                    "--gpu-targets", "gfx1201", "--dir", str(tmp_path / "t"),
@@ -418,7 +417,6 @@ def test_dry_run_prints_the_plan_and_downloads_nothing(tmp_path, monkeypatch,
 def test_a_build_that_cannot_succeed_does_not_start(tmp_path, monkeypatch):
     # Validates: docs/build-engine.md, 'The toolchain': the toolchain is checked before anything is fetched
     monkeypatch.setenv("ROCM_PATH", str(tmp_path / "nowhere"))
-    monkeypatch.setattr(bld.upd, "load_engines_config", lambda: (None, {}))
     monkeypatch.setattr(bld, "install_built",
                         lambda *a, **k: pytest.fail("must not build"))
 

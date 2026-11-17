@@ -314,7 +314,7 @@ def test_min_context_is_a_consumed_field(make_model):
 
 
 def test_audio_keys_are_consumed_fields(make_model, caplog):
-    # documented sidecar keys (models_AGENTS.md): vram_mb pins fixed-overhead
+    # documented sidecar keys (AGENTS.md): vram_mb pins fixed-overhead
     # VRAM (vram.py/writer.py), audio_cpp drives AudioCppBackend.build_cmd.
     # Neither may warn nor leak to clients as metadata.
     # Validates: SPEC.md, 'Model Metadata': the audio-cpp keys are consumed by the builder.

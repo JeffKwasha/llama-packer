@@ -69,7 +69,7 @@ _HARDWARE_KEYS = {
     "host_pressure", "cgroup_dir",
 }
 _BACKEND_KEYS = {
-    "llama_server": {"args", "batch", "ubatch"},
+    "llama_server": {"bin", "args", "batch", "ubatch"},
     "vllm": {"image", "bin", "docker_args", "podman_args", "container_args",
              "container_port", "container_vendor", "gpu_mem_util", "hf_cache",
              "args"},

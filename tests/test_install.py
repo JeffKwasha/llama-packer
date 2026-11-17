@@ -289,6 +289,7 @@ def test_install_binaries_pins_every_engine_to_the_run_dir(tmp_path):
     class Recorder(ins.Runner):
         def run(self, cmd, **kwargs):
             seen["cmd"] = cmd
+            seen["cwd"] = kwargs.get("cwd")
 
     build = ins.tools_dir(tmp_path) / "llama-b11658"
     build.mkdir(parents=True)
@@ -296,11 +297,70 @@ def test_install_binaries_pins_every_engine_to_the_run_dir(tmp_path):
     make = ins.tools_dir(tmp_path) / "llama-swap"
     make.write_text("x")
 
-    ins.install_binaries(Recorder(False), tmp_path, "update")
+    ins.install_binaries(Recorder(False), tmp_path, "update", "svc")
 
     cmd = seen["cmd"]
-    for engine in ("cpp", "swap", "audio", "whisper", "sd"):
-        assert f"{engine}={ins.tools_dir(tmp_path)}" in cmd, engine
+    assert "--dir" not in cmd, "the run directory resolves tools/ by itself"
+    assert "packer=" not in " ".join(cmd), "the updater does not install llama-packer"
+    assert "--fetch" in cmd, "a bare update only links; the installer fetches"
+    assert seen["cwd"] == tmp_path, "resolution must start in the run directory"
+
+
+def test_install_packer_installs_a_snapshot_and_links_its_launcher(
+        tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'What it does': llama-packer is installed as a
+    # package by the installer, not by the updater.
+    seen = {}
+    script = tmp_path / "env" / "bin" / "llama-packer"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(ins.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(ins, "packer_script", lambda _py: script)
+
+    class Recorder(ins.Runner):
+        def run(self, argv, **kw):
+            seen["cmd"] = [str(a) for a in argv]
+            return None
+
+    ins.install_packer(Recorder(False), tmp_path, str(tmp_path / "src"))
+    assert "-e" not in seen["cmd"]
+    assert seen["cmd"][-1] == str(tmp_path / "src")
+    assert seen["cmd"][1:3] == ["-m", "pip"]
+    link = ins.tools_dir(tmp_path) / "llama-packer"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(script.resolve())
+
+
+def test_install_packer_can_target_another_interpreter(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'What it does': a distro Python that refuses
+    # installs is bypassed with --python, and the launcher comes from that env.
+    script = tmp_path / "uv-env" / "bin" / "llama-packer"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\n")
+    seen = {}
+    monkeypatch.setattr(ins.shutil, "which", lambda _n: "/usr/bin/uv")
+    monkeypatch.setattr(ins, "packer_script", lambda py: script)
+
+    class Recorder(ins.Runner):
+        def run(self, argv, **kw):
+            seen["cmd"] = [str(a) for a in argv]
+            return None
+
+    ins.install_packer(Recorder(False), tmp_path, str(tmp_path / "src"),
+                       python="/opt/uv/env/bin/python")
+    py = seen["cmd"].index("--python")
+    assert seen["cmd"][py + 1] == "/opt/uv/env/bin/python"
+    assert os.readlink(tmp_path / "tools" / "llama-packer") == str(script)
+
+
+def test_install_updater_copies_itself_into_tools(tmp_path):
+    # Validates: docs/install.md, 'Where an update installs': update is one of
+    # the deployment's tools.
+    ins.install_updater(ins.Runner(False), tmp_path)
+    target = ins.tools_dir(tmp_path) / "update"
+    assert target.is_file()
+    assert target.read_bytes() == (EXTRAS / "update.py").read_bytes()
+    assert target.stat().st_mode & 0o111
 
 
 def test_binaries_go_in_the_tools_subdirectory(tmp_path):
@@ -386,7 +446,7 @@ def test_config_is_generated_from_the_run_directory(tmp_path, monkeypatch):
     # Validates: docs/install.md, 'Running llama-packer afterwards': Run llama-packer as the service user to (re)write the config. As the service user rather than root, so the ``derived:`` blocks it.
     seen = {}
     monkeypatch.setattr(ins, "REPO", tmp_path / "repo")
-    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    monkeypatch.setattr(ins, "find_packer", lambda e, d=None: "llama-packer")
     (tmp_path / "repo").mkdir()
     opt = tmp_path / "opt"
     opt.mkdir()
@@ -418,7 +478,7 @@ def test_install_does_not_invent_hf_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HF_HOME", "/should/not/be/used")
     seen = {}
     monkeypatch.setattr(ins, "REPO", Path("/repo"))
-    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    monkeypatch.setattr(ins, "find_packer", lambda e, d=None: "llama-packer")
 
     class _R:
         dry_run = False
@@ -444,7 +504,7 @@ def test_install_does_not_invent_hf_home(monkeypatch, tmp_path):
 def test_install_passes_hf_home_through(monkeypatch, tmp_path):
     # Validates: docs/install.md, 'Running llama-packer afterwards': Run llama-packer as the service user to (re)write the config. As the service user rather than root, so the ``derived:`` blocks it.
     seen = {}
-    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    monkeypatch.setattr(ins, "find_packer", lambda e, d=None: "llama-packer")
 
     class _R:
         dry_run = False
@@ -697,6 +757,80 @@ def test_existing_group_proceeds(tmp_path, monkeypatch):
     assert set(added) == set(ins._GPU_GROUPS), added
 
 
+# --- finding llama-packer --------------------------------------------------
+
+
+class _Completed:
+    """The slice of ``subprocess.CompletedProcess`` the probe reads."""
+
+    def __init__(self, returncode: int):
+        self.returncode = returncode
+
+
+def test_find_packer_probes_the_deployments_own_launcher(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': `extras/install.py` generates the config with that launcher when it runs: `<dir>/tools/llama-packer --version` exiting zero is what "it runs" means.
+    launcher = ins.tools_dir(tmp_path) / "llama-packer"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return _Completed(0)
+
+    monkeypatch.setattr(ins.subprocess, "run", fake_run)
+    assert ins.find_packer(None, tmp_path) == str(launcher)
+    assert seen["cmd"] == [str(launcher), "--version"]
+
+
+def test_find_packer_reports_a_launcher_that_does_not_run(
+        tmp_path, monkeypatch, caplog):
+    # Validates: docs/install.md, 'Where an update installs': A launcher that is absent, or that does not run, is reported and the search continues with this checkout's `.venv`, then `PATH`.
+    launcher = ins.tools_dir(tmp_path) / "llama-packer"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("x")
+    monkeypatch.setattr(ins.subprocess, "run", lambda *a, **k: _Completed(1))
+    monkeypatch.setattr(ins, "REPO", tmp_path / "repo")
+    monkeypatch.setattr(ins.shutil, "which", lambda _n: "/usr/bin/llama-packer")
+    with caplog.at_level("WARNING", logger="install"):
+        assert ins.find_packer(None, tmp_path) == "/usr/bin/llama-packer"
+    assert "does not run" in caplog.text
+
+
+def test_find_packer_falls_back_from_a_dangling_launcher_symlink(
+        tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': A launcher that is absent, or that does not run, is reported and the search continues with this checkout's `.venv`, then `PATH`.
+    launcher = ins.tools_dir(tmp_path) / "llama-packer"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(tmp_path / "gone" / "llama-packer")
+    venv = tmp_path / "repo" / ".venv" / "bin" / "llama-packer"
+    venv.parent.mkdir(parents=True)
+    venv.write_text("x")
+
+    def boom(*a, **k):
+        raise OSError("cannot execute")
+
+    monkeypatch.setattr(ins.subprocess, "run", boom)
+    monkeypatch.setattr(ins, "REPO", tmp_path / "repo")
+    assert ins.find_packer(None, tmp_path) == str(venv)
+
+
+def test_explicit_packer_wins_over_every_other_candidate(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': `--packer PATH` skips the search.
+    monkeypatch.setattr(ins.subprocess, "run",
+                        lambda *a, **k: pytest.fail("probed the launcher"))
+    assert ins.find_packer("/opt/bin/llama-packer", tmp_path) == \
+        "/opt/bin/llama-packer"
+
+
+def test_find_packer_refuses_when_nothing_resolves(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'Where an update installs': A launcher that is absent, or that does not run, is reported and the search continues with this checkout's `.venv`, then `PATH`.
+    monkeypatch.setattr(ins, "REPO", tmp_path / "repo")
+    monkeypatch.setattr(ins.shutil, "which", lambda _n: None)
+    with pytest.raises(ins.InstallError, match="not found"):
+        ins.find_packer(None, tmp_path)
+
+
 # --- installed profiles.yaml ----------------------------------------------
 
 
@@ -752,7 +886,7 @@ def test_generate_config_uses_the_installed_profiles_path(monkeypatch, tmp_path)
     # Validates: docs/install.md, 'profiles.yaml is yours': re-packing reads
     # the run directory's copy, not the repo source.
     seen = {}
-    monkeypatch.setattr(ins, "find_packer", lambda e: "llama-packer")
+    monkeypatch.setattr(ins, "find_packer", lambda e, d=None: "llama-packer")
     monkeypatch.setattr(ins, "report_resolved", lambda _d: None)
 
     class _R:
