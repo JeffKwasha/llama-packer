@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
-"""gpu-vram-monitor: local VRAM usage API for validating estimation.
-
-Samples global VRAM every 15 seconds, keeps 5 minutes of history, serves
-it as JSON. Run alongside a model load to measure the actual VRAM cost of a
-serving configuration.
-
-Per-process VRAM is NOT available on this hardware for Vulkan workloads,
-verified by checking every available source:
-
-  - amd-smi process: only tracks ROCm/HIP, reports "No running processes
-    detected" for Vulkan (Mesa/RADV) workloads
-  - /sys/kernel/debug/dri/client-*/: files are proc_info, vm_pagetable_info,
-    device — no per-client VRAM file on this kernel
-  - amdgpu_vram_mm (card-level): global allocator state, not per-process
-  - umr: requires secure boot disabled (not available without reboot)
-  - amdgpu_top: not installed (and is a TUI, not an API)
-  - /proc/<pid>/: no per-process GPU memory exposed by the kernel for amdgpu
-
-The "processes" list is a contamination check: it tells you who else had the
-GPU open during the sample so a delta that looks wrong can be explained.
-The global counter before/after the load is the actual measurement.
-
-To get per-process VRAM, either:
-  - Kill other GPU users first (isolate the measurement)
-  - Install umr + disable secure boot (reboot required)
-  - Use amd-smi for ROCm/HIP processes only (not Vulkan)
-
-Usage:
-    ./extras/gpu_vram_monitor.py [--port 18099] [--interval 15] [--history 300]
-
-API:
-    GET /current          latest sample
-    GET /history?from=T&to=T   samples in [from, to] (epoch seconds, optional)
-    GET /health           "ok"
-"""
+"""Local VRAM JSON API. See docs/memory-and-eviction.md §Live VRAM attribution."""
 
 import argparse
 import json
@@ -62,21 +28,108 @@ def read_sysfs(path):
 DEBUGFS_CARD = "/sys/kernel/debug/dri/0000:2d:00.0"
 
 
-def sample_gpu_processes():
-    """Per-process VRAM from amdgpu debugfs.
+def _fdinfo_kv(path):
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return {}
+    out = {}
+    for line in lines:
+        key, sep, value = line.partition(":")
+        if sep:
+            out[key.strip()] = value.strip()
+    return out
 
-    The kernel exposes per-client VRAM accounting under
-    /sys/kernel/debug/dri/<card>/client-<id>/amdgpu_vram_mm, which contains
-    a "usage:" line giving that client's VRAM allocation in bytes. The
-    client ID is mapped to a PID via the "clients" file in the same directory.
 
-    This is the only per-process VRAM source on this hardware for Vulkan
-    workloads. It requires root (debugfs is mode 0700). Without root, the
-    global counter (read_sysfs) is still available but per-process
-    attribution is not.
+def _mib(value):
+    """An fdinfo size like '711892 KiB' in MiB; None when unusable."""
+    if not value:
+        return None
+    parts = value.split()
+    try:
+        number = float(parts[0])
+    except ValueError:
+        return None
+    unit = parts[1].upper() if len(parts) > 1 else "KIB"
+    if unit == "KIB":
+        number /= 1024
+    elif unit == "B":
+        number /= 1024 * 1024
+    elif unit not in ("MIB", "MB"):
+        return None
+    return round(number, 1)
 
-    Returns a list of {pid, name, vram_mib} dicts.
+
+def sample_gpu_processes_fdinfo(proc_root="/proc"):
+    """Per-process VRAM from DRM fdinfo, no root and no debugfs.
+
+    Every fd on a DRM or KFD node carries `drm-client-id` plus resident VRAM
+    and GTT sizes. Several fds on one client are one allocation, so dedupe by
+    (pid, client) and sum distinct clients in a process. Processes the caller
+    cannot read are skipped; they show up in the debugfs fallback when root
+    is available, or not at all.
     """
+    root = Path(proc_root)
+    seen: set[tuple[int, str]] = set()
+    per_pid: dict[int, dict] = {}
+    for pid_dir in root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        pid = int(pid_dir.name)
+        try:
+            fds = list((pid_dir / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            node = Path(target).name
+            if not node.startswith(("renderD", "card", "kfd")):
+                continue
+            info = _fdinfo_kv(pid_dir / "fdinfo" / fd.name)
+            client = info.get("drm-client-id") or info.get("pasid") or fd.name
+            key = (pid, client)
+            if key in seen:
+                continue
+            seen.add(key)
+            vram = _mib(info.get("drm-resident-vram")
+                        or info.get("drm-total-vram"))
+            gtt = _mib(info.get("drm-resident-gtt")
+                       or info.get("drm-total-gtt"))
+            if vram is None and gtt is None:
+                continue
+            entry = per_pid.setdefault(pid, {
+                "pid": pid,
+                "name": (pid_dir / "comm").read_text().strip()
+                if (pid_dir / "comm").is_file() else "?",
+                "vram_mib": 0.0, "gtt_mib": 0.0,
+            })
+            entry["vram_mib"] += vram or 0.0
+            entry["gtt_mib"] += gtt or 0.0
+    procs = sorted(per_pid.values(), key=lambda p: p["vram_mib"], reverse=True)
+    for proc in procs:
+        proc["vram_mib"] = round(proc["vram_mib"], 1)
+        proc["gtt_mib"] = round(proc["gtt_mib"], 1)
+    return procs
+
+
+def sample_gpu_processes_with_source():
+    """``(processes, source)`` so callers can judge attribution coverage."""
+    procs = sample_gpu_processes_fdinfo()
+    if procs:
+        return procs, "fdinfo"
+    procs = _sample_gpu_processes_debugfs()
+    if procs and any(p.get("vram_mib") is not None for p in procs):
+        return procs, "debugfs"
+    if procs:
+        return procs, "process-names"
+    return [], "none"
+
+
+def _sample_gpu_processes_debugfs():
+    """Root-only fallback; docs/memory-and-eviction.md §Live VRAM attribution."""
     card = Path(DEBUGFS_CARD)
     if not card.is_dir():
         # Fall back to /proc scanning (no VRAM, just process names)
@@ -153,11 +206,23 @@ def _sample_gpu_processes_fallback():
 def take_sample():
     total = read_sysfs(VRAM_USED)
     total_max = read_sysfs(VRAM_TOTAL)
+    procs, source = sample_gpu_processes_with_source()
+    complete = source in ("fdinfo", "debugfs")
+    note = ""
+    if not complete and total is not None and total > 512 * 1024**2:
+        note = ("GPU is in use but no process has a VRAM figure; other "
+                "users' processes (e.g. lemonade's llama-swap children) "
+                "are not visible via fdinfo without their credentials")
     return {
         "ts": time.time(),
         "vram_used_mib": total // (1024 * 1024) if total is not None else None,
         "vram_total_mib": total_max // (1024 * 1024) if total_max is not None else None,
-        "processes": sample_gpu_processes(),  # contamination check, not VRAM
+        "processes": procs,
+        "attribution": {
+            "source": source,
+            "complete": complete,
+            "note": note,
+        },
     }
 
 

@@ -247,6 +247,9 @@ profiles:
 # are set (a warning points at the keys).  Non-conflicting flags (e.g.
 # --flash-attn) apply to all roles and ARE part of the VRAM measurement
 # shape — changing them re-measures every persisted `derived:` block.
+# Logging flags (-lv 5, -v, --log-*) are the exception: vram.shape_key()
+# strips them from the stamp, so turning on server logs is free. The set
+# is the one place to add another memory-inert flag later.
 #
 # batch/ubatch are first-class planning keys with a resolution cascade:
 #   sidecar batch:/ubatch:  >  profile key  >  llama_server: here  >  backend

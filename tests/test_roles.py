@@ -8,37 +8,50 @@ from llama_packer.roles import Share
 
 
 def test_share_is_a_request_weight():
-    # Validates: docs/allocation.md, 'The auction': a role's share is its
-    # request weight in each set, not a fraction of the fleet.
+    # Validates: FLOW_SHARE_WEIGHTS_UNCAPPED — docs/profiles-authoring.md
+    # weight, a percentage is a claim, and fill carries no baked-in weight.
     table, problems = roles.parse_roles({"roles": {
         "chat": {"share": "fill"},
         "dog": {"share": "40%"},
         "cat": {"share": 0.2},
     }})
     assert problems == []
-    assert table["dog"].share == Share("weight", 40.0)
+    assert table["dog"].share == Share("percent", 40.0)
     assert table["cat"].share == Share("weight", 0.2)
-    assert table["chat"].share == Share("fill", 100.0)
+    assert table["chat"].share == Share("fill", 0.0)
 
 
 def test_share_values_are_uncapped():
-    # Validates: docs/allocation.md, 'The auction': weights are relative and
-    # may exceed 100; they are normalised per set.
+    # Validates: FLOW_SHARE_WEIGHTS_UNCAPPED — docs/profiles-authoring.md
+    # and may exceed 100; only percentage claims are checked.
     table, problems = roles.parse_roles({"roles": {
-        "a": {"share": "80%"},
-        "b": {"share": "40%"},
+        "a": {"share": 80},
+        "b": {"share": 40},
         "c": {"share": "123"},
         "d": {"share": "min"},
         "e": {"share": 0},
     }})
     assert problems == []
+    assert table["a"].share == Share("weight", 80.0)
     assert table["c"].share == Share("weight", 123.0)
     assert table["d"].share == Share("min", 0.0)
     assert table["e"].share == Share("zero", 0.0)
 
 
+def test_percentage_claims_above_one_hundred_warn():
+    # Validates: docs/allocation.md, 'The auction': N% is a claim of N points
+    # in a 100-point space; claims that cannot all be met are warned about.
+    _table, problems = roles.parse_roles({"roles": {
+        "a": {"share": "80%"},
+        "b": {"share": "40%"},
+    }})
+    assert len(problems) == 1
+    assert "120" in problems[0]
+    assert "cannot" in problems[0]
+
+
 def test_bad_share_is_reported():
-    # Validates: docs/plans/requirement-trace.md, requirement #110
+    # Validates: FLOW_SHARE_WEIGHTS_UNCAPPED — docs/profiles-authoring.md
     _table, problems = roles.parse_roles({"roles": {
         "a": {"share": "banana"},
         "b": {"share": -1},
@@ -47,7 +60,7 @@ def test_bad_share_is_reported():
 
 
 def test_role_registry_derives_its_sets():
-    # Validates: docs/plans/requirement-trace.md, requirement #90
+    # Validates: ARCH_ROLE_REGISTRY_CLOSED_ENDPOINTS — docs/architecture.md §Models, tasks, engines and endpoints
     assert roles.names() == ("chat", "embeddings", "rerank",
                              "image", "s2t", "t2s")
     assert all(r.device is None for r in roles.ROLES.values())
@@ -55,7 +68,7 @@ def test_role_registry_derives_its_sets():
 
 
 def test_custom_role_is_data_and_gets_its_own_pool():
-    # Validates: docs/plans/requirement-trace.md, requirement #107
+    # Validates: ARCH_ROLE_IS_OPERATOR_DATA — docs/profiles-authoring.md
     try:
         roles.configure({"roles": {
             "cat": {},
@@ -104,7 +117,7 @@ def test_role_dir_rejects_paths_outside_the_models_root():
 
 
 def test_custom_role_parse_reports_every_problem():
-    # Validates: docs/plans/requirement-trace.md, requirement #107
+    # Validates: ARCH_ROLE_IS_OPERATOR_DATA — docs/profiles-authoring.md
     _roles, problems = roles.parse_roles({"roles": {
         "cat": {"kind": "unicorn", "weight": 0},
         "dog": {"unknown": 1},
@@ -116,7 +129,7 @@ def test_custom_role_parse_reports_every_problem():
 
 
 def test_every_engine_endpoint_is_closed_and_served():
-    # Validates: docs/plans/requirement-trace.md, requirement #90
+    # Validates: ARCH_ROLE_REGISTRY_CLOSED_ENDPOINTS — docs/architecture.md §Models, tasks, engines and endpoints
     from llama_packer import endpoints
 
     served = {e for b in BACKENDS.values() for e in b.endpoints}
@@ -139,7 +152,7 @@ def test_persistent_is_retired():
 
 
 def test_role_device_uses_the_sidecar_vocabulary():
-    # Validates: SPEC.md, Roles: device is cpu or a GPU index, exactly like a
+    # Validates: FLOW_ROLE_DEVICE_PLACEMENT — SPEC.md §Host pool
     # sidecar; there is no gpu/any spelling.
     table, problems = roles.parse_roles({"roles": {
         "a": {"dir": "x", "device": "cpu"},
@@ -170,7 +183,7 @@ def test_one_role_may_list_overlapping_trees():
 
 
 def test_share_forms():
-    # Validates: docs/allocation.md, 'The auction': a number is a weight,
+    # Validates: FLOW_SHARE_WEIGHTS_UNCAPPED — docs/profiles-authoring.md
     # `fill` is 100, `min` is 0 with no accept, and `0` accepts leftovers.
     def share(value):
         table, problems = roles.parse_roles(
@@ -178,16 +191,16 @@ def test_share_forms():
         assert problems == []
         return table["a"].share
 
-    assert share("40%") == Share("weight", 40.0)
+    assert share("40%") == Share("percent", 40.0)
     assert share(40) == Share("weight", 40.0)
     assert share(0.4) == Share("weight", 0.4)
-    assert share("fill") == Share("fill", 100.0)
+    assert share("fill") == Share("fill", 0.0)
     assert share("min") == Share("min", 0.0)
     assert share(0) == Share("zero", 0.0)
 
 
 def test_fill_is_not_a_role_key():
-    # Validates: docs/roles-tasks-routing.md, Role: `share` carries the
+    # Validates: FLOW_SHARE_WEIGHTS_UNCAPPED — docs/profiles-authoring.md
     # request; there is no fill or per-role count key.
     _table, problems = roles.parse_roles({"roles": {
         "a": {"fill": True},

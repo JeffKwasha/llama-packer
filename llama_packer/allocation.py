@@ -1,17 +1,14 @@
-"""The allocation algebra: floors, set expressions, and the auction.
-
-The authority is ``docs/allocation.md``. The auction runs on one device pool
-at a time: a role vies for the pool its model runs on (``gpu0``, ``cpu``,
-...). The other fields of the cost tuple are static charges and capacities,
-not memory to be shared out.
-"""
+"""Floors, set expressions and the auction. See docs/allocation.md."""
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from collections import namedtuple
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9._:-]+|[&|()]")
@@ -124,37 +121,40 @@ def floor_of(expr: Expr, floors: dict[str, int]) -> int:
     return max(floor_of(expr.left, floors), floor_of(expr.right, floors))
 
 
-def effective_weights(members, weights, fills):
-    """The weight each claimant uses in the normalised split.
+#: The weight-space whole; docs/allocation.md §The auction.
+WEIGHT_WHOLE = 100.0
 
-    A fill weighs what the weighted roles leave below 100, split equally
-    among fills. If the weighted roles already claim 100 or more, the fill
-    weighs 0 and becomes an acceptor of any remainder a capped role frees.
-    """
-    weighted_sum = sum(weights.get(r, 0.0) for r in members
-                       if r not in fills)
-    out = {r: weights.get(r, 0.0) for r in members}
-    free_fill = [r for r in members if r in fills]
-    if free_fill:
-        each = (100.0 - weighted_sum) / len(free_fill) \
-            if weighted_sum < 100.0 else 0.0
-        for role in free_fill:
-            out[role] = each
-    return out
+
+def resolve_shares(members, shares, set_name=""):
+    """Claims -> weights, fills, accepts for one set; docs/allocation.md."""
+    weights, fills, accepts = {}, set(), set()
+    for name in members:
+        share = shares.get(name)
+        kind = share.kind if share is not None else ""
+        weights[name] = share.weight if share is not None and share.claims else 0.0
+        if kind == "fill":
+            fills.add(name)
+        if share is not None and share.accepts:
+            accepts.add(name)
+    if fills:
+        raw = sorted(n for n in members
+                     if (s := shares.get(n)) is not None
+                     and s.kind == "weight" and weights[n] > 0)
+        if raw:
+            log.warning(
+                "set %r: fill roles [%s] mixed with raw weights [%s]! "
+                "use '%%' shares with fill",
+                set_name, " ".join(sorted(fills)), " ".join(raw))
+        each = max(0.0, WEIGHT_WHOLE - sum(
+            weights[n] for n in members if n not in fills)) / len(fills)
+        for name in fills:
+            weights[name] = each
+    return weights, frozenset(fills), frozenset(accepts)
 
 
 def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
-            weights: dict[str, float], fills: frozenset[str] = frozenset(),
-            accepts: frozenset[str] = frozenset()
-            ) -> tuple[dict[str, int], dict[str, int]]:
-    """Allocate one pool set by set, then take the minimum per role.
-
-    Each set gets the full budget. Floors come out, the weighted roles and
-    fills divide what is left, and `0` roles take any remainder. A role's
-    final allocation is the smallest offer across the sets it belongs to.
-    Adding a set can only lower a role; memory a capped role leaves in a set
-    is reported as unallocated, never moved to another role.
-    """
+            shares: dict) -> tuple[dict[str, int], dict[str, int]]:
+    """Allocate each set, take the minimum per role; docs/allocation.md."""
     members = {name: leaves(expr) for name, expr in sets.items()}
     ceilings = {name: budget - floor_of(expr, floors)
                 for name, expr in sets.items()}
@@ -169,22 +169,23 @@ def auction(budget: int, sets: dict[str, Expr], floors: dict[str, int],
     for name, roles in members.items():
         roles = order(roles)
         available = ceilings[name]
-        effective = effective_weights(roles, weights, fills)
-        total = sum(effective.values())
+        weights, fills, accepts = resolve_shares(roles, shares, name)
+        total = sum(weights.values())
         alloc = {role: floors[role] for role in roles}
         if total > 0:
             for role in roles:
-                if effective[role] > 0:
+                if weights[role] > 0:
                     alloc[role] = floors[role] + int(
-                        available * effective[role] / total)
-        used = sum(alloc[role] - floors[role] for role in roles)
-        idle = [role for role in roles
-                if role in accepts and effective.get(role, 0.0) == 0.0]
-        left = available - used
-        if idle and left > 0:
-            part = left // len(idle)
-            for role in order(idle):
-                alloc[role] += part
+                        available * weights[role] / total)
+        left = available - sum(alloc[role] - floors[role] for role in roles)
+        if left > 0:
+            fill_accept = [r for r in roles if r in fills and r in accepts]
+            idle = [r for r in roles if r in accepts and weights[r] == 0.0]
+            recipients = fill_accept or idle
+            if recipients:
+                part = left // len(recipients)
+                for role in order(recipients):
+                    alloc[role] += part
         offers[name] = alloc
 
     alloc = {}

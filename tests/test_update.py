@@ -820,7 +820,7 @@ def test_cpp_truncated_dir_is_not_certified_as_installed(tmp_path,
     its path into config.yaml as LLAMA_DIR. Requiring the binary is what
     makes a partial install invisible to both tools.
 
-    Validates: docs/plans/requirement-trace.md #37: installs are atomic; a truncated
+    # Validates: DEPLOY_INSTALL_ATOMIC — docs/install.md
     tree is never certified as a good install.
     """
     (d := tmp_path / "llama-b11539").mkdir()          # directory exists...
@@ -1210,21 +1210,21 @@ def test_cleanup_engine_versions_keeps_referenced(tmp_path):
     assert not (tmp_path / "audiocpp_server-v2").exists()
 
 
-def test_engines_are_opt_in(monkeypatch, tmp_path):
-    # A plain run must not touch the audio engines: they install unverified.
-    # Validates: docs/install.md, 'Engines not fetched by a bare run': a bare run leaves the unverified engines alone.
+def test_bare_run_plans_every_engine(monkeypatch, tmp_path):
+    # Validates: docs/install.md, 'One mode: update': the name is the whole
+    # Validates: DEPLOY_UPDATE_ALL_ENGINES — tests/test_update.py
+    # contract — a bare run plans every engine, including the unverified ones.
     monkeypatch.setattr(upd.sys, "argv", ["update.py"])
     seen = []
 
     def _plan(eng, *a, **k):
-        if eng.key in ("audio", "whisper", "sd"):
-            seen.append(eng.key)
+        seen.append(eng.key)
         return upd.Plan(engine=eng, directory=tmp_path, noop=True,
                         note="up to date")
 
     monkeypatch.setattr(upd, "plan_engine", _plan)
-    assert upd.main(["--fetch"]) == 0
-    assert seen == []
+    assert upd.main([]) == 0
+    assert set(seen) == set(upd.ALL_TARGETS)
 
 
 # --- target selection ------------------------------------------------------
@@ -1264,7 +1264,7 @@ def test_target_glob_selects_a_set():
 
 def test_ambiguous_prefix_is_an_error_not_a_guess():
     """
-    Validates: docs/plans/requirement-trace.md #39: an ambiguous selector exits
+    # Validates: DEPLOY_AMBIGUOUS_SELECTOR_EXITS_NONZERO — docs/install.md
     non-zero instead of falling through to the default targets.
     """
     # Guessing wrong here installs the wrong engine's binary.
@@ -1303,16 +1303,14 @@ def test_main_selects_only_named_targets(tmp_path, monkeypatch, capsys):
     assert "audio.cpp" in capsys.readouterr().out
 
 
-def test_bare_run_still_defaults_to_the_verified_pair(tmp_path, monkeypatch,
-                                                      capsys):
-    # A routine bare run must install the serving stack and the tool that
-    # writes its config, not the three engines that publish no checksums.
-    # Validates: docs/install.md, 'The updater command line': no target means llama.cpp and llama-swap.
+def test_bare_run_defaults_to_every_engine(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'The updater command line': no target means
+    # all five engines; 'all' is the same run spelled out.
     monkeypatch.chdir(tmp_path)
     calls = []
     _stub_plans(monkeypatch, calls)
-    assert upd.main(["--fetch"]) == 0
-    assert calls == ["cpp", "swap"]
+    assert upd.main([]) == 0
+    assert set(calls) == set(upd.ALL_TARGETS)
 
 
 def test_main_all_selects_every_target(tmp_path, monkeypatch):
@@ -1348,7 +1346,7 @@ def test_sd_asset_patterns_are_backend_specific():
 
 def test_sd_uses_x86_64_not_x64():
     # stable-diffusion.cpp spells it differently from every other project.
-    # Validates: docs/install.md, 'Engines not fetched by a bare run': engine_arch.
+    # Validates: docs/install.md, 'Engines an update cannot reach': engine_arch.
     assert upd.engine_arch(upd.STABLE_DIFFUSION, "x64") == "x86_64"
     assert upd.engine_arch(upd.WHISPER, "x64") == "x64"
 
@@ -1448,7 +1446,7 @@ def test_prune_never_removes_the_bundle_a_symlink_points_at(tmp_path):
     whisper.cpp and stable-diffusion.cpp -- and the engine just installed
     was the one deleted, leaving a dangling link.
 
-    Validates: docs/plans/requirement-trace.md #38: the pruner must not delete a
+    # Validates: DEPLOY_PRUNE_KEEPS_SYMLINK_TARGET — docs/install.md
     bundle a symlink points at.
     """
     keep = _bundle(tmp_path, "sd-server-v1000")
@@ -1503,7 +1501,7 @@ def test_cpu_backend_does_not_install_vulkan(tmp_path, monkeypatch):
     claimed the request. An operator on a box without Vulkan silently got
     a build they did not ask for.
 
-    Validates: docs/plans/requirement-trace.md #40: cpu/cuda must not silently install
+    # Validates: DEPLOY_CPU_CUDA_NEVER_VULKAN — docs/install.md
     Vulkan.
     """
     seen = {}
@@ -1832,37 +1830,51 @@ def test_dir_override_must_be_engine_equals_path():
         upd.parse_dir_overrides(["nope=/x"])
 
 
-def test_a_bare_run_links_what_is_installed_and_never_downloads(
+def test_a_failed_target_is_reported_with_its_reason(
         tmp_path, monkeypatch, capsys):
-    # Validates: docs/install.md, 'The updater command line': by default the
-    # updater only links what is already installed.
-    entry = tmp_path / "llama-b11539"
+    # Validates: docs/install.md, 'One mode: update': the readout names what
+    # Validates: DEPLOY_UPDATE_ALL_ENGINES — tests/test_update.py
+    # was not updated and why, instead of calling everything up to date.
+    def _plan(engine, directory, *a, **k):
+        if engine.key == "cpp":
+            return upd.Plan(engine=engine, directory=directory,
+                            error="Error: no llama.cpp release carries a build")
+        return upd.Plan(engine=engine, directory=directory, noop=True,
+                        note=f"{engine.label} up to date")
+
+    monkeypatch.setattr(upd, "plan_engine", _plan)
+    assert upd.main(["cpp", "swap", "--dir", f"cpp={tmp_path}",
+                     "--dir", f"swap={tmp_path}"]) == 1
+    out = capsys.readouterr().out
+    assert "llama.cpp" in out and "not updated" in out
+    assert "no llama.cpp release carries a build" in out
+    assert "llama-swap" in out and "up to date" in out
+
+
+def _installed_build(root, tag, *, mode=0o755):
+    entry = root / f"llama-{tag}"
     entry.mkdir()
-    (entry / "llama-server").write_bytes(b"bin")
-    (entry / "llama-server").chmod(0o755)
-    monkeypatch.setattr(upd, "plan_engine",
-                        lambda *a, **k: pytest.fail("must not resolve a release"))
-    monkeypatch.setattr(upd, "gh_api",
-                        lambda *a, **k: pytest.fail("must not touch the network"))
+    binary = entry / "llama-server"
+    binary.write_bytes(b"bin")
+    binary.chmod(mode)
+    return entry
 
-    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
 
-    assert os.readlink(tmp_path / "llama-server") == \
-        "./llama-b11539/llama-server"
-    assert "linked b11539" in capsys.readouterr().out
-
-    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
-    assert "already linked" in capsys.readouterr().out
+def _stub_current_plan(monkeypatch, tag="b11539"):
+    """A current target that still goes through the link-convergence step."""
+    def _plan(engine, directory, *a, **k):
+        return upd.Plan(engine=engine, directory=directory, tag=tag,
+                        noop=True, note=f"{engine.label} up to date")
+    monkeypatch.setattr(upd, "plan_engine", _plan)
 
 
 def test_a_tool_the_service_user_cannot_execute_is_not_linked(
         tmp_path, monkeypatch, capsys):
     # Validates: docs/install.md, 'Where an update installs': only a tool the
     # service account can execute is linked.
-    entry = tmp_path / "llama-b11539"
-    entry.mkdir()
-    (entry / "llama-server").write_bytes(b"bin")
-    (entry / "llama-server").chmod(0o644)
+    binary = _installed_build(tmp_path, "b11539") / "llama-server"
+    binary.chmod(0o644)
+    _stub_current_plan(monkeypatch)
     seen = {}
 
     def fake_run(cmd, **kw):
@@ -1872,7 +1884,7 @@ def test_a_tool_the_service_user_cannot_execute_is_not_linked(
     monkeypatch.setattr(upd.shutil, "which", lambda _n: "/sbin/runuser")
     monkeypatch.setattr(upd.subprocess, "run", fake_run)
     assert upd.main(["cpp", "--user", "svc", "--dir",
-                     f"cpp={tmp_path}"]) == 1
+                     f"cpp={tmp_path}"]) == 0
 
     assert not (tmp_path / "llama-server").exists()
     assert seen["cmd"][:3] == ["/sbin/runuser", "-u", "svc"]
@@ -1883,10 +1895,8 @@ def test_a_tool_the_service_user_can_execute_is_linked(
         tmp_path, monkeypatch):
     # Validates: docs/install.md, 'Where an update installs': the execute bit
     # is checked as the service account, not as the caller.
-    entry = tmp_path / "llama-b11539"
-    entry.mkdir()
-    (entry / "llama-server").write_bytes(b"bin")
-    (entry / "llama-server").chmod(0o755)
+    _installed_build(tmp_path, "b11539")
+    _stub_current_plan(monkeypatch)
     seen = {"runs": 0, "cmd": []}
 
     def fake_run(cmd, **kw):
@@ -1905,22 +1915,14 @@ def test_a_tool_the_service_user_can_execute_is_linked(
         "./llama-b11539/llama-server"
 
 
-def _installed_build(root, tag, *, mode=0o755):
-    entry = root / f"llama-{tag}"
-    entry.mkdir()
-    binary = entry / "llama-server"
-    binary.write_bytes(b"bin")
-    binary.chmod(mode)
-    return entry
-
-
-def test_link_mode_leaves_a_real_primary_alone(tmp_path, capsys):
-    # Validates: docs/install.md, 'Where an update installs': by default a real
-    # binary is not replaced by a link; --fetch is what installs over it.
+def test_a_real_primary_is_left_alone(tmp_path, monkeypatch, capsys):
+    # Validates: docs/install.md, 'Where an update installs': a real binary is
+    # not replaced by a link without an explicit migration.
     _installed_build(tmp_path, "b11539")
     real = tmp_path / "llama-server"
     real.write_text("#!/bin/sh\n")
     real.chmod(0o755)
+    _stub_current_plan(monkeypatch)
 
     assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
 
@@ -1930,12 +1932,13 @@ def test_link_mode_leaves_a_real_primary_alone(tmp_path, capsys):
     assert "real file" in out + err
 
 
-def test_a_noop_link_run_does_not_rewrite_the_symlink(tmp_path):
-    # Validates: docs/install.md, 'Where an update installs': a repeated run
-    # touches nothing it does not have to.
+def test_a_current_target_keeps_its_symlink(tmp_path, monkeypatch):
+    # Validates: docs/install.md, 'One mode: update': a repeated run touches
+    # nothing it does not have to.
     make_binary(tmp_path / "llama-swap-v262", "stub")
     os.symlink("llama-swap-v262", tmp_path / "llama-swap")
     before = (tmp_path / "llama-swap").lstat()
+    _stub_current_plan(monkeypatch, tag="v262")
 
     assert upd.main(["swap", "--dir", f"swap={tmp_path}"]) == 0
 
@@ -1944,38 +1947,14 @@ def test_a_noop_link_run_does_not_rewrite_the_symlink(tmp_path):
                                                  before.st_mtime_ns)
 
 
-def test_link_mode_falls_back_to_an_executable_older_build(tmp_path, capsys):
-    # Validates: docs/install.md, 'Where an update installs': only an
-    # executable entry is linked, and the newest unusable one is skipped.
-    _installed_build(tmp_path, "b11539", mode=0o644)
-    _installed_build(tmp_path, "b11500", mode=0o755)
-
-    assert upd.main(["cpp", "--dir", f"cpp={tmp_path}"]) == 0
-
-    assert os.readlink(tmp_path / "llama-server") == \
-        "./llama-b11500/llama-server"
-    assert "b11539" in capsys.readouterr().err
-
-
-def test_link_mode_refuses_a_pin_that_is_not_installed(tmp_path, capsys):
-    # Validates: docs/install.md, 'The updater command line': a version is
-    # either linked or reported, never silently ignored.
-    _installed_build(tmp_path, "b11539")
-
+def test_a_pin_not_found_upstream_is_reported(tmp_path, monkeypatch, capsys):
+    # Validates: docs/install.md, 'The updater command line': a version that
+    # cannot be resolved is reported with the reason, never silently ignored.
+    monkeypatch.setattr(upd, "gh_api",
+                        lambda *a, **k: {"message": "Not Found"})
     assert upd.main(["cpp", "b9999", "--dir", f"cpp={tmp_path}"]) == 1
-    assert "b9999 is not installed" in capsys.readouterr().err
-
-
-def test_a_pin_is_reported_even_when_a_real_primary_exists(tmp_path, capsys):
-    # Validates: docs/install.md, 'The updater command line': a version is
-    # either linked or reported, never silently ignored.
-    _installed_build(tmp_path, "b11539")
-    real = tmp_path / "llama-server"
-    real.write_text("#!/bin/sh\n")
-    real.chmod(0o755)
-
-    assert upd.main(["cpp", "b9999", "--dir", f"cpp={tmp_path}"]) == 1
-    assert "b9999 is not installed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "b9999" in out and "not found" in out
 
 
 def test_the_gate_fails_closed_when_runuser_is_missing(tmp_path, monkeypatch,
@@ -1983,10 +1962,11 @@ def test_the_gate_fails_closed_when_runuser_is_missing(tmp_path, monkeypatch,
     # Validates: docs/install.md, 'Where an update installs': the check runs as
     # the account, and an unanswerable check is not a pass.
     _installed_build(tmp_path, "b11539")
+    _stub_current_plan(monkeypatch)
     monkeypatch.setattr(upd.shutil, "which", lambda _n: None)
 
     assert upd.main(["cpp", "--user", "svc", "--dir",
-                     f"cpp={tmp_path}"]) == 1
+                     f"cpp={tmp_path}"]) == 0
     assert "runuser not found" in capsys.readouterr().err
     assert not (tmp_path / "llama-server").exists()
 

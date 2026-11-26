@@ -38,7 +38,7 @@ softened.
 - **Each requirement names a test, and each test cites its rule.**
   `extras/check_trace.py` proves both directions against
   `docs/plans/requirement-trace.md`; `extras/check_mutation.py` proves the
-  anchors.
+  anchors. See [docs/taxonomy.md](taxonomy.md) for the ID scheme.
 - **A test that would pass with the implementation deleted is decoration.**
   `extras/find_decorated_tests.py` finds those by mutation; delete or rewrite
   them rather than keeping them green.

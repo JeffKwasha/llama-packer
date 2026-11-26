@@ -49,7 +49,7 @@ def test_cpu_served_uses_cpu_layers(make_model):
 
 
 def test_capabilities_context_is_served_window(make_model):
-    # Validates: docs/plans/requirement-trace.md, requirement #56
+    # Validates: FLOW_CAPABILITIES_CONTEXT_SERVED_WINDOW — SPEC.md §Model Metadata
     model = make_model("m", backend="llama-server")
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -65,9 +65,9 @@ def test_capabilities_context_is_served_window(make_model):
 
 
 def test_sidecar_lowers_max_output_tokens(make_model):
-    # Validates: SPEC.md, 'Model Metadata': a sidecar may lower the
+    # Validates: FLOW_MAX_OUTPUT_TOKENS_CANNOT_RAISE_WINDOW — SPEC.md §Model Metadata
     # generation ceiling below the served window.
-    # Validates: docs/plans/requirement-trace.md, requirement #57
+    # Validates: FLOW_MAX_OUTPUT_TOKENS_CANNOT_RAISE_WINDOW — SPEC.md §Model Metadata
     model = make_model("m", backend="llama-server", max_output_tokens=32768)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -79,9 +79,9 @@ def test_sidecar_lowers_max_output_tokens(make_model):
 
 
 def test_max_output_tokens_never_exceeds_the_served_window(make_model):
-    # Validates: SPEC.md, 'Model Metadata': the emitted ceiling is clamped
+    # Validates: FLOW_MAX_OUTPUT_TOKENS_CANNOT_RAISE_WINDOW — SPEC.md §Model Metadata
     # to the served window even when the sidecar asks for more.
-    # Validates: docs/plans/requirement-trace.md, requirement #57
+    # Validates: FLOW_MAX_OUTPUT_TOKENS_CANNOT_RAISE_WINDOW — SPEC.md §Model Metadata
     model = make_model("m", backend="llama-server", max_output_tokens=262144)
     _, entry = _build_entry(
         model, parallel=1, cache_type="q8_0",
@@ -370,6 +370,26 @@ def test_vision_capability_removed(make_model, caplog):
                for r in caplog.records if r.levelno >= logging.ERROR)
 
 
+def test_mmproj_capability_check_is_role_agnostic(make_model, tmp_path, caplog):
+    # Validates: docs/architecture.md, '_filter_supported': role names are
+    # Validates: ARCH_MMPROJ_CHECK_IGNORES_ROLE_NAMES — tests/test_writer.py
+    # operator-defined, so the companion/capability check cannot key on them.
+    (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
+    warnings = {}
+    for role in ("embeddings", "my_custom_role"):
+        caplog.clear()
+        model = make_model(f"v-{role}", mmproj={"file": "v-mmproj.gguf"},
+                           role=role)
+        with caplog.at_level(logging.WARNING, logger="llama_packer.writer"):
+            _filter_supported([model], "q8_0")
+        warnings[role] = [r.message for r in caplog.records
+                          if "mmproj companion present" in r.message]
+    assert len(warnings["embeddings"]) == len(warnings["my_custom_role"]) == 1
+    # The only difference is the model stem in the message.
+    strip = lambda m: m.split(": ", 1)[1]
+    assert strip(warnings["embeddings"][0]) == strip(warnings["my_custom_role"][0])
+
+
 def test_video_is_input_only(make_model):
     # video input without a video-generating arch stays input-only.
     # Validates: SPEC.md, 'Output Format': video is an input modality.
@@ -586,7 +606,7 @@ def test_write_yaml_preserves_heredoc_newlines(tmp_path, make_model):
 
 
 def test_overallocation_guard_catches_an_injected_violation(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #35
+    # Validates: FLOW_NO_ENTRY_EXCEEDS_VRAM — SPEC.md §VRAM Allocation
     # An injected over-budget entry is removed at ERROR, never emitted.
     import logging
 
@@ -621,7 +641,7 @@ def test_overallocation_guard_is_quiet_when_the_plan_is_sane(make_model,
                                                              monkeypatch, caplog):
     """The other half: silence when the plan is fine.
 
-    Validates: docs/plans/requirement-trace.md #28.
+    Validates: FLOW_OVERALLOCATION_GUARD_QUIET_WHEN_SANE — SPEC.md §VRAM Allocation
     """
     import logging
     from llama_packer.writer import build_config

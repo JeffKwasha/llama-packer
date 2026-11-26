@@ -74,8 +74,11 @@ rule is preferred until the role-drop order is specified.
 A role holding models on different pools contributes its floor to each
 field, even though only one model runs. That over-reserves. Splitting the
 role is the current answer; a placement-aware role floor is future work.
-Warn when a role with `share: min`, `share: 0`, or a weight below 25 has a
-floor that dominates its set. A large weight is expected to use the pool.
+A role with `share: min` or `share: 0` (or a weight below 25) gets only its
+floor: it takes no surplus, so the floor is a permanent reservation. When one
+model sets a floor above a tenth of the pool, the warning names that model
+and its task — move the model to its own role if the reservation is not
+intended. A large weight is expected to use the pool and is not warned about.
 
 ## Set members
 
@@ -105,29 +108,47 @@ The auction runs once per device pool. A role's share applies to the pool
 its model runs on; the other fields are zero for allocation. A GPU model's
 host footprint is static and is not grown by the auction.
 
-Each role in the set carries a request weight and an accept flag from its
-`share:`:
+Each member of a set carries one `share:` claim. The auction resolves all
+claims for that set into plain weights, fill flags and accept flags in one
+pass, then only the weights take part in the memory arithmetic. Weight space
+is one 100-point scale; the point is a unit, not a hard cap:
 
-| `share:` | request | accept surplus |
+| `share:` | weight | accept surplus |
 |---|---|---|
 | `min` | 0 | no |
 | `0` | 0 | yes |
-| `27%` | 27 | yes |
-| `fill` | what the weighted roles leave below 100, else 0 | yes |
+| `27` | 27 (raw weight, uncapped) | yes |
+| `27%` | 27 (a claim of 27 points) | yes |
+| `fill` | what is left of the 100 points, split equally among fills | yes |
 
-Every claimant is normalised by the sum of its weight. A weighted role
-uses its number. A fill uses what the weighted roles leave below 100, split
-equally among fills; when they leave nothing, the fill weighs 0 and takes
-any remainder a capped role frees. A lone 60 therefore leaves 40 for one
-fill. Any positive value is valid.
+- A plain number is a **weight**: it is normalised with every other weight
+  in the set, so its absolute size does not matter. Weights may exceed 100.
+- `N%` is a **claim** of N points in that same space. Claims are checked
+  when the role table is read: if the percentages sum above 100 they cannot
+  all be met, and the run warns.
+- `fill` is the **residual**: its weight is `max(0, 100 − Σ other weights in
+  the set)`, divided equally among fills. It claims last: its offer is that
+  share **plus any surplus the other roles leave unclaimed** (rounding, or a
+  role that does not accept).
 
-Requests are normalised inside each set, never capped at an absolute
-percentage:
+Resolution happens once per set, before any memory math: a `weight` or
+`percent` claim contributes its number, `min`/`zero` contribute zero, and a
+`fill` gets the unclaimed points. The result is the weight vector the auction
+normalises inside its set:
 
 ```
-request(role, set) = weight(role) / Σ weights in set × auction(set)
+weight(fill, set)  = max(0, 100 − Σ other weights in set) / n_fills
+request(role, set) = weight(role, set) / Σ weights in set × auction(set)
 offer(role, set)   = floor(role) + request(role, set)
 ```
+
+A lone raw weight of 60 with one fill leaves 40 points for the fill. Raw
+weights are never capped: 60 and 90 split a pool 6:9 — but a raw weight above
+100 leaves the fill nothing, and even a smaller raw weight makes the fill's
+share depend on a number that is only meaningful relative to other raw
+weights. A set that mixes `fill` with a raw weight therefore warns. Use
+percentages alongside `fill`: `66%` and `fill` give A 660 and B 340 out of
+1000.
 
 A role can appear in several sets. **No role accepts more than the minimum
 offer from the sets it is in**, per pool:

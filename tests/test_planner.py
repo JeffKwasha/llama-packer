@@ -125,7 +125,7 @@ def test_profiles_groups_fallback_when_nothing_matches(profiles, make_model):
 
 def test_allow_profiles_bad_regex_names_the_sidecar(profiles, make_model,
                                                    caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic about one sidecar leads with the sidecar's name.
+    # Validates: FLOW_REGEX_WARNING_NAMES_SIDECAR — docs/development.md §Claims
     """An invalid `allow_profiles` regex concerns one sidecar's declaration,
     so the warning leads with that sidecar's name."""
     import logging
@@ -465,7 +465,7 @@ def test_plan_vision_and_text_both_over_budget_disables(tmp_path, make_model,
     unchanged: a model that cannot load at any rung produces no entry rather
     than an entry at a context it cannot hold.
 
-    Validates: SPEC.md: 'A category that cannot meet min_context at any rung
+    Validates: FLOW_TASK_UNSERVABLE_EMITS_NOTHING — SPEC.md §Tasks
     emits nothing.'
     """
     (tmp_path / "vb-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
@@ -535,7 +535,7 @@ def _fake_vram(m, params):
 # ── a fixed-overhead serving's context ────────────────────────────────────
 
 def test_served_ctx_caps_the_task_context(profiles):
-    # Validates: docs/plans/requirement-trace.md, requirement #92
+    # Validates: FLOW_FIXED_SERVING_TASK_CONTEXT_CAP — docs/allocation.md §The auction
     # ctx is a cap honoured by the served context and never a floor.
     from llama_packer.tasks import TaskCatalogue
     from llama_packer.writer import served_ctx
@@ -577,7 +577,7 @@ def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
     entry advertised tool calling an order of magnitude below the window it
     needs. The verdict comes from the context this entry actually serves.
 
-    Validates: docs/plans/requirement-trace.md #30: tools is demoted on the entry's
+    Validates: FLOW_TOOLS_DEMOTED_ON_OWN_CONTEXT — SPEC.md §VRAM Allocation
     own served context.
     """
     chat = make("chat", role="chat", capabilities=["tools"])
@@ -594,7 +594,7 @@ def test_plan_demotes_tools_below_the_threshold_without_a_matrix(profiles):
 def test_plan_keeps_tools_when_the_context_clears_the_threshold(profiles):
     """The other direction, so the fix is not simply "always demote".
 
-    Validates: docs/plans/requirement-trace.md #30: the other direction, so the fix
+    Validates: FLOW_TOOLS_DEMOTED_ON_OWN_CONTEXT — SPEC.md §VRAM Allocation
     cannot read as 'always demote'.
     """
     # make() seeds context_length 32768, which would cap the served ctx
@@ -695,7 +695,7 @@ def test_rung_drops_vision_when_it_buys_context(make_model):
     *ranking* and not of the shed order: with only one level legal, any
     implementation that simply takes the first hit passes too.
 
-    Validates: SPEC.md, 'Shedding is described per category': most context
+    Validates: FLOW_VISION_SHED_BUYS_CONTEXT — SPEC.md §Context Tiers
     that fits wins.
     """
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -713,7 +713,7 @@ def test_rung_keeps_vision_when_it_is_free(make_model):
     CONTEXT + VISION." Both levels afford the same context, so the more
     capable one wins instead of being discarded for no gain.
 
-    Validates: SPEC.md, 'Shedding is described per category': 'only adds vision if VRAM
+    Validates: FLOW_VISION_KEPT_WHEN_FREE — SPEC.md §Context Tiers
     is sufficient for MAX DESIGN CONTEXT + VISION'.
     """
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -727,7 +727,7 @@ def test_rung_keeps_vision_when_it_is_free(make_model):
 def test_rung_is_none_when_the_category_cannot_be_served(make_model):
     """No id may claim a category the fleet cannot deliver.
 
-    Validates: SPEC.md: 'A category that cannot meet min_context at any rung emits
+    Validates: FLOW_TASK_UNSERVABLE_EMITS_NOTHING — SPEC.md §Tasks
     nothing.'
     """
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -739,7 +739,7 @@ def test_rung_is_none_when_the_category_cannot_be_served(make_model):
 def test_rung_honours_keep_then_falls_back_to_vision(make_model):
     """keep: [draft] stops the ladder shedding MTP, so it moves to vision.
 
-    Validates: SPEC.md: 'keep only forbids shedding'.
+    Validates: FLOW_INFEASIBLE_RUNG_SKIPPED — SPEC.md §Context Tiers
     """
     m = make_model("c", backend="llama-server", context_length=262144)
     p = _affording(m, {True: 90000, False: 200000})
@@ -758,7 +758,7 @@ def test_fallback_keeps_capability_until_the_minimum_forces_it(make_model):
     category never asked for would be a pointless trade. It sheds only when
     holding the capability would leave no legal serving at all.
 
-    Validates: docs/plans/requirement-trace.md, requirement #11.
+    Validates: FLOW_FALLBACK_CAPABILITY_FIRST — SPEC.md §Context Tiers
     """
     from llama_packer.writer import fallback_task
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -779,7 +779,7 @@ def test_fallback_keeps_capability_until_the_minimum_forces_it(make_model):
 def test_fallback_sheds_when_nothing_else_fits(make_model):
     """The other direction: no legal serving with the capability attached.
 
-    Validates: docs/plans/requirement-trace.md, requirement #12.
+    Validates: FLOW_FALLBACK_SHEDS_ONLY_WHEN_FORCED — SPEC.md §Context Tiers
     """
     from llama_packer.writer import fallback_task
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -800,7 +800,7 @@ def test_keep_draft_is_enforced_now_that_the_axis_exists(make_model):
     than by design. With the axis real, a category without `keep` has to be
     able to shed it -- otherwise there is nothing for `keep` to protect.
 
-    Validates: SPEC.md: 'require and keep are different and both are honoured'.
+    Validates: FLOW_KEEP_ENFORCED_ON_DRAFT_AXIS — SPEC.md §Context Tiers
     """
     m = make_model("c", backend="llama-server", context_length=262144)
     seen = []
@@ -831,7 +831,7 @@ def test_keep_draft_is_enforced_now_that_the_axis_exists(make_model):
 def test_every_category_gets_an_entry(make_model, profiles):
     """Each satisfiable category emits its own id.
 
-    Validates: docs/plans/requirement-trace.md #3 -- `usage: [coding, chat]`
+    Validates: FLOW_TASK_EMITS_ONE_ENTRY — SPEC.md §Tasks
     on a model that can serve both produces a `.coding` and a `.chat`, so a
     client can ask for the one it wants.
     """
@@ -855,7 +855,7 @@ def test_every_category_gets_an_entry(make_model, profiles):
 def test_every_model_gets_a_fallback(make_model, profiles):
     """A category cannot satisfy every model, but the fallback always can.
 
-    Validates: docs/plans/requirement-trace.md #5 -- the fallback is the
+    Validates: FLOW_MODEL_FALLBACK_ENTRY — SPEC.md §Tasks
     floor on "a category that cannot be met emits nothing", so an untagged
     model still reaches clients.
     """
@@ -880,7 +880,7 @@ def test_model_with_no_rung_at_all_emits_nothing(make_model, profiles):
     """Even the fallback can fail. Then the model is absent, not emitted at
     a context it cannot hold.
 
-    Validates: docs/plans/requirement-trace.md #6 -- the fallback can itself
+    Validates: FLOW_FALLBACK_CAN_EMIT_NOTHING — SPEC.md §Tasks
     fail and emit nothing.
     """
     m = make_model("huge", role="chat")
@@ -895,7 +895,7 @@ def test_category_prefers_context_over_capability(make_model):
     The mirror of the fallback's rule, and the reason the two differ: coding
     would rather have 262144 tokens text-only than 131072 with a projector.
 
-    Validates: docs/plans/requirement-trace.md #10.
+    Validates: FLOW_VISION_SHED_BUYS_CONTEXT — SPEC.md §Context Tiers
     """
     coding = _demand(min_context=131072)
     m = make_model("c", backend="llama-server", context_length=262144)
@@ -912,7 +912,7 @@ def test_require_prevents_the_entry_emitted(make_model, profiles, tmp_path):
     model tagged with a category requiring vision, having no projector, gets
     **no id at all** for that category -- and the fallback carries on.
 
-    Validates: docs/plans/requirement-trace.md #16.
+    Validates: FLOW_REQUIRED_CAPABILITY_GATES_EXISTENCE — SPEC.md §Context Tiers
     """
     (tmp_path / "t-mmproj.gguf").write_bytes(b"x" * 3 * 1024 * 1024)
     m = make_model("blind", role="chat")          # text only, no mmproj
@@ -934,7 +934,7 @@ def test_require_prevents_the_entry_emitted(make_model, profiles, tmp_path):
 def test_shed_order_is_configurable(make_model):
     """What a category omits is shed in the `shed:` order, not a constant.
 
-    Validates: docs/plans/requirement-trace.md #14 -- capabilities a
+    Validates: FLOW_UNNAMED_CAPABILITIES_SHED_LAST — SPEC.md §Context Tiers
     category omits are shed last, in the order from `shed:`.
     """
     from types import SimpleNamespace
@@ -956,7 +956,7 @@ def test_fallback_slot_exponent_is_zero(make_model):
     holds*. That is why it is worth expressing as a power rather than a
     branch.
 
-    Validates: docs/plans/requirement-trace.md #35.
+    Validates: FLOW_FALLBACK_SLOT_EXPONENT_ZERO — docs/allocation.md §The auction
     """
     m = make_model("c", backend="llama-server", role="chat")
     seen = []
@@ -979,7 +979,7 @@ def test_fallback_slot_exponent_is_zero(make_model):
 def test_ties_go_to_more_slots(make_model):
     """Equal score resolves upward, not to the first candidate.
 
-    Validates: docs/plans/requirement-trace.md #36 -- ties in the slot
+    Validates: FLOW_TIE_PREFERS_MORE_SLOTS — docs/allocation.md §The auction
     score go to more slots, which is what lets a plentiful-VRAM model keep
     its context *and* take concurrency.
     """
@@ -1024,7 +1024,7 @@ def test_fixed_role_parallelism_is_ignored(make_model, profiles, caplog):
     Its slots would come straight out of the chat context, which is the
     opposite of what a fixed-overhead role is for.
 
-    Validates: SPEC.md, 'VRAM Allocation': fixed-overhead roles always serve
+    Validates: FLOW_FIXED_ROLE_PARALLEL_IGNORED — docs/allocation.md §The auction
     single-slot.
     """
     import logging
@@ -1054,7 +1054,7 @@ def test_min_image_megapixels_keeps_vision(make_model, tmp_path):
     The category sacrifices vision; the model's declared budget overrides
     that, because a budget that is never served is not a budget.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_IMAGE_BUDGET_KEEPS_VISION — docs/models/vision-context.md
     """
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
     m = make_model("v", tasks=["coding"],
@@ -1069,7 +1069,7 @@ def test_min_image_megapixels_keeps_vision(make_model, tmp_path):
 def test_no_budget_leaves_vision_shed_able(make_model, tmp_path):
     """Without a budget the category's sacrifice order stands.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_NO_BUDGET_LETS_VISION_SHED — docs/models/vision-context.md
     """
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
     m = make_model("v", tasks=["coding"],
@@ -1082,7 +1082,7 @@ def test_no_budget_leaves_vision_shed_able(make_model, tmp_path):
 def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
     """min_image_megapixels: 0 means vision need not be served at all.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_NO_BUDGET_LETS_VISION_SHED — docs/models/vision-context.md
     """
     (tmp_path / "v-mmproj.gguf").write_bytes(b"x")
     m = make_model("v", tasks=["coding"],
@@ -1097,7 +1097,7 @@ def test_zero_budget_drops_the_vision_requirement(make_model, tmp_path):
 
 
 def test_cpu_variant_refused_on_small_pool(profiles, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #70, #75
+    # Validates: FLOW_HOST_POOL_CLAMPS_TO_ZERO — SPEC.md §Host pool
     # quad exceeds the host pool emits no id and logs the shortfall.
     import logging
     m = make("cpu", role="chat", device="cpu")
@@ -1111,7 +1111,7 @@ def test_cpu_variant_refused_on_small_pool(profiles, caplog):
 
 
 def test_cpu_parallel_charge_flips_the_served_context(profiles):
-    # Validates: docs/allocation.md, 'The auction': a CPU model solves inside
+    # Validates: FLOW_CPU_CHAT_SLOTS_USE_HOST_BUDGET — SPEC.md §VRAM Allocation
     # its ram allocation. Two slots charge two KV pools and lower the served
     # context; a pool below the floor drops the serving.
     def ctx(parallel, host_mb):
@@ -1207,6 +1207,47 @@ def test_capacity_fill_splits_the_pool_above_the_floors(profiles):
         roles.configure(None)
 
 
+def test_percentage_share_reaches_the_set_auction(profiles):
+    # Validates: docs/allocation.md, 'The auction': a percent claim is priced
+    # in the set auction just like the same number of weight points.
+    from llama_packer import roles
+    def budget_for(shares):
+        roles.configure({"roles": {"a": {"share": shares[0]},
+                                   "b": {"share": shares[1]}}})
+        a = make("claim", role="a", context_length=32768)
+        b = make("weight", role="b", context_length=32768)
+        _fake_vram(a, (100, 0.1, 0))
+        _fake_vram(b, (100, 0.1, 0))
+        return Planner([a, b], profiles, fit_bin="unused", vram_total=8192,
+                       matrix_cfg={"sets": {"s": "a & b"}})._role_budgets()
+    try:
+        assert budget_for(("25%", 75)) == budget_for((25, 75))
+    finally:
+        roles.configure(None)
+
+
+def test_fixed_role_floor_warning_names_the_model(profiles, caplog):
+    # Validates: docs/allocation.md, 'Set members': a min-share role's floor is
+    # a permanent reservation; the warning names the model that sets it.
+    from llama_packer import roles
+    try:
+        roles.configure({"roles": {"small": {"share": "min"}}})
+        m = make("floor-model", role="small", context_length=32768)
+        _fake_vram(m, (2000, 0.1, 0))
+        planner = Planner([m], profiles, fit_bin="unused", vram_total=8192,
+                          matrix_cfg={"sets": {"s": "small"}})
+        with caplog.at_level(logging.WARNING, logger="llama_packer.writer"):
+            planner._role_budgets()
+        msgs = [r.message for r in caplog.records if "gets a fixed" in r.message]
+        assert len(msgs) == 1
+        assert "'small'" in msgs[0]
+        assert "floor-model" in msgs[0]
+        assert "cannot grow" in msgs[0]
+        assert "of the pool" in msgs[0]
+    finally:
+        roles.configure(None)
+
+
 def test_cpu_model_emits_nothing_without_a_host_pool(profiles):
     # Validates: docs/allocation.md, 'Routers': a CPU serving charges ram;
     # with no host pool there is no allocation to solve inside.
@@ -1220,7 +1261,7 @@ def test_cpu_model_emits_nothing_without_a_host_pool(profiles):
     assert "ucpu" not in plan
 
 def test_no_host_pool_never_gates(profiles, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #76
+    # Validates: FLOW_NO_HOST_POOL_NO_GATE — SPEC.md §Host pool
     # pool the planner never refuses on host grounds.
     import logging
     m = make("cpu", role="chat", device="cpu")
@@ -1233,7 +1274,7 @@ def test_no_host_pool_never_gates(profiles, caplog):
 
 
 def test_cpu_solve_measures_through_allow_cpu(profiles):
-    # Validates: docs/allocation.md, 'The auction': a CPU model's solve
+    # Validates: FLOW_CPU_SERVING_CHARGES_RAM_ONLY — SPEC.md §Host pool
     # measures the host-resident quad under allow_cpu.
     m = make("e", role="embeddings", device="cpu", context_length=8192)
     seen = {}
@@ -1258,7 +1299,7 @@ def test_cpu_solve_measures_through_allow_cpu(profiles):
 
 
 def test_metadata_packing_cpu_entry(profiles):
-    # Validates: docs/plans/requirement-trace.md, requirement #77
+    # Validates: FLOW_ENTRY_PACKING_METADATA — SPEC.md §Host pool
     m = make("cpk", role="chat", device="cpu")
     _fake_vram(m, (466, 0.057, 346))
     variants = Planner([m], profiles, fit_bin="unused",
@@ -1277,7 +1318,7 @@ def test_metadata_packing_cpu_entry(profiles):
 
 
 def test_metadata_packing_gpu_entry(profiles):
-    # Validates: docs/plans/requirement-trace.md, requirement #77
+    # Validates: FLOW_ENTRY_PACKING_METADATA — SPEC.md §Host pool
     m = make("gpk", role="chat")
     _fake_vram(m, (466, 0.057, 346))
     variants = Planner([m], profiles, fit_bin="unused",
@@ -1295,7 +1336,7 @@ def test_metadata_packing_gpu_entry(profiles):
 
 
 def test_cpu_chat_entry_inherits_the_global_ttl(profiles):
-    # Validates: docs/allocation.md, 'TTL' -- an undeclared serving inherits
+    # Validates: FLOW_TTL_MOST_SPECIFIC_WINS — SPEC.md §Host pool
     # the top-level ttl, so no per-entry key is emitted.
     m = make("ttlcpu", role="chat", device="cpu")
     _fake_vram(m, (466, 0.057, 346))
@@ -1306,7 +1347,7 @@ def test_cpu_chat_entry_inherits_the_global_ttl(profiles):
 
 
 def test_gpu_entry_has_no_ttl(profiles):
-    # Validates: docs/plans/requirement-trace.md, requirement #80
+    # Validates: FLOW_TTL_MOST_SPECIFIC_WINS — SPEC.md §Host pool
     # the inherited/global TTL (no per-model ttl key emitted).
     m = make("ttlgpu", role="chat")
     _fake_vram(m, (466, 0.057, 346))

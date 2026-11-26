@@ -52,7 +52,7 @@ def _lines_at(stderr: str, level: str) -> list[str]:
 
 
 def test_pack_run_is_quiet_by_default(tmp_path):
-    # Validates: SPEC.md, 'Log Levels': the default level is WARNING — a run that goes well says nothing, and anything that went wrong is reported without a flag.
+    # Validates: FLOW_PACK_LOG_FLOOR_WARNING — SPEC.md §Log Levels
     proc = _run(tmp_path)
     # Silence is what a *finished* run sounds like, not what a run that died
     # on entry sounds like.
@@ -61,14 +61,14 @@ def test_pack_run_is_quiet_by_default(tmp_path):
 
 
 def test_verbose_flag_lifts_the_level(tmp_path):
-    # Validates: SPEC.md, 'Log Levels': -v lifts the level to INFO, -vv to DEBUG, -vvv to whatever the libraries log.
+    # Validates: FLOW_PACK_LOG_FLOOR_WARNING — SPEC.md §Log Levels
     proc = _run(tmp_path, "-v")
     assert proc.returncode == 0, proc.stderr
     assert _lines_at(proc.stderr, "I"), proc.stderr
 
 
 def test_dry_run_preview_is_visible_without_a_flag(tmp_path):
-    # Validates: SPEC.md, 'Log Levels': --dry-run lifts the floor to INFO whatever the verbosity, because its report — every write it withheld — is the output of the run.
+    # Validates: FLOW_PACK_LOG_FLOOR_WARNING — SPEC.md §Log Levels
     proc = _run(tmp_path, "--dry-run")
     assert proc.returncode == 0, proc.stderr
     assert [ln for ln in _lines_at(proc.stderr, "I") if "would " in ln], proc.stderr

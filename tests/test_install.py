@@ -136,8 +136,8 @@ def test_render_unit_lists_only_present_hidden_dirs(monkeypatch):
     # InaccessiblePaths= is a fatal namespace error (226/NAMESPACE) — the
     # service never starts. Only what exists may be listed.
     #
-    # Validates: docs/install.md, the systemd unit the installer writes.
-    # Validates: docs/plans/requirement-trace.md, requirement #53
+    # Validates: DEPLOY_INACCESSIBLE_PATHS_EXIST_ONLY — docs/install.md
+    # Validates: DEPLOY_INACCESSIBLE_PATHS_EXIST_ONLY — docs/install.md
     monkeypatch.setattr(ins, "gpu_vendor", lambda: "amd")
     monkeypatch.setattr(ins, "gpu_nodes", lambda: ["/dev/kfd"])
     monkeypatch.setattr(ins, "inaccessible_paths",
@@ -150,7 +150,7 @@ def test_render_unit_lists_only_present_hidden_dirs(monkeypatch):
 
 
 def test_inaccessible_paths_omits_absent(tmp_path):
-    """Validates: docs/install.md, the systemd unit the installer writes."""
+    # Validates: DEPLOY_INACCESSIBLE_PATHS_EXIST_ONLY — docs/install.md
     there = tmp_path / "there"
     there.mkdir()
     gone = tmp_path / "gone"
@@ -161,8 +161,8 @@ def test_unit_is_enableable():
     # Without [Install] WantedBy=, `systemctl enable` fails and the service
     # never comes back after a reboot.
     #
-    # Validates: docs/install.md, the systemd unit the installer writes.
-    # Validates: docs/plans/requirement-trace.md, requirement #52
+    # Validates: DEPLOY_UNIT_IS_ENABLEABLE — docs/install.md
+    # Validates: DEPLOY_UNIT_IS_ENABLEABLE — docs/install.md
     body = ins.TEMPLATE.read_text()
     assert "[Install]" in body
     assert "WantedBy=multi-user.target" in body
@@ -550,7 +550,7 @@ def test_report_resolved_warns_when_hf_home_is_unreadable(tmp_path, monkeypatch,
     depend on the runner's privileges, which is how the bug slipped through
     locally.
 
-    Validates: docs/install.md, 'Pass --hf-home if your models come from an
+    # Validates: DEPLOY_UNREADABLE_HF_HOME_WARNS — docs/install.md
     HF cache'.
     """
     (tmp_path / "config.env").write_text("HF_HOME=/root/.cache/huggingface\n")
@@ -582,7 +582,7 @@ def test_rejected_unit_leaves_the_previous_one_installed(tmp_path, monkeypatch):
     a unit that failed verification would become the one that starts -- not
     running now, but silently wrong once reloaded.
 
-    Validates: docs/plans/requirement-trace.md #42: the unit is verified before it
+    # Validates: DEPLOY_UNIT_VERIFIED_BEFORE_INSTALL — docs/install.md
     becomes the unit systemd reads.
     """
     unit = tmp_path / "llama-swap.service"
@@ -605,7 +605,7 @@ def test_candidate_name_is_a_valid_unit_name(tmp_path, monkeypatch):
     without inspecting anything, which would make the verify step a no-op
     that approves any unit at all.
 
-    Validates: docs/plans/requirement-trace.md #42: the candidate must keep the
+    # Validates: DEPLOY_UNIT_VERIFIED_BEFORE_INSTALL — docs/install.md
     .service suffix, or systemd-analyze exits 0 without reading it.
     """
     unit = tmp_path / "llama-swap.service"
@@ -623,7 +623,7 @@ def test_validate_runs_as_the_service_user(tmp_path, monkeypatch):
     of --group swap in a binary and have root execute it on the next
     install.
 
-    Validates: docs/plans/requirement-trace.md #41: llama-swap validates as the
+    # Validates: DEPLOY_VALIDATE_AS_SERVICE_USER — docs/install.md
     service user, never root out of a group-writable directory.
     """
     commands = []
@@ -646,7 +646,7 @@ def test_probe_waits_for_a_slow_start(monkeypatch, capsys):
     probe must poll — otherwise it reports a dead service for one that came
     up fine, which is what it did on the first successful install.
 
-    Validates: docs/install.md, the /v1/models health probe.
+    # Validates: DEPLOY_PROBE_WAITS_FOR_SOCKET — docs/install.md
     """
     import urllib.error
 
@@ -676,7 +676,7 @@ def test_probe_waits_for_a_slow_start(monkeypatch, capsys):
 
 
 def test_probe_gives_up_after_the_deadline(monkeypatch):
-    """Validates: docs/install.md, the /v1/models health probe."""
+    # Validates: DEPLOY_PROBE_DEADLINE_WITH_JOURNAL_HINT — docs/install.md
     import urllib.error
 
     clock = {"t": 0.0}

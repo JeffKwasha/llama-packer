@@ -181,16 +181,13 @@ directory as its working directory and no `--dir`, so a fresh deployment
 fills `<dir>/tools` and an engine already installed flat in `<dir>` is
 updated in place rather than duplicated.
 
-Two modes, and the default is the quiet one.
-
-**Link (default).** No network, no download. Each selected target is pointed
-at what is already installed in the run directory, and only if the service
-account can execute it (`--user`, default the invoking user). Nothing
-installed means nothing to do, and the run says so. `tools/update` after an
-install is this mode, so a repeated run touches nothing it does not have to.
-
-**Fetch (`--fetch`).** The install/upgrade pipeline, three phases, all five
-targets:
+**One mode: update.** A bare `update` selects every target and runs this
+pipeline on all of them. It installs what it can; for every target it could
+not update, the plan and the summary both print why — no usable release, no
+matching asset, an unreachable API, an architecture it cannot build for, a
+version that is not installed. A target already current is reported as such.
+The exit status is non-zero when any target failed. `--fetch` is accepted as
+an alias for the default and changes nothing. The pipeline has three phases:
 
 1. **Plan.** Every selected target is resolved against GitHub *before*
    anything is downloaded. The plan names each target's current and candidate version,
@@ -235,17 +232,19 @@ the tree). Without that, each run would reap the other's `.stage-*` as an
 interrupted leftover.
 
 That does mean **an update needs the GitHub API** (and `GITHUB_TOKEN` for
-the rate limit). There is deliberately no systemd timer for it. A new
-llama.cpp build changes the binary that VRAM constants were measured
-against — `derived: shape` records the flag string, not the build — so
-binaries moving without a re-pack would leave the config silently serving
-with a stale compute term. `-watch-config` watches the config only, so the
-swap would not even be visible as a reload. It also does not migrate
-`profiles.yaml`; after a llama-packer update, re-run the packer and read its
-key warnings (see "After a llama-packer update"). If you want this
-automated, the safe shape is a timer that updates **and** re-packs together,
-and refuses the swap when `llama-swap -validate` rejects the result; that is
-a separate piece of work from this installer.
+the rate limit). There is deliberately no systemd timer for it. A generated
+config names the stable `llama-server` link, not a `llama-b<NNNN>` build
+dir, so an update moves the binary that new model loads use without a
+re-pack. A named link whose target is missing is refused, not emitted as a
+broken command. A re-pack is still needed: a new build changes the VRAM constants
+it was measured against (`derived: shape` records the flag string, not the
+build), and the packer does not migrate `profiles.yaml` after a llama-packer
+update — read its key warnings then (see "After a llama-packer update").
+`-watch-config` watches the config only, so a link move is not visible as a
+reload: already-running models keep the old build until they are recycled.
+If you want this automated, the safe shape is a timer that updates **and**
+re-packs together, and refuses the swap when `llama-swap -validate` rejects
+the result; that is a separate piece of work from this installer.
 
 ## The updater command line
 
@@ -258,11 +257,10 @@ flags. The rules below are the ones the tool's tests hold up.
   `swap`, `audio`/`a`, `whisper`/`w`, `sd`/`stable`, and `all`.
   `all` must be typed in full — a glob works too, and `s*` selects `swap`
   and `sd`.
-- **No target means llama.cpp and llama-swap**: the serving stack. `all`
-  adds audio.cpp, whisper.cpp and stable-diffusion.cpp.
-- **By default nothing is downloaded.** The run links what is already
-  installed and prunes, and the summary says `linked` rather than
-  `installed`. `--fetch` downloads the newest release.
+- **No target means all five engines**: a bare `update` behaves as `all`.
+- **The newest release of every target is downloaded and installed.**
+  Already-current targets are reported as such, and a target that could not be
+  updated is reported with the reason. `--fetch` is an accepted alias.
 - **`--user ACCOUNT`** is the account whose execute permission decides
   whether a tool may be linked. The check runs as that account, so a binary
   that exists but is root-only is reported and left unlinked. When the check
@@ -277,10 +275,10 @@ flags. The rules below are the ones the tool's tests hold up.
   together with one of those flags is refused rather than guessed at.
 - **When two llama.cpp versions are given, the last one wins**, and a
   positional that is not a target is left to the version parser.
-- **`--plan` (also spelled `--dry-run`) shows what the run would do and
-  stops**: with `--fetch` the current → candidate versions, size and
-  destination; without it, the link decision. `--print-paths` is the narrower question and stops at the
-  directory.
+- **`--plan` (also spelled `--dry-run`) resolves every target and stops**:
+  it prints current → candidate versions, size and destination, including the
+  reason for any target that could not be resolved, and downloads nothing.
+  `--print-paths` is the narrower question and stops at the directory.
 - **`--keep-cpp N`, `--keep-swap N` and `--keep-engine-versions N`** keep
   that many old versions. A non-positive count is refused;
   `KEEP_SWAP_VERSIONS` and `KEEP_ENGINE_VERSIONS` are the environment
@@ -406,14 +404,14 @@ directory's `tools/`. There is no config file: llama-packer reads
 `profiles.yaml` for the same paths, and an engine somebody installed with
 their own package manager stays under that tool's management.
 
-## Engines not fetched by a bare run
+## Engines an update cannot reach
 
-`extras/update.py all` fetches llama.cpp, llama-swap, audio.cpp,
-whisper.cpp and stable-diffusion.cpp, so with that run the run directory holds
-every engine and nothing needs pointing anywhere else. A bare
-`extras/update.py` has nothing to fetch by default; `--fetch` gets llama.cpp
-and llama-swap, in which case the other engines are still configured by
-path —
+A bare `extras/update.py` fetches llama.cpp, llama-swap, audio.cpp,
+whisper.cpp and stable-diffusion.cpp, so the run directory holds every engine
+and nothing needs pointing anywhere else. When an upstream has no usable
+release for the detected architecture, the updater reports that target with
+the reason and leaves its installed binary alone; those engines are then
+still configured by path —
 [docs/backends/audio-cpp.md](backends/audio-cpp.md) has the detail. Point at
 them however you prefer:
 

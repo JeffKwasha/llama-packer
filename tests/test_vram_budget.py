@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import struct
 
 import pytest
@@ -75,7 +76,7 @@ _CPU_SERVE_LOG = """\
 
 
 def test_parse_host_buffers_reads_final_pass():
-    # Validates: docs/plans/requirement-trace.md, requirement #59
+    # Validates: FLOW_HOST_PARSE_READS_FINAL_PASS — SPEC.md §Host pool
     """Host sums from the final pass only: pass-1's real compute (36.10)
     must not double count, and the host weights equal the breakdown's
     model column (two CPU_Mapped buffers sum, 121.50 + 344.78)."""
@@ -88,7 +89,7 @@ def test_parse_host_buffers_reads_final_pass():
 
 
 def test_parse_host_buffers_headerless_log_parses_whole():
-    # Validates: docs/plans/requirement-trace.md, requirement #60
+    # Validates: FLOW_HOST_PARSE_REPORTS_COMPONENT_SUMS — SPEC.md §Host pool
     text = """\
 0.05.260.351 I load_tensors:   CPU_Mapped model buffer size =   344.78 MiB
 0.05.263.779 I llama_kv_cache:        CPU KV buffer size =   476.00 MiB
@@ -99,7 +100,7 @@ def test_parse_host_buffers_headerless_log_parses_whole():
 
 
 def test_parse_device_buffers_whole_log_device_path():
-    # Validates: docs/plans/requirement-trace.md, requirement #65
+    # Validates: FLOW_DEVICE_PARSE_EXCLUDES_HOST_SUMS — SPEC.md §Host pool
     """Device sums are unchanged by this refactor: host-side values of a
     CPU-shaped run contribute nothing to them (excluded upstream by the
     spill check)."""
@@ -116,7 +117,7 @@ def test_parse_spill_rejects_vulkanless_fullcpu_launch():
 
 def test_run_measure_server_cpu_shape_returns_host_buffers(
         make_model, tmp_path, guard_env):
-    # Validates: docs/plans/requirement-trace.md, requirement #61, #62
+    # Validates: FLOW_CPU_SHAPE_CARRIES_DEVICE_PIN — SPEC.md §Host pool
     model = make_model("a", device="cpu")
     stub = _stub_server(
         tmp_path,
@@ -137,7 +138,7 @@ def test_run_measure_server_cpu_shape_returns_host_buffers(
 
 def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
         make_model, tmp_path, guard_env):
-    # Validates: docs/plans/requirement-trace.md, requirement #62
+    # Validates: FLOW_CPU_SHAPE_SKIPS_SPILL_REJECTION — SPEC.md §Host pool
     model = make_model("a")
     stub = _stub_server(
         tmp_path,
@@ -153,7 +154,7 @@ def test_run_measure_server_gpu_refuses_vulkanless_fullcpu(
 
 
 def test_parse_fit_log_host_row_fallback():
-    # Validates: docs/plans/requirement-trace.md, requirement #63
+    # Validates: FLOW_FIT_LOG_HOST_ROW_FALLBACK — SPEC.md §Host pool
     """Captured CPU-shaped fit-params run: the affine report row is named
     ``Host`` — today the parse rejects the whole run."""
     text = """\
@@ -174,7 +175,7 @@ Host 466 476 316
 
 
 def test_parse_fit_log_prefers_device_row():
-    # Validates: docs/plans/requirement-trace.md, requirement #63
+    # Validates: FLOW_FIT_LOG_HOST_ROW_FALLBACK — SPEC.md §Host pool
     text = """\
 Vulkan0 18904 8704 1552
 Host 466 476 316
@@ -187,7 +188,7 @@ Host 466 476 316
 
 def test_measure_affine_trio_cpu_shape_persists_host_quad(
         make_model, tmp_path):
-    # Validates: docs/plans/requirement-trace.md, requirement #64
+    # Validates: FLOW_CPU_QUAD_PERSISTED_UNDER_SHAPE — SPEC.md §Host pool
     """Stub fit-params replays the three captured CPU-shaped runs
     (8192/1, 8192/2, 4096/1); c = (476−238)/4096, D = 0, weights 466.
     The persisted block carries the CPU device in its shape stamp."""
@@ -214,7 +215,7 @@ def test_measure_affine_trio_cpu_shape_persists_host_quad(
 
 def test_host_measurement_does_not_leak_into_vram_pricing(make_model,
                                                          tmp_path):
-    # Validates: docs/plans/requirement-trace.md, requirement #74
+    # Validates: FLOW_CPU_SERVING_CHARGES_RAM_ONLY — SPEC.md §Host pool
     # measurement (allow_cpu=True, the host ledger) caches the same quad; a
     # VRAM-priced call must still see None, or the CPU-served model is charged
     # to the chat solve after all.
@@ -478,7 +479,7 @@ def test_solve_context_never_reports_a_context_it_cannot_afford(make_model,
     count. GLM47's c with qwen35's corrected D made that reachable:
     2000 MiB left, 4 slots bought 1863 tokens, reported as 4096.
 
-    Validates: docs/plans/requirement-trace.md #27: no emitted entry may need more
+    Validates: FLOW_NO_ENTRY_EXCEEDS_VRAM — SPEC.md §VRAM Allocation
     VRAM than exists.
     """
     import logging
@@ -590,6 +591,53 @@ def test_solve_context_memory_margin_shrinks_ctx(make_model):
     assert margined == 20480
 
 
+# ── shape stamp: logging flags do not invalidate derived blocks ──────────
+
+
+def test_shape_key_strips_only_known_logging_flags():
+    # Validates: SPEC.md 'Measurement via `llama-fit-params`': vram.shape_key
+    # Validates: FLOW_SHAPE_IGNORES_LOGGING_FLAGS — tests/test_vram_budget.py
+    # is the single decision point for what counts as a VRAM shape change.
+    assert vram.shape_key("--flash-attn on -lv 5") == "--flash-attn on"
+    assert vram.shape_key("-lv 5 --log-file x.log --flash-attn on") == \
+        "--flash-attn on"
+    assert vram.shape_key("-v --log-prefix --flash-attn on") == \
+        "--flash-attn on"
+    # Unknown flags are kept: a new memory-relevant flag is never ignored.
+    assert vram.shape_key("--new-memory-flag on -lv 5") == \
+        "--new-memory-flag on"
+    # Quoted values survive the stamp round trip.
+    quoted = vram.shape_key('--foo "a b" --flash-attn on')
+    assert shlex.split(quoted) == ['--foo', 'a b', '--flash-attn', 'on']
+
+
+def test_derived_block_reused_when_only_logging_flag_changes(
+        make_model, monkeypatch):
+    # Validates: docs/backends/llama-server.md 'profiles.yaml': enabling
+    # verbose server logs fleet-wide must not force a fleet re-measure.
+    vb = make_model("s").vram
+    seen = []
+
+    def fake_trio(design, cache_type, llama_args, source, fit_bin):
+        seen.append(llama_args)
+        return FitParams(1000, 0.1, 10, 100, source, cache_type,
+                         vram.shape_key(llama_args))
+
+    monkeypatch.setattr(vb, "_measure_affine_trio", fake_trio)
+    monkeypatch.setattr(vb, "_persist", lambda params: None)
+    plain = vb.fit_params_static("unused", llama_args="--flash-attn on")
+    verbose = vb.fit_params_static("unused",
+                                   llama_args="--flash-attn on -lv 5")
+    assert plain is verbose
+    assert plain.shape == "--flash-attn on"
+    assert len(seen) == 1
+    # A real memory flag still re-measures.
+    changed = vb.fit_params_static("unused",
+                                   llama_args="--flash-attn off -lv 5")
+    assert changed is not plain
+    assert len(seen) == 2
+
+
 # ── unestimable fallback (no estimate source works) ──────────────────────
 
 
@@ -600,15 +648,21 @@ def test_solve_context_unestimable_falls_back_to_design(make_model, caplog):
 
     model = make_model("ue", context_length=32768)
     model.vram.effective_static = lambda *a, **k: None
+    model.vram._last_fit_failure = {
+        "outcome": "crash", "rc": 1, "brief": "CUDA error: OOM"}
     with caplog.at_level(logging.WARNING, logger="llama_packer.vram"):
         ctx = model.vram.solve_context(32768, fit_bin="unused")
     assert ctx == 32768
     assert model.vram.unestimated_reason is not None
-    assert any("VRAM measurement failed" in r.message for r in caplog.records)
+    failed = [r.message for r in caplog.records if "probe failed" in r.message]
+    # Validates: SPEC.md 'Context calculation formula': one short line names
+    # the device, the model, the probe's exit code and the guess.
+    assert len(failed) == 1
+    assert failed[0] == (
+        "GPU0 probe failed [ue] fit-params -> 1: CUDA error: OOM | guessing 32k")
     # The warning is deduped: a repeat solve logs it once.
     model.vram.solve_context(32768, fit_bin="unused")
-    assert sum("VRAM measurement failed" in r.message
-               for r in caplog.records) == 1
+    assert sum("probe failed" in r.message for r in caplog.records) == 1
 
 
 def test_fit_params_undecodable_output_returns_none(make_model, monkeypatch,
@@ -783,7 +837,7 @@ def test_solve_context_image_floor_native_vision(make_model, tmp_path):
     Qwen3-VL / Gemma3 have vision baked into the main weights. image_max_tokens
     is set, image tokens count against context, and the per-slot floor applies.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_NATIVE_VISION_IMAGE_FLOOR — SPEC.md §Context calculation formula
     """
     fit = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
            "compute_mib": 1000, "cache_type": "q8_0",
@@ -831,7 +885,7 @@ _FIT = {"model_mib": 25000, "kv_per_token_mib": 0.5, "slot_mib": 0.0,
 def test_min_image_megapixels_converts_through_geometry(make_model, tmp_path):
     """2 megapixels at 1024 pixels/token is 1953 image tokens.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_MEGAPIXEL_CONVERTS_THROUGH_GEOMETRY — docs/models/vision-context.md
     """
     model = _vision_geom(make_model, tmp_path, "i", _FIT,
                          min_image_megapixels=2)
@@ -843,7 +897,7 @@ def test_min_image_megapixels_converts_through_geometry(make_model, tmp_path):
 def test_min_image_megapixels_floor_includes_output_reserve(make_model, tmp_path):
     """The floor is image tokens plus room to answer, not the image alone.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_IMAGE_FLOOR_INCLUDES_OUTPUT_RESERVE — docs/models/vision-context.md
     """
     model = _vision_geom(make_model, tmp_path, "i", _FIT,
                          min_image_megapixels=1, image_output_reserve=2048)
@@ -855,7 +909,7 @@ def test_min_image_megapixels_ignored_on_non_proportional(make_model, tmp_path,
                                                             caplog):
     """A projector that does not scale with pixels cannot honour the knob.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_NONPROPORTIONAL_PROJECTOR_WARNED — docs/models/vision-context.md
     """
     import logging
     model = _vision_geom(make_model, tmp_path, "i", _FIT, patch=14, merge=1,
@@ -870,7 +924,7 @@ def test_min_image_megapixels_ignored_on_non_proportional(make_model, tmp_path,
 def test_min_image_megapixels_too_large_warns(make_model, tmp_path, caplog):
     """A budget above the declared cap is reported, then clamped.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_IMAGE_BUDGET_CLAMPED_WITH_WARNING — docs/models/vision-context.md
     """
     import logging
     model = _vision_geom(make_model, tmp_path, "i", _FIT,
@@ -885,7 +939,7 @@ def test_min_image_megapixels_too_large_warns(make_model, tmp_path, caplog):
 def test_min_image_megapixels_zero_allows_shedding(make_model, tmp_path, caplog):
     """0 means vision is not required; it may be shed, and that warns.
 
-    Validates: docs/models/vision-context.md.
+    Validates: FLOW_ZERO_IMAGE_BUDGET_DROPS_REQUIREMENT — docs/models/vision-context.md
     """
     import logging
     model = _vision_geom(make_model, tmp_path, "i", _FIT,
@@ -997,7 +1051,7 @@ def test_sidecar_ceiling_binds_in_the_squeeze_branch(make_model):
     _bounded_ctx passes design_context, which prefers the GGUF header over
     the sidecar.
 
-    Validates: docs/plans/requirement-trace.md #19: context_length is a ceiling in
+    Validates: FLOW_CONTEXT_LENGTH_IS_CEILING — SPEC.md §Context calculation formula
     both branches, not only the one that fits.
     """
     fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
@@ -1023,7 +1077,7 @@ def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
     served context above that, or "no pin" and "pinned at 32k" look
     identical in the fixtures.
 
-    Validates: docs/plans/requirement-trace.md #19.
+    Validates: FLOW_CONTEXT_LENGTH_IS_CEILING — SPEC.md §Context calculation formula
     """
     fm = {"model_mib": 4000, "kv_per_token_mib": 0.10, "slot_mib": 0.0,
           "compute_mib": 500, "source": "llama-server", "cache_type": "q8_0",
@@ -1034,8 +1088,8 @@ def test_sidecar_ceiling_is_a_min_not_a_fixed_cap(make_model):
     assert ctx == 131072
 
 
-def test_serve_measurement_mirrors_single_slot_draft_drop(make_model):
-    # Validates: SPEC.md, 'Single-sequence draft engines': the serve-shaped probe drops a dflash/dspark draft at parallel > 1 exactly like the emitted command
+def test_serve_measurement_mirrors_draft_at_any_parallel(make_model):
+    # Validates: SPEC.md, 'Single-sequence draft engines': the serve-shaped
+    # probe keeps a dflash/dspark draft at every slot count, as emitted.
     model = make_model("m", mtp=True, mtp_spec_type="draft-dspark")
-    assert "--spec-type" not in model.vram._mtp_measure_flags(4)
-    assert "--spec-type" in model.vram._mtp_measure_flags(1)
+    assert "--spec-type" in model.vram._mtp_measure_flags()

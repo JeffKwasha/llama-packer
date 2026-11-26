@@ -220,7 +220,7 @@ def test_note_fs_op_carries_the_detail(caplog):
 
 
 def test_verbosity_ladder_and_floor():
-    # Validates: SPEC.md, 'Log Levels': -v lifts the level to INFO, -vv to DEBUG, -vvv to whatever the libraries log. The floor is never lowered: -v adds detail, it never silences a warning.
+    # Validates: FLOW_PACK_LOG_FLOOR_WARNING — SPEC.md §Log Levels
     from llama_packer.__main__ import setup_logging
     import logging as _logging
     try:

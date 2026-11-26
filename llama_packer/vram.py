@@ -1,23 +1,4 @@
-"""VRAM budget calculation: affine memory measurement, context sizing, and
-matrix solving.
-
-The VRAM law (validated across families; see llama_packer.memory_probe):
-
-    VRAM(C, p) = model_mib + compute_mib + c*C + p*D
-
-
-C - the *total* shared KV pool
-p - parallel
-
-c - the shared per-token cost
-D - the fixed per-slot cost
-
-Measurements come from llama-fit-params, llama-packer --probe-memory
-llama-fit-params is blind to the recurrent-state cache, the baked-in
-MTP draft, and the batch-dependent compute
-
-llama-packer --probe-memory measures these directly into the sidecar ``derived:`` block
-"""
+"""VRAM budget: affine measurement and context sizing. See SPEC §VRAM Allocation."""
 
 from __future__ import annotations
 
@@ -54,7 +35,6 @@ from llama_packer.consts import (
     _MTP_SPEC_TYPE,
     _RESERVE_SYSTEM,
     _RESERVE_VIDEO,
-    _SINGLE_SLOT_SPEC_TYPES,
     _SD_COMPUTE_MB,
     _VLLM_PER_SEQ_MIB,
     _WHISPER_COMPUTE_MB,
@@ -281,6 +261,45 @@ def parse_fit_log(log_text: str) -> dict[str, float] | None:
         "rs": rs,
         "rs_cells": rs_cells,
     }
+
+
+#: Logging flags change stdout, not VRAM. Stripped from the shape stamp in
+#: one place so a fleet-wide `-lv 5` cannot invalidate every derived block
+#: and force a re-measure. Unknown flags are deliberately kept.
+NON_SHAPE_FLAGS = frozenset({
+    "-v", "--verbose", "--log-verbose",
+    "-lv", "--verbosity", "--log-verbosity",
+    "--log-disable", "--log-file", "--log-jsonl", "--no-log-jsonl",
+    "--log-colors", "--log-prefix", "--no-log-prefix",
+    "--log-timestamps", "--no-log-timestamps",
+})
+
+
+def shape_key(llama_args: str) -> str:
+    """The VRAM-relevant part of a flag string: the `derived: shape` key.
+
+    Only the flags listed in :data:`NON_SHAPE_FLAGS` are dropped, together
+    with their separate value token when they take one. Everything else —
+    including flags this version does not know — stays, so a new
+    memory-relevant flag can never be silently ignored.
+    """
+    try:
+        tokens = shlex.split(llama_args or "")
+    except ValueError:
+        tokens = (llama_args or "").split()
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.split("=", 1)[0] in NON_SHAPE_FLAGS:
+            i += 1
+            if "=" not in token and i < len(tokens) \
+                    and not tokens[i].startswith("-"):
+                i += 1  # the flag's value, e.g. the `5` in `-lv 5`
+            continue
+        out.append(token)
+        i += 1
+    return shlex.join(out)
 
 
 def _is_host_report_name(dev: str) -> bool:
@@ -593,6 +612,10 @@ class VramBudget:
         #: Set when no estimate source worked for this model — the planner
         #: surfaces it as metadata.estimated/estimate_error on every entry.
         self.unestimated_reason: str | None = None
+        #: Last fit-params failure: ``{outcome, rc, brief}``. Kept separate
+        #: from ``unestimated_reason`` (metadata stays short) so the summary
+        #: warning can name the failing probe and its cause in one line.
+        self._last_fit_failure: dict[str, object] = {}
         #: Set when the budget cannot even hold weights + compute (the model
         #: cannot load at any context) — the planner disables the entry.
         #: ``None`` when the budget fits; reset at the top of every
@@ -669,7 +692,7 @@ class VramBudget:
             cmd += ["-c", str(fit_ctx)]
         if parallel > 1:
             cmd += ["--parallel", str(parallel)]
-        cmd += llama_args.split()
+        cmd += shlex.split(llama_args)
 
         logger.info("measuring VRAM: %s via llama-fit-params", label)
 
@@ -692,6 +715,13 @@ class VramBudget:
                 text = f"could not parse fit-params output for {label}: {cause}"
             else:
                 text = f"fit-params failed for {label}: {cause}"
+            # The detailed warning keeps the whole cause and the log path;
+            # the context warning folds this into one terse line.
+            self._last_fit_failure = {
+                "outcome": outcome,
+                "rc": rc,
+                "brief": cause.splitlines()[0][:120],
+            }
             if artifact is not None:
                 text += f" — full log: {artifact}"
             logger.warning(text)
@@ -810,14 +840,12 @@ class VramBudget:
 
     # ── serve-shaped llama-server measurement ──
 
-    def _mtp_measure_flags(self, parallel: int = 1) -> list[str]:
+    def _mtp_measure_flags(self) -> list[str]:
         """Speculative-decode flags mirroring the serve emission exactly."""
         mtp_on, n_max = self.model._mtp_info()
         if not mtp_on:
             return []
         spec_type = self.model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
-        if parallel > 1 and _SINGLE_SLOT_SPEC_TYPES & set(str(spec_type).split(",")):
-            return []  # serve drops it at this slot count (llama_server.py)
         companion = self.model.mtp
         if companion is None and self.model.frontmatter.get("speculative"):
             return []  # declared companion missing: serve skips MTP too
@@ -854,7 +882,7 @@ class VramBudget:
         rejected (its device sums undercount the truth).  Every run is
         journaled.
         """
-        shape = (llama_args or "").strip()
+        shape = shape_key(llama_args)
         on_cpu = bool(self.model.on_cpu)
         cache_key = ("serve", on_cpu, cache_type, ctx, parallel, shape)
         if cache_key in self._serve_cache:
@@ -886,8 +914,8 @@ class VramBudget:
                 cmd += ["--n-gpu-layers", "0"]
         elif not _NGL_SHAPE_RE.search(shape):
             cmd += ["-ngl", "999"]
-        cmd += self._mtp_measure_flags(parallel)
-        cmd += shape.split()
+        cmd += self._mtp_measure_flags()
+        cmd += shlex.split(shape)
         # Line-buffered stdout even redirected to a file: the stall
         # window reads log growth, and block buffering hides it during
         # the multi-minute load (false stalls on platter models).
@@ -995,6 +1023,9 @@ class VramBudget:
         any design context works (the former ``max(C/2, 4096)`` floor
         silently mis-derived ``c`` for designs below 8192 — and sub-4k
         text designs are an error or a testcase anyway).
+        The shape stamped on the result filters logging flags through
+        :func:`shape_key`; the measurement itself keeps them (harmless).
+
         The compute row is *not* part of the fit — under serve batch
         flags it is not affine in (C, p) (deepseek2: −64 MiB per ctx
         halving, −168 per extra slot) — so its max over the trio is the
@@ -1030,7 +1061,7 @@ class VramBudget:
             compute_mib=compute_mib,
             source=source,
             cache_type=cache_type,
-            shape=llama_args,
+            shape=shape_key(llama_args),
         )
 
     def _fit_params_serve(
@@ -1045,9 +1076,8 @@ class VramBudget:
         ``compute`` come from fit-params and are unsound until a
         ``--probe-memory`` run persists a ``llama-server`` block.
         """
-        shape = (llama_args or "").strip()
         params = self._measure_affine_trio(self._design_ctx(), cache_type,
-                                           shape, source="fit-estimate",
+                                           llama_args, source="fit-estimate",
                                            fit_bin=fit_bin)
         if params is None:
             return None
@@ -1086,8 +1116,7 @@ class VramBudget:
         run re-attempts the calibrated measurement.
         """
         return self._measure_affine_trio(self._design_ctx(), cache_type,
-                                         (llama_args or "").strip(),
-                                         source="fit-params",
+                                         llama_args, source="fit-params",
                                          fit_bin=fit_bin)
 
     # ── static params (model_mib, kv_per_token_mib, slot_mib, compute_mib) ──
@@ -1099,22 +1128,7 @@ class VramBudget:
         llama_args: str = "",
         allow_cpu: bool = False,
     ) -> FitParams | None:
-        """Get affine VRAM constants for this model at *cache_type*.
-
-        Checks: saved frontmatter → in-memory cache → the fast fit-params
-        estimate (never a server; normal runs pay ~1-2 s once per model)
-        → plain fit-params pair (transient) → safetensors estimate.  New
-        estimates are persisted to the sidecar so later runs pay nothing.
-        Every path runs under the model's measured flag shape (the
-        ``llama_args`` the caller composes: global args + the resolved
-        ``-ub``) — the in-memory cache and the persisted block are both
-        shape-bound, so a profiles/batch-key change re-measures instead of
-        reusing stale compute terms.  ``remeasure`` (CLI ``--remeasure``)
-        skips the saved-block path entirely.  ``allow_cpu`` measures
-        CPU-served models too (their constants describe host RAM, used
-        for the emitted memory tag — never for VRAM sizing); without it
-        CPU-served models return None as before.
-        """
+        """Affine constants via the measurement ladder; SPEC §Measurement via `llama-fit-params`."""
         if self.model.backend in FIXED_OVERHEAD_BACKENDS:
             # Fixed-overhead backends are sized from file size + a fixed
             # buffer (effective_static); CPU-served models are not
@@ -1126,7 +1140,7 @@ class VramBudget:
             # (allow_cpu=True, the CPU budget) caches the same quad, and
             # returning it here would charge a CPU-served model VRAM again.
             return None
-        shape = (llama_args or "").strip()
+        shape = shape_key(llama_args)
         if (cache_type, shape) in self._static_cache:
             return self._static_cache[(cache_type, shape)]
 
@@ -1336,21 +1350,7 @@ class VramBudget:
         llama_args: str = "",
         allow_cpu: bool = False,
     ) -> tuple[int, float, float, int] | None:
-        """Combined affine VRAM constants for main model plus its companions.
-
-        Returns (model_mib, kv_per_token_mib, slot_mib, compute_mib) where
-        the mmproj's weight/compute is folded into the main model's
-        numbers, so downstream context math sees a single budget.  The MTP
-        draft is folded only when the main block did *not* come from the
-        serve-shaped measurement — those blocks are measured with the
-        draft running and already carry it.  ``allow_cpu`` is passed
-        through to :meth:`fit_params_static` (host-RAM constants for the
-        emitted memory tag on CPU-served models).
-
-        *include_draft* is the ladder's ``draft`` axis: a category may keep
-        an MTP companion or give it up to buy context. A draft baked into
-        the main block is not separable and stays counted either way.
-        """
+        """Combined quad with companions folded; SPEC §Companion (mmproj / MTP) VRAM accounting."""
         cache_key = ("effective", cache_type, include_mmproj, include_draft,
                      llama_args)
         if cache_key in self._effective_cache:
@@ -1445,21 +1445,7 @@ class VramBudget:
         memory_margin: float = 0.0,
         llama_args: str = "",
     ) -> int:
-        """Calculate max per-slot context size for given VRAM.
-
-        The solved value is the context available to *each* parallel slot;
-        the emitted server flag is ``--kv-unified-per-slot X`` (shared pool
-        ``parallel * X``).  Uses saved affine constants when available,
-        otherwise measures the (p=1, p=2) pair and persists them.
-
-        ``include_mmproj=False`` drops the vision projection from the budget
-        (used when skipping mmproj to reach the minimum useful context).
-        ``baseline_mb`` is the driver/compositor VRAM already in use; the
-        effective reserve is ``_RESERVE_SYSTEM + max(_RESERVE_VIDEO, baseline)``.
-        ``memory_margin`` inflates every measured term (safety against
-        measurement residual).  ``llama_args`` are the profiles global
-        server flags the measurement mirrors (flash attention, batch).
-        """
+        """Per-slot context for this VRAM; SPEC §Context calculation formula."""
         # Each solve reports its own budget: clear the gating flags so a
         # tight group's verdict does not leak into a looser group's plan.
         self.over_budget_reason = None
@@ -1495,9 +1481,19 @@ class VramBudget:
             # participants get a conservative largest-measured reserve.
             if self.unestimated_reason is None:
                 self.unestimated_reason = ESTIMATE_ERROR_REASON
+            ctx_short = (f"{design // 1024}k" if design % 1024 == 0
+                         else str(design))
+            dev = "CPU" if self.model.on_cpu else f"GPU{self.model.device or 0}"
+            fail = self._last_fit_failure
+            if fail:
+                code = (fail["rc"] if fail["rc"] is not None
+                        else fail["outcome"])
+                detail = f"fit-params -> {code}: {fail['brief']}"
+            else:
+                detail = "no estimate"
             self._warn_once(
-                "VRAM measurement failed for %s; sizing to design context "
-                "%d (unverified — may OOM)", self.model.stem, design)
+                "%s probe failed [%s] %s | guessing %s",
+                dev, self.model.stem, detail, ctx_short)
             return design
 
         model_mib, kv_per_token, slot_mib, compute_mib = static

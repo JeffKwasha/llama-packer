@@ -28,13 +28,17 @@ RETIRED_KEYS = frozenset({"min", "preferred", "cap", "weight", "exclusive",
 class Share:
     """A role's request in a set's auction."""
 
-    #: ``weight``, ``fill``, ``min``, or ``zero``.
+    #: ``weight``, ``percent``, ``fill``, ``min``, or ``zero``.
     kind: str = "zero"
     weight: float = 0.0
 
     @property
     def requests(self) -> bool:
-        return self.kind in ("weight", "fill")
+        return self.kind in ("weight", "percent", "fill")
+
+    @property
+    def claims(self) -> bool:
+        return self.kind in ("weight", "percent")
 
     @property
     def accepts(self) -> bool:
@@ -59,25 +63,26 @@ class Role:
 
 
 def _parse_share(value: object) -> Share | None:
-    """``40``, ``40%``, ``fill``, ``min``, or ``0``; None when unreadable."""
+    """``40`` (weight), ``40%`` (claim), ``fill``, ``min``, ``0``; None if bad."""
     if value is None:
         return Share()
     if isinstance(value, bool):
         return None
     text = str(value).strip().lower()
     if text == "fill":
-        return Share("fill", 100.0)
+        return Share("fill", 0.0)
     if text == "min":
         return Share("min", 0.0)
+    claim = text.endswith("%")
     try:
-        weight = float(text[:-1]) if text.endswith("%") else float(text)
+        weight = float(text[:-1]) if claim else float(text)
     except ValueError:
         return None
     if weight < 0:
         return None
     if weight == 0.0:
         return Share("zero", 0.0)
-    return Share("weight", weight)
+    return Share("percent" if claim else "weight", weight)
 
 
 def _default_specs() -> dict:
@@ -143,7 +148,7 @@ def _parse_one(name: object, spec: object,
     share = _parse_share(spec.get("share"))
     if share is None:
         problems.append(f"roles.{name}: share={spec.get('share')!r} is not a "
-                        "weight, 'fill', 'min', or 0")
+                        "weight, 'N%', 'fill', 'min', or 0")
         share = Share()
     device, device_problem = parse_device(spec.get("device"))
     if device_problem:
@@ -174,6 +179,12 @@ def parse_roles(cfg: dict | None) -> tuple[dict[str, Role], list[str]]:
         problems.extend(issues)
         if role is not None:
             out[role.name] = role
+    claims = sum(r.share.weight for r in out.values()
+                 if r.share.kind == "percent")
+    if claims > 100:
+        problems.append(
+            f"roles: percentage shares sum to {claims:g}; they cannot all "
+            "be met in the 100-point weight space")
     owned: dict[str, str] = {}
     for role in out.values():
         for d in role.dir:

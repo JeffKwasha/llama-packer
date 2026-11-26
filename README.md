@@ -69,14 +69,13 @@ installed: put it in the directory that should hold the binaries, or anywhere,
 and run it from the directory it should manage.
 
 ```sh
+./update.py              # update every engine in ./tools
 ./update.py --plan       # the decision, downloads nothing
-./update.py --fetch      # newest llama.cpp + llama-swap into ./tools
-./update.py all --fetch  # + audio.cpp, whisper.cpp, stable-diffusion.cpp
 ```
 
-A bare run only links what is already installed. The target comes from the
-directory you run it in: from an install directory it manages `<dir>/tools`;
-from `tools/` itself it manages that directory. It needs python 3.11.4 or newer
+A bare run updates what it can and reports why anything it could not update.
+The target comes from the directory you run it in: from an install directory it
+manages `<dir>/tools`; from `tools/` itself it manages that directory. It needs python 3.11.4 or newer
 and `curl`; `GITHUB_TOKEN` raises the unauthenticated API limit. Only llama-swap
 publishes a `checksums.txt`.
 

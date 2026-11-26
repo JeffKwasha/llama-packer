@@ -29,7 +29,7 @@ def _variant(**kw):
 
 
 def test_capacity_pools_are_gpu_budget_host_pool_and_role_singletons():
-    # Validates: SPEC.md, "Capacity routing": pools are the packer's
+    # Validates: FLOW_EMITTED_POOLS_ARE_AVAILABLE — SPEC.md §Capacity routing
     # available GPU budget, the detected host pool, and one size-1 pool per
     # scheduling role.
     p = Planner([], Profiles({}), "fit", 32768, baseline_mb=4096,
@@ -41,7 +41,7 @@ def test_capacity_pools_are_gpu_budget_host_pool_and_role_singletons():
 
 
 def test_pools_ram_spare_shrinks_the_host_pool():
-    # Validates: docs/plans/requirement-trace.md, requirement #108
+    # Validates: FLOW_POOL_SPARE_REDUCES_POOL — docs/profiles-authoring.md
     p = Planner([], Profiles({"pools": {"ram": {"spare": "2G"}}}), "fit",
                 32768, baseline_mb=4096, host_pool_mb=50000)
     assert p.capacity_pools["ram"] == 50000 - 2048
@@ -49,7 +49,7 @@ def test_pools_ram_spare_shrinks_the_host_pool():
 
 
 def test_custom_role_gets_its_own_size_one_pool():
-    # Validates: docs/plans/requirement-trace.md, requirement #107
+    # Validates: ARCH_ROLE_IS_OPERATOR_DATA — docs/profiles-authoring.md
     from llama_packer import roles
 
     try:
@@ -64,7 +64,7 @@ def test_custom_role_gets_its_own_size_one_pool():
 
 
 def test_custom_role_entry_charges_its_own_pool():
-    # Validates: docs/plans/requirement-trace.md, requirement #107
+    # Validates: ARCH_ROLE_IS_OPERATOR_DATA — docs/profiles-authoring.md
     caps = _capacity_fields(
         _model(role="cat"),
         _variant(task_demands=(SimpleNamespace(role="cat"),)),
@@ -74,7 +74,7 @@ def test_custom_role_entry_charges_its_own_pool():
 
 
 def test_capacity_fields_charge_gpu_ram_and_role():
-    # Validates: SPEC.md, "Capacity routing": every entry declares the pools
+    # Validates: FLOW_ENTRY_POOL_CHARGES_WITH_MARGIN — SPEC.md §Capacity routing
     # it consumes; chat entries also take their role's singleton slot.
     caps = _capacity_fields(_model(), _variant(), {"default": 30000,
                                                    "ram": 50000, "chat": 1},
@@ -84,7 +84,7 @@ def test_capacity_fields_charge_gpu_ram_and_role():
 
 
 def test_capacity_fields_cpu_helper_charges_host_only():
-    # Validates: SPEC.md, "Capacity routing": a device: cpu serving consumes
+    # Validates: FLOW_CPU_SERVING_CHARGES_RAM_ONLY — SPEC.md §Host pool
     # the host pool, never a GPU pool.
     caps = _capacity_fields(
         _model(on_cpu=True, size_mb=700, role="embeddings"),
@@ -97,7 +97,7 @@ def test_capacity_fields_cpu_helper_charges_host_only():
 
 
 def test_capacity_evict_cost_ignores_prefill_for_stateless_roles():
-    # Validates: SPEC.md, "Capacity routing": only a stateful chat serving
+    # Validates: FLOW_EVICT_COST_RELOAD_AND_PREFILL — SPEC.md §Capacity routing
     # pays the lost-prefill term; helpers pay reload time.
     caps = _capacity_fields(
         _model(role="rerank", size_mb=4000),
@@ -107,7 +107,7 @@ def test_capacity_evict_cost_ignores_prefill_for_stateless_roles():
 
 
 def test_capacity_evict_cost_uses_sidecar_prompt_rate():
-    # Validates: SPEC.md, "Capacity routing": a sidecar pp_tps: overrides the
+    # Validates: FLOW_EVICT_COST_RELOAD_AND_PREFILL — SPEC.md §Capacity routing
     # fleet default when pricing lost prefill.
     caps = _capacity_fields(
         _model(size_mb=20000, frontmatter={"pp_tps": 3000},
@@ -118,7 +118,7 @@ def test_capacity_evict_cost_uses_sidecar_prompt_rate():
 
 
 def test_capacity_unestimated_serving_uses_the_file_size_estimate():
-    # Validates: docs/allocation.md, 'Unmeasured models': a minimum estimate,
+    # Validates: FLOW_ENTRY_POOL_CHARGES_WITH_MARGIN — SPEC.md §Capacity routing
     # flagged, never the whole pool.
     caps = _capacity_fields(
         _model(size_mb=20000),

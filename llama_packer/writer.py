@@ -180,7 +180,7 @@ def _filter_supported(models: list[Model], default_cache_type: str = "q8_0") -> 
             logger.error("skipping capability 'vision' on %s: removed, use 'image' "
                          "(llama-swap modalities are text/audio/image/video)",
                          model.stem)
-        if has_mmproj and model.role not in ("s2t", "t2s", "image", "embeddings", "rerank"):
+        if has_mmproj:
             block = model.mmproj_overlay
             if not block:
                 # Legacy companion (no declared purpose): keep the
@@ -1142,22 +1142,7 @@ def measurement_args(
     profiles: Profiles, model: Model, global_args: str = "",
     profile: dict | None = None,
 ) -> str:
-    """The exact flag string VRAM constants are measured (and shape-stamped)
-    under: global args + the CPU device pin when the model is
-    CPU-served (`--n-gpu-layers 0`, the measurement of the host-side
-    quads — docs/plans/cpu-residency-budget.md) + the model's effective
-    ``-ub``.  ``batch`` is excluded — measured to have no VRAM effect, so
-    throughput tuning must not invalidate estimates.
-
-    The *effective* ubatch is stamped, not just an explicitly configured one:
-    an unset key still serves at llama.cpp's builtin, so the compute buffer
-    the constants were measured for is the one the server will actually
-    allocate.  Omitting it would change every ``derived: shape`` key and
-    force a fleet-wide re-measurement for a flag that has not moved.  The
-    same holds for the device pin: a sidecar ``device: cpu`` edit must
-    re-measure (the block describes the other budget's byte terms), so the
-    pin rides the shape stamp.
-    """
+    """Shape-stamped measurement flags; SPEC §Measurement via `llama-fit-params`."""
     _, ubatch = resolve_batch_ubatch(profiles, model, profile)
     if ubatch is None:
         ubatch = _LLAMA_CPP_DEFAULT_UBATCH
@@ -1737,7 +1722,7 @@ class Planner:
                     if share.kind == "fill":
                         slack = max(0, cap - sum(role_floor[pool].values()))
                         alloc = floor + slack // max(1, fills.get(pool, 1))
-                    elif share.kind == "weight":
+                    elif share.claims:
                         alloc = min(cap, floor + int(
                             (cap - floor) * share.weight / 100.0))
                     else:
@@ -1810,14 +1795,16 @@ class Planner:
             if share is None:
                 continue
             low = share.kind in ("min", "zero") or (
-                share.kind == "weight" and share.weight < 25)
+                share.claims and share.weight < 25)
             cap = self.capacity_pools.get(pool, 0)
             if low and cap and mb > cap / 10:
+                label = "host RAM" if pool == "ram" else "GPU VRAM"
                 logger.warning(
-                    "matrix: role %r floor %d MiB on %s (share %s) is set by "
-                    "%s/%s; that role cannot grow, so split it if the floor "
-                    "is not intended", role, mb, pool, share.kind, stem,
-                    task or "fallback")
+                    "matrix: role %r gets a fixed %d MiB on %s (share=%s, "
+                    "cannot grow), set by %s/%s — %d%% of the pool; give "
+                    "that model its own role if the reservation is unintended",
+                    role, mb, label, share.kind, stem, task or "fallback",
+                    mb * 100 // cap)
         logger.info("matrix: role floors %s",
                     {p: dict(sorted(v.items())) for p, v in role_floor.items()
                      if v})
@@ -1826,21 +1813,14 @@ class Planner:
             available = self.capacity_pools.get(pool)
             if not available:
                 continue
-            weights, fills, accepts = {}, set(), set()
+            shares = {}
             for leaf, role in leaves_by_pool[pool].items():
                 share = roles.get(role).share if role else None
-                if share is None or pool not in role_pools.get(role, set()):
-                    weights[leaf] = 0.0
-                    continue
-                weights[leaf] = share.weight if share.requests else 0.0
-                if share.kind == "fill":
-                    fills.add(leaf)
-                if share.accepts:
-                    accepts.add(leaf)
+                if share is not None and pool in role_pools.get(role, set()):
+                    shares[leaf] = share
             try:
                 alloc, left = allocation.auction(
-                    available, setmap, floors[pool], weights,
-                    frozenset(fills), frozenset(accepts))
+                    available, setmap, floors[pool], shares)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"set auction failed: {exc}") from None
             logger.info("matrix: %s auction %s -> %s (floor %d)",

@@ -194,12 +194,17 @@ A single measurement cannot separate `c` from `D`, so the system measures a
 former per-parallel sweeps.
 
 Values are persisted to the model's `.md` sidecar `derived:` block — **per
-`cache_type` and per measured flag `shape`** (the exact measurement flag
-string: global args + the resolved `-ub`; the compute buffer depends on
-batch size and flash attention, so blocks are never reused across shapes —
-a profiles/batch-key change re-measures instead of serving stale compute
-terms).  **Parallel-independent by construction** (the `parallel` and
-legacy `ctx_factor` keys of the pre-affine schema are removed on rewrite).
+`cache_type` and per measured flag `shape`** (the measurement flag string:
+global args + the resolved `-ub`, with logging-only flags removed by
+`vram.shape_key()`. The compute buffer depends on batch size and flash
+attention, so blocks are never reused across *memory-relevant* shape changes
+— a profiles/batch-key change re-measures instead of serving stale compute
+terms). `-lv 5`, `--log-file`, and the other logging flags are filtered in
+that one place: they change stdout, not VRAM, so adding them fleet-wide must
+not invalidate every `derived:` block and force a re-measure. Unknown flags
+are kept, so a new memory-relevant flag is never silently ignored.
+**Parallel-independent by construction** (the `parallel` and legacy
+`ctx_factor` keys of the pre-affine schema are removed on rewrite).
 A `cache_type` change invalidates the block and re-measures: `c` would scale
 with KV precision (`_KV_CACHE_BYTES` byte ratios), but `D`'s precision
 behavior is arch-dependent (SWA ring buffers scale, fixed slot overhead does
@@ -438,17 +443,28 @@ The auction runs on the pool the model's device names. The other fields of
 the cost tuple are static charges; a role pool of 1 is a capacity check, not
 memory to share out.
 
-Each member requests a share of it by `share:` weight. `N%` requests N,
-`fill` takes what the weighted roles leave below 100, split equally; when
-they leave nothing it weighs 0 and accepts a remainder freed by a capped
-role, `min` requests 0 and accepts nothing, `0` requests 0 and accepts what
-remains. Weights are normalised per set. A role whose memory does not grow
-with context uses `min`; its floor is the whole cost.
+Each member requests a share of it by `share:`. All weights live in one
+100-point space; the point is a unit, not a cap. A plain `N` is a relative
+weight (uncapped), `N%` is a claim of N points and is warned about when the
+role table's percentages sum above 100, `fill` weighs the residual
+`max(0, 100 − Σ other weights in the set)` split among fills and claims last
+(its offer is that share plus any surplus other roles leave unclaimed).
+`min` requests 0 and accepts
+nothing; `0` requests 0 and accepts what remains. Weights are normalised per
+set. A role whose memory does not grow with context uses `min`; its floor is
+the whole cost.
 
 ```
+weight(fill, set)  = max(0, 100 − Σ other weights in set) / n_fills
 request(role, set) = weight / Σ weights in set × auction(set)
 allocation(role)   = min over its sets of floor + request
 ```
+
+A set mixing `fill` with a raw (non-`%`) weight warns: the fill's residual
+depends on the raw weight's absolute magnitude and can be zero. Pair `fill`
+with percentage claims instead. `allocation.resolve_shares()` is the single
+boundary where claims become weights, fill flags and accept flags; the
+auction itself only sees plain weights.
 
 Each set is priced on its own. A role's limit is the minimum across the
 sets it belongs to, so adding a set can only lower it. An offer in one set
@@ -752,20 +768,24 @@ If absent, the module-level defaults apply (see `llama_packer/consts.py`).
 ### Single-sequence draft engines
 
 `draft-dflash` and `draft-dspark` (the DFlash/DSpark family, selected with
-`mtp_spec_type:`) draft for **one sequence at a time**. llama.cpp keeps their
-per-sequence hidden-state features in a single buffer, so with two slots
-decoding it hands an out-of-vocabulary draft token to the batch builder and
-aborts (`common_batch::get_sub_batch`, observed on build 11988, commit
-`abb76ab38`) — the server dies mid-request and every client behind it gets a
-502.
+`mtp_spec_type:`) draft for **one sequence at a time**. On build 11988 (commit
+`abb76ab38`) two slots decoding handed an out-of-vocabulary draft token to the
+batch builder and aborted (`common_batch::get_sub_batch`), killing the server
+mid-request.
 
-An entry solved for more than one slot therefore **omits the speculative
-flags** and reports `mtp_enabled: false`; the draft is served only at
-`parallel: 1`, which a sidecar `parallel:` pin can select. Extra slots win
-because they pay under load: on MiniCPM-V 4.7 1B, four concurrent 192-token
+That guard is gone as of build 12600. Two models were tested with concurrent
+requests and their DSpark drafts: MiniCPM-V 4.7 1B at `parallel=6` with 262144
+ctx/slot (six 160-token completions, acceptance 0.76–1.00) and Qwen3.8-27B at
+`parallel=2` (two 64-token completions, acceptance 0.64). Neither aborted, so
+the draft is now emitted at any slot count and `mtp_enabled` reports true.
+Draft engines outside this set (e.g. `draft-mtp`) always batched normally.
+
+A build old enough to still have the crash is the operator's responsibility:
+the emitted command will carry the draft flags, and no warning is issued for
+this case. The historical measurement stands as a reason to prefer more slots
+over the draft under load: on MiniCPM-V 4.7 1B, four concurrent 192-token
 requests measured 505 tok/s aggregate at four slots (no draft) versus 253 tok/s
-at one slot with DSpark, for a 14 % single-stream cost (216 vs 250 tok/s).
-Draft engines outside this set (e.g. `draft-mtp`) batch across slots normally.
+at one slot with DSpark.
 
 ### Speculative decoding under vLLM
 
@@ -1217,8 +1237,9 @@ zero KV terms, `compute_mib = 100` (measured on Vulkan: process footprint
 ≈ Σ model files — activation memory is small; sd-server keeps its 512 MiB
 diffusion buffer); a sidecar `vram_mb` pins the total outright.
 `ctx_size` tracks `design_context` (sidecar `context_length` or default)
-without affecting VRAM. An s2t serving with `ttl: 0` stays loaded and is
-charged like any other serving at its task's context. The emitted
+without affecting VRAM. `ttl: 0` disables idle unload; it does not keep a
+serving resident under capacity pressure, which charges it like any other
+serving at its task's context. The emitted
 `--parallel` maps the sidecar/profile slot count to concurrent transcription
 workers.
 
@@ -1515,9 +1536,11 @@ sources overwrite earlier values). The same order applies to every backend:
 3. per-role flags (embed/rerank mode flags) **+ the resolved named batch
    keys** — `batch:`/`ubatch:` (sidecar > profile > `llama_server:` fleet
    section > backend role defaults) render explicitly on every
-   llama-server command and win over conflicting `args` values; `cli_args`
-   `-b`/`-ub` is warned about (shadowed, and invisible to the VRAM
-   measurement)
+   llama-server command and win over conflicting `args` values. `-ub` in
+   sidecar `cli_args` is warned about: it wins in the rendered command but
+   the VRAM estimate never sees it (the estimate uses `args` plus the named
+   `ubatch:` key), so the served and measured flag shapes can diverge. `-b`
+   is not part of the measured shape and is not warned about.
 4. per-model sidecar `cli_args:`
 
 **A batch key that is unset anywhere in the cascade renders no flag at all**,

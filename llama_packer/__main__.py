@@ -409,26 +409,38 @@ def _health_check_timeout(models, args) -> int:
     return hct
 
 
+def _stable_link(path: Path) -> tuple[str, str] | None:
+    """A valid stable link -> (path, real build dir); docs/install.md."""
+    if not path.is_symlink() or not path.exists():
+        return None
+    target = path.resolve()
+    if not target.is_file():
+        return None
+    return str(path), str(target.parent)
+
+
 def resolve_llama_bin(cli: str | None, profile_bin: str | None,
                       version: str, base: Path) -> tuple[str, str]:
-    """``(llama_bin, bin_dir)`` by the same chain as every other engine.
-
-    ``--llama-server`` > ``profiles.yaml llama_server.bin`` > ``$LLAMA_BIN_DIR``
-    > ``tools/`` > the run directory. llama.cpp is the one engine whose
-    default is a versioned build directory, so the last two tiers are
-    :func:`llama_packer.utils.find_bin_dir`.
-    """
+    """Binary and real build dir; docs/backends/llama-server.md §Binary."""
     chosen = cli or profile_bin
     if chosen:
         path = Path(str(chosen)).expanduser()
         if path.is_dir():
             path = path / "llama-server"
-        # resolve() follows a symlinked llama-server into the versioned
-        # build dir, the home of its llama.cpp siblings (fit-params, ...).
+        if path.is_symlink():
+            stable = _stable_link(path)
+            if stable is None:
+                fatal("stable llama-server link %s is dangling", path)
+            return stable
         resolved = path.resolve()
         return str(resolved), str(resolved.parent)
     bin_dir = find_bin_dir(version, base)
-    return str(base / bin_dir / "llama-server"), bin_dir
+    binary = base / bin_dir / "llama-server"
+    for directory in utils.binary_search_dirs(base):
+        stable = _stable_link(directory / "llama-server")
+        if stable is not None:
+            return stable
+    return str(binary), bin_dir
 
 
 def resolve_host_binary(

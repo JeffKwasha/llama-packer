@@ -99,21 +99,16 @@ def test_llama_server_mtp_args(make_model):
                     "mtp_draft_p_min": 0.75}
 
 
-def test_llama_server_multi_slot_drops_single_slot_draft_engine(make_model, caplog):
-    # Validates: SPEC.md, 'Single-sequence draft engines': a dflash/dspark draft is omitted when the entry serves more than one slot, so the first concurrent batch cannot abort llama-server
-    import logging
+def test_llama_server_single_slot_draft_engine_survives_multi_slot(make_model):
+    # Validates: SPEC.md, 'Single-sequence draft engines': the build-11988
+    # Validates: FLOW_DSPARK_SURVIVES_MULTI_SLOT — tests/test_backends.py
+    # guard is gone after concurrent-request tests on build 12600.
     b = LlamaServerBackend()
     m = make_model("m", mtp=True, mtp_spec_type="draft-dspark")
-    with caplog.at_level(logging.WARNING):
-        cmd, meta = b.build_cmd(m, 32768, 4, "q8_0", _tvars())
-    assert "--spec-type" not in cmd
-    assert meta == {"mtp_enabled": False}
-    assert any("one sequence at a time" in r.message for r in caplog.records)
-
-    # One slot is the engine's native shape: the draft stays.
-    cmd, meta = b.build_cmd(m, 32768, 1, "q8_0", _tvars())
-    assert "--spec-type draft-dspark" in cmd
-    assert meta["mtp_enabled"] is True
+    for parallel in (1, 4, 6):
+        cmd, meta = b.build_cmd(m, 32768, parallel, "q8_0", _tvars())
+        assert "--spec-type draft-dspark" in cmd
+        assert meta["mtp_enabled"] is True
 
 
 def test_llama_server_multi_slot_keeps_batchable_draft_engine(make_model):
@@ -310,7 +305,7 @@ def test_warn_unhandled(caplog):
 
 
 def test_warn_unhandled_names_the_sidecar(caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic about one sidecar leads with the sidecar's name.
+    # Validates: FLOW_UNHANDLED_WARNING_NAMES_SIDECAR — docs/development.md §Claims
     import logging
     b = get_backend("vllm")
     with caplog.at_level(logging.WARNING):
@@ -391,7 +386,7 @@ def test_infer_backend_gguf_prefers_llama_server(make_model):
 
 
 def test_infer_backend_gguf_image_goes_to_sd_server(make_model):
-    # Validates: docs/plans/requirement-trace.md, requirement #90
+    # Validates: ARCH_ROLE_REGISTRY_CLOSED_ENDPOINTS — docs/architecture.md §Models, tasks, engines and endpoints
     from llama_packer.backends import infer_backend
     m = make_model("img", role="image")
     assert infer_backend(m, {"llama_bin": "/opt/llama-server",
@@ -532,9 +527,9 @@ def test_llama_server_global_args_role_flags_win(make_model):
     assert "--flash-attn on" in cmd
 
 
-def test_llama_server_batch_ubatch_render_and_defaults(make_model):
-    # The resolved batch keys render explicitly in the per-role slot:
-    # they win over conflicting fleet args, lose to cli_args (warned).
+def test_llama_server_batch_ubatch_render_and_defaults(make_model, caplog):
+    # The resolved batch keys render explicitly in the per-role slot: they
+    # win over conflicting fleet args, lose to cli_args.
     # Validates: docs/backends/llama-server.md, 'Command shape': build_cmd.
     be = LlamaServerBackend()
     tv = {**_tvars(), "llama_args": "--flash-attn on -b 512 -ub 512"}
@@ -543,10 +538,28 @@ def test_llama_server_batch_ubatch_render_and_defaults(make_model):
     assert "-b 2048 -ub 512" in cmd
     assert "-b 512" not in cmd and "-ub 512" in cmd
     assert "--flash-attn on" in cmd
-    # cli_args -b/-ub warn once (shadowed + invisible to measurement).
-    cmd2, _ = be.build_cmd(make_model("w", cli_args="-b 4096"), 32768, 1,
-                           "q8_0", tv, batch=2048, ubatch=512)
+    # cli_args -b is harmless to the estimate, so it stays quiet.
+    with caplog.at_level(logging.WARNING,
+                         logger="llama_packer.backends.llama_server"):
+        cmd2, _ = be.build_cmd(make_model("w", cli_args="-b 4096"), 32768, 1,
+                               "q8_0", tv, batch=2048, ubatch=512)
     assert "-b 4096 -ub 512" in cmd2  # named flags win per-flag
+    assert not [r for r in caplog.records if "cli_args" in r.message]
+
+
+def test_llama_server_cli_args_ub_warning_names_the_fix(make_model, caplog):
+    # Validates: SPEC.md 'Flags and precedence': a cli_args -ub override is
+    # warned about because the VRAM estimate never sees it; -b is not.
+    be = LlamaServerBackend()
+    with caplog.at_level(logging.WARNING,
+                         logger="llama_packer.backends.llama_server"):
+        be.build_cmd(make_model("w", cli_args="-ub 999"), 32768, 1, "q8_0",
+                     _tvars(), batch=2048, ubatch=512)
+    msgs = [r.message for r in caplog.records
+            if "cli_args -ub" in r.message]
+    assert len(msgs) == 1
+    assert msgs[0] == ("w: cli_args -ub ignored by VRAM probe; "
+                       "set 'ubatch: N' instead")
 
 
 def test_llama_server_unset_batch_ubatch_renders_no_flag(make_model):
@@ -606,7 +619,7 @@ def test_measurement_shape_stamps_builtin_ubatch(make_model):
 
 
 def test_measurement_shape_stamps_cpu_device(make_model):
-    # Validates: docs/plans/requirement-trace.md, requirement #61
+    # Validates: FLOW_CPU_SHAPE_CARRIES_DEVICE_PIN — SPEC.md §Host pool
     """A CPU-served model's measurement shape carries the device pin:
     fit-params reports host buffers under it, and a later device flip
     (sidecar edit) invalidates the persisted block by shape."""
@@ -844,7 +857,7 @@ def test_infer_backend_allowed_reorders_and_disables(make_model):
 
 
 def test_apply_overrides_backend_is_alien(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #96
+    # Validates: ARCH_AUTHORED_SIDECAR_DECLARES_ENGINES — SPEC.md §Backend Selection
     from llama_packer.scope import ScopeStack
     m = make_model("p", backend="vllm-docker")
     m.stub = False
