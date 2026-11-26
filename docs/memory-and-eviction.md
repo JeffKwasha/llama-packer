@@ -78,23 +78,25 @@ not grow with context, such as a fixed RAG window or a whisper backend, uses
 
 Each member requests a share of it, by weight:
 
-| `share:` | request | accepts surplus |
+| `share:` | weight | accepts surplus |
 |---|---|---|
 | `min` | 0 | no |
 | `0` | 0 | yes |
-| `27%` | 27 | yes |
-| `fill` | what the weighted roles leave below 100, else 0 | yes |
+| `27` | 27 (relative, uncapped) | yes |
+| `27%` | 27 (a 27-point claim; warned if claims sum above 100) | yes |
+| `fill` | residual 100-point space, split among fills | yes |
 
 ```
-request(role, set) = weight% × auction(set)
+weight(fill, set)  = max(0, 100 − Σ other weights in set) / n_fills
+request(role, set) = weight / Σ weights in set × auction(set)
 offer(role, set)   = floor + request
 allocation(role)   = min over its sets of offer
 ```
 
-Every claimant is normalised by the sum of its weight. A weighted role uses
-its number. A fill uses what the weighted roles leave below 100, split
-equally; when they leave nothing, the fill weighs 0 and accepts any
-remainder a capped role frees.
+Every claimant is normalised by the sum of its weight. A plain number is a
+relative weight; `N%` is a claim of N points in the same space. `fill` takes
+whatever points are left, claims last, and receives surplus nobody else
+accepts.
 
 Each set is priced on its own. A role's limit is the minimum across the sets
 it belongs to, so adding a set can only lower it. An offer in one set does
@@ -104,6 +106,18 @@ headroom.
 A model then solves inside its role's allocation. One role runs one serving
 at a time: in capacity mode every role is a pool of value 1 and every entry
 charges 1; in matrix mode a role label expands to one of its entries.
+
+## Live VRAM attribution
+
+`extras/gpu_vram_monitor.py` samples the global VRAM counter and, per GPU fd,
+the kernel's DRM fdinfo (`drm-resident-vram`, `drm-resident-gtt`, deduped by
+`drm-client-id`). fdinfo is rootless but uid-scoped: it sees servers the
+caller owns, not the `lemonade`-owned llama-swap children. Each sample's
+`attribution` block names the source and whether it covers the GPU's users;
+check `attribution.complete` before treating an empty `processes` list as an
+idle GPU. debugfs is a root-only fallback; `nvtop -s` shows the same fdinfo
+data as a snapshot. llama-swap's `/logs/stream/upstream` exposes child logs,
+but they carry no `-lv 5` buffers unless the serving command asks for them.
 
 ## Emission: capacities and margin
 

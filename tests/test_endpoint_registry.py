@@ -12,23 +12,23 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_registry_invariants_hold():
-    # Validates: docs/plans/requirement-trace.md, requirement #97
+    # Validates: ARCH_ENDPOINT_REGISTRY_SINGLE_OWNER — SPEC.md §Backend Selection
     assert endpoints.check_registry() == []
 
 
 def test_registry_engine_table_matches_backends():
-    # Validates: docs/plans/requirement-trace.md, requirement #97
+    # Validates: ARCH_ENDPOINT_REGISTRY_SINGLE_OWNER — SPEC.md §Backend Selection
     for bound in BACKENDS.values():
         assert bound.endpoints == endpoints.ENGINE_ENDPOINTS[bound.engine.name]
 
 
 def test_registry_docs_agree():
-    # Validates: docs/plans/requirement-trace.md, requirement #97
+    # Validates: ARCH_ENDPOINT_REGISTRY_SINGLE_OWNER — SPEC.md §Backend Selection
     assert endpoints.docs_agree(ROOT) == []
 
 
 def test_registry_engines_value_shape():
-    # Validates: docs/plans/requirement-trace.md, requirement #97
+    # Validates: ARCH_ENDPOINT_REGISTRY_SINGLE_OWNER — SPEC.md §Backend Selection
     assert endpoints.validate_engines_value(None) == []
     assert endpoints.validate_engines_value("vllm") == []
     assert endpoints.validate_engines_value([]) == [

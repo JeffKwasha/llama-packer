@@ -43,7 +43,7 @@ def _run(budget, **kwargs):
 
 def test_fit_crash_records_argv_and_stderr(budget, artifact_dir, monkeypatch,
                                            caplog):
-    # Validates: requirement 94 — a crash keeps argv, model facts, exit code and the full log; the warning names the artifact.
+    # Validates: FLOW_FIT_FAILURE_RECORDS_EVIDENCE — SPEC.md §Measurement via `llama-fit-params`
     def fake_run(cmd, **kwargs):
         assert kwargs["capture_output"] is True
         return subprocess.CompletedProcess(
@@ -74,7 +74,7 @@ def test_fit_crash_records_argv_and_stderr(budget, artifact_dir, monkeypatch,
 
 def test_fit_crash_recorded_once_per_invocation(budget, artifact_dir,
                                                 monkeypatch, caplog):
-    # Validates: requirement 94 — one artifact per distinct failing invocation; repeats warn once, not per call.
+    # Validates: FLOW_FIT_FAILURE_RECORDS_EVIDENCE — SPEC.md §Measurement via `llama-fit-params`
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, "", "error: boom\n")
 
@@ -87,7 +87,7 @@ def test_fit_crash_recorded_once_per_invocation(budget, artifact_dir,
 
 
 def test_fit_timeout_records_argv(budget, artifact_dir, monkeypatch):
-    # Validates: requirement 94 — a timeout records the command it was running, even though there is no output to keep.
+    # Validates: FLOW_FIT_FAILURE_RECORDS_EVIDENCE — SPEC.md §Measurement via `llama-fit-params`
     def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 60)
 
@@ -102,7 +102,7 @@ def test_fit_timeout_records_argv(budget, artifact_dir, monkeypatch):
 
 
 def test_fit_unparseable_records_output(budget, artifact_dir, monkeypatch):
-    # Validates: requirement 94 — an exit-0 run whose log will not parse keeps the output too, since that is the whole evidence.
+    # Validates: FLOW_FIT_FAILURE_RECORDS_EVIDENCE — SPEC.md §Measurement via `llama-fit-params`
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, "not a fit-params log\n",
                                            "")

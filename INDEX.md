@@ -60,6 +60,7 @@ Engines and transports are independent axes: each engine declares the transports
 - [docs/plans/](docs/plans/) — design records and unscheduled proposals; not normative. The current contract is [SPEC.md](SPEC.md) and [docs/architecture.md](docs/architecture.md).
 - [docs/plans/roadmap.md](docs/plans/roadmap.md) — followers designed but unscheduled, and open defects, so a shipped plan can be pruned without losing them
 - [docs/glossary.md](docs/glossary.md) — **one name per concept**: sidecar, spare, derived:, rung, demand, blessed, coload, entry id, and the rest, each tied to the identifier that implements it
+- [docs/taxonomy.md](docs/taxonomy.md) — named requirement IDs, owner docs, citations, and the gate; [docs/requirement-index.md](docs/requirement-index.md) is generated from the registry
 - [docs/reference.md](docs/reference.md) — external links
 - [docs/install.md](docs/install.md) — deploying under systemd from a run directory: service account, group-writable config, GPU-node discovery ([extras/install.py](extras/install.py))
 

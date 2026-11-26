@@ -13,6 +13,10 @@ The default engine: GGUF chat, embeddings and rerank via llama.cpp's
   `PATH` fallback, because a build that is not a versioned `llama-b*`
   directory is not a build the planner can size against. Its cwd scan is the
   reason the other backends' resolution gained a run-directory tier too.
+  When a stable `llama-server` link sits beside the build in `tools/` (or the
+  run directory), the emitted config names that link rather than the versioned
+  directory, so an engine update moves the served binary without a re-pack.
+  `llama-fit-params` is still resolved inside the build the link points at.
 - **Proxied:** no — llama-swap manages the process and proxies by port.
 
 ## Command shape
@@ -50,15 +54,25 @@ byte-identical to a `-c parallel*X` pool (validated against `llama-fit-params`).
   `n_batch = n_ubatch` when embeddings are enabled.
 - Reasoning flags and image-token flags are chat/vision-only and skipped
   elsewhere (with warnings when a declaration cannot apply).
-- A `draft-dflash`/`draft-dspark` draft is omitted when the entry serves more
-  than one slot: those engines are single-sequence and abort llama-server on
-  the first concurrent batch. See SPEC.md, "Single-sequence draft engines".
+- A `draft-dflash`/`draft-dspark` draft is emitted at any slot count. Those
+  engines are single-sequence and aborted llama-server on a concurrent batch
+  on build 11988; build 12600 passed concurrent-request tests with the
+  MiniCPM-V 4.7 1B and Qwen3.8-27B drafts. See SPEC.md, "Single-sequence draft
+  engines".
 
 ## profiles.yaml
 
 - `llama_server: {args: "...", batch: N, ubatch: M}` — fleet-wide args and the
   first-class batch keys. Precedence: `built-ins < args < role flags <
-  sidecar cli_args`; the named `-b`/`-ub` win over conflicting `args`.
+  sidecar cli_args`; the named `-b`/`-ub` win over conflicting `args`. Put
+  `-ub` in `ubatch:` (or `args`), not sidecar `cli_args`: the VRAM estimate
+  reads the named key and `args`, so a `cli_args` override makes the served
+  flags disagree with the measured shape. `-b` has no effect on the estimate.
+  Logging flags (`-lv 5`, `-v`, `--log-*`) are the exception: they are
+  stripped from the shape stamp by `vram.shape_key()`, so enabling verbose
+  server logs fleet-wide in `args` does not invalidate `derived:` blocks or
+  trigger a re-measure. Only memory-relevant flags do. Stamp tokens are
+  shlex-quoted, so a value containing spaces survives the round trip.
 
 ## VRAM
 

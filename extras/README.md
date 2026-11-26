@@ -31,10 +31,9 @@ llama-packer Python package.
   `whisper`/`w`, `sd`/`stable`, and `all` for everything. Globs
   work (`s*`), and an ambiguous prefix is an error rather than a guess. `all` is
   matched in full only, because `a` is an alias for audio.cpp — otherwise the
-  one-letter shorthand would be ambiguous. A bare `./extras/update.py` only
-  links what the service account can execute; `--fetch` downloads and updates
-  **llama.cpp and llama-swap**; `all` adds audio.cpp, whisper.cpp and
-  stable-diffusion.cpp.
+  one-letter shorthand would be ambiguous. A bare `./extras/update.py` behaves
+  as `all`: it downloads and updates every engine it can, and reports why any
+  it could not update. `--fetch` is an accepted alias for the default.
   Only llama-swap publishes a `checksums.txt`; every other target says plainly
   that the download was authenticated by its immutable tag URL over TLS and
   nothing more. `--require-checksums` refuses an archive nobody checksummed.

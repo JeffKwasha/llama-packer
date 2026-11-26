@@ -201,8 +201,8 @@ MUTATIONS = {
 }
 
 
-def tests_for(req: int, trace: str) -> list[str]:
-    row = re.search(rf"^\| {req} \|(.+)$", trace, re.MULTILINE)
+def tests_for(req: str, trace: str) -> list[str]:
+    row = re.search(rf"^\| {re.escape(req)} \|(.+)$", trace, re.MULTILINE)
     return re.findall(r"`(test_[A-Za-z0-9_]+)`", row.group(1)) if row else []
 
 

@@ -39,7 +39,7 @@ def test_parse_ctx_size_rejects_junk(raw):
 
 
 def test_task_declares_device_and_max_context():
-    # Validates: docs/plans/requirement-trace.md, requirement #107
+    # Validates: ARCH_ROLE_IS_OPERATOR_DATA — docs/profiles-authoring.md
     cat = TaskCatalogue.from_cfg({
         "spot": {"endpoint": CHAT, "device": 1,
                  "max_context": "8k", "min_context": "2k"},
@@ -150,7 +150,7 @@ def test_resolve_tasks_dedupes_repeats():
 
 
 def test_resolve_tasks_ignores_unblessed_tag_with_warning(caplog):
-    # Validates: SPEC.md, 'Usage categories (`tasks:`)': an undeclared tag is warned about and ignored.
+    # Validates: FLOW_TASK_UNKNOWN_WARNS_IGNORED — SPEC.md §Tasks
     cat = catalogue({"chat": {"min_context": "64k"}})
     with caplog.at_level("WARNING"):
         got = resolve_tasks(["chat", "code"], cat)
@@ -406,7 +406,7 @@ def test_untagged_gets_a_bare_id(make_model):
     the id; a repack that moved 182k to 180k must not rename the model out
     from under a client that cached it.
 
-    Validates: SPEC.md, 'Ids carry no context': an untagged entry is the bare stem.
+    Validates: FLOW_MODEL_FALLBACK_ENTRY — SPEC.md §Tasks
     """
     m = make_model("plain", context_length=262144)
     config = emit_config([m], {"plain": [_variant(131072, ())]},
@@ -417,7 +417,7 @@ def test_untagged_gets_a_bare_id(make_model):
 
 def test_same_model_two_groups_disambiguated(make_model):
     """
-    Validates: SPEC.md, 'Ids carry no context': ids stay stable across repacks, so the
+    Validates: FLOW_ENTRY_ID_STABLE_ACROSS_REPACKS — SPEC.md §Output Format
     disambiguator describes the serving and never the solve.
     """
     # Two profile groups can land on the same category+flags; the first keeps
@@ -441,7 +441,7 @@ def test_duplicate_ids_do_not_move_when_context_moves(make_model):
     out: opencode/hermes cache ids at startup, so a context-derived suffix
     repoints a cached id at a different serving on every repack.
 
-    Validates: SPEC.md, 'Ids carry no context': 182k -> 180k must not rename a model.
+    Validates: FLOW_ENTRY_ID_IGNORES_CONTEXT — SPEC.md §Output Format
     """
     m = make_model("qwen38", context_length=262144,
                    capabilities=["tools", "image"])
@@ -471,7 +471,7 @@ def test_category_slugged_for_the_id(make_model):
 def test_unusable_category_name_falls_back_to_a_bare_id(make_model):
     """A name that cannot survive slugging drops the segment, not the entry.
 
-    Validates: SPEC.md, 'Ids carry no context': a name that cannot slug drops the
+    Validates: FLOW_UNSLUGGABLE_NAME_DROPS_SEGMENT — SPEC.md §Output Format
     segment, not the entry.
     """
     m = make_model("m", context_length=262144)
@@ -490,7 +490,7 @@ def test_require_gates_existence(make_model, tmp_path):
     Planner.met_demands and went when that did, which briefly let a
     text-only model claim `require: [vision]`.
 
-    Validates: SPEC.md: 'require and keep are different and both are
+    Validates: FLOW_REQUIRED_CAPABILITY_GATES_EXISTENCE — SPEC.md §Context Tiers
     honoured'.
     """
     from llama_packer.writer import Planner
@@ -522,7 +522,7 @@ def test_shed_levels_are_prefixes_of_the_declared_order():
     threshold before any category was read, so a category that would rather
     keep vision and give up its draft had no say in it.
 
-    Validates: SPEC.md, 'Shedding is described per category': the ladder walks the
+    Validates: FLOW_SACRIFICE_ORDER_DRIVES_LADDER — SPEC.md §Context Tiers
     category's own sacrifice order, not a global one.
     """
     # Cumulative along the declared order, then the default tail: a category
@@ -539,7 +539,7 @@ def test_shed_levels_are_prefixes_of_the_declared_order():
 
 def test_required_capabilities_are_never_shed():
     """
-    Validates: SPEC.md, 'Shedding is described per category': require gates existence.
+    Validates: FLOW_REQUIRED_CAPABILITY_NEVER_SHED — SPEC.md §Context Tiers
     """
     order = writer.shed_levels(("vision",), required=frozenset({"vision"}))
     assert frozenset({"vision"}) not in order, order
@@ -551,7 +551,7 @@ def test_unnamed_capabilities_come_last_not_first():
     Empty tuple is *no stated preference*, not *refuse to degrade* — the
     distinction matters, and conflating them was the bug.
 
-    Validates: SPEC.md, 'Shedding is described per category': what a category omits is
+    Validates: FLOW_UNNAMED_CAPABILITIES_SHED_LAST — SPEC.md §Context Tiers
     shed last, in the order from `shed:`.
     """
     assert writer.shed_levels(()) == (
@@ -587,7 +587,7 @@ def test_keep_protects_from_shedding_without_gating_existence():
     draft companion -- a large share of the fleet -- which is why it needed
     a word of its own rather than a wider meaning for `require`.
 
-    Validates: SPEC.md: 'require and keep are different and both are honoured' -- keep
+    Validates: FLOW_KEEP_FORBIDS_SHED_ONLY — SPEC.md §Context Tiers
     forbids shedding; only require gates existence.
     """
     d = Task("coding", CHAT, "chat", min_context=133120, keep=frozenset({"draft"}))
@@ -644,7 +644,7 @@ def test_keep_is_parsed_from_profiles():
 def test_task_ids_resolve_to_declared_demands():
     """A sidecar's `tasks:` resolves to exactly what profiles.yaml declared.
 
-    Validates: docs/plans/requirement-trace.md #1 -- the category comes from
+    Validates: FLOW_TASK_DECLARED_ONLY — SPEC.md §Tasks
     the sidecar tag; nothing infers or overrides it.
     """
     profiles = Profiles({"defaults": {}, "tasks": {
@@ -680,7 +680,7 @@ def test_usage_tag_not_declared_warns_and_is_ignored(caplog):
 def test_usage_warnings_lead_with_the_sidecar_name(caplog):
     """Every `tasks:` warning is about one sidecar, so it names it first.
 
-    Validates: SPEC.md, 'Usage categories (`tasks:`)': a diagnostic leads
+    Validates: FLOW_WARNING_NAMES_SIDECAR — docs/development.md §Claims
     with the sidecar's name, so an operator can triage it by name.
     """
     import logging
@@ -698,7 +698,7 @@ def test_usage_warnings_lead_with_the_sidecar_name(caplog):
 
 
 def test_audio_cpp_task_must_match_the_model_task(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #98
+    # Validates: ARCH_TASK_CATALOGUE_ONLY_VOCABULARY — SPEC.md §Tasks
     from llama_packer.discover import _warn_unsupported_values
 
     m = make_model("tts", tasks=["s2t"], audio_cpp={"family": "qwen3_tts",
@@ -714,7 +714,7 @@ def test_audio_cpp_task_must_match_the_model_task(make_model, caplog):
 def test_a_declared_task_id_is_arbitrary(make_model, tmp_path):
     """A task id that appears nowhere in the code still serves.
 
-    Validates: docs/plans/requirement-trace.md #99 -- task ids are declared
+    Validates: ARCH_TASK_ID_IS_DECLARED_DATA — SPEC.md §Tasks
     in profiles; only the endpoint and scheduling role are checked.
     """
     arbitrary = "zq7-odd-job"
@@ -741,7 +741,7 @@ def test_a_declared_task_id_is_arbitrary(make_model, tmp_path):
 def test_an_undeclared_task_id_fails(make_model, caplog):
     """The same arbitrary id, undeclared, is not a task.
 
-    Validates: docs/plans/requirement-trace.md #99 -- an id outside the
+    Validates: ARCH_TASK_ID_IS_DECLARED_DATA — SPEC.md §Tasks
     declared catalogue warns and produces no task entry.
     """
     declared = "chat"

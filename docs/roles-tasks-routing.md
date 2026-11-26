@@ -158,9 +158,10 @@ bare model id with no endpoint in its role. In short:
 - A set's floor follows its expression: `&` sums floors, `|` takes the
   maximum, `+set` inlines a set.
 - `auction(set) = available − floor(set)`, on the model's device pool.
-  Members request it by `share` weight; a role's limit is the minimum offer
-  across the sets it belongs to. Each set keeps its own offer and its own
-  unallocated headroom.
+  Members request it by `share`: a number is an uncapped relative weight,
+  `N%` is a claim of N points, and `fill` takes the residual points and
+  claims last. A role's limit is the minimum offer across the sets it belongs
+  to. Each set keeps its own offer and its own unallocated headroom.
 
 A role runs one serving at a time in both routers. In capacity mode every
 role is a pool of value 1 and every entry charges 1. In matrix mode a role

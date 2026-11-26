@@ -1,63 +1,5 @@
 #!/usr/bin/env python3
-"""update — install and refresh prebuilt engine binaries.
-
-Every target goes through one pipeline: resolve a release, download it,
-verify the hash when upstream publishes one, extract into a staging directory
-on the destination filesystem, promote by rename, move one stable symlink and
-prune what is no longer needed. llama-packer is not a target: installing it
-is the installer's job (see docs/install.md), and this tool only fills the
-engines that llama-packer then configures.
-
-**Where things install.** Derived from where the command was run, never from
-where this file lives: run it from the install directory and it updates
-``<install>/tools``; run it from ``tools`` itself and it updates that
-directory. One flat directory holds every engine, each as a versioned entry
-plus a stable symlink:
-
-    tools/llama-server       -> ./llama-b12345/llama-server
-    tools/llama-swap         -> llama-swap-v266
-    tools/whisper-server     -> ./whisper-server-b4938/whisper-server
-    tools/audiocpp_server    -> audiocpp_server-v0.9.2
-    tools/update                            a copy of this file
-
-Old versions stay beside the new one, so rolling forward is a symlink change
-and rolling back is one too.
-
-Usage: ./extras/update.py [target|backend|version ...] [options]
-
-Targets are positional selectors; `all` must be typed in full.
-
-    ./extras/update.py             # link what is installed, no download
-    ./extras/update.py --fetch     # llama.cpp and llama-swap
-    ./extras/update.py all         # every target
-    ./extras/update.py llama       # llama.cpp + llama-swap
-    ./extras/update.py ll          # same, abbreviated
-    ./extras/update.py cpp         # llama.cpp alone
-    ./extras/update.py swap        # llama-swap alone
-    ./extras/update.py audio       # audio.cpp -> audiocpp_server
-    ./extras/update.py whisper     # whisper.cpp -> whisper-server
-    ./extras/update.py sd          # stable-diffusion.cpp -> sd-server
-    ./extras/update.py "s*"        # globs select a set (here: swap + sd)
-
-Backends are positional, and apply to whichever targets offer one:
-
-    ./extras/update.py sd rocm     # native ROCm build
-    ./extras/update.py llama rocm
-
-Versions still work, in the historical shapes:
-
-    ./extras/update.py b8913       # specific llama.cpp build + latest llama-swap
-    ./extras/update.py vulkan      # latest Vulkan build + latest llama-swap
-    ./extras/update.py rocm
-    ./extras/update.py --swap-only v252  # specific llama-swap version
-    ./extras/update.py --skip-swap  # skip llama-swap
-
-``--plan`` resolves every selected target and prints current -> candidate,
-size and destination without downloading anything. Releases are chosen by
-channel and date (see :func:`select_release`), not by list order.
-
-Standard library only — no venv, no third-party deps.
-"""
+"""Update prebuilt engines. See docs/install.md §The updater command line."""
 
 from __future__ import annotations
 
@@ -506,18 +448,7 @@ def _discovery_candidates() -> list[Path]:
 def resolve_install_dirs(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, tuple[Path, str]]:
-    """``{engine key: (directory, why)}`` for every target.
-
-    The rule: **update what is already installed, where it already is**. An
-    engine found in a candidate directory is updated there; only an engine
-    with no existing install is placed under the configured root.
-
-    Precedence: ``--dir``, ``$<KEY>_BIN_DIR``, an existing install in the
-    run directory's ``tools/`` or in the install directory itself, then
-    ``$LLAMA_DIR``, then the run directory's ``tools/``. There is no config
-    file: llama-packer reads ``profiles.yaml`` for the same paths, and an
-    engine installed by something else is that tool's to manage.
-    """
+    """Directory and reason per engine; docs/install.md §Where an update installs."""
     overrides = {k: v for k, v in (overrides or {}).items() if v}
     candidates = _discovery_candidates()
     resolved: dict[str, tuple[Path, str]] = {}
@@ -1005,9 +936,6 @@ TARGET_ALIASES: dict[str, tuple[str, ...]] = {
 #: make that one-letter shorthand ambiguous.
 ALL_ALIASES = ("all",)
 
-DEFAULT_TARGETS = ("cpp", "swap")
-
-
 class TargetError(ValueError):
     """A target selector matched nothing, or matched too much."""
 
@@ -1204,7 +1132,6 @@ class Plan:
     source: str = ""
     policy: str = ""
     noop: bool = False
-    link_only: bool = False
     note: str = ""
     error: str = ""
 
@@ -1496,54 +1423,8 @@ def executable_by(path: Path | None, user: str = "") -> tuple[bool, str]:
     return False, f"not executable by {user}"
 
 
-def plan_link(engine: Engine, install_dir: Path, user: str = "",
-              preferred: str = "") -> Plan:
-    """Plan a link to what is already installed. No network, no download."""
-    preferred = _normalize_tag(engine, preferred)
-    plan = Plan(engine=engine, directory=install_dir, link_only=True)
-    plan.current = current_engine_tag(engine, install_dir)
-    primary = install_dir / engine.primary
-    entries = versioned_entries(engine, install_dir)
-    if preferred:
-        pinned = install_dir / engine.versioned.format(tag=preferred)
-        if not _engine_is_intact(engine, pinned):
-            plan.error = (f"Error: {engine.label} {preferred} is not installed "
-                          f"in {install_dir}; add --fetch to download it")
-            return plan
-        entries = [pinned, *(e for e in entries if e != pinned)]
-    elif primary.is_file() and not primary.is_symlink():
-        plan.noop = True
-        plan.note = (f"{engine.label}: {primary.name} is a real file, not a "
-                     "link; leaving it alone (remove it to get the link)")
-        return plan
-    refused: list[str] = []
-    for entry in entries:
-        if not _engine_is_intact(engine, entry):
-            continue
-        target = link_target_for(engine, entry)
-        if not target:
-            continue
-        ok, why = executable_by(entry_binary(engine, entry), user)
-        if not ok:
-            eprint(f"Note: {entry.name}: {why}; skipping")
-            refused.append(f"{entry.name}: {why}")
-            continue
-        plan.tag = engine.tag_from_name(entry.name)
-        if primary.is_symlink() and os.readlink(primary) == target:
-            plan.noop = True
-            plan.note = f"{engine.label} {plan.tag} already linked"
-        return plan
-    if refused:
-        plan.error = "Error: " + "; ".join(refused)
-    else:
-        plan.noop = True
-        plan.note = f"no {engine.label} installed in {install_dir}"
-    return plan
-
-
 def ensure_links(engine: Engine, install_dir: Path,
-                 preferred: str = "", user: str = "",
-                 adopt_real_file: bool = True) -> tuple[bool, bool]:
+                 preferred: str = "", user: str = "") -> tuple[bool, bool]:
     """Point the stable name at an intact entry, from what is on disk.
 
     *preferred* is the tag this run just installed, so an explicit pin moves
@@ -1552,10 +1433,6 @@ def ensure_links(engine: Engine, install_dir: Path,
     wins, so a run that was killed after the rename converges on the next one
     instead of reporting "already installed" forever with a stale link.
     """
-    primary = install_dir / engine.primary
-    if primary.is_file() and not primary.is_symlink() and not adopt_real_file:
-        eprint(f"Note: {primary.name} is a real file; leaving it alone")
-        return True, False
     installed = versioned_entries(engine, install_dir)
     if preferred:
         pinned = install_dir / engine.versioned.format(tag=preferred)
@@ -1695,11 +1572,10 @@ def report_summary(plans: list[Plan], results: list[bool]) -> None:
     print("\nDone:" if not failed else "\nDone (with failures):")
     for plan, ok in zip(plans, results):
         if not ok:
-            print(f"  {plan.engine.label:<22} failed")
+            reason = plan.error or "see the plan above"
+            print(f"  {plan.engine.label:<22} not updated: {reason}")
         elif plan.noop:
             print(f"  {plan.engine.label:<22} up to date")
-        elif plan.link_only:
-            print(f"  {plan.engine.label:<22} linked {plan.tag}")
         else:
             print(f"  {plan.engine.label:<22} installed {plan.tag}")
 
@@ -1793,8 +1669,8 @@ def build_parser() -> argparse.ArgumentParser:
             + "\n".join(alias_lines)
             + f"\n  {'all':<9} {' '.join(ALL_ALIASES)}   # everything\n"
             "  (a glob works too: 's*' selects swap and sd)\n"
-            "With no target, llama.cpp and llama-swap are updated.\n"
-            "'all' adds audio.cpp, whisper.cpp and stable-diffusion.cpp.\n"
+            "With no target, all five engines are updated; 'all' spells it out.\n"
+            "A named version pins only that target.\n"
             "\n"
             "Backends (positional): " + ", ".join(KNOWN_BACKENDS)
             + "\n\n"
@@ -1890,8 +1766,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fetch",
         action="store_true",
-        help="Download and install the newest release (default: only link "
-             "what is already installed).",
+        help="Accepted alias for the default: a bare run already downloads "
+             "and installs the newest release.",
     )
     parser.add_argument(
         "--user",
@@ -1952,7 +1828,7 @@ def _select_targets(args: argparse.Namespace, targets: tuple[str, ...]
         return ("cpp",)
     if args.skip_swap:
         return ("cpp",)
-    return DEFAULT_TARGETS
+    return ALL_TARGETS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2015,11 +1891,6 @@ def main(argv: list[str] | None = None) -> int:
     for key in selected:
         directory = install_dirs[key][0]
         try:
-            if not args.fetch:
-                plan = plan_link(ENGINES[key], directory, args.user,
-                                 preferred=pinned.get(key, ""))
-                plans.append(plan)
-                continue
             if key == "cpp":
                 plan = plan_engine(
                     CPP, directory, arch=get_llama_cpp_arch(args.arch),
@@ -2071,17 +1942,11 @@ def apply_one(plan: Plan, keep: int, user: str = "") -> bool:
     link is finished by the next one instead of being reported as current
     forever.
     """
-    if plan.link_only:
-        if plan.error:
-            eprint(plan.error)
-            return False
-        if plan.noop:
-            print(plan.note)
-    elif not apply_plan(plan):
+    if not apply_plan(plan):
         return False
     if plan.tag:
         ok, backed_up = ensure_links(plan.engine, plan.directory, plan.tag,
-                                     user, adopt_real_file=not plan.link_only)
+                                     user)
     else:
         ok, backed_up = True, False
     if ok:

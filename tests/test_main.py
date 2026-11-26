@@ -251,7 +251,7 @@ def test_every_backend_uses_the_same_chain():
 
 
 def test_role_device_places_every_model_of_the_role(tmp_path):
-    # Validates: SPEC.md, 'Roles': a role's device: places every model it
+    # Validates: FLOW_ROLE_DEVICE_PLACEMENT — SPEC.md §Host pool
     # owns, indistinguishable from a sidecar device: cpu.
     from llama_packer import roles
     from llama_packer.discover import discover
@@ -273,7 +273,7 @@ def test_role_device_places_every_model_of_the_role(tmp_path):
 
 
 def test_role_device_does_not_override_a_sidecar(tmp_path):
-    # Validates: SPEC.md, 'Roles': the sidecar is the more specific source.
+    # Validates: FLOW_ROLE_DEVICE_PLACEMENT — SPEC.md §Host pool
     from llama_packer import roles
     from llama_packer.discover import discover
     root = tmp_path / "models"
@@ -381,6 +381,48 @@ def test_llama_server_profiles_bin_accepts_a_directory(tmp_path):
     llama_bin, _ = resolve_llama_bin(None, str(binary.parent), "latest", base)
 
     assert llama_bin == str(binary.resolve())
+
+
+def test_llama_server_config_names_the_stable_link(tmp_path, monkeypatch):
+    # Validates: docs/glossary.md 'stable primary', docs/install.md
+    # Validates: DEPLOY_CONFIG_NAMES_STABLE_LINK — tests/test_main.py
+    # 'The updater installs the engines': a config that names the link follows
+    # an engine update instead of pinning the build it was generated against.
+    base = tmp_path / "run"
+    base.mkdir()
+    build = _build(base / "tools", "llama-b12")
+    link = base / "tools" / "llama-server"
+    link.symlink_to(build)
+
+    llama_bin, bin_dir = resolve_llama_bin(None, None, "latest", base)
+
+    assert llama_bin == str(link)
+    assert bin_dir == str(build.parent)
+
+
+def test_llama_server_profiles_bin_keeps_a_stable_link(tmp_path):
+    # Validates: docs/backends/llama-server.md 'Binary': an explicit stable
+    # link stays a link in the config; only its siblings need the real build.
+    base = tmp_path / "run"
+    base.mkdir()
+    build = _build(tmp_path / "opt", "llama-b12")
+    link = tmp_path / "opt" / "llama-server"
+    link.symlink_to(build)
+
+    llama_bin, bin_dir = resolve_llama_bin(None, str(link), "latest", base)
+
+    assert llama_bin == str(link)
+    assert bin_dir == str(build.parent)
+
+
+def test_llama_server_refuses_a_dangling_named_link(tmp_path):
+    # Validates: docs/install.md, 'Where an update installs': a named stable
+    # Validates: DEPLOY_DANGLING_LINK_REFUSED — tests/test_main.py
+    # link with a missing target is refused, not emitted as a broken command.
+    link = tmp_path / "llama-server"
+    link.symlink_to(tmp_path / "llama-b9999/llama-server")
+    with pytest.raises(SystemExit):
+        resolve_llama_bin(None, str(link), "latest", tmp_path)
 
 
 def test_llama_server_falls_back_to_the_environment_then_tools(

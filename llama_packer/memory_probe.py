@@ -1,30 +1,4 @@
-"""VRAM probe: serve-shaped measurement and affine-law validation.
-
-The VRAM law (validated 2026-09-07 across qwen35/gemma4 — dense, MoE and
-SWA architectures, q8_0/f16/bf16/q4_0, p ∈ {1,2,4,8}, C ∈ {64k,128k,256k}):
-
-    VRAM(C, p) = model_mib + compute_mib + c*C + p*D
-
-``C`` is the *total* shared KV pool (llama.cpp ``-c``; byte-identical to
-``--kv-unified-per-slot X -np p`` with pool ``p*X``), ``c`` the per-token
-cost, and ``D`` the fixed per-slot cost.  Everything serve-shaped — MTP
-draft KV and compute, hybrid-arch recurrent-state caches, batch-dependent
-compute — is affine in ``(C, p)``.  A measurement trio — ``(C, 1)``,
-``(C, 2)``, ``(C/2, 1)`` — pins the law from device totals alone:
-``D = t(C,2) − t(C,1)``, ``c = 2·(t(C,1) − t(C/2,1))/C``,
-``fixed = t(C,1) − c·C − D``.
-
-Measurement source: real ``llama-server`` runs under the exact flags the
-server will run with (fit-params reports the KV pool only and misses the
-RS/draft/batch terms — the 2026-09-07 Dirk GTT spill).  The probe CLI
-(``llama-packer --probe-memory [ARCH...]``) measures one representative
-per GGUF arch family on a small (C, p) grid (p ∈ {1,2}; the {1,2,4,8}
-sweep above was the one-off validation campaign) and reports the derived
-constants plus the max residual against the law — the check when a new
-architecture family shows up.  The correction rows it writes are the only
-persisted state (the pack-time estimate and the emitted config are
-untouched).
-"""
+"""Serve-shaped VRAM probe. See SPEC §Measurement via `llama-fit-params`."""
 
 from __future__ import annotations
 
@@ -37,6 +11,7 @@ from llama_packer.consts import _MEASURE_CTX_CAP, _MIN_CTX_SIZE
 from llama_packer.profiles import Profiles
 from llama_packer.vram import (
     FitParams,
+    shape_key,
 )
 
 if TYPE_CHECKING:
@@ -242,7 +217,7 @@ def affine_report(
                 "delta_d": d - est.slot_mib,
                 "rep_stem": model.stem,
                 "cache_type": cache_type,
-                "shape": (llama_args or "").strip()}
+                "shape": shape_key(llama_args)}
         # The correction table's mtp dimension is the *baked-in* draft shape
         # only (Model.mtp_baked_in — the same predicate the packer keys its
         # lookup on).  A witness that ran with --spec-draft-model carries the
@@ -275,7 +250,7 @@ def affine_report(
                 compute_mib=int(bufs[(big, 1)]["compute"]),
                 source="llama-server",
                 cache_type=cache_type,
-                shape=(llama_args or "").strip(),
+                shape=shape_key(llama_args),
             )
             persist = getattr(model, "persist_measured", None)
             if callable(persist):

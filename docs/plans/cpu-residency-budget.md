@@ -10,7 +10,7 @@ under pressure like any other resident; a non-chat helper defaults to
 prices each role directly. The set composition section and the host-ledger
 unit judgement below are history:
 each fixed CPU category is judged on its own quad against what is free
-after the committed pair (requirement #70).
+after the committed pair (FLOW_HOST_POOL_CLAMPS_TO_ZERO).
 **Amended 2026-11-11:** `HostLedger` is retired. A CPU model now solves its
 context down inside its role's `ram` allocation — `floor + share ×
 (available − floor)` — exactly like a GPU model inside `default`; the

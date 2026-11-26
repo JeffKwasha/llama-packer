@@ -12,7 +12,7 @@ from llama_packer.profiles import check_profiles, validate_profiles_keys
 
 
 def test_unknown_profiles_key_warns_with_a_hint(caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #89
+    # Validates: FLOW_UNKNOWN_PROFILES_KEY_HINT — docs/profiles-authoring.md
     # nothing reads warns (with a near-miss hint) instead of doing nothing.
     log = logging.getLogger("t")
     with caplog.at_level(logging.WARNING):
@@ -25,7 +25,7 @@ def test_unknown_profiles_key_warns_with_a_hint(caplog):
 
 
 def test_check_profiles_names_every_nested_error():
-    # Validates: docs/plans/requirement-trace.md, requirement #106
+    # Validates: FLOW_PROFILES_VALIDATION_NAMES_ERRORS — docs/profiles-authoring.md
     problems = check_profiles({
         "profiles": {"default": {"temperatur": 0.5}},
         "tasks": {"chat": {"role": "chat"}},
@@ -56,7 +56,7 @@ def test_check_profiles_accepts_llama_server_bin():
 
 
 def test_check_profiles_validates_sets_and_retired_routing():
-    # Validates: docs/plans/requirement-trace.md, requirement #109
+    # Validates: FLOW_MATRIX_SETS_SELECT_ROUTER — docs/profiles-authoring.md
     problems = check_profiles({
         "profiles": {"default": {}},
         "routing": {"use": "turbo"},
@@ -68,7 +68,7 @@ def test_check_profiles_validates_sets_and_retired_routing():
 
 
 def test_matrix_sets_are_accepted_and_select_the_router():
-    # Validates: docs/plans/requirement-trace.md, requirement #109
+    # Validates: FLOW_MATRIX_SETS_SELECT_ROUTER — docs/profiles-authoring.md
     problems = check_profiles({
         "profiles": {"default": {}},
         "matrix": {"sets": {"rag": "chat & embeddings"}},
@@ -77,7 +77,7 @@ def test_matrix_sets_are_accepted_and_select_the_router():
 
 
 def test_matrix_sets_expand_roles_to_entry_ids():
-    # Validates: docs/plans/requirement-trace.md, requirement #109
+    # Validates: FLOW_MATRIX_SETS_SELECT_ROUTER — docs/profiles-authoring.md
     from llama_packer.__main__ import _expand_matrix_sets
 
     got = _expand_matrix_sets(
@@ -90,14 +90,14 @@ def test_matrix_sets_expand_roles_to_entry_ids():
 
 
 def test_check_profiles_accepts_the_example():
-    # Validates: docs/plans/requirement-trace.md, requirement #106
+    # Validates: FLOW_PROFILES_VALIDATION_NAMES_ERRORS — docs/profiles-authoring.md
     root = Path(__file__).resolve().parent.parent
     cfg = yaml.safe_load((root / "profiles.yaml.example").read_text())
     assert check_profiles(cfg) == []
 
 
 def test_check_mode_exits_before_discovery(tmp_path):
-    # Validates: docs/plans/requirement-trace.md, requirement #106
+    # Validates: FLOW_PROFILES_VALIDATION_NAMES_ERRORS — docs/profiles-authoring.md
     from llama_packer.__main__ import main
 
     good = tmp_path / "good.yaml"

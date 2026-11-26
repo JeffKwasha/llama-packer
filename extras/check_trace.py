@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Verify the requirement trace: every named test exists and cites a doc.
+"""Verify the taxonomy registry. See docs/taxonomy.md.
 
-    python extras/check_trace.py
-
-The point is that "implemented" is checkable. A requirement with no test is
-unimplemented no matter what the code looks like, and a test without a
-`Validates:` citation cannot be traced back to the rule it holds up.
+    python extras/check_trace.py [--write]
 """
+import argparse
 import ast
 import re
 import sys
@@ -14,56 +11,129 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TRACE = ROOT / "docs/plans/requirement-trace.md"
+INDEX = ROOT / "docs/requirement-index.md"
+FAMILIES = frozenset({"USER", "ARCH", "FLOW", "DEPLOY"})
+BANNED = frozenset({"RULE", "REQ", "TEST", "MISC"})
+ID_RE = re.compile(r"^[A-Z]+(?:_[A-Z0-9]+){2,}$")
+ROW_RE = re.compile(
+    r"^\| ([A-Z_]+) \| ([^|]+?) \| ([^|]*?) \| (.+?) \| (.+?) \|$")
+TEST_RE = re.compile(r"`(test_[A-Za-z0-9_]+)`")
 
 
-def scan_tests() -> tuple[set[str], set[str]]:
-    """``(defined, cited)`` in one pass over the test tree.
-
-    A test is *cited* when its own body carries a ``Validates:`` line, so the
-    citation is read from the function's source segment rather than the file:
-    a line elsewhere in the module does not hold up the test that merely sits
-    near it.
-    """
+def scan_tests() -> tuple[set[str], dict[str, set[str]]]:
+    """Defined tests and the IDs each one cites in its own source segment."""
     defined: set[str] = set()
-    cited: set[str] = set()
+    cited: dict[str, set[str]] = {}
     for path in (ROOT / "tests").rglob("*.py"):
         text = path.read_text()
         for node in ast.walk(ast.parse(text)):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            if not node.name.startswith("test_"):
+            if not isinstance(node, ast.FunctionDef) \
+                    or not node.name.startswith("test_"):
                 continue
             defined.add(node.name)
-            if "Validates:" in (ast.get_source_segment(text, node) or ""):
-                cited.add(node.name)
+            source = ast.get_source_segment(text, node) or ""
+            ids = set(re.findall(
+                r"Validates:[^\n]*?\b((?:USER|ARCH|FLOW|DEPLOY)_[A-Z0-9_]+)",
+                source))
+            cited[node.name] = ids
     return defined, cited
 
 
+def parse_registry(text: str) -> list[dict]:
+    rows = []
+    for line in text.splitlines():
+        if line.startswith("| ID |") or line.startswith("|---"):
+            continue
+        match = ROW_RE.match(line)
+        if not match:
+            continue
+        ident, owner, satisfies, requirement, tests = (
+            part.strip() for part in match.groups())
+        rows.append({
+            "id": ident, "owner": owner, "satisfies": satisfies,
+            "requirement": requirement, "tests": TEST_RE.findall(tests),
+        })
+    return rows
+
+
+def owner_ok(owner: str) -> bool:
+    path_s, _, section = owner.partition(" §")
+    path = ROOT / path_s.strip()
+    if not path.is_file():
+        return False
+    return not section or section.strip() in path.read_text()
+
+
+def validate(rows: list[dict], defined: set[str], cited: dict[str, set[str]],
+             write: bool) -> list[str]:
+    errors: list[str] = []
+    ids: set[str] = set()
+    known: set[str] = set()
+    by_test: dict[str, set[str]] = {}
+    for row in rows:
+        ident = row["id"]
+        family, _, rest = ident.partition("_")
+        if family not in FAMILIES or not ID_RE.match(ident) \
+                or set(rest.split("_")) & BANNED:
+            errors.append(f"{ident}: malformed taxonomy ID")
+        if ident in ids:
+            errors.append(f"{ident}: duplicate ID")
+        ids.add(ident)
+        known.add(ident)
+        if not owner_ok(row["owner"]):
+            errors.append(f"{ident}: owner does not resolve: {row['owner']}")
+        for want_id in re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", row["satisfies"]):
+            if want_id not in ids and want_id not in FAMILIES:
+                errors.append(f"{ident}: unknown satisfied ID {want_id}")
+        if not row["tests"]:
+            errors.append(f"{ident}: no test named")
+        for test in row["tests"]:
+            if test not in defined:
+                errors.append(f"{ident}: test not defined: {test}")
+            by_test.setdefault(test, set()).add(ident)
+    for test, wanted in by_test.items():
+        found = cited.get(test, set())
+        if not found & wanted:
+            errors.append(
+                f"{test}: cites {sorted(found) or 'nothing'}; "
+                f"expected one of {sorted(wanted)}")
+    for test, found in cited.items():
+        for ident in found:
+            if ident not in known:
+                errors.append(f"{test}: unknown taxonomy ID {ident}")
+    index = "\n".join(
+        f"| {r['id']} | {r['owner']} | {r['requirement']} | "
+        f"{', '.join(f'`{t}`' for t in r['tests'])} |" for r in rows)
+    expected = (
+        "# Requirement index\n\nGenerated by `extras/check_trace.py --write`.\n\n"
+        "| ID | Owner | Requirement | Tests |\n"
+        "|---|---|---|---|\n" + index + "\n")
+    if write:
+        INDEX.write_text(expected)
+    elif not INDEX.exists() or INDEX.read_text() != expected:
+        errors.append("requirement index is stale; run --write")
+    return errors
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write", action="store_true",
+                        help="regenerate docs/requirement-index.md")
+    args = parser.parse_args()
     if not TRACE.exists():
         print(f"missing {TRACE}", file=sys.stderr)
         return 2
-    trace = TRACE.read_text()
-    want = set(re.findall(r"`(test_[A-Za-z0-9_]+)`", trace))
-    have, cited = scan_tests()
-
-    missing = sorted(want - have)
-    requirements = len(re.findall(r"^\| \d+ \|", trace, re.MULTILINE))
-
-    print(f"{requirements} requirements, {len(want)} tests named")
-    if missing:
-        print(f"\nNAMED BUT NOT DEFINED ({len(missing)}):")
-        for name in missing:
-            print(f"  {name}")
-    uncited = sorted(want - cited)
-    if uncited:
-        print(f"\nDEFINED BUT NO `Validates:` CITATION ({len(uncited)}):")
-        for name in uncited:
-            print(f"  {name}")
-    if not missing and not uncited:
-        print("\ntrace is complete: every requirement has a test, "
-              "every test cites its rule.")
-    return 1 if (missing or uncited) else 0
+    rows = parse_registry(TRACE.read_text())
+    defined, cited = scan_tests()
+    errors = validate(rows, defined, cited, args.write)
+    print(f"{len(rows)} requirements, {len(defined)} tests defined")
+    if errors:
+        print("\nTAXONOMY ERRORS:")
+        for error in errors:
+            print(f"  {error}")
+        return 1
+    print("trace is complete: every ID has a resolvable owner and a citing test.")
+    return 0
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ def test_merge_base_expression_missing_below_skipped(caplog):
 
 
 def test_merge_bad_base_expression_names_the_origin(caplog):
-    # Validates: SPEC.md, 'Usage categories (`usage:`)': a diagnostic leads with the name of the sidecar or layer it is about.
+    # Validates: FLOW_BASE_ERROR_NAMES_ORIGIN — docs/development.md §Claims
     """A `base *` expression that cannot be evaluated warns naming the
     layer the expression came from, not a bare fact."""
     import logging

@@ -10,7 +10,7 @@ from llama_packer.backends.base import BaseBackend
 from llama_packer.endpoints import ENGINE_ENDPOINTS
 from llama_packer import endpoints as eps
 from llama_packer import utils
-from llama_packer.consts import _MTP_SPEC_TYPE, _SINGLE_SLOT_SPEC_TYPES
+from llama_packer.consts import _MTP_SPEC_TYPE
 
 if TYPE_CHECKING:
     from llama_packer.model import Model
@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 _STATIC_IMAGE_ARCHES = frozenset({"gemma3", "gemma4"})
 _warned_static_arch: set[str] = set()
 _warned_cli_batch: set[str] = set()
-_warned_spec_parallel: set[str] = set()
 
 
 class LlamaServerBackend(BaseBackend):
@@ -44,21 +43,12 @@ class LlamaServerBackend(BaseBackend):
         eps.RERANK: "--rerank --pooling rank",
     }
 
-    def _mtp_args(self, model: "Model", parallel: int = 1) -> tuple[list[str], dict]:
+    def _mtp_args(self, model: "Model") -> tuple[list[str], dict]:
         """Speculative-decoding flags plus metadata contributions."""
         mtp_on, n_max = model._mtp_info()
         if not mtp_on:
             return [], {"mtp_enabled": False}
         spec_type = model.frontmatter.get("mtp_spec_type", _MTP_SPEC_TYPE)
-        if parallel > 1 and _SINGLE_SLOT_SPEC_TYPES & set(str(spec_type).split(",")):
-            msg = (f"{model.stem}: {spec_type} serves one sequence at a time; "
-                   f"dropping speculative decoding at parallel={parallel} "
-                   f"(llama-server aborts on the first concurrent batch) — "
-                   f"pin 'parallel: 1' to keep the draft")
-            if msg not in _warned_spec_parallel:
-                _warned_spec_parallel.add(msg)
-                logger.warning(msg)
-            return [], {"mtp_enabled": False}
         p_min = model.mtp_draft_p_min
         args = ["--spec-type", spec_type, "--spec-draft-n-max", str(n_max),
                 "--draft-p-min", str(p_min)]
@@ -118,10 +108,11 @@ class LlamaServerBackend(BaseBackend):
         entry_id: str | None = None,
     ) -> tuple[str, dict]:
         # First-class batch keys render explicitly in the per-role slot
-        # (named flags win over conflicting fleet args, lose to cli_args —
-        # which is why cli_args -b/-ub is warned about).  Each half renders
-        # independently and only when set: an unset key means "use llama.cpp's
-        # own default", so the flag is left off the command entirely.
+        # (named flags win over conflicting fleet args, lose to cli_args).
+        # Each half renders independently and only when set: an unset key
+        # means "use llama.cpp's own default", so the flag is left off the
+        # command entirely. A cli_args -ub override is warned about because
+        # the VRAM estimate never sees it; -b has no effect on the estimate.
         role_flags = " ".join(
             flag for ep, flag in self._ENDPOINT_FLAGS.items()
             if model.serves_endpoint(ep))
@@ -130,10 +121,9 @@ class LlamaServerBackend(BaseBackend):
         if ubatch is not None:
             role_flags += f" -ub {ubatch}"
         cli = (model.frontmatter.get("cli_args") or "").strip()
-        if any(tok in ("-b", "-ub") for tok in cli.split()):
-            msg = (f"{model.stem}: cli_args carries -b/-ub — shadowed by the "
-                   f"rendered batch/ubatch and invisible to the VRAM "
-                   f"measurement; use the batch:/ubatch: keys instead")
+        if "-ub" in cli.split():
+            msg = (f"{model.stem}: cli_args -ub ignored by VRAM probe; "
+                   f"set 'ubatch: N' instead")
             if msg not in _warned_cli_batch:
                 _warned_cli_batch.add(msg)
                 logger.warning(msg)
@@ -154,7 +144,7 @@ class LlamaServerBackend(BaseBackend):
         if model.on_cpu:
             flags += ["--n-gpu-layers", "0"]
 
-        mtp_args, meta = self._mtp_args(model, parallel)
+        mtp_args, meta = self._mtp_args(model)
         flags += mtp_args
 
         if include_mmproj and model.mmproj and model.mmproj.gguf_path:

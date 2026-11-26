@@ -33,9 +33,11 @@ that PR.
 
 Legal references, in order of preference:
 
-1. a `SPEC.md` §section or `docs/` page — `SPEC §Knobs (matrix section keys)`;
-2. a `requirement-trace.md` row — `requirement #74`;
+1. a taxonomy ID — `FLOW_FILL_CLAIMS_RESIDUAL`, `DEPLOY_INSTALL_ATOMIC`;
+2. a `SPEC.md` §section or `docs/` page — `SPEC §Knobs (matrix section keys)`;
 3. a symbol — `_host_unit_refusals`, `AGENTS.md`.
+
+The ID scheme and the gate live in [docs/taxonomy.md](docs/taxonomy.md).
 
 If none of those says it, explain it right there in the sentence. Never
 `file.py:123`, never `SPEC 305`, never `PR #12`, never a second copy of the

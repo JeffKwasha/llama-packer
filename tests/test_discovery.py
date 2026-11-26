@@ -162,7 +162,7 @@ def test_type_field_does_not_choose_a_role(tmp_path):
 
 
 def test_role_is_a_valid_sidecar_key(make_model, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #88
+    # Validates: FLOW_ROLE_KEY_AND_DEVICE_VOCABULARY — docs/profiles-authoring.md
     import logging
     from llama_packer.discover import _warn_unsupported_values
     m = make_model("tk", role="chat", tasks=["chat"])
@@ -173,7 +173,7 @@ def test_role_is_a_valid_sidecar_key(make_model, caplog):
 
 
 def test_usage_is_an_alien_sidecar_key(tmp_path, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #88
+    # Validates: FLOW_ROLE_KEY_AND_DEVICE_VOCABULARY — docs/profiles-authoring.md
     import logging
     root = tmp_path / "models"
     root.mkdir()
@@ -186,7 +186,7 @@ def test_usage_is_an_alien_sidecar_key(tmp_path, caplog):
 
 
 def test_unknown_device_value_warns(tmp_path, caplog):
-    # Validates: docs/plans/requirement-trace.md, requirement #88
+    # Validates: FLOW_ROLE_KEY_AND_DEVICE_VOCABULARY — docs/profiles-authoring.md
     # or a non-negative index; anything else used to place the model on the
     # default GPU as if the key were absent.
     import logging

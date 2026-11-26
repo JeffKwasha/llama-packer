@@ -236,9 +236,12 @@ roles:
 - A role has no behaviour. The models under it declare `tasks:`, and each
   task names the endpoint it is served at. A role is ownership and
   allocation, nothing else.
-- `share` — the role's request in each set: a number (`40`, `40%`, and values
-  above 100 are relative weights), `fill` (the remainder, or 0 when none), `min` (0, accept nothing), or `0` (0, accept what remains). Weights are normalised per set; they do not
-  sum to a cap.
+- `share` — the role's request in each set: a number (`40`; values above 100
+  are valid relative weights), `40%` (a claim of 40 points — percentages that
+  sum above 100 are warned about), `fill` (the residual points, claimed last,
+  so it also gets surplus nobody else accepts), `min` (0, accept nothing), or
+  `0` (0, accept what remains). Weights are normalised per set in one
+  100-point space; the point is a unit, not a cap on raw weights.
 - `device` — `auto`, `cpu`, or a GPU index, the same vocabulary as a sidecar.
   Unset leaves placement to the sidecar/task. See
   [SPEC §Device](../SPEC.md#device-device) for the precedence and the
